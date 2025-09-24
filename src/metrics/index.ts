@@ -14,10 +14,17 @@ type LatencyStats = {
 
 type HistogramSnapshot = Record<string, number>;
 
+type PipelineRestartMeta = {
+  reason: string;
+  attempt: number | null;
+  delayMs: number | null;
+};
+
 type PipelineSnapshot = {
   restarts: number;
   lastRestartAt: string | null;
   byReason: CounterMap;
+  lastRestart: PipelineRestartMeta | null;
 };
 
 type SuppressionSnapshot = {
@@ -71,6 +78,8 @@ class MetricsRegistry {
   private readonly histograms = new Map<string, Map<string, number>>();
   private readonly ffmpegRestartReasons = new Map<string, number>();
   private readonly audioRestartReasons = new Map<string, number>();
+  private lastFfmpegRestartMeta: PipelineRestartMeta | null = null;
+  private lastAudioRestartMeta: PipelineRestartMeta | null = null;
   private readonly suppressionByRule = new Map<string, number>();
   private readonly suppressionByReason = new Map<string, number>();
   private totalEvents = 0;
@@ -91,6 +100,8 @@ class MetricsRegistry {
     this.histograms.clear();
     this.ffmpegRestartReasons.clear();
     this.audioRestartReasons.clear();
+    this.lastFfmpegRestartMeta = null;
+    this.lastAudioRestartMeta = null;
     this.suppressionByRule.clear();
     this.suppressionByReason.clear();
     this.totalEvents = 0;
@@ -138,16 +149,37 @@ class MetricsRegistry {
     }
   }
 
-  recordPipelineRestart(type: 'ffmpeg' | 'audio', reason: string) {
+  recordPipelineRestart(
+    type: 'ffmpeg' | 'audio',
+    reason: string,
+    meta?: { delayMs?: number; attempt?: number }
+  ) {
     const normalized = reason || 'unknown';
     if (type === 'ffmpeg') {
       this.ffmpegRestarts += 1;
       this.lastFfmpegRestartAt = Date.now();
       this.ffmpegRestartReasons.set(normalized, (this.ffmpegRestartReasons.get(normalized) ?? 0) + 1);
+      this.lastFfmpegRestartMeta = {
+        reason: normalized,
+        attempt: typeof meta?.attempt === 'number' ? meta?.attempt : null,
+        delayMs: typeof meta?.delayMs === 'number' ? meta?.delayMs : null
+      };
     } else {
       this.audioRestarts += 1;
       this.lastAudioRestartAt = Date.now();
       this.audioRestartReasons.set(normalized, (this.audioRestartReasons.get(normalized) ?? 0) + 1);
+      this.lastAudioRestartMeta = {
+        reason: normalized,
+        attempt: typeof meta?.attempt === 'number' ? meta?.attempt : null,
+        delayMs: typeof meta?.delayMs === 'number' ? meta?.delayMs : null
+      };
+    }
+
+    const delay = meta?.delayMs;
+    if (typeof delay === 'number' && delay >= 0) {
+      const metric = `pipeline.${type}.restart.delay`;
+      this.observeLatency(metric, delay);
+      this.observeHistogram(metric, delay);
     }
   }
 
@@ -229,12 +261,14 @@ class MetricsRegistry {
         ffmpeg: {
           restarts: this.ffmpegRestarts,
           lastRestartAt: this.lastFfmpegRestartAt ? new Date(this.lastFfmpegRestartAt).toISOString() : null,
-          byReason: mapFrom(this.ffmpegRestartReasons)
+          byReason: mapFrom(this.ffmpegRestartReasons),
+          lastRestart: this.lastFfmpegRestartMeta
         },
         audio: {
           restarts: this.audioRestarts,
           lastRestartAt: this.lastAudioRestartAt ? new Date(this.lastAudioRestartAt).toISOString() : null,
-          byReason: mapFrom(this.audioRestartReasons)
+          byReason: mapFrom(this.audioRestartReasons),
+          lastRestart: this.lastAudioRestartMeta
         }
       },
       suppression: {

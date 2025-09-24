@@ -8,15 +8,23 @@ import { VideoSource } from './video/source.js';
 import LightDetector from './video/lightDetector.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector from './video/personDetector.js';
-import type { PersonConfig } from './config/index.js';
+import type { CameraFfmpegConfig, PersonConfig, VideoConfig } from './config/index.js';
 
-const videoConfig = config.get<{ testFile: string; framesPerSecond: number }>('video');
+const videoConfig = config.get<VideoConfig>('video');
 const personConfig = config.get<PersonConfig>('person');
-const videoFile = ensureSampleVideo(videoConfig.testFile);
+const sampleSource = videoConfig.testFile ?? 'assets/test-video.mp4';
+const videoFile = ensureSampleVideo(sampleSource);
+const ffmpegConfig: CameraFfmpegConfig | undefined = videoConfig.ffmpeg;
 
 const source = new VideoSource({
   file: videoFile,
   framesPerSecond: videoConfig.framesPerSecond,
+  startTimeoutMs: ffmpegConfig?.startTimeoutMs,
+  watchdogTimeoutMs: ffmpegConfig?.watchdogTimeoutMs,
+  forceKillTimeoutMs: ffmpegConfig?.forceKillTimeoutMs,
+  restartDelayMs: ffmpegConfig?.restartDelayMs,
+  restartMaxDelayMs: ffmpegConfig?.restartMaxDelayMs,
+  restartJitterFactor: ffmpegConfig?.restartJitterFactor,
   commandFactory: ({ file, framesPerSecond }) =>
     ffmpeg(file)
       .inputOptions('-stream_loop', '-1')
@@ -116,7 +124,7 @@ async function main() {
 
   source.on('recover', info => {
     logger.warn(
-      { reason: info.reason, attempt: info.attempt },
+      { reason: info.reason, attempt: info.attempt, delayMs: info.delayMs },
       `Video source reconnecting (reason=${info.reason})`
     );
   });

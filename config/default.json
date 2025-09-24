@@ -38,7 +38,13 @@
     "framesPerSecond": 2,
     "ffmpeg": {
       "inputArgs": ["-re"],
-      "rtspTransport": "tcp"
+      "rtspTransport": "tcp",
+      "startTimeoutMs": 4000,
+      "watchdogTimeoutMs": 5000,
+      "forceKillTimeoutMs": 3000,
+      "restartDelayMs": 500,
+      "restartMaxDelayMs": 5000,
+      "restartJitterFactor": 0.2
     },
     "cameras": [
       {

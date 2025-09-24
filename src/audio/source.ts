@@ -279,7 +279,10 @@ export class AudioSource extends EventEmitter {
     this.retryCount += 1;
     const delay = this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
 
-    metrics.recordPipelineRestart('audio', reason);
+    metrics.recordPipelineRestart('audio', reason, {
+      attempt: this.retryCount,
+      delayMs: delay
+    });
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       this.startProcess();

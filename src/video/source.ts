@@ -13,6 +13,8 @@ const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0
 const DEFAULT_START_TIMEOUT_MS = 4000;
 const DEFAULT_IDLE_TIMEOUT_MS = 5000;
 const DEFAULT_RESTART_DELAY_MS = 500;
+const DEFAULT_RESTART_MAX_DELAY_MS = 5000;
+const DEFAULT_RESTART_JITTER_FACTOR = 0.2;
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
 const DEFAULT_MAX_BUFFER_BYTES = 5 * 1024 * 1024;
 
@@ -23,6 +25,8 @@ export type VideoSourceOptions = {
   watchdogTimeoutMs?: number;
   startTimeoutMs?: number;
   restartDelayMs?: number;
+  restartMaxDelayMs?: number;
+  restartJitterFactor?: number;
   maxBufferBytes?: number;
   forceKillTimeoutMs?: number;
   inputArgs?: string[];
@@ -33,11 +37,13 @@ export type VideoSourceOptions = {
     inputArgs?: string[];
     rtspTransport?: string;
   }) => ffmpeg.FfmpegCommand;
+  random?: () => number;
 };
 
 export type RecoverEvent = {
   reason: string;
   attempt: number;
+  delayMs: number;
 };
 
 export class VideoSource extends EventEmitter {
@@ -71,8 +77,9 @@ export class VideoSource extends EventEmitter {
     this.clearRestartTimer();
     this.clearStartTimer();
     this.clearWatchdogTimer();
+    this.clearKillTimer();
     this.cleanupStream();
-    this.terminateCommand(true);
+    this.terminateCommand(true, { skipForceDelay: true });
   }
 
   consume(stream: Readable) {
@@ -277,22 +284,24 @@ export class VideoSource extends EventEmitter {
 
     this.recovering = true;
     this.restartCount += 1;
-    metrics.recordPipelineRestart('ffmpeg', reason);
-    this.emit('recover', { reason, attempt: this.restartCount } as RecoverEvent);
+    const attempt = this.restartCount;
+    const delay = this.computeRestartDelay(attempt);
+
+    metrics.recordPipelineRestart('ffmpeg', reason, { attempt, delayMs: delay });
+    this.emit('recover', { reason, attempt, delayMs: delay } satisfies RecoverEvent);
 
     this.clearStartTimer();
     this.clearWatchdogTimer();
     this.cleanupStream();
     this.terminateCommand(true);
 
-    const delay = this.options.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS;
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
       this.startCommand();
     }, delay);
   }
 
-  private terminateCommand(force = false) {
+  private terminateCommand(force = false, options: { skipForceDelay?: boolean } = {}) {
     if (!this.command) {
       return;
     }
@@ -315,6 +324,14 @@ export class VideoSource extends EventEmitter {
 
     this.clearKillTimer();
     const delay = this.options.forceKillTimeoutMs ?? DEFAULT_FORCE_KILL_TIMEOUT_MS;
+    if (options.skipForceDelay || delay <= 0) {
+      try {
+        command.kill('SIGKILL');
+      } catch (error) {
+        // Ignore
+      }
+      return;
+    }
 
     const cleanup = () => {
       this.clearKillTimer();
@@ -406,6 +423,24 @@ export class VideoSource extends EventEmitter {
       this.emit('error', new Error('Video source watchdog timeout'));
       this.scheduleRecovery('watchdog-timeout');
     }, idleTimeout);
+  }
+
+  private computeRestartDelay(attempt: number) {
+    const baseDelay = Math.max(0, this.options.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS);
+    const maxDelay = Math.max(baseDelay, this.options.restartMaxDelayMs ?? DEFAULT_RESTART_MAX_DELAY_MS);
+    if (attempt <= 1) {
+      return baseDelay;
+    }
+
+    const factor = Math.max(0, this.options.restartJitterFactor ?? DEFAULT_RESTART_JITTER_FACTOR);
+    const growth = Math.min(maxDelay, Math.max(baseDelay, baseDelay * 2 ** (attempt - 1)));
+    if (factor <= 0) {
+      return growth;
+    }
+
+    const random = this.options.random?.() ?? Math.random();
+    const jitter = Math.round(growth * factor * Math.min(1, Math.max(0, random)));
+    return Math.min(maxDelay, growth + jitter);
   }
 }
 
