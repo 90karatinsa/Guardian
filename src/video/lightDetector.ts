@@ -1,7 +1,12 @@
 import { EventEmitter } from 'node:events';
 import eventBus from '../eventBus.js';
 import { EventPayload } from '../types.js';
-import { averageLuminance, readFrameAsGrayscale } from './utils.js';
+import {
+  averageLuminance,
+  readFrameAsGrayscale,
+  gaussianBlur,
+  medianFilter
+} from './utils.js';
 
 export interface LightDetectorOptions {
   source: string;
@@ -9,15 +14,26 @@ export interface LightDetectorOptions {
   normalHours?: Array<{ start: number; end: number }>;
   smoothingFactor?: number;
   minIntervalMs?: number;
+  debounceFrames?: number;
+  backoffFrames?: number;
+  noiseMultiplier?: number;
+  noiseSmoothing?: number;
 }
 
 const DEFAULT_DELTA_THRESHOLD = 30;
 const DEFAULT_SMOOTHING = 0.2;
 const DEFAULT_MIN_INTERVAL_MS = 60000;
+const DEFAULT_DEBOUNCE_FRAMES = 2;
+const DEFAULT_BACKOFF_FRAMES = 3;
+const DEFAULT_NOISE_MULTIPLIER = 2.5;
+const DEFAULT_NOISE_SMOOTHING = 0.1;
 
 export class LightDetector {
   private baseline: number | null = null;
   private lastEventTs = 0;
+  private noiseLevel = 0;
+  private pendingFrames = 0;
+  private backoffFrames = 0;
 
   constructor(
     private readonly options: LightDetectorOptions,
@@ -26,32 +42,70 @@ export class LightDetector {
 
   handleFrame(frame: Buffer, ts = Date.now()) {
     const grayscale = readFrameAsGrayscale(frame);
-    const luminance = averageLuminance(grayscale);
+    const blurred = gaussianBlur(grayscale);
+    const smoothed = medianFilter(blurred);
+    const luminance = averageLuminance(smoothed);
 
     if (this.baseline === null) {
       this.baseline = luminance;
+      this.noiseLevel = 0;
       return;
     }
 
     const smoothing = this.options.smoothingFactor ?? DEFAULT_SMOOTHING;
-    this.baseline = this.baseline * (1 - smoothing) + luminance * smoothing;
-
-    if (this.isWithinNormalHours(ts)) {
-      return;
-    }
+    const debounceFrames = this.options.debounceFrames ?? DEFAULT_DEBOUNCE_FRAMES;
+    const backoffFrames = this.options.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
+    const noiseMultiplier = this.options.noiseMultiplier ?? DEFAULT_NOISE_MULTIPLIER;
+    const noiseSmoothing = this.options.noiseSmoothing ?? DEFAULT_NOISE_SMOOTHING;
 
     const deltaThreshold = this.options.deltaThreshold ?? DEFAULT_DELTA_THRESHOLD;
     const delta = Math.abs(luminance - this.baseline);
+    const currentNoiseLevel = this.noiseLevel === 0 ? delta : this.noiseLevel;
+    const adaptiveThreshold = Math.max(deltaThreshold, currentNoiseLevel * noiseMultiplier);
 
-    if (delta < deltaThreshold) {
+    if (this.isWithinNormalHours(ts)) {
+      this.updateBaseline(luminance, smoothing);
+      this.resetDebounce();
       return;
     }
 
-    if (ts - this.lastEventTs < (this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS)) {
+    if (delta < adaptiveThreshold) {
+      if (this.noiseLevel === 0) {
+        this.noiseLevel = delta;
+      } else {
+        this.noiseLevel =
+          this.noiseLevel * (1 - noiseSmoothing) + delta * noiseSmoothing;
+      }
+      this.updateBaseline(luminance, smoothing);
+      this.resetDebounce(false);
+      if (this.backoffFrames > 0) {
+        this.backoffFrames -= 1;
+      }
+      return;
+    }
+
+    this.noiseLevel = Math.max(this.noiseLevel * (1 - noiseSmoothing), deltaThreshold);
+
+    if (this.backoffFrames > 0) {
+      this.backoffFrames -= 1;
+      return;
+    }
+
+    this.pendingFrames += 1;
+    if (this.pendingFrames < debounceFrames) {
+      return;
+    }
+
+    const minInterval = this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
+    if (ts - this.lastEventTs < minInterval) {
+      this.pendingFrames = 0;
       return;
     }
 
     this.lastEventTs = ts;
+    this.pendingFrames = 0;
+    this.backoffFrames = backoffFrames;
+    this.baseline = luminance;
 
     const payload: EventPayload = {
       ts,
@@ -63,11 +117,25 @@ export class LightDetector {
         baseline: this.baseline,
         luminance,
         delta,
-        deltaThreshold
+        deltaThreshold,
+        adaptiveThreshold,
+        noiseLevel: this.noiseLevel
       }
     };
 
     this.bus.emit('event', payload);
+  }
+
+  private updateBaseline(luminance: number, smoothing: number) {
+    this.baseline = this.baseline! * (1 - smoothing) + luminance * smoothing;
+  }
+
+  private resetDebounce(fullReset = true) {
+    if (fullReset) {
+      this.pendingFrames = 0;
+    } else if (this.pendingFrames > 0) {
+      this.pendingFrames -= 1;
+    }
   }
 
   private isWithinNormalHours(ts: number) {

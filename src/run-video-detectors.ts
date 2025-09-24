@@ -50,10 +50,17 @@ source.on('end', () => {
   logger.warn('Video source ended');
 });
 
+source.on('recover', info => {
+  logger.warn({ reason: info.reason, attempt: info.attempt }, 'Video source recovering');
+});
+
 source.start();
 
-process.on('SIGINT', () => {
-  logger.info('Stopping video detectors');
+const shutdown = (signal: NodeJS.Signals) => {
+  logger.info({ signal }, 'Stopping video detectors');
   source.stop();
   process.exit(0);
-});
+};
+
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
