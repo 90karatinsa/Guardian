@@ -21,6 +21,18 @@ import MotionDetector from './video/motionDetector.js';
 import PersonDetector from './video/personDetector.js';
 import { RetentionTask, startRetentionTask } from './tasks/retention.js';
 
+type CameraPipelineState = {
+  channel: string;
+  input: string;
+  framesPerSecond: number;
+  ffmpeg: CameraFfmpegConfig;
+  person: {
+    score: number;
+    snapshotDir?: string;
+    minIntervalMs?: number;
+  };
+};
+
 type CameraRuntime = {
   id: string;
   channel: string;
@@ -31,6 +43,7 @@ type CameraRuntime = {
   detectionAttempts: number;
   checkEvery: number;
   maxDetections: number;
+  pipelineState: CameraPipelineState;
 };
 
 type GuardConfig = {
@@ -69,10 +82,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
   let activeConfig = baseConfig;
   const videoConfig = activeConfig.video;
-  const personConfig = activeConfig.person;
-  const motionConfig = activeConfig.motion;
   const eventsConfig = activeConfig.events;
-  if (!motionConfig) {
+  if (!activeConfig.motion) {
     throw new Error('Motion configuration is required');
   }
 
@@ -88,8 +99,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   }
 
   const pipelines = new Map<string, CameraRuntime>();
+  const pipelinesById = new Map<string, CameraRuntime>();
   let stopWatching: (() => void) | null = null;
   let retentionTask: RetentionTask | null = null;
+  let syncPromise: Promise<void> = Promise.resolve();
 
   const configureRetention = (config: GuardConfig) => {
     const retentionOptions = buildRetentionOptions({
@@ -116,17 +129,120 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
   configureRetention(activeConfig);
 
-  const handleReload = ({ next }: ConfigReloadEvent) => {
-    activeConfig = pickGuardConfig(next);
-    for (const runtime of pipelines.values()) {
-      const cameraConfig = findCameraConfig(activeConfig.video, runtime.id);
-      const resolvedMotion = resolveCameraMotion(cameraConfig?.motion, activeConfig.motion);
-      runtime.motionDetector.updateOptions({
-        diffThreshold: resolvedMotion.diffThreshold,
-        areaThreshold: resolvedMotion.areaThreshold,
-        minIntervalMs: resolvedMotion.minIntervalMs
+  const createPipeline = async (camera: CameraConfig, config: GuardConfig) => {
+    const context = buildCameraContext(camera, config);
+
+    const source = new VideoSource({
+      file: context.pipelineState.input,
+      framesPerSecond: context.pipelineState.framesPerSecond,
+      rtspTransport: context.pipelineState.ffmpeg.rtspTransport,
+      inputArgs: context.pipelineState.ffmpeg.inputArgs,
+      startTimeoutMs: context.pipelineState.ffmpeg.startTimeoutMs,
+      watchdogTimeoutMs: context.pipelineState.ffmpeg.watchdogTimeoutMs,
+      forceKillTimeoutMs: context.pipelineState.ffmpeg.forceKillTimeoutMs,
+      restartDelayMs: context.pipelineState.ffmpeg.restartDelayMs,
+      restartMaxDelayMs: context.pipelineState.ffmpeg.restartMaxDelayMs,
+      restartJitterFactor: context.pipelineState.ffmpeg.restartJitterFactor
+    });
+
+    const motionDetector = new MotionDetector({
+      source: context.pipelineState.channel,
+      diffThreshold: context.motion.diffThreshold,
+      areaThreshold: context.motion.areaThreshold,
+      minIntervalMs: context.motion.minIntervalMs
+    });
+
+    const personDetector = await PersonDetector.create({
+      source: context.pipelineState.channel,
+      modelPath: config.person.modelPath,
+      scoreThreshold: context.pipelineState.person.score,
+      snapshotDir: context.pipelineState.person.snapshotDir,
+      minIntervalMs:
+        context.pipelineState.person.minIntervalMs ?? config.person.minIntervalMs ?? 2000
+    });
+
+    const runtime: CameraRuntime = {
+      id: camera.id,
+      channel: context.pipelineState.channel,
+      source,
+      motionDetector,
+      personDetector,
+      framesSinceMotion: null,
+      detectionAttempts: 0,
+      checkEvery: context.checkEvery,
+      maxDetections: context.maxDetections,
+      pipelineState: context.pipelineState
+    };
+
+    pipelines.set(context.pipelineState.channel, runtime);
+    pipelinesById.set(camera.id, runtime);
+
+    setupSourceHandlers(logger, runtime);
+    source.start();
+
+    logger.info(
+      { camera: camera.id, input: context.pipelineState.input, channel: context.pipelineState.channel },
+      'Starting guard pipeline'
+    );
+
+    return runtime;
+  };
+
+  const syncPipelines = async (config: GuardConfig) => {
+    const camerasForConfig = buildCameraList(config.video);
+    const desiredIds = new Set(camerasForConfig.map(camera => camera.id));
+
+    for (const runtime of [...pipelinesById.values()]) {
+      if (!desiredIds.has(runtime.id)) {
+        pipelines.delete(runtime.channel);
+        pipelinesById.delete(runtime.id);
+        runtime.source.stop();
+        logger.info({ camera: runtime.id }, 'Stopping guard pipeline');
+      }
+    }
+
+    for (const camera of camerasForConfig) {
+      const existing = pipelinesById.get(camera.id);
+      const context = buildCameraContext(camera, config);
+
+      if (!existing) {
+        await createPipeline(camera, config);
+        continue;
+      }
+
+      if (needsPipelineRestart(existing.pipelineState, context.pipelineState)) {
+        pipelines.delete(existing.channel);
+        pipelinesById.delete(existing.id);
+        existing.source.stop();
+        logger.info({ camera: existing.id }, 'Restarting guard pipeline');
+        await createPipeline(camera, config);
+        continue;
+      }
+
+      existing.pipelineState = context.pipelineState;
+      existing.checkEvery = context.checkEvery;
+      existing.maxDetections = context.maxDetections;
+      existing.motionDetector.updateOptions({
+        diffThreshold: context.motion.diffThreshold,
+        areaThreshold: context.motion.areaThreshold,
+        minIntervalMs: context.motion.minIntervalMs
       });
     }
+  };
+
+  const runSync = (config: GuardConfig) => {
+    syncPromise = syncPromise
+      .then(() => syncPipelines(config))
+      .catch(error => {
+        logger.error({ err: error }, 'Failed to apply camera configuration');
+      });
+
+    return syncPromise;
+  };
+
+  const handleReload = ({ next }: ConfigReloadEvent) => {
+    activeConfig = pickGuardConfig(next);
+    runSync(activeConfig);
 
     if (bus instanceof EventBus) {
       const suppressionRules = activeConfig.events?.suppression?.rules ?? [];
@@ -167,73 +283,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
   bus.on('event', eventHandler);
 
-  for (const camera of cameras) {
-    const channel = camera.channel ?? `video:${camera.id}`;
-    const input = resolveCameraInput(camera, videoConfig);
-    const fps = camera.framesPerSecond ?? videoConfig.framesPerSecond;
-
-    const cameraFfmpeg = resolveCameraFfmpeg(camera.ffmpeg, videoConfig.ffmpeg);
-
-    const source = new VideoSource({
-      file: input,
-      framesPerSecond: fps,
-      rtspTransport: cameraFfmpeg.rtspTransport,
-      inputArgs: cameraFfmpeg.inputArgs,
-      startTimeoutMs: cameraFfmpeg.startTimeoutMs,
-      watchdogTimeoutMs: cameraFfmpeg.watchdogTimeoutMs,
-      forceKillTimeoutMs: cameraFfmpeg.forceKillTimeoutMs,
-      restartDelayMs: cameraFfmpeg.restartDelayMs,
-      restartMaxDelayMs: cameraFfmpeg.restartMaxDelayMs,
-      restartJitterFactor: cameraFfmpeg.restartJitterFactor
-    });
-
-    const motionOverrides = resolveCameraMotion(camera.motion, motionConfig);
-
-    const motionDetector = new MotionDetector({
-      source: channel,
-      diffThreshold: motionOverrides.diffThreshold,
-      areaThreshold: motionOverrides.areaThreshold,
-      minIntervalMs: motionOverrides.minIntervalMs
-    });
-
-    const detector = await PersonDetector.create({
-      source: channel,
-      modelPath: personConfig.modelPath,
-      scoreThreshold: camera.person?.score ?? personConfig.score,
-      snapshotDir: camera.person?.snapshotDir ?? personConfig.snapshotDir,
-      minIntervalMs: camera.person?.minIntervalMs ?? personConfig.minIntervalMs ?? 2000
-    });
-
-    const checkEvery = Math.max(
-      1,
-      camera.person?.checkEveryNFrames ?? personConfig.checkEveryNFrames ?? DEFAULT_CHECK_EVERY
-    );
-
-    const maxDetections = Math.max(
-      1,
-      camera.person?.maxDetections ?? personConfig.maxDetections ?? DEFAULT_MAX_DETECTIONS
-    );
-
-    const runtime: CameraRuntime = {
-      id: camera.id,
-      channel,
-      source,
-      motionDetector,
-      personDetector: detector,
-      framesSinceMotion: null,
-      detectionAttempts: 0,
-      checkEvery,
-      maxDetections
-    };
-
-    pipelines.set(channel, runtime);
-
-    setupSourceHandlers(logger, runtime);
-
-    source.start();
-
-    logger.info({ camera: camera.id, input, channel }, 'Starting guard pipeline');
-  }
+  await runSync(activeConfig);
 
   const stop = () => {
     bus.off('event', eventHandler);
@@ -241,10 +291,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       manager.off('reload', handleReload);
       stopWatching?.();
     }
-    for (const runtime of pipelines.values()) {
+    for (const runtime of pipelinesById.values()) {
       runtime.source.stop();
     }
     pipelines.clear();
+    pipelinesById.clear();
     retentionTask?.stop();
   };
 
@@ -310,8 +361,103 @@ function resolveCameraMotion(
   };
 }
 
-function findCameraConfig(videoConfig: VideoConfig, id: string): CameraConfig | undefined {
-  return videoConfig.cameras?.find(camera => camera.id === id);
+function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
+  if (!config.motion) {
+    throw new Error('Motion configuration is required');
+  }
+
+  const channel = camera.channel ?? `video:${camera.id}`;
+  const input = resolveCameraInput(camera, config.video);
+  const framesPerSecond = camera.framesPerSecond ?? config.video.framesPerSecond;
+  const ffmpeg = resolveCameraFfmpeg(camera.ffmpeg, config.video.ffmpeg);
+  const minIntervalMs = camera.person?.minIntervalMs ?? config.person.minIntervalMs ?? 2000;
+
+  const pipelineState: CameraPipelineState = {
+    channel,
+    input,
+    framesPerSecond,
+    ffmpeg,
+    person: {
+      score: camera.person?.score ?? config.person.score,
+      snapshotDir: camera.person?.snapshotDir ?? config.person.snapshotDir,
+      minIntervalMs
+    }
+  };
+
+  const motion = resolveCameraMotion(camera.motion, config.motion);
+
+  const checkEvery = Math.max(
+    1,
+    camera.person?.checkEveryNFrames ?? config.person.checkEveryNFrames ?? DEFAULT_CHECK_EVERY
+  );
+
+  const maxDetections = Math.max(
+    1,
+    camera.person?.maxDetections ?? config.person.maxDetections ?? DEFAULT_MAX_DETECTIONS
+  );
+
+  return { pipelineState, motion, checkEvery, maxDetections } as const;
+}
+
+function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelineState) {
+  if (previous.channel !== next.channel) {
+    return true;
+  }
+
+  if (previous.input !== next.input) {
+    return true;
+  }
+
+  if (previous.framesPerSecond !== next.framesPerSecond) {
+    return true;
+  }
+
+  if (!ffmpegOptionsEqual(previous.ffmpeg, next.ffmpeg)) {
+    return true;
+  }
+
+  if (previous.person.score !== next.person.score) {
+    return true;
+  }
+
+  if (previous.person.snapshotDir !== next.person.snapshotDir) {
+    return true;
+  }
+
+  if (previous.person.minIntervalMs !== next.person.minIntervalMs) {
+    return true;
+  }
+
+  return false;
+}
+
+function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
+  return (
+    arrayEqual(a.inputArgs, b.inputArgs) &&
+    a.rtspTransport === b.rtspTransport &&
+    a.startTimeoutMs === b.startTimeoutMs &&
+    a.watchdogTimeoutMs === b.watchdogTimeoutMs &&
+    a.forceKillTimeoutMs === b.forceKillTimeoutMs &&
+    a.restartDelayMs === b.restartDelayMs &&
+    a.restartMaxDelayMs === b.restartMaxDelayMs &&
+    a.restartJitterFactor === b.restartJitterFactor
+  );
+}
+
+function arrayEqual<T>(a: T[] | undefined, b: T[] | undefined) {
+  if (!a && !b) {
+    return true;
+  }
+
+  if (!a || !b) {
+    return false;
+  }
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  return a.every((value, index) => value === b[index]);
 }
 
 function pickGuardConfig(config: GuardianConfig): GuardConfig {
