@@ -23,11 +23,20 @@ interface InternalSuppressionRule {
   detectors?: string[];
   sources?: string[];
   severities?: EventSeverity[];
+  channels?: string[];
   suppressForMs?: number;
   rateLimit?: RateLimitConfig;
   reason: string;
   suppressedUntil: number;
   history: number[];
+}
+
+type SuppressionHitType = 'window' | 'rate-limit';
+
+interface SuppressionHit {
+  rule: InternalSuppressionRule;
+  type: SuppressionHitType;
+  reason: string;
 }
 
 class EventBus extends EventEmitter {
@@ -79,18 +88,27 @@ class EventBus extends EventEmitter {
       meta: payload.meta
     };
 
-    const { suppressed, reason, matchedRules, ruleType, ruleId } =
-      this.evaluateSuppression(normalized);
+    const evaluation = this.evaluateSuppression(normalized);
 
-    if (suppressed) {
+    if (evaluation.suppressed) {
+      const primary = evaluation.hits[0];
       const meta = {
         ...normalized.meta,
         suppressed: true,
-        suppressionReason: reason,
-        suppressionType: ruleType,
-        suppressionRuleId: ruleId
+        suppressionReason: primary?.reason,
+        suppressionType: primary?.type,
+        suppressionRuleId: primary?.rule.id,
+        suppressedBy: evaluation.hits.map(hit => ({
+          ruleId: hit.rule.id,
+          reason: hit.reason,
+          type: hit.type,
+          suppressForMs: hit.rule.suppressForMs,
+          rateLimit: hit.rule.rateLimit
+        }))
       };
-      this.metrics.recordSuppressedEvent(ruleId, reason);
+      for (const hit of evaluation.hits) {
+        this.metrics.recordSuppressedEvent(hit.rule.id, hit.reason);
+      }
       this.log.info(
         {
           detector: normalized.detector,
@@ -103,8 +121,8 @@ class EventBus extends EventEmitter {
       return false;
     }
 
-    for (const rule of matchedRules) {
-      if (rule.suppressForMs) {
+    for (const rule of evaluation.matchedRules) {
+      if (rule.suppressForMs && !rule.rateLimit) {
         rule.suppressedUntil = normalized.ts + rule.suppressForMs;
       }
 
@@ -118,39 +136,45 @@ class EventBus extends EventEmitter {
   }
 
   private evaluateSuppression(event: EventRecord) {
-    const matchedRules = this.suppressionRules.filter(rule => ruleMatchesEvent(rule, event));
+    const hits: SuppressionHit[] = [];
+    const matchedRules: InternalSuppressionRule[] = [];
 
-    for (const rule of matchedRules) {
+    for (const rule of this.suppressionRules) {
+      if (!ruleMatchesEvent(rule, event)) {
+        continue;
+      }
+
+      matchedRules.push(rule);
+
       if (rule.suppressForMs && event.ts < rule.suppressedUntil) {
-        return {
-          suppressed: true,
-          reason: rule.reason,
-          matchedRules: [],
-          ruleType: 'window',
-          ruleId: rule.id
-        } as const;
+        hits.push({ rule, type: 'window', reason: rule.reason });
+        continue;
       }
 
       if (rule.rateLimit) {
         pruneHistory(rule, event.ts);
         if (rule.history.length >= rule.rateLimit.count) {
-          return {
-            suppressed: true,
-            reason: rule.reason,
-            matchedRules: [],
-            ruleType: 'rate-limit',
-            ruleId: rule.id
-          } as const;
+          hits.push({ rule, type: 'rate-limit', reason: rule.reason });
+          if (rule.suppressForMs) {
+            rule.suppressedUntil = Math.max(rule.suppressedUntil, event.ts + rule.suppressForMs);
+          }
+          rule.history.push(event.ts);
         }
       }
     }
 
+    if (hits.length > 0) {
+      return {
+        suppressed: true,
+        hits,
+        matchedRules: []
+      } as const;
+    }
+
     return {
       suppressed: false,
-      reason: undefined,
-      matchedRules,
-      ruleType: undefined,
-      ruleId: undefined
+      hits,
+      matchedRules
     } as const;
   }
 }
@@ -179,6 +203,7 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     detectors: asArray(rule.detector),
     sources: asArray(rule.source),
     severities: asArray(rule.severity),
+    channels: asArray(rule.channel),
     suppressForMs: rule.suppressForMs,
     rateLimit: rule.rateLimit,
     reason: rule.reason,
@@ -207,6 +232,17 @@ function ruleMatchesEvent(rule: InternalSuppressionRule, event: EventRecord): bo
     return false;
   }
 
+  if (rule.channels) {
+    const eventChannels = extractEventChannels(event.meta);
+    if (eventChannels.length === 0) {
+      return false;
+    }
+
+    if (!eventChannels.some(channel => rule.channels?.includes(channel))) {
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -228,4 +264,22 @@ function pruneHistory(rule: InternalSuppressionRule, ts: number) {
   if (removeCount > 0) {
     rule.history.splice(0, removeCount);
   }
+}
+
+function extractEventChannels(meta: Record<string, unknown> | undefined): string[] {
+  if (!meta) {
+    return [];
+  }
+
+  const candidate = meta.channel;
+
+  if (typeof candidate === 'string') {
+    return [candidate];
+  }
+
+  if (Array.isArray(candidate)) {
+    return candidate.filter((value): value is string => typeof value === 'string');
+  }
+
+  return [];
 }

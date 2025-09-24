@@ -28,6 +28,7 @@ export interface EventSuppressionRule {
   detector?: string | string[];
   source?: string | string[];
   severity?: EventSeverity | EventSeverity[];
+  channel?: string | string[];
   suppressForMs?: number;
   rateLimit?: RateLimitConfig;
   reason: string;

@@ -39,6 +39,7 @@
     "ffmpeg": {
       "inputArgs": ["-re"],
       "rtspTransport": "tcp",
+      "idleTimeoutMs": 5000,
       "startTimeoutMs": 4000,
       "watchdogTimeoutMs": 5000,
       "forceKillTimeoutMs": 3000,
@@ -56,7 +57,14 @@
         },
         "motion": {
           "diffThreshold": 20,
-          "areaThreshold": 0.02
+          "areaThreshold": 0.02,
+          "debounceFrames": 2,
+          "backoffFrames": 3,
+          "noiseMultiplier": 2.5,
+          "noiseSmoothing": 0.15,
+          "areaSmoothing": 0.2,
+          "areaInflation": 1.2,
+          "areaDeltaThreshold": 0.015
         },
         "ffmpeg": {
           "inputArgs": ["-use_wallclock_as_timestamps", "1"]
@@ -75,6 +83,62 @@
   "motion": {
     "diffThreshold": 25,
     "areaThreshold": 0.015,
-    "minIntervalMs": 1500
+    "minIntervalMs": 1500,
+    "debounceFrames": 2,
+    "backoffFrames": 4,
+    "noiseMultiplier": 3,
+    "noiseSmoothing": 0.2,
+    "areaSmoothing": 0.25,
+    "areaInflation": 1.4,
+    "areaDeltaThreshold": 0.02
+  },
+  "light": {
+    "deltaThreshold": 35,
+    "smoothingFactor": 0.1,
+    "minIntervalMs": 60000,
+    "debounceFrames": 3,
+    "backoffFrames": 4,
+    "noiseMultiplier": 2.5,
+    "noiseSmoothing": 0.15,
+    "normalHours": [
+      { "start": 7, "end": 22 }
+    ]
+  },
+  "audio": {
+    "idleTimeoutMs": 4000,
+    "startTimeoutMs": 3000,
+    "watchdogTimeoutMs": 6000,
+    "restartDelayMs": 500,
+    "restartMaxDelayMs": 4000,
+    "restartJitterFactor": 0.2,
+    "forceKillTimeoutMs": 2000,
+    "micFallbacks": {
+      "default": [
+        { "format": "alsa", "device": "default" },
+        { "format": "alsa", "device": "hw:0" },
+        { "format": "alsa", "device": "plughw:0" }
+      ],
+      "darwin": [
+        { "format": "avfoundation", "device": ":0" },
+        { "format": "avfoundation", "device": "0:0" }
+      ],
+      "win32": [
+        { "format": "dshow", "device": "audio=\"default\"" },
+        { "format": "dshow", "device": "audio=\"Microphone\"" }
+      ]
+    },
+    "anomaly": {
+      "sampleRate": 16000,
+      "rmsThreshold": 0.25,
+      "centroidJumpThreshold": 200,
+      "minIntervalMs": 2000,
+      "minTriggerDurationMs": 150,
+      "rmsWindowMs": 200,
+      "centroidWindowMs": 250,
+      "thresholds": {
+        "night": { "rms": 0.2, "centroidJump": 120 }
+      },
+      "nightHours": { "start": 21, "end": 6 }
+    }
   }
 }

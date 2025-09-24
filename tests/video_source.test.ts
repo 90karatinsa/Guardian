@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import metrics from '../src/metrics/index.js';
-import { VideoSource } from '../src/video/source.js';
+import { VideoSource, type RecoverEventMeta } from '../src/video/source.js';
 
 const SAMPLE_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAAZuX6kAAAAASUVORK5CYII=',
@@ -224,7 +224,12 @@ describe('VideoSource', () => {
 
     expect(sourceInstances).toHaveLength(1);
     const instance = sourceInstances[0];
-    instance.emit('recover', { reason: 'watchdog-timeout', attempt: 2, delayMs: 1234 });
+    instance.emit('recover', {
+      reason: 'watchdog-timeout',
+      attempt: 2,
+      delayMs: 1234,
+      meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+    });
 
     expect(warn).toHaveBeenCalledWith(
       { camera: 'camera-1', attempt: 2, reason: 'watchdog-timeout', delayMs: 1234 },
@@ -264,9 +269,11 @@ describe('VideoSource', () => {
 
     const delays: number[] = [];
     const attempts: number[] = [];
+    const metas: RecoverEventMeta[] = [];
     source.on('recover', info => {
       delays.push(info.delayMs);
       attempts.push(info.attempt);
+      metas.push(info.meta);
     });
     source.on('error', () => {});
 
@@ -280,12 +287,20 @@ describe('VideoSource', () => {
 
     expect(delays).toEqual([10, 20, 40]);
     expect(attempts).toEqual([1, 2, 3]);
+    expect(metas.map(meta => meta.baseDelayMs)).toEqual([10, 20, 40]);
+    expect(metas.map(meta => meta.appliedJitterMs)).toEqual([0, 0, 0]);
+    expect(metas.map(meta => meta.minDelayMs)).toEqual([10, 10, 10]);
+    expect(metas.map(meta => meta.maxDelayMs)).toEqual([40, 40, 40]);
 
     const snapshot = metrics.snapshot();
     expect(snapshot.pipelines.ffmpeg.lastRestart).toEqual({
       reason: 'start-timeout',
       attempt: 3,
-      delayMs: 40
+      delayMs: 40,
+      baseDelayMs: 40,
+      minDelayMs: 10,
+      maxDelayMs: 40,
+      jitterMs: 0
     });
     expect(snapshot.latencies['pipeline.ffmpeg.restart.delay'].count).toBeGreaterThanOrEqual(3);
     expect(snapshot.histograms['pipeline.ffmpeg.restart.delay']).toMatchObject({
@@ -295,6 +310,45 @@ describe('VideoSource', () => {
 
     source.stop();
     expect(commands.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('VideoSourceStop cancels scheduled restarts and clears timers', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 5,
+      restartDelayMs: 25,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      watchdogTimeoutMs: 0,
+      forceKillTimeoutMs: 0,
+      random: () => 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    source.start();
+    expect(commands).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(6);
+    expect(commands[0].killedSignals).toContain('SIGTERM');
+
+    source.stop();
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(commands).toHaveLength(1);
+    expect(commands[0].killedSignals).toContain('SIGKILL');
+
+    vi.useRealTimers();
   });
 });
 

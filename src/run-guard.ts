@@ -135,8 +135,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     const source = new VideoSource({
       file: context.pipelineState.input,
       framesPerSecond: context.pipelineState.framesPerSecond,
+      channel: context.pipelineState.channel,
       rtspTransport: context.pipelineState.ffmpeg.rtspTransport,
       inputArgs: context.pipelineState.ffmpeg.inputArgs,
+      idleTimeoutMs: context.pipelineState.ffmpeg.idleTimeoutMs,
       startTimeoutMs: context.pipelineState.ffmpeg.startTimeoutMs,
       watchdogTimeoutMs: context.pipelineState.ffmpeg.watchdogTimeoutMs,
       forceKillTimeoutMs: context.pipelineState.ffmpeg.forceKillTimeoutMs,
@@ -149,7 +151,14 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       source: context.pipelineState.channel,
       diffThreshold: context.motion.diffThreshold,
       areaThreshold: context.motion.areaThreshold,
-      minIntervalMs: context.motion.minIntervalMs
+      minIntervalMs: context.motion.minIntervalMs,
+      debounceFrames: context.motion.debounceFrames,
+      backoffFrames: context.motion.backoffFrames,
+      noiseMultiplier: context.motion.noiseMultiplier,
+      noiseSmoothing: context.motion.noiseSmoothing,
+      areaSmoothing: context.motion.areaSmoothing,
+      areaInflation: context.motion.areaInflation,
+      areaDeltaThreshold: context.motion.areaDeltaThreshold
     });
 
     const personDetector = await PersonDetector.create({
@@ -341,6 +350,7 @@ function resolveCameraFfmpeg(
   return {
     inputArgs: camera?.inputArgs ?? defaults?.inputArgs,
     rtspTransport: camera?.rtspTransport ?? defaults?.rtspTransport,
+    idleTimeoutMs: camera?.idleTimeoutMs ?? defaults?.idleTimeoutMs,
     startTimeoutMs: camera?.startTimeoutMs ?? defaults?.startTimeoutMs,
     watchdogTimeoutMs: camera?.watchdogTimeoutMs ?? defaults?.watchdogTimeoutMs,
     forceKillTimeoutMs: camera?.forceKillTimeoutMs ?? defaults?.forceKillTimeoutMs,
@@ -353,11 +363,18 @@ function resolveCameraFfmpeg(
 function resolveCameraMotion(
   cameraMotion: CameraMotionConfig | undefined,
   defaults: MotionConfig
-): Pick<MotionConfig, 'diffThreshold' | 'areaThreshold' | 'minIntervalMs'> {
+): MotionConfig {
   return {
     diffThreshold: cameraMotion?.diffThreshold ?? defaults.diffThreshold,
     areaThreshold: cameraMotion?.areaThreshold ?? defaults.areaThreshold,
-    minIntervalMs: cameraMotion?.minIntervalMs ?? defaults.minIntervalMs
+    minIntervalMs: cameraMotion?.minIntervalMs ?? defaults.minIntervalMs,
+    debounceFrames: cameraMotion?.debounceFrames ?? defaults.debounceFrames,
+    backoffFrames: cameraMotion?.backoffFrames ?? defaults.backoffFrames,
+    noiseMultiplier: cameraMotion?.noiseMultiplier ?? defaults.noiseMultiplier,
+    noiseSmoothing: cameraMotion?.noiseSmoothing ?? defaults.noiseSmoothing,
+    areaSmoothing: cameraMotion?.areaSmoothing ?? defaults.areaSmoothing,
+    areaInflation: cameraMotion?.areaInflation ?? defaults.areaInflation,
+    areaDeltaThreshold: cameraMotion?.areaDeltaThreshold ?? defaults.areaDeltaThreshold
   };
 }
 
@@ -435,6 +452,7 @@ function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
   return (
     arrayEqual(a.inputArgs, b.inputArgs) &&
     a.rtspTransport === b.rtspTransport &&
+    a.idleTimeoutMs === b.idleTimeoutMs &&
     a.startTimeoutMs === b.startTimeoutMs &&
     a.watchdogTimeoutMs === b.watchdogTimeoutMs &&
     a.forceKillTimeoutMs === b.forceKillTimeoutMs &&

@@ -33,7 +33,7 @@ describe('RestApiEvents', () => {
     return runtime;
   }
 
-  it('returns paginated and filtered event lists', async () => {
+  it('HttpEventsCameraFilter filters by camera, channel, and time range', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'sample.png');
     fs.writeFileSync(snapshotPath, Buffer.from([0, 1, 2, 3]));
@@ -44,19 +44,19 @@ describe('RestApiEvents', () => {
       detector: 'motion',
       severity: 'warning',
       message: 'Motion started',
-      meta: { snapshot: snapshotPath, channel: 'video:cam-1' }
+      meta: { snapshot: snapshotPath, channel: 'video:cam-1', camera: 'video:cam-1' }
     });
     storeEvent({
       ts: now - 500,
-      source: 'cam-1',
+      source: 'video:test-camera',
       detector: 'motion',
       severity: 'info',
       message: 'Motion continuing',
-      meta: { channel: 'video:cam-1' }
+      meta: { channel: 'video:cam-1', camera: 'video:test-camera' }
     });
     storeEvent({
       ts: now - 100,
-      source: 'cam-2',
+      source: 'video:other-camera',
       detector: 'person',
       severity: 'critical',
       message: 'Person detected',
@@ -88,6 +88,25 @@ describe('RestApiEvents', () => {
     expect(channelPayload.items.every((item: { meta: { channel: string } }) => item.meta?.channel === 'video:cam-1')).toBe(
       true
     );
+
+    const cameraResponse = await fetch(
+      `http://localhost:${port}/api/events?camera=${encodeURIComponent('video:test-camera')}`
+    );
+    expect(cameraResponse.status).toBe(200);
+    const cameraPayload = await cameraResponse.json();
+    expect(cameraPayload.items).toHaveLength(1);
+    expect(cameraPayload.items[0].source).toBe('video:test-camera');
+
+    const from = new Date(now - 700).toISOString();
+    const to = new Date(now - 200).toISOString();
+    const rangeResponse = await fetch(
+      `http://localhost:${port}/api/events?camera=${encodeURIComponent('video:test-camera')}&from=${encodeURIComponent(
+        from
+      )}&to=${encodeURIComponent(to)}`
+    );
+    const rangePayload = await rangeResponse.json();
+    expect(rangePayload.items).toHaveLength(1);
+    expect(rangePayload.items[0].source).toBe('video:test-camera');
   });
 
   it('serves snapshot files for events', async () => {
@@ -116,11 +135,11 @@ describe('RestApiEvents', () => {
     expect(buffer.length).toBeGreaterThan(0);
   });
 
-  it('DashboardStream streams events with heartbeat', async () => {
+  it('DashboardStream streams events with heartbeat and stream-status metadata', async () => {
     const { port } = await ensureServer();
     const controller = new AbortController();
 
-    const response = await fetch(`http://localhost:${port}/api/events/stream`, {
+    const response = await fetch(`http://localhost:${port}/api/events/stream?camera=cam-stream&retry=2500`, {
       signal: controller.signal
     });
     expect(response.status).toBe(200);
@@ -131,7 +150,11 @@ describe('RestApiEvents', () => {
 
     const firstChunk = await reader!.read();
     expect(firstChunk.done).toBe(false);
-    expect(decoder.decode(firstChunk.value)).toContain(': connected');
+    const initialText = decoder.decode(firstChunk.value);
+    expect(initialText).toContain(': connected');
+    expect(initialText).toContain('retry: 2500');
+    expect(initialText).toContain('stream-status');
+    expect(initialText).toContain('cam-stream');
 
     const event = {
       id: 123,
@@ -140,7 +163,7 @@ describe('RestApiEvents', () => {
       detector: 'motion',
       severity: 'warning',
       message: 'stream event',
-      meta: { channel: 'video:stream' }
+      meta: { channel: 'video:stream', camera: 'cam-stream' }
     };
 
     bus.emit('event', event);

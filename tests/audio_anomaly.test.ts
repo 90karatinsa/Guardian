@@ -32,7 +32,7 @@ vi.mock('meyda', () => {
   };
 });
 
-describe('AudioWindowing', () => {
+describe('AudioAnomalyAdaptiveWindow', () => {
   const sampleRate = 16000;
   const frameSize = 1024;
   const hopSize = 512;
@@ -49,7 +49,7 @@ describe('AudioWindowing', () => {
     });
   });
 
-  it('suppresses a single-frame RMS spike', () => {
+  it('AudioAnomalyAdaptiveWindow suppresses bursts shorter than configured window', () => {
     const detector = new AudioAnomalyDetector(
       {
         source: 'audio:test',
@@ -59,7 +59,8 @@ describe('AudioWindowing', () => {
         rmsThreshold: 0.5,
         centroidJumpThreshold: 5000,
         minIntervalMs: 0,
-        minTriggerDurationMs: 120
+        minTriggerDurationMs: 150,
+        rmsWindowMs: 200
       },
       bus
     );
@@ -70,12 +71,12 @@ describe('AudioWindowing', () => {
     );
 
     detector.handleChunk(spike, 0);
-    detector.handleChunk(createConstantFrame(frameSize, 0), 100);
+    detector.handleChunk(createConstantFrame(frameSize, 0), 80);
 
     expect(events).toHaveLength(0);
   });
 
-  it('emits event when RMS stays high across consecutive frames', () => {
+  it('AudioAnomalyAdaptiveWindow emits after sustained RMS elevation and reports baselines', () => {
     const detector = new AudioAnomalyDetector(
       {
         source: 'audio:test',
@@ -85,7 +86,8 @@ describe('AudioWindowing', () => {
         rmsThreshold: 0.4,
         centroidJumpThreshold: 5000,
         minIntervalMs: 0,
-        minTriggerDurationMs: 100
+        minTriggerDurationMs: 100,
+        rmsWindowMs: 150
       },
       bus
     );
@@ -102,9 +104,13 @@ describe('AudioWindowing', () => {
     const windowMeta = events[0].meta?.window as Record<string, number>;
     expect(Number(windowMeta?.frameDurationMs)).toBeCloseTo(frameDurationMs, 3);
     expect(Number(windowMeta?.hopDurationMs)).toBeCloseTo(hopDurationMs, 3);
+    const thresholds = events[0].meta?.thresholds as Record<string, number>;
+    expect(Number(thresholds?.rms)).toBeCloseTo(0.4, 3);
+    const baselines = events[0].meta?.baselines as Record<string, number>;
+    expect(Number(baselines?.rms)).toBeLessThan(Number(events[0].meta?.rms));
   });
 
-  it('detects sustained spectral centroid shifts', () => {
+  it('AudioAnomalyAdaptiveWindow applies night thresholds to centroid jumps', () => {
     const detector = new AudioAnomalyDetector(
       {
         source: 'audio:test',
@@ -112,9 +118,14 @@ describe('AudioWindowing', () => {
         frameDurationMs,
         hopDurationMs,
         rmsThreshold: 0.6,
-        centroidJumpThreshold: 50,
-        minIntervalMs: 0,
-        minTriggerDurationMs: 100
+        centroidJumpThreshold: 200,
+        minIntervalMs: 500,
+        minTriggerDurationMs: 120,
+        centroidWindowMs: 160,
+        thresholds: {
+          night: { centroidJump: 40 }
+        },
+        nightHours: { start: 20, end: 6 }
       },
       bus
     );
@@ -122,12 +133,16 @@ describe('AudioWindowing', () => {
     const toneLow = generateSineWave(sampleRate, 200, 0.2, frameSize);
     const toneHigh = generateSineWave(sampleRate, 2200, 0.2, frameSize);
 
-    detector.handleChunk(toneLow, 0);
-    detector.handleChunk(toneHigh, 120);
-    detector.handleChunk(toneHigh, 240);
+    const eveningTs = new Date('2023-01-01T22:00:00.000Z').getTime();
+
+    detector.handleChunk(toneLow, eveningTs);
+    detector.handleChunk(toneHigh, eveningTs + 120);
+    detector.handleChunk(toneHigh, eveningTs + 240);
 
     expect(events).toHaveLength(1);
     expect(events[0].meta?.triggeredBy).toBe('centroid');
+    const thresholds = events[0].meta?.thresholds as Record<string, number>;
+    expect(Number(thresholds?.centroidJump)).toBeCloseTo(40, 3);
   });
 });
 

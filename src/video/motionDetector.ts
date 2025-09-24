@@ -89,7 +89,11 @@ export class MotionDetector {
         0.05,
         0.5
       );
-      const adaptiveDiffThreshold = Math.max(diffThreshold, currentNoiseLevel * noiseMultiplier);
+      const cappedNoiseLevel =
+        currentNoiseLevel === 0
+          ? 0
+          : Math.min(currentNoiseLevel, diffThreshold * noiseMultiplier);
+      const adaptiveDiffThreshold = Math.max(diffThreshold, cappedNoiseLevel * noiseMultiplier);
 
       let changedPixels = 0;
       for (let i = 0; i < stats.totalPixels; i += 1) {
@@ -146,6 +150,7 @@ export class MotionDetector {
         this.noiseLevel * (1 - effectiveNoiseSmoothing) + stats.meanDelta * effectiveNoiseSmoothing;
 
       this.areaBaseline = nextBaseline;
+      this.baselineFrame = smoothed;
 
       if (this.backoffFrames > 0) {
         this.backoffFrames -= 1;
@@ -178,13 +183,16 @@ export class MotionDetector {
           diffThreshold,
           adaptiveDiffThreshold,
           adaptiveAreaThreshold,
+          areaBaseline: this.areaBaseline,
           noiseLevel: this.noiseLevel,
           areaDelta,
           areaDeltaThreshold,
           effectiveDebounceFrames,
           effectiveBackoffFrames,
           noiseSmoothing: effectiveNoiseSmoothing,
-          areaSmoothing: effectiveAreaSmoothing
+          areaSmoothing: effectiveAreaSmoothing,
+          noiseMultiplier,
+          areaInflation
         }
       };
 

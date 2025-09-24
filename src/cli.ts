@@ -1,5 +1,6 @@
 import process from 'node:process';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import logger from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
@@ -117,9 +118,7 @@ export function buildHealthPayload(): HealthPayload {
 
 export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_IO): Promise<number> {
   if (argv.includes('--health')) {
-    const payload = buildHealthPayload();
-    io.stdout.write(`${JSON.stringify(payload)}\n`);
-    return resolveHealthExitCode(payload.status);
+    return outputHealth(io);
   }
 
   const command = argv[0] ?? 'start';
@@ -134,6 +133,9 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
     case 'status': {
       return printStatus(io);
     }
+    case 'health': {
+      return outputHealth(io);
+    }
     case 'help':
     case '--help':
     case '-h': {
@@ -145,7 +147,7 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
           '  guardian start        Start the detector daemon',
           '  guardian stop         Stop the running daemon',
           '  guardian status       Print service status summary',
-          '  guardian --health     Print health JSON'
+          '  guardian health       Print health JSON'
         ].join('\n') + '\n'
       );
       return 0;
@@ -221,8 +223,9 @@ async function stopDaemon(io: CliIo): Promise<number> {
     return 1;
   }
 
-  io.stdout.write('Guardian daemon stopped\n');
-  return 0;
+  const payload = buildHealthPayload();
+  io.stdout.write(`Guardian daemon stopped (status: ${payload.status})\n`);
+  return resolveHealthExitCode(payload.status);
 }
 
 async function printStatus(io: CliIo): Promise<number> {
@@ -276,12 +279,15 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
 
   const shutdownTask = (async () => {
     const runtime = state.runtime;
+    let shutdownDurationMs: number | null = null;
     try {
+      const startedAt = performance.now();
       await metrics.time('guard.shutdown.ms', async () => {
         if (runtime) {
           await Promise.resolve(runtime.stop());
         }
       });
+      shutdownDurationMs = performance.now() - startedAt;
     } catch (error) {
       const err = error as Error;
       state.lastShutdownError = err;
@@ -294,6 +300,9 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
       state.stopResolver = null;
       state.shuttingDown = false;
       state.shutdownPromise = null;
+      if (shutdownDurationMs !== null) {
+        logger.info({ reason, signal, shutdownDurationMs }, 'Guardian daemon stopped gracefully');
+      }
     }
   })();
 
@@ -315,4 +324,10 @@ if (resolvedPath === modulePath) {
       process.exit(1);
     }
   );
+}
+
+async function outputHealth(io: CliIo): Promise<number> {
+  const payload = buildHealthPayload();
+  io.stdout.write(`${JSON.stringify(payload)}\n`);
+  return resolveHealthExitCode(payload.status);
 }

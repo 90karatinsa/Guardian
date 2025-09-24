@@ -10,6 +10,7 @@ class MockVideoSource extends EventEmitter {
       framesPerSecond: number;
       rtspTransport?: string;
       inputArgs?: string[];
+      idleTimeoutMs?: number;
       startTimeoutMs?: number;
       watchdogTimeoutMs?: number;
       forceKillTimeoutMs?: number;
@@ -241,6 +242,7 @@ describe('run-guard multi camera orchestration', () => {
           framesPerSecond: 5,
           ffmpeg: {
             startTimeoutMs: 111,
+            idleTimeoutMs: 222,
             watchdogTimeoutMs: 222,
             forceKillTimeoutMs: 333,
             restartDelayMs: 444,
@@ -282,6 +284,7 @@ describe('run-guard multi camera orchestration', () => {
     const [defaultSource, overrideSource] = MockVideoSource.instances;
 
     expect(defaultSource.options).toMatchObject({
+      idleTimeoutMs: 222,
       startTimeoutMs: 111,
       watchdogTimeoutMs: 222,
       forceKillTimeoutMs: 333,
@@ -291,6 +294,7 @@ describe('run-guard multi camera orchestration', () => {
     });
 
     expect(overrideSource.options).toMatchObject({
+      idleTimeoutMs: 222,
       startTimeoutMs: 111,
       watchdogTimeoutMs: 777,
       restartDelayMs: 1000,
@@ -298,8 +302,18 @@ describe('run-guard multi camera orchestration', () => {
       restartJitterFactor: 0
     });
 
-    defaultSource.emit('recover', { reason: 'watchdog-timeout', attempt: 2, delayMs: 444 });
-    overrideSource.emit('recover', { reason: 'start-timeout', attempt: 1, delayMs: 1000 });
+    defaultSource.emit('recover', {
+      reason: 'watchdog-timeout',
+      attempt: 2,
+      delayMs: 444,
+      meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+    });
+    overrideSource.emit('recover', {
+      reason: 'start-timeout',
+      attempt: 1,
+      delayMs: 1000,
+      meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+    });
 
     expect(logger.warn).toHaveBeenCalledWith(
       { camera: 'cam-default', attempt: 2, reason: 'watchdog-timeout', delayMs: 444 },

@@ -8,6 +8,12 @@ import eventBus from '../eventBus.js';
 import logger from '../logger.js';
 import metrics from '../metrics/index.js';
 import { EventPayload } from '../types.js';
+import {
+  DEFAULT_NMS_IOU_THRESHOLD,
+  YOLO_CLASS_START_INDEX,
+  parseYoloDetections
+} from './yoloParser.js';
+import type { PreprocessMeta, YoloDetection } from './yoloParser.js';
 
 export interface PersonDetectorOptions {
   source: string;
@@ -15,44 +21,12 @@ export interface PersonDetectorOptions {
   scoreThreshold?: number;
   snapshotDir?: string;
   minIntervalMs?: number;
+  maxDetections?: number;
 }
-
-type PreprocessMeta = {
-  scale: number;
-  padX: number;
-  padY: number;
-  originalWidth: number;
-  originalHeight: number;
-};
-
-type BoundingBox = {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-};
-
-type Detection = {
-  score: number;
-  classId: number;
-  bbox: BoundingBox;
-  objectness: number;
-  classProbability: number;
-  areaRatio: number;
-};
-
-type TensorAccessor = {
-  detections: number;
-  attributes: number;
-  get: (detectionIndex: number, attributeIndex: number) => number;
-};
 
 const TARGET_SIZE = 640;
 const PERSON_CLASS_INDEX = 0;
-const OBJECTNESS_INDEX = 4;
-const CLASS_START_INDEX = 5;
 const DEFAULT_SCORE_THRESHOLD = 0.5;
-const DEFAULT_NMS_IOU_THRESHOLD = 0.45;
 const DEFAULT_MIN_INTERVAL_MS = 5000;
 
 type InferenceSessionLike = {
@@ -103,16 +77,18 @@ export class PersonDetector {
         return;
       }
 
-      const detection = pickBestPerson(
-        output,
-        this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
-        meta
-      );
+      const detections = parseYoloDetections(output, meta, {
+        classIndex: PERSON_CLASS_INDEX,
+        scoreThreshold: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
+        nmsThreshold: DEFAULT_NMS_IOU_THRESHOLD,
+        maxDetections: this.options.maxDetections
+      });
 
-      if (!detection) {
+      if (detections.length === 0) {
         return;
       }
 
+      const primaryDetection = detections[0];
       const snapshotPath = saveSnapshot(frame, ts, this.options.snapshotDir);
       this.lastEventTs = ts;
 
@@ -123,16 +99,18 @@ export class PersonDetector {
         severity: 'critical',
         message: 'Person detected',
         meta: {
-          score: detection.score,
-          classId: detection.classId,
-          bbox: detection.bbox,
+          score: primaryDetection.score,
+          classId: primaryDetection.classId,
+          bbox: primaryDetection.bbox,
           snapshot: snapshotPath,
-          objectness: detection.objectness,
-          classProbability: detection.classProbability,
-          areaRatio: detection.areaRatio,
+          objectness: primaryDetection.objectness,
+          classProbability: primaryDetection.classProbability,
+          areaRatio: primaryDetection.areaRatio,
           thresholds: {
-            score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD
-          }
+            score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
+            nms: DEFAULT_NMS_IOU_THRESHOLD
+          },
+          detections: detections.map(serializeDetection)
         }
       };
 
@@ -161,6 +139,17 @@ export class PersonDetector {
     this.inputName = this.session.inputNames[0] ?? null;
     this.outputName = this.session.outputNames[0] ?? null;
   }
+}
+
+function serializeDetection(detection: YoloDetection) {
+  return {
+    score: detection.score,
+    classId: detection.classId,
+    bbox: detection.bbox,
+    objectness: detection.objectness,
+    classProbability: detection.classProbability,
+    areaRatio: detection.areaRatio
+  };
 }
 
 function preprocessFrame(frame: Buffer): { tensor: ort.Tensor; meta: PreprocessMeta } {
@@ -209,254 +198,6 @@ function preprocessFrame(frame: Buffer): { tensor: ort.Tensor; meta: PreprocessM
   };
 }
 
-function pickBestPerson(
-  tensor: ort.OnnxValue,
-  threshold: number,
-  meta: PreprocessMeta
-): Detection | null {
-  const accessor = createTensorAccessor(tensor);
-
-  if (!accessor) {
-    return null;
-  }
-
-  const classIndex = CLASS_START_INDEX + PERSON_CLASS_INDEX;
-
-  if (classIndex >= accessor.attributes) {
-    return null;
-  }
-
-  const candidates: Detection[] = [];
-
-  for (let i = 0; i < accessor.detections; i += 1) {
-    const objectnessLogit = accessor.get(i, OBJECTNESS_INDEX);
-    const classLogit = accessor.get(i, classIndex);
-    const objectness = sigmoid(objectnessLogit);
-    const classProbability = sigmoid(classLogit);
-    const score = clamp(objectness * classProbability, 0, 1);
-
-    if (score < threshold) {
-      continue;
-    }
-
-    const cx = accessor.get(i, 0);
-    const cy = accessor.get(i, 1);
-    const w = accessor.get(i, 2);
-    const h = accessor.get(i, 3);
-
-    const bbox = projectBoundingBox(cx, cy, w, h, meta);
-
-    if (bbox.width <= 0 || bbox.height <= 0) {
-      continue;
-    }
-
-    const areaRatio = computeAreaRatio(bbox, meta);
-
-    candidates.push({
-      score,
-      classId: PERSON_CLASS_INDEX,
-      bbox,
-      objectness,
-      classProbability,
-      areaRatio
-    });
-  }
-
-  if (candidates.length === 0) {
-    return null;
-  }
-
-  const selected = nonMaxSuppression(
-    candidates,
-    DEFAULT_NMS_IOU_THRESHOLD
-  );
-
-  return selected[0] ?? null;
-}
-
-function createTensorAccessor(tensor: ort.OnnxValue): TensorAccessor | null {
-  const data = tensor.data as Float32Array | undefined;
-
-  if (!data || data.length === 0) {
-    return null;
-  }
-
-  const dims = tensor.dims ?? [];
-  const dimsNoBatch = dims.length > 0 && dims[0] === 1 ? dims.slice(1) : dims;
-  const totalSize = data.length;
-  const candidates: TensorAccessor[] = [];
-
-  if (dimsNoBatch.length >= 1) {
-    const attributesFirst = dimsNoBatch[0];
-    const detectionsFirst =
-      dimsNoBatch.length > 1
-        ? dimsNoBatch.slice(1).reduce((acc, value) => acc * value, 1)
-        : 1;
-
-    if (attributesFirst > 0 && detectionsFirst > 0 && attributesFirst * detectionsFirst === totalSize) {
-      candidates.push({
-        attributes: attributesFirst,
-        detections: detectionsFirst,
-        get: (detectionIndex, attributeIndex) => {
-          if (attributeIndex >= attributesFirst || detectionIndex >= detectionsFirst) {
-            return 0;
-          }
-
-          return data[attributeIndex * detectionsFirst + detectionIndex];
-        }
-      });
-    }
-  }
-
-  if (dimsNoBatch.length >= 1) {
-    const attributesLast = dimsNoBatch[dimsNoBatch.length - 1];
-    const detectionsLast =
-      dimsNoBatch.length > 1
-        ? dimsNoBatch.slice(0, -1).reduce((acc, value) => acc * value, 1)
-        : 1;
-
-    if (attributesLast > 0 && detectionsLast > 0 && attributesLast * detectionsLast === totalSize) {
-      candidates.push({
-        attributes: attributesLast,
-        detections: detectionsLast,
-        get: (detectionIndex, attributeIndex) => {
-          if (attributeIndex >= attributesLast || detectionIndex >= detectionsLast) {
-            return 0;
-          }
-
-          return data[detectionIndex * attributesLast + attributeIndex];
-        }
-      });
-    }
-  }
-
-  if (candidates.length === 0 && dimsNoBatch.length === 0) {
-    const attributes = totalSize;
-    if (attributes > CLASS_START_INDEX) {
-      return {
-        attributes,
-        detections: 1,
-        get: (_detectionIndex, attributeIndex) => data[attributeIndex] ?? 0
-      };
-    }
-  }
-
-  const valid = candidates.filter(candidate => candidate.attributes > CLASS_START_INDEX && candidate.detections > 0);
-
-  if (valid.length === 0) {
-    return null;
-  }
-
-  valid.sort((a, b) => a.attributes - b.attributes);
-
-  return valid[0];
-}
-
-function projectBoundingBox(
-  cx: number,
-  cy: number,
-  width: number,
-  height: number,
-  meta: PreprocessMeta
-) {
-  const left = cx - width / 2;
-  const top = cy - height / 2;
-  const right = cx + width / 2;
-  const bottom = cy + height / 2;
-
-  const scale = meta.scale || 1;
-
-  const mappedLeft = (left - meta.padX) / scale;
-  const mappedTop = (top - meta.padY) / scale;
-  const mappedRight = (right - meta.padX) / scale;
-  const mappedBottom = (bottom - meta.padY) / scale;
-
-  const clampedLeft = clamp(mappedLeft, 0, meta.originalWidth);
-  const clampedTop = clamp(mappedTop, 0, meta.originalHeight);
-  const clampedRight = clamp(mappedRight, 0, meta.originalWidth);
-  const clampedBottom = clamp(mappedBottom, 0, meta.originalHeight);
-
-  return {
-    left: clampedLeft,
-    top: clampedTop,
-    width: Math.max(0, clampedRight - clampedLeft),
-    height: Math.max(0, clampedBottom - clampedTop)
-  };
-}
-
-function nonMaxSuppression(detections: Detection[], threshold: number) {
-  const sorted = [...detections].sort((a, b) => b.score - a.score);
-  const results: Detection[] = [];
-
-  for (const detection of sorted) {
-    let keep = true;
-
-    for (const existing of results) {
-      const iou = intersectionOverUnion(detection.bbox, existing.bbox);
-      if (iou > threshold) {
-        keep = false;
-        break;
-      }
-    }
-
-    if (keep) {
-      results.push(detection);
-    }
-  }
-
-  return results;
-}
-
-function computeAreaRatio(bbox: BoundingBox, meta: PreprocessMeta) {
-  const totalArea = meta.originalWidth * meta.originalHeight;
-
-  if (totalArea <= 0) {
-    return 0;
-  }
-
-  const area = Math.max(0, bbox.width) * Math.max(0, bbox.height);
-  return clamp(area / totalArea, 0, 1);
-}
-
-function intersectionOverUnion(a: BoundingBox, b: BoundingBox) {
-  const aRight = a.left + a.width;
-  const aBottom = a.top + a.height;
-  const bRight = b.left + b.width;
-  const bBottom = b.top + b.height;
-
-  const interLeft = Math.max(a.left, b.left);
-  const interTop = Math.max(a.top, b.top);
-  const interRight = Math.min(aRight, bRight);
-  const interBottom = Math.min(aBottom, bBottom);
-
-  const interWidth = Math.max(0, interRight - interLeft);
-  const interHeight = Math.max(0, interBottom - interTop);
-  const interArea = interWidth * interHeight;
-
-  if (interArea === 0) {
-    return 0;
-  }
-
-  const areaA = a.width * a.height;
-  const areaB = b.width * b.height;
-
-  const union = areaA + areaB - interArea;
-
-  if (union <= 0) {
-    return 0;
-  }
-
-  return interArea / union;
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function sigmoid(value: number) {
-  return 1 / (1 + Math.exp(-value));
-}
-
 function probabilityToLogit(probability: number) {
   const clamped = clamp(probability, 1e-6, 1 - 1e-6);
   return Math.log(clamped / (1 - clamped));
@@ -484,7 +225,7 @@ function createMockSession(modelPath: string): InferenceSessionLike {
     mockWarningLogged = true;
   }
 
-  const attributes = CLASS_START_INDEX + 1;
+  const attributes = YOLO_CLASS_START_INDEX + 1;
   const detections = 1;
 
   return {
@@ -501,8 +242,8 @@ function createMockSession(modelPath: string): InferenceSessionLike {
       data[1] = cy;
       data[2] = width;
       data[3] = height;
-      data[OBJECTNESS_INDEX] = probabilityToLogit(0.95);
-      data[CLASS_START_INDEX + PERSON_CLASS_INDEX] = probabilityToLogit(0.9);
+      data[4] = probabilityToLogit(0.95);
+      data[YOLO_CLASS_START_INDEX] = probabilityToLogit(0.9);
 
       return {
         output0: new ort.Tensor('float32', data, [1, attributes, detections])
@@ -517,6 +258,10 @@ function saveSnapshot(frame: Buffer, ts: number, dir?: string) {
   const filePath = path.join(folder, `${ts}-person.png`);
   fs.writeFileSync(filePath, frame);
   return filePath;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
 }
 
 export default PersonDetector;

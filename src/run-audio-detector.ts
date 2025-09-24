@@ -1,20 +1,46 @@
+import config from 'config';
 import logger from './logger.js';
 import eventBus from './eventBus.js';
 import { AudioSource } from './audio/source.js';
 import AudioAnomalyDetector from './audio/anomaly.js';
+import type { AudioConfig } from './config/index.js';
+
+const audioConfig: AudioConfig | undefined = config.has('audio')
+  ? config.get<AudioConfig>('audio')
+  : undefined;
 
 const source = new AudioSource({
   type: 'mic',
+  channel: 'audio:microphone',
   frameDurationMs: 200,
-  sampleRate: 16000
+  sampleRate: 16000,
+  idleTimeoutMs: audioConfig?.idleTimeoutMs,
+  startTimeoutMs: audioConfig?.startTimeoutMs,
+  watchdogTimeoutMs: audioConfig?.watchdogTimeoutMs,
+  restartDelayMs: audioConfig?.restartDelayMs,
+  restartMaxDelayMs: audioConfig?.restartMaxDelayMs,
+  restartJitterFactor: audioConfig?.restartJitterFactor,
+  forceKillTimeoutMs: audioConfig?.forceKillTimeoutMs,
+  micFallbacks: audioConfig?.micFallbacks
 });
+
+const anomalyConfig = audioConfig?.anomaly;
 
 const detector = new AudioAnomalyDetector({
   source: 'audio:microphone',
-  sampleRate: 16000,
-  rmsThreshold: 0.25,
-  centroidJumpThreshold: 200,
-  minIntervalMs: 2000
+  sampleRate: anomalyConfig?.sampleRate ?? 16000,
+  frameDurationMs: anomalyConfig?.frameDurationMs,
+  hopDurationMs: anomalyConfig?.hopDurationMs,
+  frameSize: anomalyConfig?.frameSize,
+  hopSize: anomalyConfig?.hopSize,
+  rmsThreshold: anomalyConfig?.rmsThreshold ?? 0.25,
+  centroidJumpThreshold: anomalyConfig?.centroidJumpThreshold ?? 200,
+  minIntervalMs: anomalyConfig?.minIntervalMs ?? 2000,
+  minTriggerDurationMs: anomalyConfig?.minTriggerDurationMs,
+  rmsWindowMs: anomalyConfig?.rmsWindowMs,
+  centroidWindowMs: anomalyConfig?.centroidWindowMs,
+  thresholds: anomalyConfig?.thresholds,
+  nightHours: anomalyConfig?.nightHours
 });
 
 logger.info('Starting audio anomaly detector');
@@ -54,6 +80,19 @@ source.on('stderr', data => {
 source.on('close', code => {
   logger.warn({ code }, 'Audio source closed');
 });
+
+const mockIdleMs = Number.parseInt(process.env.MOCK_IDLE_MS ?? '', 10);
+if (Number.isFinite(mockIdleMs) && mockIdleMs > 0) {
+  source.once('stream', stream => {
+    setTimeout(() => {
+      if (stream.destroyed) {
+        return;
+      }
+      logger.warn({ idleMs: mockIdleMs }, 'Pausing audio stream to simulate idle timeout');
+      stream.pause();
+    }, mockIdleMs);
+  });
+}
 
 source.start();
 

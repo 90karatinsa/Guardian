@@ -51,6 +51,7 @@ export interface ListEventsOptions {
   detector?: string;
   source?: string;
   channel?: string;
+  camera?: string;
   severity?: EventSeverity;
   since?: number;
   until?: number;
@@ -89,6 +90,13 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
   if (options.channel) {
     filters.push("json_extract(meta, '$.channel') = @channel");
     params.channel = options.channel;
+  }
+
+  if (options.camera) {
+    filters.push(
+      "(source = @camera OR json_extract(meta, '$.camera') = @camera OR json_extract(meta, '$.channel') = @camera)"
+    );
+    params.camera = options.camera;
   }
 
   if (options.severity) {
@@ -157,12 +165,15 @@ export interface RetentionPolicyOptions {
   snapshotDir?: string;
   snapshotDirs?: string[];
   archiveDir: string;
+  maxArchivesPerCamera?: number;
   now?: number;
 }
 
 export interface RetentionOutcome {
   removedEvents: number;
   archivedSnapshots: number;
+  prunedArchives: number;
+  warnings: Array<{ path: string; error: Error }>;
 }
 
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
@@ -174,12 +185,17 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   const removedEvents = pruneEventsOlderThan(cutoffTs);
   const directories = collectSnapshotDirectories(options);
   let archivedSnapshots = 0;
+  let prunedArchives = 0;
+  const warnings: Array<{ path: string; error: Error }> = [];
 
   for (const { sourceDir, archiveBase } of directories) {
-    archivedSnapshots += rotateSnapshots(sourceDir, archiveBase, cutoffTs);
+    const rotation = rotateSnapshots(sourceDir, archiveBase, cutoffTs, options.maxArchivesPerCamera);
+    archivedSnapshots += rotation.moved;
+    prunedArchives += rotation.pruned;
+    warnings.push(...rotation.warnings);
   }
 
-  return { removedEvents, archivedSnapshots };
+  return { removedEvents, archivedSnapshots, prunedArchives, warnings };
 }
 
 export function vacuumDatabase(mode: VacuumMode = 'auto') {
@@ -220,15 +236,27 @@ function collectSnapshotDirectories(options: RetentionPolicyOptions): SnapshotDi
   return [...directories.values()];
 }
 
-function rotateSnapshots(snapshotDir: string, archiveDir: string, cutoffTs: number): number {
+type RotationOutcome = {
+  moved: number;
+  pruned: number;
+  warnings: Array<{ path: string; error: Error }>;
+};
+
+function rotateSnapshots(
+  snapshotDir: string,
+  archiveDir: string,
+  cutoffTs: number,
+  maxArchivesPerCamera?: number
+): RotationOutcome {
   if (!fs.existsSync(snapshotDir)) {
-    return 0;
+    return { moved: 0, pruned: 0, warnings: [] };
   }
 
   fs.mkdirSync(archiveDir, { recursive: true });
 
   const entries = fs.readdirSync(snapshotDir);
   let moved = 0;
+  const warnings: Array<{ path: string; error: Error }> = [];
 
   for (const entry of entries) {
     const sourcePath = path.join(snapshotDir, entry);
@@ -240,6 +268,7 @@ function rotateSnapshots(snapshotDir: string, archiveDir: string, cutoffTs: numb
     try {
       stats = fs.statSync(sourcePath);
     } catch (error) {
+      warnings.push({ path: sourcePath, error: toError(error) });
       continue;
     }
 
@@ -251,13 +280,26 @@ function rotateSnapshots(snapshotDir: string, archiveDir: string, cutoffTs: numb
       continue;
     }
 
-    const archivePath = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
-    const targetPath = ensureUniqueArchivePath(archivePath, entry);
-    fs.renameSync(sourcePath, targetPath);
-    moved += 1;
+    try {
+      const archivePath = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
+      const targetPath = ensureUniqueArchivePath(archivePath, entry);
+      fs.renameSync(sourcePath, targetPath);
+      moved += 1;
+    } catch (error) {
+      warnings.push({ path: sourcePath, error: toError(error) });
+    }
   }
 
-  return moved;
+  let pruned = 0;
+  if (typeof maxArchivesPerCamera === 'number' && maxArchivesPerCamera >= 0) {
+    try {
+      pruned = pruneArchiveLimit(archiveDir, snapshotDir, maxArchivesPerCamera);
+    } catch (error) {
+      warnings.push({ path: path.join(archiveDir, path.basename(snapshotDir)), error: toError(error) });
+    }
+  }
+
+  return { moved, pruned, warnings };
 }
 
 function buildArchivePath(archiveDir: string, snapshotDir: string, mtimeMs: number): string {
@@ -266,6 +308,98 @@ function buildArchivePath(archiveDir: string, snapshotDir: string, mtimeMs: numb
   const targetDir = path.join(archiveDir, cameraFolder, dateFolder);
   fs.mkdirSync(targetDir, { recursive: true });
   return targetDir;
+}
+
+function pruneArchiveLimit(archiveDir: string, snapshotDir: string, limit: number): number {
+  const cameraRoot = path.join(archiveDir, path.basename(snapshotDir));
+  if (!fs.existsSync(cameraRoot)) {
+    return 0;
+  }
+
+  const files = collectArchiveFiles(cameraRoot);
+  if (files.length <= limit) {
+    return 0;
+  }
+
+  const sorted = files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const excess = sorted.slice(Math.max(limit, 0));
+  let removed = 0;
+
+  for (const file of excess) {
+    try {
+      fs.rmSync(file.path, { force: true });
+      removed += 1;
+    } catch (error) {
+      throw toError(error);
+    }
+  }
+
+  cleanupEmptyDirectories(cameraRoot);
+  return removed;
+}
+
+function collectArchiveFiles(root: string): Array<{ path: string; mtimeMs: number }> {
+  const results: Array<{ path: string; mtimeMs: number }> = [];
+  const stack: string[] = [root];
+
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const entries = fs.readdirSync(current);
+    for (const entry of entries) {
+      const resolved = path.join(current, entry);
+      let stats: fs.Stats;
+      try {
+        stats = fs.statSync(resolved);
+      } catch {
+        continue;
+      }
+
+      if (stats.isDirectory()) {
+        stack.push(resolved);
+      } else if (stats.isFile()) {
+        results.push({ path: resolved, mtimeMs: stats.mtimeMs });
+      }
+    }
+  }
+
+  return results;
+}
+
+function cleanupEmptyDirectories(root: string) {
+  const stack: string[] = [root];
+  const visited: string[] = [];
+
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    visited.push(current);
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        stack.push(path.join(current, entry.name));
+      }
+    }
+  }
+
+  for (const dir of visited.sort((a, b) => b.length - a.length)) {
+    if (dir === root) {
+      continue;
+    }
+    try {
+      const contents = fs.readdirSync(dir);
+      if (contents.length === 0) {
+        fs.rmdirSync(dir);
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function toError(input: unknown): Error {
+  if (input instanceof Error) {
+    return input;
+  }
+  return new Error(typeof input === 'string' ? input : JSON.stringify(input));
 }
 
 function ensureUniqueArchivePath(directory: string, filename: string): string {

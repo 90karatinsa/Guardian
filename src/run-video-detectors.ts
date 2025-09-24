@@ -8,10 +8,18 @@ import { VideoSource } from './video/source.js';
 import LightDetector from './video/lightDetector.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector from './video/personDetector.js';
-import type { CameraFfmpegConfig, PersonConfig, VideoConfig } from './config/index.js';
+import type {
+  CameraFfmpegConfig,
+  PersonConfig,
+  VideoConfig,
+  MotionConfig,
+  LightConfig
+} from './config/index.js';
 
 const videoConfig = config.get<VideoConfig>('video');
 const personConfig = config.get<PersonConfig>('person');
+const motionConfig = config.get<MotionConfig>('motion');
+const lightConfig = config.get<LightConfig>('light');
 const sampleSource = videoConfig.testFile ?? 'assets/test-video.mp4';
 const videoFile = ensureSampleVideo(sampleSource);
 const ffmpegConfig: CameraFfmpegConfig | undefined = videoConfig.ffmpeg;
@@ -19,6 +27,8 @@ const ffmpegConfig: CameraFfmpegConfig | undefined = videoConfig.ffmpeg;
 const source = new VideoSource({
   file: videoFile,
   framesPerSecond: videoConfig.framesPerSecond,
+  channel: 'video:test-camera',
+  idleTimeoutMs: ffmpegConfig?.idleTimeoutMs,
   startTimeoutMs: ffmpegConfig?.startTimeoutMs,
   watchdogTimeoutMs: ffmpegConfig?.watchdogTimeoutMs,
   forceKillTimeoutMs: ffmpegConfig?.forceKillTimeoutMs,
@@ -85,19 +95,28 @@ async function main() {
 
   const motionDetector = new MotionDetector({
     source: 'video:test-camera',
-    diffThreshold: 25,
-    areaThreshold: 0.015,
-    minIntervalMs: 1500
+    diffThreshold: motionConfig.diffThreshold,
+    areaThreshold: motionConfig.areaThreshold,
+    minIntervalMs: motionConfig.minIntervalMs,
+    debounceFrames: motionConfig.debounceFrames,
+    backoffFrames: motionConfig.backoffFrames,
+    noiseMultiplier: motionConfig.noiseMultiplier,
+    noiseSmoothing: motionConfig.noiseSmoothing,
+    areaSmoothing: motionConfig.areaSmoothing,
+    areaInflation: motionConfig.areaInflation,
+    areaDeltaThreshold: motionConfig.areaDeltaThreshold
   });
 
   const lightDetector = new LightDetector({
     source: 'video:test-camera',
-    deltaThreshold: 40,
-    normalHours: [
-      { start: 7, end: 22 }
-    ],
-    smoothingFactor: 0.1,
-    minIntervalMs: 30000
+    deltaThreshold: lightConfig.deltaThreshold,
+    normalHours: lightConfig.normalHours,
+    smoothingFactor: lightConfig.smoothingFactor,
+    minIntervalMs: lightConfig.minIntervalMs,
+    debounceFrames: lightConfig.debounceFrames,
+    backoffFrames: lightConfig.backoffFrames,
+    noiseMultiplier: lightConfig.noiseMultiplier,
+    noiseSmoothing: lightConfig.noiseSmoothing
   });
 
   logger.info({ file: videoFile }, 'Starting video detectors');

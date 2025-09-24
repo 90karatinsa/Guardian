@@ -96,7 +96,7 @@ describe('PersonDetector', () => {
     }
   });
 
-  it('PersonNmsParsing suppresses overlaps and rescales bounding boxes', async () => {
+  it('PersonDetectionsNms suppresses overlaps and emits capped candidates', async () => {
     const detections = 2;
     const attributes = 6;
     const detectionData = new Float32Array(attributes * detections);
@@ -132,7 +132,8 @@ describe('PersonDetector', () => {
         modelPath: 'models/yolov8n.onnx',
         scoreThreshold: 0.5,
         snapshotDir: 'snapshots',
-        minIntervalMs: 0
+        minIntervalMs: 0,
+        maxDetections: 1
       },
       bus
     );
@@ -152,7 +153,7 @@ describe('PersonDetector', () => {
     expect(meta?.classId).toBe(0);
     expect(meta?.objectness).toBeCloseTo(expectedObjectness, 5);
     expect(meta?.classProbability).toBeCloseTo(expectedClassProbability, 5);
-    expect(meta?.thresholds).toEqual({ score: 0.5 });
+    expect(meta?.thresholds).toMatchObject({ score: 0.5, nms: 0.45 });
 
     const bbox = meta?.bbox as { left: number; top: number; width: number; height: number };
     expect(bbox.left).toBeCloseTo(440, 5);
@@ -162,11 +163,17 @@ describe('PersonDetector', () => {
 
     expect(meta?.areaRatio).toBeCloseTo((400 * 400) / (1280 * 720), 5);
 
+    const candidates = meta?.detections as Array<Record<string, unknown>>;
+    expect(Array.isArray(candidates)).toBe(true);
+    expect(candidates).toHaveLength(1);
+    expect(candidates?.[0]?.score).toBe(meta?.score);
+    expect((candidates?.[0]?.bbox as any)?.width).toBeCloseTo(400, 5);
+
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
   });
 
-  it('PersonTensorShapes handles layout variations', async () => {
+  it('PersonTensorShapes handles layout variations and retains candidates', async () => {
     const attributes = 6;
     const detections = 1;
 
@@ -193,7 +200,8 @@ describe('PersonDetector', () => {
         modelPath: 'models/yolov8n.onnx',
         scoreThreshold: 0.4,
         snapshotDir: 'snapshots',
-        minIntervalMs: 0
+        minIntervalMs: 0,
+        maxDetections: 3
       },
       bus
     );
@@ -251,6 +259,9 @@ describe('PersonDetector', () => {
     expect(bbox.height).toBeCloseTo(320, 5);
     expect(bbox.left).toBeGreaterThanOrEqual(0);
     expect(bbox.top).toBeGreaterThanOrEqual(0);
+    const candidates = meta?.detections as Array<Record<string, unknown>>;
+    expect(candidates?.length).toBeGreaterThanOrEqual(1);
+    expect(candidates?.[0]?.score).toBe(meta?.score);
   });
 
   it('PersonMissingModel falls back to mock detections when ONNX model is absent', async () => {
@@ -264,7 +275,8 @@ describe('PersonDetector', () => {
         modelPath: 'missing-model.onnx',
         scoreThreshold: 0.4,
         snapshotDir: 'snapshots',
-        minIntervalMs: 0
+        minIntervalMs: 0,
+        maxDetections: 2
       },
       bus
     );
@@ -289,6 +301,10 @@ describe('PersonDetector', () => {
     expect(bbox.top).toBeGreaterThanOrEqual(0);
     expect(bbox.width).toBeGreaterThan(0);
     expect(bbox.height).toBeGreaterThan(0);
+
+    const candidates = meta?.detections as Array<Record<string, unknown>>;
+    expect(Array.isArray(candidates)).toBe(true);
+    expect(candidates?.length).toBeGreaterThanOrEqual(1);
 
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
