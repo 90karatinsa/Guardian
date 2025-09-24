@@ -10,15 +10,59 @@ Projeyi çalıştırmak için bağımlılıkları yükleyin:
 pnpm install
 ```
 
-## Sistem önyüklemesi
+## Kullanım
 
-Aşağıdaki komut uygulama omurgasını başlatır. Çalıştırıldığında `data/events.sqlite` veritabanı oluşturulur ve `system up` mesajlı bir kayıt eklenir.
+Guardian CLI, dedektör omurgasını `start` komutu ile başlatır ve kapatma sinyallerini yakalayarak tüm kaynakları kibarca serbest bırakır.
+
+### Servisi başlatma
 
 ```bash
-pnpm tsx src/app.ts
+pnpm start
+```
+
+Komut, `src/cli.ts` üzerinden guard boru hattını tetikler, log seviyelerini metriklere işler ve `SIGINT`/`SIGTERM` sinyallerinde kaynakları kapatır. Çalışan servisi durdurmak için terminalde `Ctrl+C` yeterlidir; CLI, kapatma süresini `guard.shutdown.ms` metriğinde raporlar.
+
+### Sağlık kontrolü
+
+Çalışan örnekten metrikleri ve durum kodlarını JSON olarak almak için:
+
+```bash
+pnpm health
+```
+
+CLI çıktısı, log seviyelerine göre sayaçlar, EventBus tetik sayıları ve hizmet durumunu (`ok`, `starting`, `degraded`) içeren tek satırlık bir JSON döndürür. Aynı komutu Docker healthcheck veya ters proxy kontrol uç noktalarında kullanabilirsiniz.
+
+### Sistem önyüklemesi
+
+Guard servisinin dışında kalan temel sistem önyüklemesi hâlâ `app` komutu ile tetiklenebilir. Çalıştırıldığında `data/events.sqlite` veritabanı oluşturulur ve `system up` mesajlı bir kayıt eklenir.
+
+```bash
+pnpm app
 ```
 
 Oluşturulan olay günlüğünü `data/events.sqlite` içinde görebilir veya SQLite araçlarıyla sorgulayabilirsiniz.
+
+### Docker imajı
+
+Kapsayıcı ortamlarda servisi çalıştırmak için yerleşik Dockerfile kullanılır:
+
+```bash
+docker build -t guardian:latest .
+docker run --rm -p 3000:3000 guardian:latest
+```
+
+İmaj, sağlık kontrolü için `pnpm exec tsx src/cli.ts --health` komutunu kullanır ve varsayılan giriş noktası CLI `start` komutudur.
+
+### systemd servisi
+
+`deploy/guardian.service` ünitesi, Linux ana makinelerde Guardian’ı sistem servisi olarak tanımlar. Unit dosyasını `/etc/systemd/system/guardian.service` konumuna kopyalayıp aşağıdaki komutlarla devreye alabilirsiniz:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now guardian
+```
+
+Unit, çalışma dizininde `pnpm start` komutunu kullanır; durdurma isteğinde CLI’nın graceful shutdown kancaları tetiklenir.
 
 ## Video testleri ve dedektörleri
 
@@ -63,6 +107,16 @@ pnpm tsx src/run-video-detectors.ts
 
 `pnpm tsx src/run-guard.ts` komutu, MotionDetector tetiklendikten sonra yapılandırmadaki her `checkEveryNFrames` karede PersonDetector'ı devreye alır. Maksimum deneme sayısı aşılana kadar kişi analizleri sürer. Eşik aşılırsa olay kayıt defterine kişi olayı düşer ve eş zamanlı olarak snapshot klasöründe görüntü saklanır.
 
+## Metrikler
+
+Guardian’ın metrik koleksiyonu üç ana başlıkta toplanır ve tamamı CLI sağlık çıktısında gözlemlenebilir:
+
+- **Log seviyeleri**: Pino logger’ı her kayıt yazdığında `logs.byLevel` haritasındaki sayaçlar artar. Örneğin `error` veya `fatal` seviyeleri `degraded` durumuna işaret eder ve alarm sistemlerine bağlanabilir.
+- **EventBus tetik sayıları**: `metrics.events` alanı toplam olay, dedektör başına dağılım ve en son tetik zamanını raporlar. Motion/Person dedektör zincirleri bu sayaçlarla izlenebilir.
+- **Gecikme ölçümleri**: `guard.startup.ms` ve `guard.shutdown.ms` gibi süreli işlemler `latencies` altında toplanır. `metrics.time()` yardımcı fonksiyonu, boru hattı adımlarını sarmalayarak ortalama/min/maks süreleri verir.
+
+Metrikler, Prometheus gibi sistemlere aktarım için JSON çıktısı, sistem günlükleri veya kendi toplayıcınız üzerinden kolayca tüketilebilir.
+
 ## Testler
 
 Birimin doğru kare ayrıştırmasını doğrulamak için Vitest testleri bulunmaktadır:
@@ -96,3 +150,13 @@ Ses dedektöründe kullanılan temel parametreler:
 Farklı bir cihaz kullanmak istiyorsanız `src/run-audio-detector.ts` içindeki `AudioSource` yapılandırmasını güncelleyin. Windows kullanıcılarının ffmpeg'in DirectShow cihaz adını doğru girdiğinden emin olması gerekir (`ffmpeg -list_devices true -f dshow -i dummy`). ALSA altında sanal cihaz veya `plughw` kullanabilirsiniz. Ayrıca `type: 'ffmpeg'` seçeneği ile boru hattından (`pipe:0`) gelen PCM akışları da okunabilir.
 
 Komut çalışırken el çırpma veya ani ses değişimleri en az bir `audio-anomaly` olayını oluşturur.
+
+## Sorun Giderme
+
+### ffmpeg / onnxruntime hatası
+
+Kapsayıcı dışında çalıştırırken `ffmpeg` ikilisi veya `onnxruntime-node` yerel eklentileri yüklenemezse aşağıdaki adımları uygulayın:
+
+1. Sistem paketlerini kurun: Debian/Ubuntu tabanlı dağıtımlarda `sudo apt-get install -y ffmpeg libgomp1` komutu eksik bağımlılıkları tamamlar.
+2. ONNX modeli için doğru mimariye uygun dosyayı indirdiğinizden emin olun (`models/yolov8n.onnx`). Yanlış bir dosya `onnxruntime: Failed to load model` hatasına yol açar.
+3. Değişikliklerden sonra `pnpm install` komutunu yeniden çalıştırıp CLI’yi `pnpm health` ile doğrulayın; sağlık çıktısında `status: "ok"` görülmelidir.
