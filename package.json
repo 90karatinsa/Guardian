@@ -12,7 +12,10 @@
     "config": "^3.3.9",
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
-    "pino": "^8.17.0"
+    "meyda": "^5.6.3",
+    "onnxruntime-node": "1.22.0-rev",
+    "pino": "^8.17.0",
+    "pngjs": "^7.0.0"
   },
   "devDependencies": {
     "@types/config": "^3.3.4",
@@ -27,6 +30,9 @@
       "better-sqlite3",
       "esbuild",
       "ffmpeg-static"
+    ],
+    "ignoredBuiltDependencies": [
+      "onnxruntime-node"
     ]
   }
 }
