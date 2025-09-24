@@ -7,6 +7,8 @@ import PersonDetector from '../src/video/personDetector.js';
 const runMock = vi.fn();
 
 vi.mock('pngjs', () => {
+  const store = new WeakMap<Buffer, { width: number; height: number; data: Uint8Array }>();
+
   class FakePNG {
     width: number;
     height: number;
@@ -20,7 +22,22 @@ vi.mock('pngjs', () => {
 
     static sync = {
       write(png: FakePNG) {
-        return Buffer.from(png.data);
+        const buffer = Buffer.from(png.data);
+        store.set(buffer, {
+          width: png.width,
+          height: png.height,
+          data: Uint8Array.from(png.data)
+        });
+        return buffer;
+      },
+      read(buffer: Buffer) {
+        const entry = store.get(buffer);
+        if (!entry) {
+          throw new Error('Unknown buffer');
+        }
+        const image = new FakePNG({ width: entry.width, height: entry.height });
+        image.data.set(entry.data);
+        return image;
       }
     };
   }
@@ -49,6 +66,8 @@ vi.mock('onnxruntime-node', () => {
   };
 });
 
+const ort = await import('onnxruntime-node');
+
 import { PNG } from 'pngjs';
 
 describe('PersonDetector', () => {
@@ -68,6 +87,7 @@ describe('PersonDetector', () => {
     });
 
     runMock.mockReset();
+    ort.InferenceSession.create.mockClear();
   });
 
   afterEach(() => {
@@ -77,32 +97,32 @@ describe('PersonDetector', () => {
   });
 
   it('PersonNmsParsing suppresses overlaps and rescales bounding boxes', async () => {
-    const stride = 2;
-    const channels = 6;
-    const detectionData = new Float32Array(channels * stride);
+    const detections = 2;
+    const attributes = 6;
+    const detectionData = new Float32Array(attributes * detections);
 
-    setDetection(detectionData, stride, 0, {
+    setChannelFirstDetection(detectionData, detections, 0, {
       cx: 320,
       cy: 320,
       width: 200,
       height: 200,
-      objectness: 0.9,
-      classScore: 0.95
+      objectnessLogit: 2.2,
+      classLogit: 2.1
     });
 
-    setDetection(detectionData, stride, 1, {
+    setChannelFirstDetection(detectionData, detections, 1, {
       cx: 330,
       cy: 330,
       width: 210,
       height: 210,
-      objectness: 0.85,
-      classScore: 0.9
+      objectnessLogit: 1.4,
+      classLogit: 1.3
     });
 
     runMock.mockResolvedValue({
       output0: {
         data: detectionData,
-        dims: [1, channels, stride]
+        dims: [1, attributes, detections]
       }
     });
 
@@ -124,14 +144,151 @@ describe('PersonDetector', () => {
 
     expect(events).toHaveLength(1);
     const meta = events[0].meta as Record<string, unknown>;
-    expect(meta?.score).toBeCloseTo(0.855, 3);
+    const expectedObjectness = sigmoid(2.2);
+    const expectedClassProbability = sigmoid(2.1);
+    expect(meta?.score).toBeCloseTo(expectedObjectness * expectedClassProbability, 5);
+    expect(meta?.score).toBeGreaterThan(0);
+    expect(meta?.score).toBeLessThanOrEqual(1);
     expect(meta?.classId).toBe(0);
+    expect(meta?.objectness).toBeCloseTo(expectedObjectness, 5);
+    expect(meta?.classProbability).toBeCloseTo(expectedClassProbability, 5);
+    expect(meta?.thresholds).toEqual({ score: 0.5 });
 
     const bbox = meta?.bbox as { left: number; top: number; width: number; height: number };
     expect(bbox.left).toBeCloseTo(440, 5);
     expect(bbox.top).toBeCloseTo(160, 5);
     expect(bbox.width).toBeCloseTo(400, 5);
     expect(bbox.height).toBeCloseTo(400, 5);
+
+    expect(meta?.areaRatio).toBeCloseTo((400 * 400) / (1280 * 720), 5);
+
+    const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
+    expect(fs.existsSync(snapshotPath)).toBe(true);
+  });
+
+  it('PersonTensorShapes handles layout variations', async () => {
+    const attributes = 6;
+    const detections = 1;
+
+    const channelFirst = new Float32Array(attributes * detections);
+    setChannelFirstDetection(channelFirst, detections, 0, {
+      cx: 320,
+      cy: 320,
+      width: 200,
+      height: 200,
+      objectnessLogit: 1.6,
+      classLogit: 1.4
+    });
+
+    runMock.mockResolvedValueOnce({
+      output0: {
+        data: channelFirst,
+        dims: [1, attributes, detections]
+      }
+    });
+
+    const detectorA = await PersonDetector.create(
+      {
+        source: 'video:test-camera-a',
+        modelPath: 'models/yolov8n.onnx',
+        scoreThreshold: 0.4,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0
+      },
+      bus
+    );
+
+    const frame = createUniformFrame(1280, 720, 50);
+
+    await detectorA.handleFrame(frame, 1);
+
+    expect(events).toHaveLength(1);
+    let meta = events[0].meta as Record<string, unknown>;
+    const bboxFirst = meta?.bbox as { width: number; height: number };
+    expect(bboxFirst.width).toBeCloseTo(400, 5);
+    expect(bboxFirst.height).toBeCloseTo(400, 5);
+    expect(meta?.score).toBeGreaterThan(0);
+
+    events = [];
+    runMock.mockReset();
+
+    const channelLast = new Float32Array(detections * attributes);
+    setChannelLastDetection(channelLast, attributes, 0, {
+      cx: 300,
+      cy: 280,
+      width: 180,
+      height: 160,
+      objectnessLogit: 1.2,
+      classLogit: 1.1
+    });
+
+    runMock.mockResolvedValueOnce({
+      output0: {
+        data: channelLast,
+        dims: [1, detections, attributes]
+      }
+    });
+
+    const detectorB = await PersonDetector.create(
+      {
+        source: 'video:test-camera-b',
+        modelPath: 'models/yolov8n.onnx',
+        scoreThreshold: 0.3,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0
+      },
+      bus
+    );
+
+    await detectorB.handleFrame(frame, 2);
+
+    expect(events).toHaveLength(1);
+    meta = events[0].meta as Record<string, unknown>;
+    expect(meta?.score).toBeGreaterThan(0);
+    expect(meta?.score).toBeLessThanOrEqual(1);
+    const bbox = meta?.bbox as { left: number; top: number; width: number; height: number };
+    expect(bbox.width).toBeCloseTo(360, 5);
+    expect(bbox.height).toBeCloseTo(320, 5);
+    expect(bbox.left).toBeGreaterThanOrEqual(0);
+    expect(bbox.top).toBeGreaterThanOrEqual(0);
+  });
+
+  it('PersonMissingModel falls back to mock detections when ONNX model is absent', async () => {
+    ort.InferenceSession.create.mockRejectedValueOnce(
+      new Error("Load model from models/yolov8n.onnx failed:Load model models/yolov8n.onnx failed. File doesn't exist")
+    );
+
+    const detector = await PersonDetector.create(
+      {
+        source: 'video:test-camera',
+        modelPath: 'missing-model.onnx',
+        scoreThreshold: 0.4,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0
+      },
+      bus
+    );
+
+    const frame = createUniformFrame(640, 480, 80);
+    const ts = 987654321;
+
+    await detector.handleFrame(frame, ts);
+
+    expect(runMock).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+
+    const meta = events[0]?.meta as Record<string, unknown>;
+    expect(meta?.score).toBeGreaterThan(0);
+    expect(meta?.score).toBeLessThanOrEqual(1);
+    expect(meta?.classId).toBe(0);
+    expect(meta?.objectness).toBeGreaterThan(0);
+    expect(meta?.classProbability).toBeGreaterThan(0);
+
+    const bbox = meta?.bbox as { left: number; top: number; width: number; height: number };
+    expect(bbox.left).toBeGreaterThanOrEqual(0);
+    expect(bbox.top).toBeGreaterThanOrEqual(0);
+    expect(bbox.width).toBeGreaterThan(0);
+    expect(bbox.height).toBeGreaterThan(0);
 
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
@@ -152,23 +309,49 @@ function createUniformFrame(width: number, height: number, value: number) {
   return PNG.sync.write(png);
 }
 
-function setDetection(
+function setChannelFirstDetection(
   data: Float32Array,
-  stride: number,
+  detections: number,
   index: number,
   values: {
     cx: number;
     cy: number;
     width: number;
     height: number;
-    objectness: number;
-    classScore: number;
+    objectnessLogit: number;
+    classLogit: number;
   }
 ) {
-  data[0 * stride + index] = values.cx;
-  data[1 * stride + index] = values.cy;
-  data[2 * stride + index] = values.width;
-  data[3 * stride + index] = values.height;
-  data[4 * stride + index] = values.objectness;
-  data[5 * stride + index] = values.classScore;
+  data[0 * detections + index] = values.cx;
+  data[1 * detections + index] = values.cy;
+  data[2 * detections + index] = values.width;
+  data[3 * detections + index] = values.height;
+  data[4 * detections + index] = values.objectnessLogit;
+  data[5 * detections + index] = values.classLogit;
+}
+
+function setChannelLastDetection(
+  data: Float32Array,
+  attributes: number,
+  index: number,
+  values: {
+    cx: number;
+    cy: number;
+    width: number;
+    height: number;
+    objectnessLogit: number;
+    classLogit: number;
+  }
+) {
+  const offset = index * attributes;
+  data[offset + 0] = values.cx;
+  data[offset + 1] = values.cy;
+  data[offset + 2] = values.width;
+  data[offset + 3] = values.height;
+  data[offset + 4] = values.objectnessLogit;
+  data[offset + 5] = values.classLogit;
+}
+
+function sigmoid(value: number) {
+  return 1 / (1 + Math.exp(-value));
 }

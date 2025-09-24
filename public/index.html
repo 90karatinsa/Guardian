@@ -4,6 +4,10 @@
     <meta charset="utf-8" />
     <title>Guardian Dashboard</title>
     <style>
+      :root {
+        color-scheme: light dark;
+      }
+
       body {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         margin: 0;
@@ -12,28 +16,14 @@
         color: #1f2933;
       }
 
+      header {
+        max-width: 960px;
+        margin: 0 auto 1.5rem auto;
+      }
+
       h1 {
         margin-top: 0;
-      }
-
-      #events {
-        display: grid;
-        gap: 0.75rem;
-        margin-top: 1rem;
-      }
-
-      .event {
-        background: #fff;
-        border-radius: 0.5rem;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
-        padding: 0.75rem 1rem;
-      }
-
-      .event header {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        margin-bottom: 0.5rem;
+        margin-bottom: 0.25rem;
       }
 
       .meta {
@@ -41,9 +31,115 @@
         color: #52606d;
       }
 
+      .intro {
+        margin-top: 1rem;
+        padding: 1rem 1.25rem;
+        border-radius: 0.6rem;
+        background: #e4ebf2;
+        color: #243b53;
+        line-height: 1.5;
+      }
+
+      .intro strong {
+        display: block;
+        margin-bottom: 0.35rem;
+      }
+
+      .intro ul {
+        margin: 0.35rem 0 0 1.25rem;
+        padding: 0;
+      }
+
+      .intro li + li {
+        margin-top: 0.25rem;
+      }
+
+      .filters {
+        margin-top: 1rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: flex-end;
+      }
+
+      .filters label {
+        display: flex;
+        flex-direction: column;
+        font-size: 0.85rem;
+        color: #364152;
+        gap: 0.35rem;
+      }
+
+      .filters input,
+      .filters select {
+        border: 1px solid #cbd2d9;
+        border-radius: 0.4rem;
+        padding: 0.45rem 0.6rem;
+        font-size: 0.95rem;
+        min-width: 10rem;
+      }
+
+      .filters button {
+        background: #127fbf;
+        color: #fff;
+        border: none;
+        border-radius: 0.4rem;
+        padding: 0.5rem 1rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .filters button.secondary {
+        background: #e4ebf2;
+        color: #243b53;
+      }
+
+      main.dashboard {
+        max-width: 1200px;
+        margin: 0 auto;
+        display: grid;
+        gap: 1.5rem;
+        grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+        align-items: start;
+      }
+
+      #events {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .event {
+        background: #fff;
+        border-radius: 0.5rem;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+        padding: 0.75rem 1rem;
+        border: 1px solid transparent;
+        cursor: pointer;
+        transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+      }
+
+      .event:hover {
+        border-color: #8898aa;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.12);
+      }
+
+      .event.active {
+        border-color: #127fbf;
+        box-shadow: 0 0 0 2px rgba(18, 127, 191, 0.15);
+      }
+
+      .event header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 0.5rem;
+        gap: 1rem;
+      }
+
       .severity {
-        font-weight: bold;
+        font-weight: 600;
         text-transform: uppercase;
+        font-size: 0.85rem;
       }
 
       .severity.info {
@@ -57,96 +153,92 @@
       .severity.critical {
         color: #d64545;
       }
+
+      #preview {
+        background: #fff;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        border: 1px solid #d9e2ec;
+      }
+
+      #preview figure {
+        margin: 0;
+      }
+
+      #preview img {
+        width: 100%;
+        border-radius: 0.5rem;
+        box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08);
+      }
+
+      .preview-empty {
+        text-align: center;
+        color: #52606d;
+        font-size: 0.95rem;
+      }
+
+      @media (max-width: 960px) {
+        main.dashboard {
+          grid-template-columns: 1fr;
+        }
+      }
     </style>
   </head>
   <body>
-    <h1>Guardian Events</h1>
-    <p class="meta">Streaming live events. The list updates automatically when new events arrive.</p>
-    <div id="events"></div>
+    <header>
+      <h1>Guardian Events</h1>
+      <p class="meta">
+        Streaming live events. Filter by source, channel, or severity to focus on the signals that
+        matter and click an event to preview the latest snapshot.
+      </p>
+      <div class="intro" role="note" aria-label="Dashboard quickstart">
+        <strong>Nasıl kullanılır?</strong>
+        <ul>
+          <li>
+            Sunucuyu <code>pnpm exec tsx src/server/http.ts</code> komutuyla başlatın ve kameralarınızın
+            `config/default.json` içinde tanımlandığından emin olun.
+          </li>
+          <li>Filtreleri kullanarak belirli bir kaynak veya kanal için REST istekleri oluşturabilirsiniz.</li>
+          <li>
+            Liste öğelerinden birine tıklamak, eşleşen snapshot’ı sağdaki panelde açar; kamera meta verileri ve
+            `meta.score` gibi alanlar başlıkta görünür.
+          </li>
+        </ul>
+      </div>
+      <form id="filters" class="filters" aria-label="Event filters">
+        <label>
+          Source
+          <input type="text" name="source" placeholder="video:camera-1" />
+        </label>
+        <label>
+          Channel
+          <input type="text" name="channel" placeholder="video:default" />
+        </label>
+        <label>
+          Severity
+          <select name="severity">
+            <option value="">All levels</option>
+            <option value="info">Info</option>
+            <option value="warning">Warning</option>
+            <option value="critical">Critical</option>
+          </select>
+        </label>
+        <button type="submit">Apply filters</button>
+        <button type="button" id="reset-filters" class="secondary">Reset</button>
+      </form>
+    </header>
+    <main class="dashboard">
+      <section aria-live="polite" aria-label="Live events" id="events"></section>
+      <aside id="preview" aria-label="Snapshot preview">
+        <div class="preview-empty" id="preview-empty">Select an event to view the latest snapshot.</div>
+        <figure id="preview-figure" hidden>
+          <img id="preview-image" alt="Selected event snapshot" />
+          <figcaption class="meta" id="preview-caption"></figcaption>
+        </figure>
+      </aside>
+    </main>
 
-    <script>
-      const list = document.getElementById('events');
-
-      function renderEvent(event) {
-        const container = document.createElement('article');
-        container.className = 'event';
-
-        const header = document.createElement('header');
-        const title = document.createElement('strong');
-        title.textContent = `${event.detector} · ${event.source}`;
-        header.appendChild(title);
-
-        const severity = document.createElement('span');
-        severity.className = `severity ${event.severity}`;
-        severity.textContent = event.severity;
-        header.appendChild(severity);
-
-        const message = document.createElement('p');
-        message.textContent = event.message;
-
-        const timestamp = document.createElement('p');
-        timestamp.className = 'meta';
-        timestamp.textContent = new Date(event.ts).toLocaleString();
-
-        container.appendChild(header);
-        container.appendChild(message);
-        container.appendChild(timestamp);
-
-        if (event.meta && event.meta.snapshot) {
-          const link = document.createElement('a');
-          link.href = `/api/events/${event.id}/snapshot`;
-          link.textContent = 'View snapshot';
-          link.target = '_blank';
-          container.appendChild(link);
-        }
-
-        return container;
-      }
-
-      function prependEvent(event) {
-        const element = renderEvent(event);
-        list.prepend(element);
-        while (list.childElementCount > 25) {
-          list.lastElementChild.remove();
-        }
-      }
-
-      async function loadInitial() {
-        try {
-          const response = await fetch('/api/events?limit=25');
-          if (!response.ok) {
-            return;
-          }
-          const payload = await response.json();
-          if (Array.isArray(payload.items)) {
-            payload.items.forEach(event => {
-              prependEvent(event);
-            });
-          }
-        } catch (error) {
-          console.error('Failed to load events', error);
-        }
-      }
-
-      function subscribe() {
-        const source = new EventSource('/api/events/stream');
-        source.onmessage = event => {
-          try {
-            const payload = JSON.parse(event.data);
-            prependEvent(payload);
-          } catch (error) {
-            console.error('Failed to parse event payload', error);
-          }
-        };
-
-        source.onerror = () => {
-          source.close();
-          setTimeout(subscribe, 3000);
-        };
-      }
-
-      loadInitial();
-      subscribe();
-    </script>
+    <script type="module" src="/dashboard.js"></script>
   </body>
 </html>

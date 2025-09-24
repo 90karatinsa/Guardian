@@ -13,11 +13,33 @@
       "info": 0,
       "warning": 5,
       "critical": 10
+    },
+    "retention": {
+      "retentionDays": 30,
+      "intervalMinutes": 60,
+      "vacuum": "auto",
+      "archiveDir": "archive",
+      "enabled": true
+    },
+    "suppression": {
+      "rules": [
+        {
+          "id": "motion-cooldown",
+          "detector": "motion",
+          "source": "video:test-camera",
+          "suppressForMs": 2000,
+          "reason": "Suppress repeated motion events"
+        }
+      ]
     }
   },
   "video": {
     "testFile": "assets/test-video.mp4",
     "framesPerSecond": 2,
+    "ffmpeg": {
+      "inputArgs": ["-re"],
+      "rtspTransport": "tcp"
+    },
     "cameras": [
       {
         "id": "test-camera",
@@ -25,6 +47,13 @@
         "input": "assets/test-video.mp4",
         "person": {
           "score": 0.5
+        },
+        "motion": {
+          "diffThreshold": 20,
+          "areaThreshold": 0.02
+        },
+        "ffmpeg": {
+          "inputArgs": ["-use_wallclock_as_timestamps", "1"]
         }
       }
     ]

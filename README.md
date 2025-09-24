@@ -1,162 +1,159 @@
 # Guardian
 
-Guardian, olayları tek bir veri akışında toplayan ve video test kaynağını PNG karelere dönüştüren küçük bir çalışma iskeletidir.
+Guardian, ağ kameraları ve ses girişleri üzerinden gelen olayları normalize edip tek bir metrik ve uyarı yüzeyinde toplayan, örnek dashboard ile izlenebilen küçük bir gözetleme iskeletidir.
+
+## İçindekiler
+- [Gereksinimler](#gereksinimler)
+- [Kurulum](#kurulum)
+- [Konfigürasyon](#konfigürasyon)
+  - [RTSP ve çoklu kamera](#rtsp-ve-çoklu-kamera)
+  - [Retention ve arşiv döngüsü](#retention-ve-arşiv-döngüsü)
+- [Guardian'ı çalıştırma](#guardiannı-çalıştırma)
+- [Dashboard](#dashboard)
+- [Metrikler ve sağlık çıktısı](#metrikler-ve-sağlık-çıktısı)
+- [Video ve ses boru hatları](#video-ve-ses-boru-hatları)
+- [Docker ile çalışma](#docker-ile-çalışma)
+- [systemd servisi](#systemd-servisi)
+- [Sorun giderme](#sorun-giderme)
+
+## Gereksinimler
+Guardian, Node.js ekosistemi üzerinde çalışır ancak kamera/analiz zinciri için ek araçlara ihtiyaç duyar:
+
+- **Node.js 20** ve **pnpm 8+** (corepack ile etkinleştirebilirsiniz).
+- **ffmpeg** ve **ffprobe** ikilileri. RTSP kameralar, yerel dosyalar veya mikrofonlar bu araçlarla okunur.
+- **onnxruntime-node** ve uygun bir **YOLOv8 ONNX modeli** (`models/yolov8n.onnx` gibi). Model dosyasını proje dizinine kendiniz kopyalamalısınız.
+- (İsteğe bağlı) **SQLite** istemci araçları (`sqlite3`), oluşturulan `data/events.sqlite` dosyasını incelemek için.
+
+> 💡 Linux üzerinde `sudo apt-get install -y ffmpeg libgomp1` komutu, macOS üzerinde `brew install ffmpeg`, Windows üzerinde ise [ffmpeg.org](https://ffmpeg.org) ikilisi gereksinimleri karşılar.
 
 ## Kurulum
-
-Projeyi çalıştırmak için bağımlılıkları yükleyin:
+Projeyi klonladıktan sonra bağımlılıkları yükleyin:
 
 ```bash
 pnpm install
 ```
 
-## Kullanım
+İlk çalıştırmada Guardian, örnek konfigürasyon ve veri dizinlerini otomatik oluşturur. `config/default.json` dosyası guard'ın varsayılan akışını tanımlar.
 
-Guardian CLI, dedektör omurgasını `start` komutu ile başlatır ve kapatma sinyallerini yakalayarak tüm kaynakları kibarca serbest bırakır.
+## Konfigürasyon
+Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve retention politikalarını yapılandırır. Hot reload mekanizması, dosya değişikliklerini izler ve geçersiz JSON bulunduğunda son bilinen iyi yapılandırmaya geri döner.
 
-### Servisi başlatma
+```jsonc
+{
+  "cameras": {
+    "lobby": {
+      "channel": "video:lobby",
+      "input": "rtsp://192.168.1.10/stream1",
+      "person": { "scoreThreshold": 0.35 },
+      "motion": { "diffThreshold": 18 },
+      "ffmpeg": { "rtspTransport": "tcp" }
+    }
+  },
+  "retention": {
+    "events": { "days": 14 },
+    "snapshots": { "maxArchives": 10 }
+  }
+}
+```
+
+Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kamerasını içerir. Üretimde kendi kameralarınızı tanımlamak için aşağıdaki bölümlere göz atın.
+
+### RTSP ve çoklu kamera
+- `cameras` nesnesine her kamera için benzersiz bir anahtar ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
+- `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Dashboard filtreleri bu alanı kullanır.
+- `ffmpeg` altındaki `rtspTransport`, `inputArgs` veya `hardwareAccel` gibi seçeneklerle ağ koşullarına göre ffmpeg’i ayarlayabilirsiniz. Watchdog mekanizması kare akışı durursa yeniden başlatmayı tetikler ve metriklere `pipelines.ffmpegRestarts` olarak yansır.
+- Aynı konfigürasyon dosyasında birden fazla kamera tanımlayarak çoklu kanal akışlarını aynı guard süreç içinde izleyebilirsiniz. Her kamera kendi motion/person eşiklerini (`motion.diffThreshold`, `person.scoreThreshold`) ve suppression kurallarını kullanır.
+
+### Retention ve arşiv döngüsü
+Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir retention görevine sahiptir:
+- `retention.events.days`: SQLite üzerindeki olay kayıtlarının kaç gün saklanacağını belirtir. Süre dolunca kayıtlar silinir ve `VACUUM`/`VACUUM FULL` çağrıları ile dosya boyutu sıkıştırılır.
+- `retention.snapshots.days` veya `maxArchives`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`snapshots/2024-03-18/` gibi). Maksimum arşiv sayısı aşıldığında en eski klasörler silinir.
+- Guard başlatıldığında görev planlayıcısı çalışır ve her çalıştırma sonunda loglara `Retention task completed` satırını bırakır.
+
+Retention ayarlarını değiştirip dosyayı kaydettiğinizde hot reload mekanizması yeni değerleri uygular.
+
+## Guardian'ı çalıştırma
+Guardian CLI, servis kontrolü ve sağlık kontrollerini yönetir:
 
 ```bash
+# Guard boru hattını başlatır
 pnpm start
+
+# Çalışan sürecin sağlık özetini yazdırır
+pnpm exec tsx src/cli.ts --health
+
+# systemd veya Docker konteyneri içinden zarif şekilde durdurur
+pnpm exec tsx src/cli.ts --stop
+
+# Servis durumunu exit kodlarıyla raporlar
+pnpm exec tsx src/cli.ts --status
 ```
 
-Komut, `src/cli.ts` üzerinden guard boru hattını tetikler, log seviyelerini metriklere işler ve `SIGINT`/`SIGTERM` sinyallerinde kaynakları kapatır. Çalışan servisi durdurmak için terminalde `Ctrl+C` yeterlidir; CLI, kapatma süresini `guard.shutdown.ms` metriğinde raporlar.
+`--health` çıktısı `status`, `events.byDetector.motion`, `events.byDetector.person` ve `pipelines.ffmpegRestarts` gibi anahtarları içerir. Sağlık kodları; `0=ok`, `3=degraded`, `4=stopped` gibi anlamlar taşır ve Docker healthcheck tarafından kullanılır.
 
-### Sağlık kontrolü
+## Dashboard
+`pnpm exec tsx src/server/http.ts` komutu HTTP sunucusunu başlatır. Ardından `http://localhost:3000` adresine giderek dashboard’u açabilirsiniz:
 
-Çalışan örnekten metrikleri ve durum kodlarını JSON olarak almak için:
+- Üstteki filtre alanları kaynak, kanal veya şiddete göre REST API istekleri yapar (`/api/events?channel=video:lobby`).
+- Sağ taraftaki snapshot önizlemesi seçilen olayın en güncel görüntüsünü `/snapshots/<id>.jpg` üzerinden yükler.
+- SSE akışı (`/api/events/stream`) heartbeat ile açık tutulur; bağlantı koptuğunda istemci otomatik yeniden bağlanır ve son filtreleri uygular.
 
-```bash
-pnpm health
-```
+Bu sayfa, guard’ın gerçek zamanlı olaylarını izlemenin en hızlı yoludur.
 
-CLI çıktısı, log seviyelerine göre sayaçlar, EventBus tetik sayıları ve hizmet durumunu (`ok`, `starting`, `degraded`) içeren tek satırlık bir JSON döndürür. Aynı komutu Docker healthcheck veya ters proxy kontrol uç noktalarında kullanabilirsiniz.
+## Metrikler ve sağlık çıktısı
+Guardian tüm metrikleri JSON olarak üretir:
 
-### Sistem önyüklemesi
+- CLI `--health` komutu saniyelik özet verir.
+- HTTP sunucusu `/api/metrics` uç noktasıyla Prometheus uyumlu bir çıktıyı paylaşacak şekilde genişletilebilir.
+- `metrics.events` altında dedektör başına tetik sayıları, `metrics.latency.detectors.person` altında histogramlar, `metrics.pipelines.ffmpegRestarts` altında yeniden başlatma sayaçları bulunur.
+- Log düzeyleri `metrics.logs.byLevel.error` gibi anahtarlarla etiketlenir; hata sayacının artması durumunda durum `degraded` olarak işaretlenir.
 
-Guard servisinin dışında kalan temel sistem önyüklemesi hâlâ `app` komutu ile tetiklenebilir. Çalıştırıldığında `data/events.sqlite` veritabanı oluşturulur ve `system up` mesajlı bir kayıt eklenir.
+## Video ve ses boru hatları
+- `pnpm tsx src/run-video-detectors.ts` komutu test videosunu çalıştırır ve motion/light/person dedektörlerini tetikleyerek snapshot üretir. Kare akışı 5 saniye durursa loglarda `Video source reconnecting (reason=watchdog-timeout)` mesajı görülür.
+- `pnpm tsx src/run-audio-detector.ts` komutu platforma özel ffmpeg argümanlarıyla mikrofonu okur. Cihaz bulunamadığında `Audio source recovering (reason=ffmpeg-missing)` logu yazılır ve yeniden deneme sayaçları metriklere işlenir.
 
-```bash
-pnpm app
-```
-
-Oluşturulan olay günlüğünü `data/events.sqlite` içinde görebilir veya SQLite araçlarıyla sorgulayabilirsiniz.
-
-### Docker imajı
-
-Kapsayıcı ortamlarda servisi çalıştırmak için yerleşik Dockerfile kullanılır:
+## Docker ile çalışma
+Proje kökünde çok aşamalı bir Dockerfile bulunur:
 
 ```bash
 docker build -t guardian:latest .
-docker run --rm -p 3000:3000 guardian:latest
+docker run --rm -p 3000:3000 -v $(pwd)/config:/app/config guardian:latest
 ```
 
-İmaj, sağlık kontrolü için `pnpm exec tsx src/cli.ts --health` komutunu kullanır ve varsayılan giriş noktası CLI `start` komutudur.
+İmaj derlemesi sırasında `ffmpeg` ve `onnxruntime-node` varlığı doğrulanır; eksik olduklarında build başarısız olur. Container sağlık kontrolü `pnpm exec tsx src/cli.ts --health` komutuyla çalışır ve `status: "ok"` bekler.
 
-### systemd servisi
+Guard’ı donanım hızlandırma veya RTSP kimlik bilgileriyle çalıştırmak için `config/` klasörünü volume olarak bağlayabilirsiniz.
 
-`deploy/guardian.service` ünitesi, Linux ana makinelerde Guardian’ı sistem servisi olarak tanımlar. Unit dosyasını `/etc/systemd/system/guardian.service` konumuna kopyalayıp aşağıdaki komutlarla devreye alabilirsiniz:
+## systemd servisi
+`deploy/guardian.service` unit dosyası aşağıdaki adımlarla devreye alınabilir:
 
 ```bash
+sudo cp deploy/guardian.service /etc/systemd/system/guardian.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now guardian
 ```
 
-Unit, çalışma dizininde `pnpm start` komutunu kullanır; durdurma isteğinde CLI’nın graceful shutdown kancaları tetiklenir.
+Servis, ortam değişkenlerini unit dosyasındaki `Environment=` satırlarından alır ve stop komutunda CLI’nın graceful shutdown yolunu kullanır.
 
-## Video testleri ve dedektörleri
-
-Varsayılan yapılandırma `assets/test-video.mp4` yoluna yazılan küçük bir örnek videoyu saniyede iki kare olacak şekilde PNG formatında ayrıştırır. `pnpm tsx src/run-video-detectors.ts` komutu bu akışı Motion ve Light dedektörleriyle analiz eder.
-
-Dedektörler, olay yakalandığında `event` kanalına olay düşer ve otomatik olarak SQLite veritabanına kaydedilir.
-
-### MotionDetector
-
-- **diffThreshold**: Piksel başına minimum fark (varsayılan 25). Bu değeri azaltmak küçük hareketleri yakalar, yükseltmek gürültüyü filtreler.
-- **areaThreshold**: Toplam kareye göre yüzde olarak değişen piksel oranı (varsayılan %1.5). %0.02 = %2 alan anlamına gelir.
-- **minIntervalMs**: Aynı hareketin tekrar raporlanmaması için minimum bekleme süresi.
-
-### LightDetector
-
-- **deltaThreshold**: Ortalama lüminansta beklenmeyen sıçramayı tetikleyen fark (varsayılan 40/255).
-- **normalHours**: Aydınlığın normal kabul edildiği saat aralıkları. Saatler dışında kalan tüm değişimler eşik ile karşılaştırılır. Örneğin `{ start: 7, end: 22 }` gündüz ışığını, `{ start: 22, end: 6 }` gece ışığını tanımlar.
-- **smoothingFactor**: Lüminans baz çizgisini yumuşatmak için EMA katsayısı.
-- **minIntervalMs**: Aynı ışık olayının tekrarlanmasını sınırlar.
-
-### PersonDetector
-
-- **modelPath**: `models/yolov8n.onnx` benzeri YOLOv8 tabanlı ONNX modelinin yolu. Model dosyasını bu klasöre kendiniz yerleştirmelisiniz.
-- **score**: Kişi sınıfı için minimum güven skoru. Örneğin `0.5` üzerindeki sonuçlar kişi olarak raporlanır.
-- **checkEveryNFrames**: Hareket algılandıktan sonra her N. karede kişi analizi yapılır.
-- **maxDetections**: Tek bir hareket tetiklemesinden sonra kaç kareye kadar kişi analizi yapılacağını sınırlar.
-- **snapshotDir**: `snapshots/` varsayılanına yazılan kişi görüntülerinin klasörü.
-
-Dedektör, kareleri 640x640 çözünürlüğe `letterbox` yöntemiyle ölçeklendirir ve YOLOv8 çıktısındaki kişi skorunu eşiğin üzerinde bulduğunda `snapshots/<timestamp>-person.png` dosyası oluşturup olaya kutu koordinatlarını ekler.
-
-Farklı bir test videosu veya kare hızı kullanmak isterseniz `config/default.json` altındaki `video.testFile` ve `video.framesPerSecond` ayarlarını güncelleyin. Dedektör eşikleri kod içinde parametre olarak belirtilmiştir, gerekirse scripti düzenleyin.
-
-Örnek komut:
-
-```bash
-pnpm tsx src/run-video-detectors.ts
-```
-
-Örnek video üzerinde bu komut en az bir motion veya light olayını terminale ve veritabanına yazar.
-
-## Hareket → kişi tetik zinciri
-
-`pnpm tsx src/run-guard.ts` komutu, MotionDetector tetiklendikten sonra yapılandırmadaki her `checkEveryNFrames` karede PersonDetector'ı devreye alır. Maksimum deneme sayısı aşılana kadar kişi analizleri sürer. Eşik aşılırsa olay kayıt defterine kişi olayı düşer ve eş zamanlı olarak snapshot klasöründe görüntü saklanır.
-
-## Metrikler
-
-Guardian’ın metrik koleksiyonu üç ana başlıkta toplanır ve tamamı CLI sağlık çıktısında gözlemlenebilir:
-
-- **Log seviyeleri**: Pino logger’ı her kayıt yazdığında `logs.byLevel` haritasındaki sayaçlar artar. Örneğin `error` veya `fatal` seviyeleri `degraded` durumuna işaret eder ve alarm sistemlerine bağlanabilir.
-- **EventBus tetik sayıları**: `metrics.events` alanı toplam olay, dedektör başına dağılım ve en son tetik zamanını raporlar. Motion/Person dedektör zincirleri bu sayaçlarla izlenebilir.
-- **Gecikme ölçümleri**: `guard.startup.ms` ve `guard.shutdown.ms` gibi süreli işlemler `latencies` altında toplanır. `metrics.time()` yardımcı fonksiyonu, boru hattı adımlarını sarmalayarak ortalama/min/maks süreleri verir.
-
-Metrikler, Prometheus gibi sistemlere aktarım için JSON çıktısı, sistem günlükleri veya kendi toplayıcınız üzerinden kolayca tüketilebilir.
-
-## Testler
-
-Birimin doğru kare ayrıştırmasını doğrulamak için Vitest testleri bulunmaktadır:
-
-```bash
-pnpm vitest run -t Bootstrap
-pnpm vitest run -t VideoSource
-pnpm vitest run -t "(Motion|Light)Detector"
-pnpm vitest run -t AudioAnomaly
-pnpm vitest run -t PersonDetector
-```
-
-`Bootstrap` testi uygulama başlangıcını, `VideoSource` testi sahte bir PNG akışını; `MotionDetector` ve `LightDetector` sentetik karelerle video eşiklerini; `PersonDetector` hareket sonrası kişi senaryosunu; `AudioAnomaly` ise sentetik PCM örnekleriyle ses dedektörünü doğrular.
-
-## Ses dedektörü
-
-`pnpm tsx src/run-audio-detector.ts` komutu mikrofon akışını (veya uygun şekilde yönlendirilmiş `ffmpeg` girişini) 16 kHz tek kanal PCM formatında alır ve RMS / spektral centroid (Meyda ile) hesaplayarak olağan dışı durumlarda `audio-anomaly` olayı üretir.
-
-Varsayılan olarak işletim sistemine göre şu ffmpeg seçenekleri kullanılır:
-
-- **Linux (ALSA)**: `-f alsa -i default`
-- **macOS (AVFoundation)**: `-f avfoundation -i :0`
-- **Windows (DirectShow)**: `-f dshow -i audio="default"`
-
-Ses dedektöründe kullanılan temel parametreler:
-
-- **rmsThreshold** ≈ 0.25: Ses seviyesinin (0-1 aralığı) aşması hâlinde `critical` seviye üretir.
-- **centroidJumpThreshold** ≈ 200 Hz: Spektral centroidte ani sıçramaları `warning` olarak raporlar.
-- **minIntervalMs**: Aynı anomali tekrarının bastırılması için bekleme süresi.
-
-Farklı bir cihaz kullanmak istiyorsanız `src/run-audio-detector.ts` içindeki `AudioSource` yapılandırmasını güncelleyin. Windows kullanıcılarının ffmpeg'in DirectShow cihaz adını doğru girdiğinden emin olması gerekir (`ffmpeg -list_devices true -f dshow -i dummy`). ALSA altında sanal cihaz veya `plughw` kullanabilirsiniz. Ayrıca `type: 'ffmpeg'` seçeneği ile boru hattından (`pipe:0`) gelen PCM akışları da okunabilir.
-
-Komut çalışırken el çırpma veya ani ses değişimleri en az bir `audio-anomaly` olayını oluşturur.
-
-## Sorun Giderme
-
+## Sorun giderme
 ### ffmpeg / onnxruntime hatası
+1. Sistem paketlerini kurun: Debian/Ubuntu için `sudo apt-get install -y ffmpeg libgomp1`, macOS için `brew install ffmpeg`, Windows için resmi ffmpeg paketini PATH’e ekleyin.
+2. ONNX modeli için doğru mimariye uygun dosyayı indirin (`models/yolov8n.onnx`). Yanlış bir dosya `onnxruntime: Failed to load model` hatasına yol açar.
+3. Değişikliklerden sonra `pnpm install` komutunu yeniden çalıştırıp CLI’yi `pnpm exec tsx src/cli.ts --health` ile doğrulayın; sağlık çıktısında `status: "ok"` görülmelidir.
 
-Kapsayıcı dışında çalıştırırken `ffmpeg` ikilisi veya `onnxruntime-node` yerel eklentileri yüklenemezse aşağıdaki adımları uygulayın:
+### RTSP akışı bağlanmıyor
+- `ffmpeg -rtsp_transport tcp -i rtsp://...` komutunu elle çalıştırarak ağ gecikmesini test edin.
+- Konfigürasyonda `ffmpeg.inputArgs` içerisine `-stimeout 5000000` gibi değerler ekleyerek bağlantı süresini kısaltın.
+- Watchdog yeniden bağlanmayı tetikliyorsa loglar ve `pipelines.ffmpegRestarts` metriği artacaktır; çok sık artıyorsa ağ veya kamera ayarlarını gözden geçirin.
 
-1. Sistem paketlerini kurun: Debian/Ubuntu tabanlı dağıtımlarda `sudo apt-get install -y ffmpeg libgomp1` komutu eksik bağımlılıkları tamamlar.
-2. ONNX modeli için doğru mimariye uygun dosyayı indirdiğinizden emin olun (`models/yolov8n.onnx`). Yanlış bir dosya `onnxruntime: Failed to load model` hatasına yol açar.
-3. Değişikliklerden sonra `pnpm install` komutunu yeniden çalıştırıp CLI’yi `pnpm health` ile doğrulayın; sağlık çıktısında `status: "ok"` görülmelidir.
+### Retention beklenen dosyaları silmiyor
+- `config/default.json` içindeki `retention` alanında gün sayısını ve `maxArchives` değerini doğrulayın.
+- `pnpm tsx src/run-guard.ts --max-runtime 60000` komutuyla guard’ı kısa süreliğine çalıştırarak loglarda `Retention task completed` satırını arayın.
+- Snapshot klasörlerinin tarih bazlı (`YYYY-MM-DD`) olarak oluştuğunu ve eski klasörlerin silindiğini denetleyin.
+
+### Dashboard boş görünüyor
+- HTTP sunucusunu `pnpm exec tsx src/server/http.ts` komutuyla başlattığınızdan emin olun.
+- Tarayıcı geliştirici araçlarında SSE isteğinin (`/api/events/stream`) açık olduğundan emin olun. CORS veya reverse proxy kullanıyorsanız SSE başlıklarını (`Cache-Control: no-cache`, `Connection: keep-alive`) iletmeyi unutmayın.
+- Filtre alanlarını temizlemek için dashboard’daki **Reset** butonuna tıklayın; yanlış kanal/şiddet filtresi genellikle boş listeye sebep olur.
+
+Guardian ile ilgili geri bildirimlerinizi veya hata raporlarınızı Issues sekmesinden paylaşabilirsiniz. İyi gözlemler!

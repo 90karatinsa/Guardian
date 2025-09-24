@@ -2,6 +2,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
+import metrics from '../metrics/index.js';
 
 const ffmpegPath = ffmpegStatic as string | null;
 if (ffmpegPath) {
@@ -9,6 +10,7 @@ if (ffmpegPath) {
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const DEFAULT_START_TIMEOUT_MS = 4000;
 const DEFAULT_IDLE_TIMEOUT_MS = 5000;
 const DEFAULT_RESTART_DELAY_MS = 500;
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
@@ -18,10 +20,19 @@ export type VideoSourceOptions = {
   file: string;
   framesPerSecond: number;
   idleTimeoutMs?: number;
+  watchdogTimeoutMs?: number;
+  startTimeoutMs?: number;
   restartDelayMs?: number;
   maxBufferBytes?: number;
   forceKillTimeoutMs?: number;
-  commandFactory?: (options: { file: string; framesPerSecond: number }) => ffmpeg.FfmpegCommand;
+  inputArgs?: string[];
+  rtspTransport?: string;
+  commandFactory?: (options: {
+    file: string;
+    framesPerSecond: number;
+    inputArgs?: string[];
+    rtspTransport?: string;
+  }) => ffmpeg.FfmpegCommand;
 };
 
 export type RecoverEvent = {
@@ -35,12 +46,14 @@ export class VideoSource extends EventEmitter {
   private stream: Readable | null = null;
   private streamCleanup: (() => void) | null = null;
   private buffer = Buffer.alloc(0);
-  private idleTimer: NodeJS.Timeout | null = null;
+  private startTimer: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
   private killTimer: NodeJS.Timeout | null = null;
   private shouldStop = false;
   private recovering = false;
   private restartCount = 0;
+  private hasReceivedFrame = false;
 
   constructor(private readonly options: VideoSourceOptions) {
     super();
@@ -49,13 +62,15 @@ export class VideoSource extends EventEmitter {
   start() {
     this.shouldStop = false;
     this.restartCount = 0;
+    this.hasReceivedFrame = false;
     this.startCommand();
   }
 
   stop() {
     this.shouldStop = true;
     this.clearRestartTimer();
-    this.clearIdleTimer();
+    this.clearStartTimer();
+    this.clearWatchdogTimer();
     this.cleanupStream();
     this.terminateCommand(true);
   }
@@ -66,7 +81,13 @@ export class VideoSource extends EventEmitter {
     this.buffer = Buffer.alloc(0);
 
     const onData = (chunk: Buffer) => {
-      this.resetIdleTimer();
+      if (!this.hasReceivedFrame) {
+        this.hasReceivedFrame = true;
+        this.restartCount = 0;
+        this.clearStartTimer();
+      }
+
+      this.resetWatchdogTimer();
       this.buffer = Buffer.concat([this.buffer, chunk]);
       const { frames, remainder, corrupted } = this.extractFrames(this.buffer);
       this.buffer = remainder;
@@ -77,20 +98,20 @@ export class VideoSource extends EventEmitter {
 
       if (corrupted) {
         this.emit('error', new Error('Corrupted frame encountered'));
-        this.scheduleRecovery('Corrupted frame encountered');
+        this.scheduleRecovery('corrupted-frame');
       }
     };
 
     const onError = (err: Error) => {
       this.emit('error', err);
-      this.scheduleRecovery('Stream error');
+      this.scheduleRecovery('stream-error');
     };
 
     const onClose = () => {
       if (this.shouldStop) {
         return;
       }
-      this.scheduleRecovery('Stream closed');
+      this.scheduleRecovery('stream-closed');
     };
 
     stream.on('data', onData);
@@ -105,7 +126,8 @@ export class VideoSource extends EventEmitter {
       stream.off('close', onClose);
     };
 
-    this.resetIdleTimer();
+    this.emit('stream', stream);
+    this.resetWatchdogTimer();
   }
 
   private startCommand() {
@@ -114,6 +136,9 @@ export class VideoSource extends EventEmitter {
     }
 
     this.recovering = false;
+    this.hasReceivedFrame = false;
+    this.resetStartTimer();
+    this.clearWatchdogTimer();
     const command = this.createCommand();
     this.command = command;
 
@@ -123,7 +148,7 @@ export class VideoSource extends EventEmitter {
         return;
       }
       this.emit('error', err);
-      this.scheduleRecovery('ffmpeg error');
+      this.scheduleRecovery('ffmpeg-error');
     };
 
     const onEnd = () => {
@@ -132,15 +157,20 @@ export class VideoSource extends EventEmitter {
         return;
       }
       this.emit('end');
-      this.scheduleRecovery('ffmpeg ended');
+      this.scheduleRecovery('ffmpeg-ended');
     };
 
     command.once('error', onError);
     command.once('end', onEnd);
+    const onStart = () => {
+      this.clearStartTimer();
+    };
+    command.once('start', onStart);
 
     this.commandCleanup = () => {
       command.off('error', onError);
       command.off('end', onEnd);
+      command.off('start', onStart);
     };
 
     try {
@@ -148,7 +178,7 @@ export class VideoSource extends EventEmitter {
       this.consume(stream);
     } catch (error) {
       this.emit('error', error as Error);
-      this.scheduleRecovery('Unable to start ffmpeg');
+      this.scheduleRecovery('start-error');
     }
   }
 
@@ -156,11 +186,28 @@ export class VideoSource extends EventEmitter {
     if (this.options.commandFactory) {
       return this.options.commandFactory({
         file: this.options.file,
-        framesPerSecond: this.options.framesPerSecond
+        framesPerSecond: this.options.framesPerSecond,
+        inputArgs: this.options.inputArgs,
+        rtspTransport: this.options.rtspTransport
       });
     }
 
-    return ffmpeg(this.options.file)
+    const command = ffmpeg(this.options.file);
+
+    const inputOptions: string[] = [];
+    if (this.options.rtspTransport) {
+      inputOptions.push('-rtsp_transport', this.options.rtspTransport);
+    }
+
+    if (this.options.inputArgs?.length) {
+      inputOptions.push(...this.options.inputArgs);
+    }
+
+    if (inputOptions.length > 0) {
+      command.inputOptions(inputOptions);
+    }
+
+    return command
       .outputOptions('-vf', `fps=${this.options.framesPerSecond}`)
       .outputOptions('-f', 'image2pipe')
       .outputOptions('-vcodec', 'png');
@@ -230,9 +277,11 @@ export class VideoSource extends EventEmitter {
 
     this.recovering = true;
     this.restartCount += 1;
+    metrics.recordPipelineRestart('ffmpeg', reason);
     this.emit('recover', { reason, attempt: this.restartCount } as RecoverEvent);
 
-    this.clearIdleTimer();
+    this.clearStartTimer();
+    this.clearWatchdogTimer();
     this.cleanupStream();
     this.terminateCommand(true);
 
@@ -287,11 +336,32 @@ export class VideoSource extends EventEmitter {
     }, delay);
   }
 
-  private clearIdleTimer() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
+  private clearStartTimer() {
+    if (this.startTimer) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
     }
+  }
+
+  private resetStartTimer() {
+    this.clearStartTimer();
+    if (this.shouldStop) {
+      return;
+    }
+
+    const timeout = this.options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+    if (timeout <= 0) {
+      return;
+    }
+
+    this.startTimer = setTimeout(() => {
+      this.startTimer = null;
+      if (this.shouldStop || this.hasReceivedFrame) {
+        return;
+      }
+      this.emit('error', new Error('Video source failed to start before timeout'));
+      this.scheduleRecovery('start-timeout');
+    }, timeout);
   }
 
   private clearRestartTimer() {
@@ -308,19 +378,33 @@ export class VideoSource extends EventEmitter {
     }
   }
 
-  private resetIdleTimer() {
-    this.clearIdleTimer();
+  private clearWatchdogTimer() {
+    if (this.watchdogTimer) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private resetWatchdogTimer() {
+    this.clearWatchdogTimer();
     if (this.shouldStop) {
       return;
     }
 
-    const idleTimeout = this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-    this.idleTimer = setTimeout(() => {
-      this.idleTimer = null;
+    const idleTimeout =
+      this.options.watchdogTimeoutMs ?? this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+
+    if (idleTimeout <= 0) {
+      return;
+    }
+
+    this.watchdogTimer = setTimeout(() => {
+      this.watchdogTimer = null;
       if (this.shouldStop) {
         return;
       }
-      this.scheduleRecovery('Stream stalled');
+      this.emit('error', new Error('Video source watchdog timeout'));
+      this.scheduleRecovery('watchdog-timeout');
     }, idleTimeout);
   }
 }

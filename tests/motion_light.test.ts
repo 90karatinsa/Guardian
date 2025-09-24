@@ -17,13 +17,22 @@ vi.mock('pngjs', () => {
       this.height = height;
       this.data = new Uint8Array(width * height * 4);
     }
-
-    static sync = {
-      write(png: FakePNG) {
-        return Buffer.from(png.data);
-      }
-    };
   }
+
+  FakePNG.sync = {
+    write(png: FakePNG) {
+      const header = Buffer.alloc(8);
+      header.writeUInt32BE(png.width, 0);
+      header.writeUInt32BE(png.height, 4);
+      return Buffer.concat([header, Buffer.from(png.data)]);
+    },
+    read(buffer: Buffer) {
+      const width = buffer.readUInt32BE(0);
+      const height = buffer.readUInt32BE(4);
+      const data = new Uint8Array(buffer.subarray(8));
+      return { width, height, data };
+    }
+  } as const;
 
   return { PNG: FakePNG };
 });
@@ -44,7 +53,7 @@ describe('MotionDetector', () => {
     });
   });
 
-  it('MotionBackoff suppresses noise and emits single event for sustained motion', () => {
+  it('MotionAdaptiveDebounce MotionBackoff suppresses noise and emits single event for sustained motion', () => {
     const detector = new MotionDetector(
       {
         source: 'test-camera',
@@ -88,6 +97,8 @@ describe('MotionDetector', () => {
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('motion');
     expect(events[0].meta?.areaPct as number).toBeGreaterThan(0.05);
+    expect((events[0].meta as Record<string, number>).effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
+    expect((events[0].meta as Record<string, number>).effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
 
     detector.handleFrame(motionFrames[2], 200);
     expect(events).toHaveLength(1);
@@ -148,6 +159,8 @@ describe('LightDetector', () => {
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('light');
     expect(events[0].meta?.delta as number).toBeGreaterThan(150);
+    expect((events[0].meta as Record<string, number>).effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
+    expect((events[0].meta as Record<string, number>).effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
 
     detector.handleFrame(brightShift[2], ts0 + 20000);
     expect(events).toHaveLength(1);

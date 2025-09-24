@@ -11,6 +11,8 @@ export interface AudioAnomalyOptions {
   minIntervalMs?: number;
   frameSize?: number;
   hopSize?: number;
+  frameDurationMs?: number;
+  hopDurationMs?: number;
   minTriggerDurationMs?: number;
 }
 
@@ -29,6 +31,8 @@ export class AudioAnomalyDetector {
   private readonly frameSize: number;
   private readonly hopSize: number;
   private readonly window: Float32Array;
+  private readonly frameDurationMs: number;
+  private readonly hopDurationMs: number;
   private rmsDurationMs = 0;
   private centroidDurationMs = 0;
 
@@ -36,10 +40,29 @@ export class AudioAnomalyDetector {
     private readonly options: AudioAnomalyOptions,
     private readonly bus: EventEmitter = eventBus
   ) {
-    this.frameSize = Math.max(1, options.frameSize ?? DEFAULT_FRAME_SIZE);
-    const configuredHop = options.hopSize ?? Math.floor(this.frameSize / 2);
+    const sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
+    if (options.frameSize && options.frameSize > 0) {
+      this.frameSize = Math.max(1, Math.floor(options.frameSize));
+    } else if (options.frameDurationMs && options.frameDurationMs > 0) {
+      this.frameSize = Math.max(1, Math.round((sampleRate * options.frameDurationMs) / 1000));
+    } else {
+      this.frameSize = DEFAULT_FRAME_SIZE;
+    }
+
+    const configuredHopDuration = options.hopDurationMs ?? null;
+    let configuredHop = options.hopSize;
+    if (!configuredHop && configuredHopDuration && configuredHopDuration > 0) {
+      configuredHop = Math.round((sampleRate * configuredHopDuration) / 1000);
+    }
+
+    if (!configuredHop || configuredHop <= 0) {
+      configuredHop = Math.floor(this.frameSize / 2);
+    }
+
     this.hopSize = Math.min(this.frameSize, Math.max(1, configuredHop));
     this.window = createHanningWindow(this.frameSize);
+    this.frameDurationMs = (this.frameSize / sampleRate) * 1000;
+    this.hopDurationMs = (this.hopSize / sampleRate) * 1000;
   }
 
   handleChunk(samples: Int16Array, ts = Date.now()) {
@@ -54,7 +77,7 @@ export class AudioAnomalyDetector {
     const minInterval = this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
     const minTriggerDuration =
       this.options.minTriggerDurationMs ?? DEFAULT_MIN_TRIGGER_DURATION_MS;
-    const frameDurationMs = (this.frameSize / sampleRate) * 1000;
+    const frameDurationMs = this.frameDurationMs;
 
     while (this.buffer.length >= this.frameSize) {
       const frame = this.buffer.slice(0, this.frameSize);
@@ -139,7 +162,9 @@ export class AudioAnomalyDetector {
           triggeredBy,
           window: {
             frameSize: this.frameSize,
-            hopSize: this.hopSize
+            hopSize: this.hopSize,
+            frameDurationMs: this.frameDurationMs,
+            hopDurationMs: this.hopDurationMs
           },
           durationAboveThresholdMs: triggeredDurationMs
         }

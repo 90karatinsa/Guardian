@@ -5,9 +5,13 @@ After=network.target
 [Service]
 Type=simple
 Environment=NODE_ENV=production
+Environment=GUARDIAN_CONFIG=/etc/guardian/config.json
+Environment=GUARDIAN_DATA_DIR=/var/lib/guardian
+Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
 ExecStart=/usr/bin/env pnpm start
-ExecReload=/usr/bin/env pnpm health
+ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts --health
+ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop
 KillSignal=SIGINT
 Restart=on-failure
 RestartSec=5

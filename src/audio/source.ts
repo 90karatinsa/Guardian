@@ -7,6 +7,7 @@ import {
 } from 'node:child_process';
 import { Readable } from 'node:stream';
 import ffmpegStatic from 'ffmpeg-static';
+import metrics from '../metrics/index.js';
 
 export type AudioSourceOptions =
   | {
@@ -52,6 +53,10 @@ export class AudioSource extends EventEmitter {
   private shouldStop = false;
   private currentBinaryIndex = 0;
   private lastSuccessfulIndex = 0;
+  private micInputArgs: string[][] = [];
+  private micCandidateIndex = 0;
+  private expectedSampleBytes = 0;
+  private alignChunks = false;
 
   constructor(private readonly options: AudioSourceOptions) {
     super();
@@ -65,6 +70,14 @@ export class AudioSource extends EventEmitter {
     this.shouldStop = false;
     this.retryCount = 0;
     this.currentBinaryIndex = this.lastSuccessfulIndex;
+    if (this.options.type === 'mic') {
+      this.micInputArgs = buildMicInputArgs(process.platform, this.options);
+      this.micCandidateIndex = 0;
+    } else {
+      this.micInputArgs = [];
+      this.micCandidateIndex = 0;
+    }
+    this.alignChunks = this.options.type === 'ffmpeg' && this.options.input === 'pipe:0';
     this.startProcess();
   }
 
@@ -80,18 +93,23 @@ export class AudioSource extends EventEmitter {
     });
   }
 
-  static async listDevices(format: 'alsa' | 'avfoundation' | 'dshow') {
-    const args = ['-hide_banner', '-loglevel', 'info', '-f', format, '-list_devices', 'true', '-i', 'dummy'];
-
+  static async listDevices(format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto') {
+    const formats = resolveDeviceFormats(format, process.platform);
     let lastError: Error | null = null;
 
-    for (const command of FFPROBE_CANDIDATES) {
-      try {
-        const { stdout, stderr } = await execFileAsync(command, args);
-        const parsed = parseDeviceList(`${stdout}\n${stderr}`);
-        return parsed;
-      } catch (error) {
-        lastError = error as Error;
+    for (const fmt of formats) {
+      const args = ['-hide_banner', '-loglevel', 'info', '-f', fmt, '-list_devices', 'true', '-i', 'dummy'];
+
+      for (const command of FFPROBE_CANDIDATES) {
+        try {
+          const { stdout, stderr } = await execFileAsync(command, args);
+          const parsed = parseDeviceList(`${stdout}\n${stderr}`);
+          if (parsed.length > 0) {
+            return parsed;
+          }
+        } catch (error) {
+          lastError = error as Error;
+        }
       }
     }
 
@@ -105,33 +123,65 @@ export class AudioSource extends EventEmitter {
 
     const sampleRate = this.options.sampleRate ?? DEFAULT_SAMPLE_RATE;
     const channels = this.options.channels ?? DEFAULT_CHANNELS;
-    const args = this.buildFfmpegArgs(sampleRate, channels);
+    this.expectedSampleBytes = channels * 2;
 
-    let attemptIndex = this.currentBinaryIndex;
+    const argSets = this.buildArgSets(sampleRate, channels);
+    if (argSets.length === 0) {
+      const error = new Error('No audio input candidates available');
+      this.emit('error', error);
+      this.scheduleRetry('spawn-error', error);
+      return;
+    }
 
-    while (attemptIndex < FFMPEG_CANDIDATES.length) {
-      const binary = FFMPEG_CANDIDATES[attemptIndex];
-      try {
-        const stdio =
-          this.options.type === 'ffmpeg' && this.options.input === 'pipe:0'
-            ? ['pipe', 'pipe', 'pipe']
-            : ['ignore', 'pipe', 'pipe'];
+    if (this.options.type === 'mic' && this.micInputArgs.length === 0) {
+      this.micInputArgs = argSets;
+    }
 
-        const proc = spawn(binary, args, { stdio });
+    let candidateIndex = this.options.type === 'mic' ? this.micCandidateIndex % argSets.length : 0;
+    const attemptedCandidates = new Set<number>();
+    let spawnError: Error | null = null;
 
-        this.attachProcess(proc, sampleRate, channels, attemptIndex);
-        return;
-      } catch (error) {
-        const err = error as NodeJS.ErrnoException;
-        if (err.code === 'ENOENT') {
-          attemptIndex += 1;
-          continue;
+    while (attemptedCandidates.size < argSets.length) {
+      attemptedCandidates.add(candidateIndex);
+      const args = argSets[candidateIndex];
+      let attemptIndex = this.currentBinaryIndex;
+
+      while (attemptIndex < FFMPEG_CANDIDATES.length) {
+        const binary = FFMPEG_CANDIDATES[attemptIndex];
+        try {
+          const stdio = this.alignChunks ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'];
+          const proc = spawn(binary, args, { stdio });
+          this.attachProcess(proc, sampleRate, channels, attemptIndex, candidateIndex, argSets.length);
+          return;
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          if (err.code === 'ENOENT') {
+            attemptIndex += 1;
+            continue;
+          }
+
+          spawnError = err;
+          break;
         }
-
-        this.emit('error', err);
-        this.scheduleRetry('spawn-error', err);
-        return;
       }
+
+      this.currentBinaryIndex = 0;
+
+      if (this.options.type !== 'mic') {
+        break;
+      }
+
+      candidateIndex = (candidateIndex + 1) % argSets.length;
+    }
+
+    if (this.options.type === 'mic' && argSets.length > 1) {
+      this.micCandidateIndex = (candidateIndex + 1) % argSets.length;
+    }
+
+    if (spawnError) {
+      this.emit('error', spawnError);
+      this.scheduleRetry('spawn-error', spawnError);
+      return;
     }
 
     this.currentBinaryIndex = 0;
@@ -144,7 +194,9 @@ export class AudioSource extends EventEmitter {
     proc: ChildProcessWithoutNullStreams,
     sampleRate: number,
     channels: number,
-    binaryIndex: number
+    binaryIndex: number,
+    candidateIndex: number,
+    totalCandidates: number
   ) {
     this.teardownListeners();
     this.process = proc;
@@ -190,6 +242,10 @@ export class AudioSource extends EventEmitter {
         return;
       }
 
+      if (this.options.type === 'mic' && totalCandidates > 1) {
+        this.micCandidateIndex = (candidateIndex + 1) % totalCandidates;
+      }
+
       this.currentBinaryIndex = this.lastSuccessfulIndex;
       this.scheduleRetry('process-exit');
     };
@@ -223,6 +279,7 @@ export class AudioSource extends EventEmitter {
     this.retryCount += 1;
     const delay = this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
 
+    metrics.recordPipelineRestart('audio', reason);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       this.startProcess();
@@ -259,6 +316,14 @@ export class AudioSource extends EventEmitter {
   }
 
   private consumeChunk(chunk: Buffer, sampleRate: number, channels: number) {
+    if (this.alignChunks && this.expectedSampleBytes > 0) {
+      if (chunk.length % this.expectedSampleBytes !== 0) {
+        this.emit('error', new Error('Audio chunk misaligned with sample alignment'));
+        this.buffer = Buffer.alloc(0);
+        return;
+      }
+    }
+
     this.buffer = Buffer.concat([this.buffer, chunk]);
     const frameSizeSamples = this.calculateFrameSize(sampleRate, channels);
     const frameSizeBytes = frameSizeSamples * 2;
@@ -276,7 +341,7 @@ export class AudioSource extends EventEmitter {
     return Math.max(1, Math.floor((sampleRate * frameDuration) / 1000)) * channels;
   }
 
-  private buildFfmpegArgs(sampleRate: number, channels: number) {
+  private buildArgSets(sampleRate: number, channels: number) {
     const outputArgs = [
       '-ac',
       String(channels),
@@ -290,19 +355,14 @@ export class AudioSource extends EventEmitter {
     ];
 
     if (this.options.type === 'mic') {
-      const platform = process.platform;
-      const format = this.options.inputFormat ?? defaultMicFormat(platform);
-      const device = this.options.device ?? defaultMicDevice(platform);
-      const inputArgs: string[] = [];
-      if (format) {
-        inputArgs.push('-f', format);
-      }
-      inputArgs.push('-i', device);
-      return [...inputArgs, ...outputArgs];
+      const candidates = this.micInputArgs.length
+        ? this.micInputArgs
+        : buildMicInputArgs(process.platform, this.options);
+      return candidates.map(candidate => [...candidate, ...outputArgs]);
     }
 
     const inputArgs = [...(this.options.extraInputArgs ?? []), '-i', this.options.input];
-    return [...inputArgs, ...outputArgs];
+    return [[...inputArgs, ...outputArgs]];
   }
 }
 
@@ -333,6 +393,71 @@ function defaultMicDevice(platform: NodeJS.Platform): string {
       return 'audio="default"';
     default:
       return 'default';
+  }
+}
+
+type MicCandidate = { format?: string; device: string };
+
+function buildMicInputArgs(platform: NodeJS.Platform, options: Extract<AudioSourceOptions, { type: 'mic' }>) {
+  const candidates: string[][] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (entry: MicCandidate | null) => {
+    if (!entry) {
+      return;
+    }
+
+    const format = entry.format ?? undefined;
+    const device = entry.device;
+
+    if (!device) {
+      return;
+    }
+
+    const key = `${format ?? 'none'}|${device}`;
+    if (seen.has(key)) {
+      return;
+    }
+
+    const args: string[] = [];
+    if (format) {
+      args.push('-f', format);
+    }
+    args.push('-i', device);
+    candidates.push(args);
+    seen.add(key);
+  };
+
+  addCandidate({
+    format: options.inputFormat ?? defaultMicFormat(platform) ?? undefined,
+    device: options.device ?? defaultMicDevice(platform)
+  });
+
+  for (const fallback of getMicFallbacks(platform)) {
+    addCandidate(fallback);
+  }
+
+  return candidates;
+}
+
+function getMicFallbacks(platform: NodeJS.Platform): MicCandidate[] {
+  switch (platform) {
+    case 'darwin':
+      return [
+        { format: 'avfoundation', device: ':0' },
+        { format: 'avfoundation', device: '0:0' }
+      ];
+    case 'win32':
+      return [
+        { format: 'dshow', device: 'audio="default"' },
+        { format: 'dshow', device: 'audio="Microphone"' }
+      ];
+    default:
+      return [
+        { format: 'alsa', device: 'default' },
+        { format: 'alsa', device: 'hw:0' },
+        { format: 'alsa', device: 'plughw:0' }
+      ];
   }
 }
 
@@ -395,6 +520,24 @@ function parseDeviceList(output: string) {
   }
 
   return Array.from(devices);
+}
+
+function resolveDeviceFormats(
+  format: 'alsa' | 'avfoundation' | 'dshow' | 'auto',
+  platform: NodeJS.Platform
+) {
+  if (format !== 'auto') {
+    return [format];
+  }
+
+  switch (platform) {
+    case 'win32':
+      return ['dshow', 'alsa', 'avfoundation'];
+    case 'darwin':
+      return ['avfoundation', 'dshow', 'alsa'];
+    default:
+      return ['alsa', 'dshow', 'avfoundation'];
+  }
 }
 
 export default AudioSource;

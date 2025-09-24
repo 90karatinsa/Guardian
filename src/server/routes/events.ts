@@ -14,11 +14,13 @@ type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
 
 export class EventsRouter {
   private readonly bus: EventEmitter;
-  private readonly clients = new Set<ServerResponse>();
+  private readonly clients = new Map<ServerResponse, NodeJS.Timeout>();
   private readonly handlers: Handler[];
+  private readonly heartbeatMs: number;
 
   constructor(options: EventsRouterOptions) {
     this.bus = options.bus;
+    this.heartbeatMs = 15000;
     this.handlers = [
       (req, res, url) => this.handleList(req, res, url),
       (req, res, url) => this.handleStream(req, res, url),
@@ -45,7 +47,8 @@ export class EventsRouter {
 
   close() {
     this.bus.off('event', this.handleBusEvent);
-    for (const client of this.clients) {
+    for (const [client, timer] of this.clients) {
+      clearInterval(timer);
       client.end();
     }
     this.clients.clear();
@@ -53,8 +56,20 @@ export class EventsRouter {
 
   private readonly handleBusEvent = (event: EventRecord) => {
     const payload = JSON.stringify(event);
-    for (const client of this.clients) {
-      client.write(`data: ${payload}\n\n`);
+    for (const [client, timer] of this.clients) {
+      if (client.writableEnded) {
+        clearInterval(timer);
+        this.clients.delete(client);
+        continue;
+      }
+
+      try {
+        client.write(`data: ${payload}\n\n`);
+      } catch (error) {
+        clearInterval(timer);
+        client.end();
+        this.clients.delete(client);
+      }
     }
   };
 
@@ -88,9 +103,28 @@ export class EventsRouter {
     });
     res.write(': connected\n\n');
 
-    this.clients.add(res);
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded) {
+        clearInterval(heartbeat);
+        this.clients.delete(res);
+        return;
+      }
+
+      try {
+        res.write(`: heartbeat ${Date.now()}\n\n`);
+      } catch (error) {
+        clearInterval(heartbeat);
+        this.clients.delete(res);
+      }
+    }, this.heartbeatMs);
+
+    this.clients.set(res, heartbeat);
 
     const cleanup = () => {
+      const timer = this.clients.get(res);
+      if (timer) {
+        clearInterval(timer);
+      }
       this.clients.delete(res);
     };
 
@@ -204,6 +238,11 @@ function parseListOptions(url: URL): ListEventsOptions {
   const severity = params.get('severity');
   if (severity) {
     options.severity = severity as ListEventsOptions['severity'];
+  }
+
+  const channel = params.get('channel');
+  if (channel) {
+    options.channel = channel;
   }
 
   return options;

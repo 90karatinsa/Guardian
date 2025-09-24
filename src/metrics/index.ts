@@ -12,6 +12,20 @@ type LatencyStats = {
   averageMs: number;
 };
 
+type HistogramSnapshot = Record<string, number>;
+
+type PipelineSnapshot = {
+  restarts: number;
+  lastRestartAt: string | null;
+  byReason: CounterMap;
+};
+
+type SuppressionSnapshot = {
+  total: number;
+  byRule: CounterMap;
+  byReason: CounterMap;
+};
+
 type MetricsSnapshot = {
   createdAt: string;
   events: {
@@ -22,8 +36,31 @@ type MetricsSnapshot = {
   };
   logs: {
     byLevel: CounterMap;
+    lastErrorAt: string | null;
+    lastErrorMessage: string | null;
   };
   latencies: Record<string, LatencyStats>;
+  histograms: Record<string, HistogramSnapshot>;
+  pipelines: {
+    ffmpeg: PipelineSnapshot;
+    audio: PipelineSnapshot;
+  };
+  suppression: SuppressionSnapshot;
+};
+
+type HistogramConfig = {
+  buckets: number[];
+  format: (bucket: number, previous?: number) => string;
+};
+
+const DEFAULT_HISTOGRAM: HistogramConfig = {
+  buckets: [25, 50, 100, 250, 500, 1000, 2000, 5000, 10000],
+  format: (bucket, previous) => {
+    if (typeof previous === 'undefined') {
+      return `<${bucket}`;
+    }
+    return previous === bucket ? `${bucket}` : `${previous}-${bucket}`;
+  }
 };
 
 class MetricsRegistry {
@@ -31,13 +68,53 @@ class MetricsRegistry {
   private readonly detectorCounters = new Map<string, number>();
   private readonly severityCounters = new Map<string, number>();
   private readonly latencyStats = new Map<string, { count: number; totalMs: number; minMs: number; maxMs: number }>();
+  private readonly histograms = new Map<string, Map<string, number>>();
+  private readonly ffmpegRestartReasons = new Map<string, number>();
+  private readonly audioRestartReasons = new Map<string, number>();
+  private readonly suppressionByRule = new Map<string, number>();
+  private readonly suppressionByReason = new Map<string, number>();
   private totalEvents = 0;
   private lastEventTimestamp: number | null = null;
+  private ffmpegRestarts = 0;
+  private audioRestarts = 0;
+  private lastFfmpegRestartAt: number | null = null;
+  private lastAudioRestartAt: number | null = null;
+  private suppressionTotal = 0;
+  private lastErrorAt: number | null = null;
+  private lastErrorMessage: string | null = null;
 
-  incrementLogLevel(level: string) {
+  reset() {
+    this.logLevelCounters.clear();
+    this.detectorCounters.clear();
+    this.severityCounters.clear();
+    this.latencyStats.clear();
+    this.histograms.clear();
+    this.ffmpegRestartReasons.clear();
+    this.audioRestartReasons.clear();
+    this.suppressionByRule.clear();
+    this.suppressionByReason.clear();
+    this.totalEvents = 0;
+    this.lastEventTimestamp = null;
+    this.ffmpegRestarts = 0;
+    this.audioRestarts = 0;
+    this.lastFfmpegRestartAt = null;
+    this.lastAudioRestartAt = null;
+    this.suppressionTotal = 0;
+    this.lastErrorAt = null;
+    this.lastErrorMessage = null;
+  }
+
+  incrementLogLevel(level: string, context?: { message?: string }) {
     const normalized = level.toLowerCase();
     const next = (this.logLevelCounters.get(normalized) ?? 0) + 1;
     this.logLevelCounters.set(normalized, next);
+
+    if (normalized === 'error' || normalized === 'fatal') {
+      this.lastErrorAt = Date.now();
+      if (context?.message) {
+        this.lastErrorMessage = context.message;
+      }
+    }
   }
 
   recordEvent(event: EventRecord) {
@@ -49,6 +126,29 @@ class MetricsRegistry {
 
     const severity = event.severity ?? 'info';
     this.severityCounters.set(severity, (this.severityCounters.get(severity) ?? 0) + 1);
+  }
+
+  recordSuppressedEvent(ruleId?: string, reason?: string) {
+    this.suppressionTotal += 1;
+    if (ruleId) {
+      this.suppressionByRule.set(ruleId, (this.suppressionByRule.get(ruleId) ?? 0) + 1);
+    }
+    if (reason) {
+      this.suppressionByReason.set(reason, (this.suppressionByReason.get(reason) ?? 0) + 1);
+    }
+  }
+
+  recordPipelineRestart(type: 'ffmpeg' | 'audio', reason: string) {
+    const normalized = reason || 'unknown';
+    if (type === 'ffmpeg') {
+      this.ffmpegRestarts += 1;
+      this.lastFfmpegRestartAt = Date.now();
+      this.ffmpegRestartReasons.set(normalized, (this.ffmpegRestartReasons.get(normalized) ?? 0) + 1);
+    } else {
+      this.audioRestarts += 1;
+      this.lastAudioRestartAt = Date.now();
+      this.audioRestartReasons.set(normalized, (this.audioRestartReasons.get(normalized) ?? 0) + 1);
+    }
   }
 
   observeLatency(metric: string, durationMs: number) {
@@ -70,6 +170,22 @@ class MetricsRegistry {
     };
 
     this.latencyStats.set(metric, next);
+  }
+
+  observeHistogram(metric: string, durationMs: number, config: HistogramConfig = DEFAULT_HISTOGRAM) {
+    const histogram = this.histograms.get(metric) ?? new Map<string, number>();
+    if (!this.histograms.has(metric)) {
+      this.histograms.set(metric, histogram);
+    }
+
+    const bucketLabel = resolveHistogramBucket(durationMs, config);
+    histogram.set(bucketLabel, (histogram.get(bucketLabel) ?? 0) + 1);
+  }
+
+  observeDetectorLatency(detector: string, durationMs: number) {
+    const metricName = `detector.${detector}.latency`;
+    this.observeLatency(metricName, durationMs);
+    this.observeHistogram(metricName, durationMs);
   }
 
   async time<T>(metric: string, fn: () => Promise<T> | T): Promise<T> {
@@ -103,9 +219,29 @@ class MetricsRegistry {
         bySeverity: mapFrom(this.severityCounters)
       },
       logs: {
-        byLevel: mapFrom(this.logLevelCounters)
+        byLevel: mapFrom(this.logLevelCounters),
+        lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
+        lastErrorMessage: this.lastErrorMessage
       },
-      latencies: mapFromLatencies(this.latencyStats)
+      latencies: mapFromLatencies(this.latencyStats),
+      histograms: mapFromHistograms(this.histograms),
+      pipelines: {
+        ffmpeg: {
+          restarts: this.ffmpegRestarts,
+          lastRestartAt: this.lastFfmpegRestartAt ? new Date(this.lastFfmpegRestartAt).toISOString() : null,
+          byReason: mapFrom(this.ffmpegRestartReasons)
+        },
+        audio: {
+          restarts: this.audioRestarts,
+          lastRestartAt: this.lastAudioRestartAt ? new Date(this.lastAudioRestartAt).toISOString() : null,
+          byReason: mapFrom(this.audioRestartReasons)
+        }
+      },
+      suppression: {
+        total: this.suppressionTotal,
+        byRule: mapFrom(this.suppressionByRule),
+        byReason: mapFrom(this.suppressionByReason)
+      }
     };
   }
 }
@@ -114,7 +250,9 @@ function mapFrom(source: Map<string, number>): CounterMap {
   return Object.fromEntries(Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b)));
 }
 
-function mapFromLatencies(source: Map<string, { count: number; totalMs: number; minMs: number; maxMs: number }>): Record<string, LatencyStats> {
+function mapFromLatencies(
+  source: Map<string, { count: number; totalMs: number; minMs: number; maxMs: number }>
+): Record<string, LatencyStats> {
   const result: Record<string, LatencyStats> = {};
   for (const [name, stats] of source.entries()) {
     result[name] = {
@@ -128,8 +266,49 @@ function mapFromLatencies(source: Map<string, { count: number; totalMs: number; 
   return result;
 }
 
+function mapFromHistograms(source: Map<string, Map<string, number>>): Record<string, HistogramSnapshot> {
+  const result: Record<string, HistogramSnapshot> = {};
+  for (const [metric, histogram] of source.entries()) {
+    const ordered = Array.from(histogram.entries()).sort(([a], [b]) => compareHistogramKeys(a, b));
+    result[metric] = Object.fromEntries(ordered);
+  }
+  return result;
+}
+
+function compareHistogramKeys(a: string, b: string) {
+  const extract = (key: string) => {
+    if (key.startsWith('<')) {
+      return [parseFloat(key.slice(1)), -1] as const;
+    }
+    if (key.endsWith('+')) {
+      return [parseFloat(key.slice(0, -1)), Number.POSITIVE_INFINITY] as const;
+    }
+    const [start, end] = key.split('-').map(Number);
+    return [start, end ?? start] as const;
+  };
+
+  const [aStart, aEnd] = extract(a);
+  const [bStart, bEnd] = extract(b);
+  if (aStart === bStart) {
+    return aEnd - bEnd;
+  }
+  return aStart - bStart;
+}
+
+function resolveHistogramBucket(duration: number, config: HistogramConfig) {
+  const { buckets, format } = config;
+  let previous = 0;
+  for (const bucket of buckets) {
+    if (duration < bucket) {
+      return format(bucket, previous === 0 ? undefined : previous);
+    }
+    previous = bucket;
+  }
+  return `${buckets[buckets.length - 1]}+`;
+}
+
 const defaultRegistry = new MetricsRegistry();
 
-export type { MetricsSnapshot };
+export type { HistogramSnapshot, MetricsSnapshot, PipelineSnapshot, SuppressionSnapshot };
 export { MetricsRegistry };
 export default defaultRegistry;

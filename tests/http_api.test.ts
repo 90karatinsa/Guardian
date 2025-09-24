@@ -44,7 +44,7 @@ describe('RestApiEvents', () => {
       detector: 'motion',
       severity: 'warning',
       message: 'Motion started',
-      meta: { snapshot: snapshotPath }
+      meta: { snapshot: snapshotPath, channel: 'video:cam-1' }
     });
     storeEvent({
       ts: now - 500,
@@ -52,7 +52,7 @@ describe('RestApiEvents', () => {
       detector: 'motion',
       severity: 'info',
       message: 'Motion continuing',
-      meta: {}
+      meta: { channel: 'video:cam-1' }
     });
     storeEvent({
       ts: now - 100,
@@ -60,7 +60,7 @@ describe('RestApiEvents', () => {
       detector: 'person',
       severity: 'critical',
       message: 'Person detected',
-      meta: {}
+      meta: { channel: 'video:cam-2' }
     });
 
     const { port } = await ensureServer();
@@ -79,6 +79,13 @@ describe('RestApiEvents', () => {
     const filterPayload = await filterResponse.json();
     expect(filterPayload.items).toHaveLength(2);
     expect(filterPayload.items.every((item: { detector: string }) => item.detector === 'motion')).toBe(
+      true
+    );
+
+    const channelResponse = await fetch(`http://localhost:${port}/api/events?channel=video:cam-1`);
+    const channelPayload = await channelResponse.json();
+    expect(channelPayload.items).toHaveLength(2);
+    expect(channelPayload.items.every((item: { meta: { channel: string } }) => item.meta?.channel === 'video:cam-1')).toBe(
       true
     );
   });
@@ -108,4 +115,59 @@ describe('RestApiEvents', () => {
     const buffer = Buffer.from(await response.arrayBuffer());
     expect(buffer.length).toBeGreaterThan(0);
   });
+
+  it('DashboardStream streams events with heartbeat', async () => {
+    const { port } = await ensureServer();
+    const controller = new AbortController();
+
+    const response = await fetch(`http://localhost:${port}/api/events/stream`, {
+      signal: controller.signal
+    });
+    expect(response.status).toBe(200);
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+
+    const firstChunk = await reader!.read();
+    expect(firstChunk.done).toBe(false);
+    expect(decoder.decode(firstChunk.value)).toContain(': connected');
+
+    const event = {
+      id: 123,
+      ts: Date.now(),
+      source: 'cam-stream',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'stream event',
+      meta: { channel: 'video:stream' }
+    };
+
+    bus.emit('event', event);
+
+    const payloadChunk = await readUntil(reader!, chunk => chunk.includes('data:'));
+    expect(payloadChunk).toContain('stream event');
+
+    controller.abort();
+  });
 });
+
+async function readUntil(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  predicate: (chunk: string) => boolean,
+  timeoutMs = 2000
+): Promise<string> {
+  const decoder = new TextDecoder();
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    const text = decoder.decode(value);
+    if (predicate(text)) {
+      return text;
+    }
+  }
+  throw new Error('Timed out waiting for stream chunk');
+}

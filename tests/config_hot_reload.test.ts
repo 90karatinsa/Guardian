@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { ConfigManager, loadConfigFromFile } from '../src/config/index.js';
+import { EventBus } from '../src/eventBus.js';
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
@@ -48,6 +49,16 @@ vi.mock('../src/video/sampleVideo.js', () => ({
   ensureSampleVideo: (input: string) => input
 }));
 
+const retentionMock = {
+  configure: vi.fn(),
+  stop: vi.fn()
+};
+
+vi.mock('../src/tasks/retention.js', () => ({
+  startRetentionTask: vi.fn(() => retentionMock),
+  RetentionTask: class {}
+}));
+
 describe('ConfigHotReload', () => {
   let tempDir: string;
   let configPath: string;
@@ -61,9 +72,11 @@ describe('ConfigHotReload', () => {
   afterEach(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
     vi.clearAllMocks();
+    retentionMock.configure.mockReset();
+    retentionMock.stop.mockReset();
   });
 
-  it('throws when configuration is invalid', () => {
+  it('ConfigSchemaValidation rejects invalid config', () => {
     fs.writeFileSync(configPath, JSON.stringify({ app: { name: 'test' } }));
 
     expect(() => loadConfigFromFile(configPath)).toThrow();
@@ -110,9 +123,146 @@ describe('ConfigHotReload', () => {
       runtime.stop();
     }
   });
+
+  it('ConfigHotReload reloads suppression rules and resets state', async () => {
+    const initialConfig = createConfig({
+      diffThreshold: 25,
+      suppressionRules: [
+        {
+          id: 'initial',
+          detector: 'motion',
+          source: 'video:cam-1',
+          suppressForMs: 1000,
+          reason: 'initial suppression'
+        }
+      ]
+    });
+    fs.writeFileSync(configPath, JSON.stringify(initialConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const busLogger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const metricsMock = { recordEvent: vi.fn(), recordSuppressedEvent: vi.fn() };
+    const bus = new EventBus({ store: vi.fn(), log: busLogger as any, metrics: metricsMock as any });
+
+    const runtime = await startGuard({ bus, logger, configManager: manager });
+
+    try {
+      const firstAllowed = bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 0
+      });
+      expect(firstAllowed).toBe(true);
+
+      const suppressed = bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 500
+      });
+      expect(suppressed).toBe(false);
+
+      const initialSuppression = busLogger.info.mock.calls.find(([, message]) => message === 'Event suppressed');
+      expect(initialSuppression?.[0]?.meta).toMatchObject({ suppressionRuleId: 'initial' });
+
+      busLogger.info.mockClear();
+
+      const updatedConfig = createConfig({
+        diffThreshold: 30,
+        suppressionRules: [
+          {
+            id: 'updated',
+            detector: 'motion',
+            source: 'video:cam-1',
+            suppressForMs: 1500,
+            reason: 'updated suppression'
+          }
+        ]
+      });
+
+      fs.writeFileSync(configPath, JSON.stringify(updatedConfig, null, 2));
+
+      await waitFor(() => logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded'));
+
+      const allowedAfterReload = bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 600
+      });
+      expect(allowedAfterReload).toBe(true);
+
+      const suppressedWithNewRule = bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 700
+      });
+      expect(suppressedWithNewRule).toBe(false);
+
+      const updatedSuppression = busLogger.info.mock.calls.find(([, message]) => message === 'Event suppressed');
+      expect(updatedSuppression?.[0]?.meta).toMatchObject({ suppressionRuleId: 'updated' });
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('ConfigHotReload reverts to last known good config on invalid JSON', async () => {
+    const initialConfig = createConfig({ diffThreshold: 20 });
+    const serialized = JSON.stringify(initialConfig, null, 2);
+    fs.writeFileSync(configPath, serialized);
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      fs.writeFileSync(configPath, '{ invalid json');
+
+      await waitFor(() => {
+        const contents = fs.readFileSync(configPath, 'utf-8');
+        return contents.trim() === serialized.trim();
+      });
+
+      const current = manager.getConfig();
+      expect(current.motion.diffThreshold).toBe(20);
+      expect(logger.error).not.toHaveBeenCalled();
+    } finally {
+      runtime.stop();
+    }
+  });
 });
 
-function createConfig(overrides: { diffThreshold: number }) {
+function createConfig(overrides: { diffThreshold: number; suppressionRules?: Record<string, unknown>[] }) {
   const base = {
     app: { name: 'Guardian Test' },
     logging: { level: 'silent' },
@@ -122,6 +272,25 @@ function createConfig(overrides: { diffThreshold: number }) {
         info: 0,
         warning: 5,
         critical: 10
+      },
+      retention: {
+        retentionDays: 30,
+        intervalMinutes: 60,
+        vacuum: 'auto',
+        archiveDir: path.join(os.tmpdir(), 'guardian-archive'),
+        enabled: false
+      },
+      suppression: {
+        rules:
+          overrides.suppressionRules ?? [
+            {
+              id: 'default-cooldown',
+              detector: 'motion',
+              source: 'video:cam-1',
+              suppressForMs: 1000,
+              reason: 'default cooldown'
+            }
+          ]
       }
     },
     video: {

@@ -32,6 +32,9 @@ importers:
       pngjs:
         specifier: ^7.0.0
         version: 7.0.0
+      tsx:
+        specifier: ^4.15.7
+        version: 4.20.5
     devDependencies:
       '@types/config':
         specifier: ^3.3.4
@@ -42,9 +45,6 @@ importers:
       '@types/node':
         specifier: ^20.14.11
         version: 20.19.17
-      tsx:
-        specifier: ^4.15.7
-        version: 4.20.5
       typescript:
         specifier: ^5.5.4
         version: 5.9.2
