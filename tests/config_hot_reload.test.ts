@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { ConfigManager, loadConfigFromFile } from '../src/config/index.js';
+import type { CameraConfig, GuardianConfig } from '../src/config/index.js';
 import { EventBus } from '../src/eventBus.js';
 
 class MockVideoSource extends EventEmitter {
@@ -31,6 +32,26 @@ class MockMotionDetector {
     MockMotionDetector.instances.push(this);
   }
   handleFrame() {}
+}
+
+class InMemoryConfigManager extends EventEmitter {
+  constructor(private current: GuardianConfig) {
+    super();
+  }
+
+  getConfig() {
+    return this.current;
+  }
+
+  setConfig(next: GuardianConfig) {
+    const previous = this.current;
+    this.current = next;
+    this.emit('reload', { previous, next });
+  }
+
+  watch() {
+    return () => {};
+  }
 }
 
 vi.mock('../src/video/source.js', () => ({
@@ -225,6 +246,70 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigReloadRestartsPipelines stops removed cameras', async () => {
+    const initialConfig = createConfig({
+      diffThreshold: 20,
+      cameras: [
+        {
+          id: 'cam-1',
+          channel: 'video:cam-1',
+          input: 'sample-a.mp4',
+          person: { score: 0.5 }
+        },
+        {
+          id: 'cam-2',
+          channel: 'video:cam-2',
+          input: 'sample-b.mp4',
+          person: { score: 0.6 }
+        }
+      ]
+    });
+
+    const manager = new InMemoryConfigManager(initialConfig);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(runtime.pipelines.size).toBe(2);
+      const cam2Runtime = runtime.pipelines.get('video:cam-2');
+      expect(cam2Runtime).toBeDefined();
+
+      const stopSpy = vi.spyOn(cam2Runtime!.source as MockVideoSource, 'stop');
+
+      const updatedConfig = createConfig({
+        diffThreshold: 22,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'sample-a.mp4',
+            person: { score: 0.55 }
+          }
+        ]
+      });
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => runtime.pipelines.size === 1);
+
+      expect(runtime.pipelines.has('video:cam-2')).toBe(false);
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigHotReload reverts to last known good config on invalid JSON', async () => {
     const initialConfig = createConfig({ diffThreshold: 20 });
     const serialized = JSON.stringify(initialConfig, null, 2);
@@ -262,7 +347,11 @@ describe('ConfigHotReload', () => {
   });
 });
 
-function createConfig(overrides: { diffThreshold: number; suppressionRules?: Record<string, unknown>[] }) {
+function createConfig(overrides: {
+  diffThreshold: number;
+  suppressionRules?: Record<string, unknown>[];
+  cameras?: CameraConfig[];
+}) {
   const base = {
     app: { name: 'Guardian Test' },
     logging: { level: 'silent' },
@@ -295,16 +384,17 @@ function createConfig(overrides: { diffThreshold: number; suppressionRules?: Rec
     },
     video: {
       framesPerSecond: 1,
-      cameras: [
-        {
-          id: 'cam-1',
-          channel: 'video:cam-1',
-          input: 'sample.mp4',
-          person: {
-            score: 0.5
+      cameras:
+        overrides.cameras ?? [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'sample.mp4',
+            person: {
+              score: 0.5
+            }
           }
-        }
-      ]
+        ]
     },
     person: {
       modelPath: 'model.onnx',

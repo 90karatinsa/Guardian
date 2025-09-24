@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import type { ConfigManager, GuardianConfig } from '../src/config/index.js';
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
@@ -47,6 +48,26 @@ class MockMotionDetector {
     MockMotionDetector.instances.push(this);
   }
   handleFrame() {}
+}
+
+class MockConfigManager extends EventEmitter {
+  constructor(private current: GuardianConfig) {
+    super();
+  }
+
+  getConfig() {
+    return this.current;
+  }
+
+  setConfig(next: GuardianConfig) {
+    const previous = this.current;
+    this.current = next;
+    this.emit('reload', { previous, next });
+  }
+
+  watch() {
+    return () => {};
+  }
 }
 
 vi.mock('../src/video/source.js', () => ({
@@ -292,6 +313,167 @@ describe('run-guard multi camera orchestration', () => {
     runtime.stop();
   });
 
+  it('GuardCameraHotReload orchestrates dynamic camera pipelines', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      app: { name: 'Guardian Test' },
+      logging: { level: 'silent' },
+      database: { path: 'guardian-test.sqlite' },
+      events: {
+        thresholds: { info: 0, warning: 1, critical: 2 },
+        suppression: { rules: [] }
+      },
+      video: {
+        framesPerSecond: 5,
+        ffmpeg: { inputArgs: ['-re'] },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: {
+              score: 0.5,
+              checkEveryNFrames: 1,
+              maxDetections: 1,
+              minIntervalMs: 1000
+            },
+            motion: {
+              diffThreshold: 25,
+              areaThreshold: 0.02
+            }
+          }
+        ]
+      },
+      person: {
+        modelPath: 'model.onnx',
+        score: 0.5,
+        checkEveryNFrames: 2,
+        maxDetections: 2,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 1200
+      },
+      motion: {
+        diffThreshold: 25,
+        areaThreshold: 0.02,
+        minIntervalMs: 1500
+      }
+    };
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(MockVideoSource.instances).toHaveLength(1);
+      const initialSource = MockVideoSource.instances[0];
+      const stopSpy = vi.spyOn(initialSource, 'stop');
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream2',
+              ffmpeg: {
+                rtspTransport: 'tcp',
+                inputArgs: ['-stimeout', '5000000']
+              },
+              person: {
+                score: 0.6,
+                checkEveryNFrames: 2,
+                maxDetections: 2,
+                minIntervalMs: 900
+              },
+              motion: {
+                diffThreshold: 30,
+                areaThreshold: 0.018
+              }
+            },
+            {
+              id: 'cam-2',
+              channel: 'video:cam-2',
+              input: 'rtsp://camera-2/stream',
+              person: {
+                score: 0.55,
+                checkEveryNFrames: 1,
+                maxDetections: 1,
+                minIntervalMs: 1000
+              },
+              motion: {
+                diffThreshold: 28,
+                areaThreshold: 0.02
+              }
+            }
+          ]
+        },
+        events: {
+          ...initialConfig.events,
+          suppression: {
+            rules: [
+              {
+                id: 'cam-2-cooldown',
+                detector: 'motion',
+                source: 'video:cam-2',
+                suppressForMs: 750,
+                reason: 'cooldown'
+              }
+            ]
+          }
+        }
+      };
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => runtime.pipelines.size === 2);
+      await waitFor(() => stopSpy.mock.calls.length > 0);
+
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+
+      const cam1Runtime = runtime.pipelines.get('video:cam-1');
+      const cam2Runtime = runtime.pipelines.get('video:cam-2');
+
+      expect(cam1Runtime).toBeDefined();
+      expect(cam2Runtime).toBeDefined();
+
+      const cam1Source = cam1Runtime?.source as MockVideoSource;
+      const cam2Source = cam2Runtime?.source as MockVideoSource;
+
+      expect(cam1Source).not.toBe(initialSource);
+      expect(cam1Source.options).toMatchObject({
+        file: 'rtsp://camera-1/stream2',
+        rtspTransport: 'tcp',
+        inputArgs: ['-stimeout', '5000000']
+      });
+
+      expect(cam2Source.options).toMatchObject({
+        file: 'rtsp://camera-2/stream',
+        framesPerSecond: 5
+      });
+
+      expect(cam1Runtime?.checkEvery).toBe(2);
+      expect(cam1Runtime?.maxDetections).toBe(2);
+
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
+      );
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('run-guard multi camera testi triggers detectors per source', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 
@@ -367,3 +549,14 @@ describe('run-guard multi camera orchestration', () => {
     runtime.stop();
   });
 });
+
+async function waitFor(predicate: () => boolean, timeout = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error('Timed out waiting for condition');
+}
