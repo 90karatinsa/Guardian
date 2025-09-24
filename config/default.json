@@ -36,5 +36,10 @@
     "maxDetections": 5,
     "snapshotDir": "snapshots",
     "minIntervalMs": 2000
+  },
+  "motion": {
+    "diffThreshold": 25,
+    "areaThreshold": 0.015,
+    "minIntervalMs": 1500
   }
 }

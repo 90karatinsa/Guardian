@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guardian Dashboard</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 0;
+        padding: 1.5rem;
+        background: #f5f7fa;
+        color: #1f2933;
+      }
+
+      h1 {
+        margin-top: 0;
+      }
+
+      #events {
+        display: grid;
+        gap: 0.75rem;
+        margin-top: 1rem;
+      }
+
+      .event {
+        background: #fff;
+        border-radius: 0.5rem;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+        padding: 0.75rem 1rem;
+      }
+
+      .event header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 0.5rem;
+      }
+
+      .meta {
+        font-size: 0.9rem;
+        color: #52606d;
+      }
+
+      .severity {
+        font-weight: bold;
+        text-transform: uppercase;
+      }
+
+      .severity.info {
+        color: #127fbf;
+      }
+
+      .severity.warning {
+        color: #ffb100;
+      }
+
+      .severity.critical {
+        color: #d64545;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Guardian Events</h1>
+    <p class="meta">Streaming live events. The list updates automatically when new events arrive.</p>
+    <div id="events"></div>
+
+    <script>
+      const list = document.getElementById('events');
+
+      function renderEvent(event) {
+        const container = document.createElement('article');
+        container.className = 'event';
+
+        const header = document.createElement('header');
+        const title = document.createElement('strong');
+        title.textContent = `${event.detector} · ${event.source}`;
+        header.appendChild(title);
+
+        const severity = document.createElement('span');
+        severity.className = `severity ${event.severity}`;
+        severity.textContent = event.severity;
+        header.appendChild(severity);
+
+        const message = document.createElement('p');
+        message.textContent = event.message;
+
+        const timestamp = document.createElement('p');
+        timestamp.className = 'meta';
+        timestamp.textContent = new Date(event.ts).toLocaleString();
+
+        container.appendChild(header);
+        container.appendChild(message);
+        container.appendChild(timestamp);
+
+        if (event.meta && event.meta.snapshot) {
+          const link = document.createElement('a');
+          link.href = `/api/events/${event.id}/snapshot`;
+          link.textContent = 'View snapshot';
+          link.target = '_blank';
+          container.appendChild(link);
+        }
+
+        return container;
+      }
+
+      function prependEvent(event) {
+        const element = renderEvent(event);
+        list.prepend(element);
+        while (list.childElementCount > 25) {
+          list.lastElementChild.remove();
+        }
+      }
+
+      async function loadInitial() {
+        try {
+          const response = await fetch('/api/events?limit=25');
+          if (!response.ok) {
+            return;
+          }
+          const payload = await response.json();
+          if (Array.isArray(payload.items)) {
+            payload.items.forEach(event => {
+              prependEvent(event);
+            });
+          }
+        } catch (error) {
+          console.error('Failed to load events', error);
+        }
+      }
+
+      function subscribe() {
+        const source = new EventSource('/api/events/stream');
+        source.onmessage = event => {
+          try {
+            const payload = JSON.parse(event.data);
+            prependEvent(payload);
+          } catch (error) {
+            console.error('Failed to parse event payload', error);
+          }
+        };
+
+        source.onerror = () => {
+          source.close();
+          setTimeout(subscribe, 3000);
+        };
+      }
+
+      loadInitial();
+      subscribe();
+    </script>
+  </body>
+</html>

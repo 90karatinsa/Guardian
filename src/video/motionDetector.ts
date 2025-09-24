@@ -44,9 +44,13 @@ export class MotionDetector {
   private backoffFrames = 0;
 
   constructor(
-    private readonly options: MotionDetectorOptions,
+    private options: MotionDetectorOptions,
     private readonly bus: EventEmitter = eventBus
   ) {}
+
+  updateOptions(options: Partial<Omit<MotionDetectorOptions, 'source'>>) {
+    this.options = { ...this.options, ...options };
+  }
 
   handleFrame(frame: Buffer, ts = Date.now()) {
     const grayscale = readFrameAsGrayscale(frame);

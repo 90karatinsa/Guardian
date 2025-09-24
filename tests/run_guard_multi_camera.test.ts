@@ -106,6 +106,11 @@ describe('run-guard multi camera orchestration', () => {
           maxDetections: 2,
           snapshotDir: 'snapshots',
           minIntervalMs: 1000
+        },
+        motion: {
+          diffThreshold: 25,
+          areaThreshold: 0.02,
+          minIntervalMs: 1200
         }
       }
     });
