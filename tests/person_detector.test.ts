@@ -53,18 +53,33 @@ describe('PersonDetector', () => {
     }
   });
 
-  it('emits event and saves snapshot when person score passes threshold', async () => {
-    const detectionData = new Float32Array(84);
-    detectionData[0] = 320;
-    detectionData[1] = 320;
-    detectionData[2] = 200;
-    detectionData[3] = 200;
-    detectionData[4] = 0.9;
+  it('PersonNmsParsing suppresses overlaps and rescales bounding boxes', async () => {
+    const stride = 2;
+    const channels = 6;
+    const detectionData = new Float32Array(channels * stride);
+
+    setDetection(detectionData, stride, 0, {
+      cx: 320,
+      cy: 320,
+      width: 200,
+      height: 200,
+      objectness: 0.9,
+      classScore: 0.95
+    });
+
+    setDetection(detectionData, stride, 1, {
+      cx: 330,
+      cy: 330,
+      width: 210,
+      height: 210,
+      objectness: 0.85,
+      classScore: 0.9
+    });
 
     runMock.mockResolvedValue({
       output0: {
         data: detectionData,
-        dims: [1, 84, 1]
+        dims: [1, channels, stride]
       }
     });
 
@@ -79,20 +94,21 @@ describe('PersonDetector', () => {
       bus
     );
 
-    const frame = createUniformFrame(640, 640, 25);
+    const frame = createUniformFrame(1280, 720, 25);
     const ts = 1234567890;
 
     await detector.handleFrame(frame, ts);
 
     expect(events).toHaveLength(1);
-    expect(events[0].detector).toBe('person');
-    expect(events[0].meta?.score).toBeCloseTo(0.9, 5);
+    const meta = events[0].meta as Record<string, unknown>;
+    expect(meta?.score).toBeCloseTo(0.855, 3);
+    expect(meta?.classId).toBe(0);
 
-    const bbox = events[0].meta?.bbox as { left: number; top: number; width: number; height: number };
-    expect(bbox.left).toBeCloseTo(220, 0);
-    expect(bbox.top).toBeCloseTo(220, 0);
-    expect(bbox.width).toBeCloseTo(200, 0);
-    expect(bbox.height).toBeCloseTo(200, 0);
+    const bbox = meta?.bbox as { left: number; top: number; width: number; height: number };
+    expect(bbox.left).toBeCloseTo(440, 5);
+    expect(bbox.top).toBeCloseTo(160, 5);
+    expect(bbox.width).toBeCloseTo(400, 5);
+    expect(bbox.height).toBeCloseTo(400, 5);
 
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
@@ -111,4 +127,25 @@ function createUniformFrame(width: number, height: number, value: number) {
     }
   }
   return PNG.sync.write(png);
+}
+
+function setDetection(
+  data: Float32Array,
+  stride: number,
+  index: number,
+  values: {
+    cx: number;
+    cy: number;
+    width: number;
+    height: number;
+    objectness: number;
+    classScore: number;
+  }
+) {
+  data[0 * stride + index] = values.cx;
+  data[1 * stride + index] = values.cy;
+  data[2 * stride + index] = values.width;
+  data[3 * stride + index] = values.height;
+  data[4 * stride + index] = values.objectness;
+  data[5 * stride + index] = values.classScore;
 }

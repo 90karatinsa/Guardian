@@ -33,6 +33,20 @@ source.on('error', error => {
   logger.error({ err: error }, 'Audio source error');
 });
 
+source.on('recover', event => {
+  if (event.reason === 'ffmpeg-missing') {
+    logger.warn(
+      { attempt: event.attempt, delayMs: event.delayMs },
+      `ffmpeg missing, retrying in ${event.delayMs}ms`
+    );
+  } else {
+    logger.warn(
+      { attempt: event.attempt, delayMs: event.delayMs, reason: event.reason },
+      `Audio source recovering, retrying in ${event.delayMs}ms`
+    );
+  }
+});
+
 source.on('stderr', data => {
   logger.debug({ ffmpeg: data });
 });

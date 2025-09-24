@@ -22,19 +22,25 @@ type PreprocessMeta = {
   originalHeight: number;
 };
 
+type BoundingBox = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
 type Detection = {
   score: number;
-  bbox: {
-    left: number;
-    top: number;
-    width: number;
-    height: number;
-  };
+  classId: number;
+  bbox: BoundingBox;
 };
 
 const TARGET_SIZE = 640;
-const PERSON_CLASS_INDEX = 4;
+const PERSON_CLASS_INDEX = 0;
+const OBJECTNESS_INDEX = 4;
+const CLASS_START_INDEX = 5;
 const DEFAULT_SCORE_THRESHOLD = 0.5;
+const DEFAULT_NMS_IOU_THRESHOLD = 0.45;
 const DEFAULT_MIN_INTERVAL_MS = 5000;
 
 export class PersonDetector {
@@ -98,6 +104,7 @@ export class PersonDetector {
       message: 'Person detected',
       meta: {
         score: detection.score,
+        classId: detection.classId,
         bbox: detection.bbox,
         snapshot: snapshotPath
       }
@@ -179,15 +186,28 @@ function pickBestPerson(
   const numDetections = dims[dims.length - 1];
   const numChannels = dims[dims.length - 2];
 
-  if (numChannels <= PERSON_CLASS_INDEX) {
+  if (numChannels <= CLASS_START_INDEX) {
+    return null;
+  }
+
+  const classIndex = CLASS_START_INDEX + PERSON_CLASS_INDEX;
+
+  if (classIndex >= numChannels) {
     return null;
   }
 
   const stride = numDetections;
-  let best: Detection | null = null;
+  const candidates: Detection[] = [];
 
   for (let i = 0; i < numDetections; i += 1) {
-    const score = data[PERSON_CLASS_INDEX * stride + i];
+    const objectness = data[OBJECTNESS_INDEX * stride + i];
+
+    if (objectness <= 0) {
+      continue;
+    }
+
+    const classScore = data[classIndex * stride + i] ?? 0;
+    const score = objectness * classScore;
 
     if (score < threshold) {
       continue;
@@ -204,12 +224,23 @@ function pickBestPerson(
       continue;
     }
 
-    if (!best || score > best.score) {
-      best = { score, bbox };
-    }
+    candidates.push({
+      score,
+      classId: PERSON_CLASS_INDEX,
+      bbox
+    });
   }
 
-  return best;
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const selected = nonMaxSuppression(
+    candidates,
+    DEFAULT_NMS_IOU_THRESHOLD
+  );
+
+  return selected[0] ?? null;
 }
 
 function projectBoundingBox(
@@ -242,6 +273,60 @@ function projectBoundingBox(
     width: Math.max(0, clampedRight - clampedLeft),
     height: Math.max(0, clampedBottom - clampedTop)
   };
+}
+
+function nonMaxSuppression(detections: Detection[], threshold: number) {
+  const sorted = [...detections].sort((a, b) => b.score - a.score);
+  const results: Detection[] = [];
+
+  for (const detection of sorted) {
+    let keep = true;
+
+    for (const existing of results) {
+      const iou = intersectionOverUnion(detection.bbox, existing.bbox);
+      if (iou > threshold) {
+        keep = false;
+        break;
+      }
+    }
+
+    if (keep) {
+      results.push(detection);
+    }
+  }
+
+  return results;
+}
+
+function intersectionOverUnion(a: BoundingBox, b: BoundingBox) {
+  const aRight = a.left + a.width;
+  const aBottom = a.top + a.height;
+  const bRight = b.left + b.width;
+  const bBottom = b.top + b.height;
+
+  const interLeft = Math.max(a.left, b.left);
+  const interTop = Math.max(a.top, b.top);
+  const interRight = Math.min(aRight, bRight);
+  const interBottom = Math.min(aBottom, bBottom);
+
+  const interWidth = Math.max(0, interRight - interLeft);
+  const interHeight = Math.max(0, interBottom - interTop);
+  const interArea = interWidth * interHeight;
+
+  if (interArea === 0) {
+    return 0;
+  }
+
+  const areaA = a.width * a.height;
+  const areaB = b.width * b.height;
+
+  const union = areaA + areaB - interArea;
+
+  if (union <= 0) {
+    return 0;
+  }
+
+  return interArea / union;
 }
 
 function clamp(value: number, min: number, max: number) {

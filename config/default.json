@@ -17,13 +17,24 @@
   },
   "video": {
     "testFile": "assets/test-video.mp4",
-    "framesPerSecond": 2
+    "framesPerSecond": 2,
+    "cameras": [
+      {
+        "id": "test-camera",
+        "channel": "video:test-camera",
+        "input": "assets/test-video.mp4",
+        "person": {
+          "score": 0.5
+        }
+      }
+    ]
   },
   "person": {
     "modelPath": "models/yolov8n.onnx",
     "score": 0.5,
     "checkEveryNFrames": 3,
     "maxDetections": 5,
-    "snapshotDir": "snapshots"
+    "snapshotDir": "snapshots",
+    "minIntervalMs": 2000
   }
 }

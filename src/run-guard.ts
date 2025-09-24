@@ -1,97 +1,278 @@
 import config from 'config';
-import logger from './logger.js';
-import eventBus from './eventBus.js';
+import { EventEmitter } from 'node:events';
+import loggerModule from './logger.js';
+import defaultBus from './eventBus.js';
 import { ensureSampleVideo } from './video/sampleVideo.js';
 import { VideoSource } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector from './video/personDetector.js';
 
-const videoConfig = config.get<{ testFile: string; framesPerSecond: number }>('video');
-const personConfig = config.get<{
+type CameraPersonConfig = {
+  score?: number;
+  checkEveryNFrames?: number;
+  maxDetections?: number;
+  snapshotDir?: string;
+  minIntervalMs?: number;
+};
+
+type CameraConfig = {
+  id: string;
+  channel?: string;
+  input?: string;
+  framesPerSecond?: number;
+  person?: CameraPersonConfig;
+};
+
+type VideoConfig = {
+  framesPerSecond: number;
+  cameras?: CameraConfig[];
+  testFile?: string;
+};
+
+type PersonConfig = {
   modelPath: string;
   score: number;
   checkEveryNFrames?: number;
   maxDetections?: number;
   snapshotDir?: string;
-}>('person');
+  minIntervalMs?: number;
+};
 
-const videoFile = ensureSampleVideo(videoConfig.testFile);
+type CameraRuntime = {
+  id: string;
+  channel: string;
+  source: VideoSource;
+  motionDetector: MotionDetector;
+  personDetector: PersonDetector;
+  framesSinceMotion: number | null;
+  detectionAttempts: number;
+  checkEvery: number;
+  maxDetections: number;
+};
 
-const source = new VideoSource({
-  file: videoFile,
-  framesPerSecond: videoConfig.framesPerSecond
-});
+type GuardConfig = {
+  video: VideoConfig;
+  person: PersonConfig;
+};
 
-const motionDetector = new MotionDetector({
-  source: 'video:test-camera',
-  diffThreshold: 25,
-  areaThreshold: 0.015,
-  minIntervalMs: 1500
-});
+type GuardLogger = Pick<typeof loggerModule, 'info' | 'warn' | 'error'>;
 
-const personDetector = await PersonDetector.create({
-  source: 'video:test-camera',
-  modelPath: personConfig.modelPath,
-  scoreThreshold: personConfig.score,
-  snapshotDir: personConfig.snapshotDir,
-  minIntervalMs: 2000
-});
+export interface GuardStartOptions {
+  config?: GuardConfig;
+  bus?: EventEmitter;
+  logger?: GuardLogger;
+}
 
-const checkEvery = Math.max(1, personConfig.checkEveryNFrames ?? 3);
-const maxDetections = Math.max(1, personConfig.maxDetections ?? 5);
+export type GuardRuntime = {
+  stop: () => void;
+  pipelines: Map<string, CameraRuntime>;
+};
 
-let framesSinceMotion: number | null = null;
-let detectionAttempts = 0;
+const DEFAULT_CHECK_EVERY = 3;
+const DEFAULT_MAX_DETECTIONS = 5;
 
-logger.info({ file: videoFile }, 'Starting guard pipeline');
+export async function startGuard(options: GuardStartOptions = {}): Promise<GuardRuntime> {
+  const bus = options.bus ?? defaultBus;
+  const logger = options.logger ?? loggerModule;
 
-eventBus.on('event', payload => {
-  if (payload.detector === 'motion') {
-    framesSinceMotion = 0;
-    detectionAttempts = 0;
+  const configSource = options.config ?? {
+    video: config.get<VideoConfig>('video'),
+    person: config.get<PersonConfig>('person')
+  };
+
+  const videoConfig = configSource.video;
+  const personConfig = configSource.person;
+
+  const cameras = buildCameraList(videoConfig);
+
+  if (cameras.length === 0) {
+    throw new Error('No cameras configured');
   }
-});
 
-source.on('frame', async frame => {
-  const ts = Date.now();
+  const pipelines = new Map<string, CameraRuntime>();
 
-  try {
-    motionDetector.handleFrame(frame, ts);
-  } catch (error) {
-    logger.error({ err: error }, 'Motion detector failed');
+  const eventHandler = (payload: { detector?: string; source?: string }) => {
+    if (payload.detector !== 'motion' || !payload.source) {
+      return;
+    }
+
+    const runtime = pipelines.get(payload.source);
+    if (!runtime) {
+      return;
+    }
+
+    runtime.framesSinceMotion = 0;
+    runtime.detectionAttempts = 0;
+  };
+
+  bus.on('event', eventHandler);
+
+  for (const camera of cameras) {
+    const channel = camera.channel ?? `video:${camera.id}`;
+    const input = resolveCameraInput(camera, videoConfig);
+    const fps = camera.framesPerSecond ?? videoConfig.framesPerSecond;
+
+    const source = new VideoSource({
+      file: input,
+      framesPerSecond: fps
+    });
+
+    const motionDetector = new MotionDetector({
+      source: channel,
+      diffThreshold: 25,
+      areaThreshold: 0.015,
+      minIntervalMs: 1500
+    });
+
+    const detector = await PersonDetector.create({
+      source: channel,
+      modelPath: personConfig.modelPath,
+      scoreThreshold: camera.person?.score ?? personConfig.score,
+      snapshotDir: camera.person?.snapshotDir ?? personConfig.snapshotDir,
+      minIntervalMs: camera.person?.minIntervalMs ?? personConfig.minIntervalMs ?? 2000
+    });
+
+    const checkEvery = Math.max(
+      1,
+      camera.person?.checkEveryNFrames ?? personConfig.checkEveryNFrames ?? DEFAULT_CHECK_EVERY
+    );
+
+    const maxDetections = Math.max(
+      1,
+      camera.person?.maxDetections ?? personConfig.maxDetections ?? DEFAULT_MAX_DETECTIONS
+    );
+
+    const runtime: CameraRuntime = {
+      id: camera.id,
+      channel,
+      source,
+      motionDetector,
+      personDetector: detector,
+      framesSinceMotion: null,
+      detectionAttempts: 0,
+      checkEvery,
+      maxDetections
+    };
+
+    pipelines.set(channel, runtime);
+
+    setupSourceHandlers(logger, runtime);
+
+    source.start();
+
+    logger.info({ camera: camera.id, input, channel }, 'Starting guard pipeline');
   }
 
-  if (framesSinceMotion !== null) {
-    framesSinceMotion += 1;
-    const shouldDetect = framesSinceMotion === 1 || framesSinceMotion % checkEvery === 0;
+  const stop = () => {
+    bus.off('event', eventHandler);
+    for (const runtime of pipelines.values()) {
+      runtime.source.stop();
+    }
+    pipelines.clear();
+  };
 
-    if (shouldDetect && detectionAttempts < maxDetections) {
-      detectionAttempts += 1;
-      try {
-        await personDetector.handleFrame(frame, ts);
-      } catch (error) {
-        logger.error({ err: error }, 'Person detector failed');
+  return { stop, pipelines };
+}
+
+function buildCameraList(videoConfig: VideoConfig) {
+  if (Array.isArray(videoConfig.cameras) && videoConfig.cameras.length > 0) {
+    return videoConfig.cameras;
+  }
+
+  if (videoConfig.testFile) {
+    return [
+      {
+        id: 'default',
+        channel: 'video:default',
+        input: videoConfig.testFile
+      }
+    ];
+  }
+
+  return [];
+}
+
+function resolveCameraInput(camera: CameraConfig, videoConfig: VideoConfig) {
+  const input = camera.input ?? videoConfig.testFile;
+
+  if (!input) {
+    throw new Error(`Camera "${camera.id}" is missing an input`);
+  }
+
+  if (hasScheme(input)) {
+    return input;
+  }
+
+  return ensureSampleVideo(input);
+}
+
+function hasScheme(input: string) {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(input);
+}
+
+function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
+  const { source, motionDetector, personDetector } = runtime;
+
+  source.on('frame', async frame => {
+    const ts = Date.now();
+
+    try {
+      motionDetector.handleFrame(frame, ts);
+    } catch (error) {
+      logger.error({ err: error, camera: runtime.id }, 'Motion detector failed');
+    }
+
+    if (runtime.framesSinceMotion !== null) {
+      runtime.framesSinceMotion += 1;
+      const shouldDetect =
+        runtime.framesSinceMotion === 1 || runtime.framesSinceMotion % runtime.checkEvery === 0;
+
+      if (shouldDetect && runtime.detectionAttempts < runtime.maxDetections) {
+        runtime.detectionAttempts += 1;
+        try {
+          await personDetector.handleFrame(frame, ts);
+        } catch (error) {
+          logger.error({ err: error, camera: runtime.id }, 'Person detector failed');
+        }
+      }
+
+      if (runtime.detectionAttempts >= runtime.maxDetections) {
+        runtime.framesSinceMotion = null;
       }
     }
+  });
 
-    if (detectionAttempts >= maxDetections) {
-      framesSinceMotion = null;
-    }
-  }
-});
+  source.on('error', error => {
+    logger.error({ err: error, camera: runtime.id }, 'Video source error');
+  });
 
-source.on('error', error => {
-  logger.error({ err: error }, 'Video source error');
-});
+  source.on('recover', event => {
+    logger.warn(
+      { camera: runtime.id, attempt: event.attempt, reason: event.reason },
+      'Video source reconnecting'
+    );
+  });
 
-source.on('end', () => {
-  logger.warn('Video source ended');
-});
+  source.on('end', () => {
+    logger.warn({ camera: runtime.id }, 'Video source ended');
+  });
+}
 
-source.start();
+if (process.env.NODE_ENV !== 'test' || process.env.GUARDIAN_FORCE_GUARD === '1') {
+  const runtimePromise = startGuard().catch(error => {
+    loggerModule.error({ err: error }, 'Failed to start guard pipeline');
+    process.exitCode = 1;
+    return null;
+  });
 
-process.on('SIGINT', () => {
-  logger.info('Stopping guard pipeline');
-  source.stop();
-  process.exit(0);
-});
+  process.on('SIGINT', () => {
+    loggerModule.info('Stopping guard pipeline');
+    runtimePromise
+      .then(runtime => {
+        runtime?.stop();
+      })
+      .finally(() => {
+        process.exit(0);
+      });
+  });
+}
