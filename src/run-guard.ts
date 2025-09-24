@@ -1,42 +1,19 @@
-import config from 'config';
 import { EventEmitter } from 'node:events';
 import loggerModule from './logger.js';
 import defaultBus from './eventBus.js';
+import configManager, {
+  CameraConfig,
+  ConfigManager,
+  ConfigReloadEvent,
+  GuardianConfig,
+  MotionConfig,
+  PersonConfig,
+  VideoConfig
+} from './config/index.js';
 import { ensureSampleVideo } from './video/sampleVideo.js';
 import { VideoSource } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector from './video/personDetector.js';
-
-type CameraPersonConfig = {
-  score?: number;
-  checkEveryNFrames?: number;
-  maxDetections?: number;
-  snapshotDir?: string;
-  minIntervalMs?: number;
-};
-
-type CameraConfig = {
-  id: string;
-  channel?: string;
-  input?: string;
-  framesPerSecond?: number;
-  person?: CameraPersonConfig;
-};
-
-type VideoConfig = {
-  framesPerSecond: number;
-  cameras?: CameraConfig[];
-  testFile?: string;
-};
-
-type PersonConfig = {
-  modelPath: string;
-  score: number;
-  checkEveryNFrames?: number;
-  maxDetections?: number;
-  snapshotDir?: string;
-  minIntervalMs?: number;
-};
 
 type CameraRuntime = {
   id: string;
@@ -53,6 +30,7 @@ type CameraRuntime = {
 type GuardConfig = {
   video: VideoConfig;
   person: PersonConfig;
+  motion?: MotionConfig;
 };
 
 type GuardLogger = Pick<typeof loggerModule, 'info' | 'warn' | 'error'>;
@@ -61,6 +39,7 @@ export interface GuardStartOptions {
   config?: GuardConfig;
   bus?: EventEmitter;
   logger?: GuardLogger;
+  configManager?: ConfigManager;
 }
 
 export type GuardRuntime = {
@@ -74,14 +53,16 @@ const DEFAULT_MAX_DETECTIONS = 5;
 export async function startGuard(options: GuardStartOptions = {}): Promise<GuardRuntime> {
   const bus = options.bus ?? defaultBus;
   const logger = options.logger ?? loggerModule;
+  const manager = options.configManager ?? configManager;
+  const injectedConfig = options.config;
+  const baseConfig = injectedConfig
+    ? mergeGuardConfig(injectedConfig, manager.getConfig())
+    : pickGuardConfig(manager.getConfig());
 
-  const configSource = options.config ?? {
-    video: config.get<VideoConfig>('video'),
-    person: config.get<PersonConfig>('person')
-  };
-
-  const videoConfig = configSource.video;
-  const personConfig = configSource.person;
+  let activeConfig = baseConfig;
+  const videoConfig = activeConfig.video;
+  const personConfig = activeConfig.person;
+  const motionConfig = activeConfig.motion;
 
   const cameras = buildCameraList(videoConfig);
 
@@ -90,6 +71,32 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   }
 
   const pipelines = new Map<string, CameraRuntime>();
+  let stopWatching: (() => void) | null = null;
+
+  const handleReload = ({ next }: ConfigReloadEvent) => {
+    activeConfig = pickGuardConfig(next);
+    for (const runtime of pipelines.values()) {
+      runtime.motionDetector.updateOptions({
+        diffThreshold: activeConfig.motion.diffThreshold,
+        areaThreshold: activeConfig.motion.areaThreshold,
+        minIntervalMs: activeConfig.motion.minIntervalMs
+      });
+    }
+
+    logger.info(
+      {
+        diffThreshold: activeConfig.motion.diffThreshold,
+        areaThreshold: activeConfig.motion.areaThreshold,
+        minIntervalMs: activeConfig.motion.minIntervalMs
+      },
+      'configuration reloaded'
+    );
+  };
+
+  if (!injectedConfig) {
+    stopWatching = manager.watch();
+    manager.on('reload', handleReload);
+  }
 
   const eventHandler = (payload: { detector?: string; source?: string }) => {
     if (payload.detector !== 'motion' || !payload.source) {
@@ -119,9 +126,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
     const motionDetector = new MotionDetector({
       source: channel,
-      diffThreshold: 25,
-      areaThreshold: 0.015,
-      minIntervalMs: 1500
+      diffThreshold: motionConfig.diffThreshold,
+      areaThreshold: motionConfig.areaThreshold,
+      minIntervalMs: motionConfig.minIntervalMs
     });
 
     const detector = await PersonDetector.create({
@@ -165,6 +172,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
   const stop = () => {
     bus.off('event', eventHandler);
+    if (!injectedConfig) {
+      manager.off('reload', handleReload);
+      stopWatching?.();
+    }
     for (const runtime of pipelines.values()) {
       runtime.source.stop();
     }
@@ -204,6 +215,22 @@ function resolveCameraInput(camera: CameraConfig, videoConfig: VideoConfig) {
   }
 
   return ensureSampleVideo(input);
+}
+
+function pickGuardConfig(config: GuardianConfig): GuardConfig {
+  return {
+    video: config.video,
+    person: config.person,
+    motion: config.motion
+  };
+}
+
+function mergeGuardConfig(injected: GuardConfig, fallback: GuardianConfig): GuardConfig {
+  return {
+    video: injected.video,
+    person: injected.person,
+    motion: injected.motion ?? fallback.motion
+  };
 }
 
 function hasScheme(input: string) {

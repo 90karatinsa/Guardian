@@ -1,13 +1,36 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { PNG } from 'pngjs';
-import MotionDetector from '../src/video/motionDetector.js';
-import LightDetector from '../src/video/lightDetector.js';
 
 interface CapturedEvent {
   detector: string;
   meta?: Record<string, unknown>;
 }
+
+vi.mock('pngjs', () => {
+  class FakePNG {
+    width: number;
+    height: number;
+    data: Uint8Array;
+
+    constructor({ width, height }: { width: number; height: number }) {
+      this.width = width;
+      this.height = height;
+      this.data = new Uint8Array(width * height * 4);
+    }
+
+    static sync = {
+      write(png: FakePNG) {
+        return Buffer.from(png.data);
+      }
+    };
+  }
+
+  return { PNG: FakePNG };
+});
+
+import { PNG } from 'pngjs';
+import MotionDetector from '../src/video/motionDetector.js';
+import LightDetector from '../src/video/lightDetector.js';
 
 describe('MotionDetector', () => {
   let bus: EventEmitter;

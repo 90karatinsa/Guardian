@@ -2,10 +2,31 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { PNG } from 'pngjs';
 import PersonDetector from '../src/video/personDetector.js';
 
 const runMock = vi.fn();
+
+vi.mock('pngjs', () => {
+  class FakePNG {
+    width: number;
+    height: number;
+    data: Uint8Array;
+
+    constructor({ width, height }: { width: number; height: number }) {
+      this.width = width;
+      this.height = height;
+      this.data = new Uint8Array(width * height * 4);
+    }
+
+    static sync = {
+      write(png: FakePNG) {
+        return Buffer.from(png.data);
+      }
+    };
+  }
+
+  return { PNG: FakePNG };
+});
 
 vi.mock('onnxruntime-node', () => {
   class Tensor<T> {
@@ -27,6 +48,8 @@ vi.mock('onnxruntime-node', () => {
     Tensor
   };
 });
+
+import { PNG } from 'pngjs';
 
 describe('PersonDetector', () => {
   const snapshotsDir = path.resolve('snapshots');

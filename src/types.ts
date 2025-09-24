@@ -17,3 +17,17 @@ export interface EventRecord {
   message: string;
   meta: Record<string, unknown> | undefined;
 }
+
+export interface RateLimitConfig {
+  count: number;
+  perMs: number;
+}
+
+export interface EventSuppressionRule {
+  detector?: string | string[];
+  source?: string | string[];
+  severity?: EventSeverity | EventSeverity[];
+  suppressForMs?: number;
+  rateLimit?: RateLimitConfig;
+  reason: string;
+}
