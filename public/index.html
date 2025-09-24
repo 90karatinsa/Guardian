@@ -199,7 +199,7 @@
             Sunucuyu <code>pnpm exec tsx src/server/http.ts</code> komutuyla başlatın ve kameralarınızın
             `config/default.json` içinde tanımlandığından emin olun.
           </li>
-          <li>Filtreleri kullanarak belirli bir kaynak veya kanal için REST istekleri oluşturabilirsiniz.</li>
+          <li>Filtreleri kullanarak belirli bir kamera, kanal veya zaman aralığı için REST istekleri oluşturabilirsiniz.</li>
           <li>
             Liste öğelerinden birine tıklamak, eşleşen snapshot’ı sağdaki panelde açar; kamera meta verileri ve
             `meta.score` gibi alanlar başlıkta görünür.
@@ -210,6 +210,10 @@
         <label>
           Source
           <input type="text" name="source" placeholder="video:camera-1" />
+        </label>
+        <label>
+          Camera
+          <input type="text" name="camera" placeholder="video:test-camera" />
         </label>
         <label>
           Channel
@@ -223,6 +227,14 @@
             <option value="warning">Warning</option>
             <option value="critical">Critical</option>
           </select>
+        </label>
+        <label>
+          From
+          <input type="datetime-local" name="from" aria-label="Events from timestamp" />
+        </label>
+        <label>
+          To
+          <input type="datetime-local" name="to" aria-label="Events until timestamp" />
         </label>
         <button type="submit">Apply filters</button>
         <button type="button" id="reset-filters" class="secondary">Reset</button>

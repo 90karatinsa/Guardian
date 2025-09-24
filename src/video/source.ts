@@ -21,6 +21,7 @@ const DEFAULT_MAX_BUFFER_BYTES = 5 * 1024 * 1024;
 export type VideoSourceOptions = {
   file: string;
   framesPerSecond: number;
+  channel?: string;
   idleTimeoutMs?: number;
   watchdogTimeoutMs?: number;
   startTimeoutMs?: number;
@@ -40,10 +41,23 @@ export type VideoSourceOptions = {
   random?: () => number;
 };
 
+export type RecoverEventMeta = {
+  minDelayMs: number;
+  maxDelayMs: number;
+  baseDelayMs: number;
+  appliedJitterMs: number;
+};
+
 export type RecoverEvent = {
   reason: string;
   attempt: number;
   delayMs: number;
+  meta: RecoverEventMeta;
+};
+
+type RestartDelayResult = {
+  delayMs: number;
+  meta: RecoverEventMeta;
 };
 
 export class VideoSource extends EventEmitter {
@@ -67,17 +81,19 @@ export class VideoSource extends EventEmitter {
 
   start() {
     this.shouldStop = false;
+    this.recovering = false;
     this.restartCount = 0;
     this.hasReceivedFrame = false;
+    this.clearAllTimers();
     this.startCommand();
   }
 
   stop() {
     this.shouldStop = true;
-    this.clearRestartTimer();
-    this.clearStartTimer();
-    this.clearWatchdogTimer();
-    this.clearKillTimer();
+    this.recovering = false;
+    this.restartCount = 0;
+    this.hasReceivedFrame = false;
+    this.clearAllTimers();
     this.cleanupStream();
     this.terminateCommand(true, { skipForceDelay: true });
   }
@@ -285,10 +301,21 @@ export class VideoSource extends EventEmitter {
     this.recovering = true;
     this.restartCount += 1;
     const attempt = this.restartCount;
-    const delay = this.computeRestartDelay(attempt);
+    const timing = this.computeRestartDelay(attempt);
 
-    metrics.recordPipelineRestart('ffmpeg', reason, { attempt, delayMs: delay });
-    this.emit('recover', { reason, attempt, delayMs: delay } satisfies RecoverEvent);
+    metrics.recordPipelineRestart('ffmpeg', reason, {
+      attempt,
+      delayMs: timing.delayMs,
+      baseDelayMs: timing.meta.baseDelayMs,
+      minDelayMs: timing.meta.minDelayMs,
+      maxDelayMs: timing.meta.maxDelayMs,
+      jitterMs: timing.meta.appliedJitterMs,
+      channel: this.options.channel
+    });
+    this.emit(
+      'recover',
+      { reason, attempt, delayMs: timing.delayMs, meta: timing.meta } satisfies RecoverEvent
+    );
 
     this.clearStartTimer();
     this.clearWatchdogTimer();
@@ -298,7 +325,14 @@ export class VideoSource extends EventEmitter {
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
       this.startCommand();
-    }, delay);
+    }, Math.max(0, timing.delayMs));
+  }
+
+  private clearAllTimers() {
+    this.clearRestartTimer();
+    this.clearStartTimer();
+    this.clearWatchdogTimer();
+    this.clearKillTimer();
   }
 
   private terminateCommand(force = false, options: { skipForceDelay?: boolean } = {}) {
@@ -425,22 +459,47 @@ export class VideoSource extends EventEmitter {
     }, idleTimeout);
   }
 
-  private computeRestartDelay(attempt: number) {
-    const baseDelay = Math.max(0, this.options.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS);
-    const maxDelay = Math.max(baseDelay, this.options.restartMaxDelayMs ?? DEFAULT_RESTART_MAX_DELAY_MS);
-    if (attempt <= 1) {
-      return baseDelay;
+  private computeRestartDelay(attempt: number): RestartDelayResult {
+    const minDelayMs = Math.max(0, this.options.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS);
+    const maxDelayMs = Math.max(
+      minDelayMs,
+      this.options.restartMaxDelayMs ?? DEFAULT_RESTART_MAX_DELAY_MS
+    );
+
+    let baseDelayMs = minDelayMs;
+    if (attempt > 1) {
+      const exponential = minDelayMs * 2 ** (attempt - 1);
+      baseDelayMs = Math.min(maxDelayMs, Math.max(minDelayMs, Math.round(exponential)));
     }
 
     const factor = Math.max(0, this.options.restartJitterFactor ?? DEFAULT_RESTART_JITTER_FACTOR);
-    const growth = Math.min(maxDelay, Math.max(baseDelay, baseDelay * 2 ** (attempt - 1)));
-    if (factor <= 0) {
-      return growth;
+    const random = this.options.random?.() ?? Math.random();
+    const jitterRange = Math.round(baseDelayMs * factor);
+    let appliedJitterMs = 0;
+
+    if (jitterRange > 0) {
+      const centered = random * 2 - 1;
+      appliedJitterMs = Math.round(centered * jitterRange);
     }
 
-    const random = this.options.random?.() ?? Math.random();
-    const jitter = Math.round(growth * factor * Math.min(1, Math.max(0, random)));
-    return Math.min(maxDelay, growth + jitter);
+    let delayMs = baseDelayMs + appliedJitterMs;
+    if (delayMs > maxDelayMs) {
+      delayMs = maxDelayMs;
+    } else if (delayMs < minDelayMs) {
+      delayMs = minDelayMs;
+    }
+
+    appliedJitterMs = delayMs - baseDelayMs;
+
+    return {
+      delayMs,
+      meta: {
+        minDelayMs,
+        maxDelayMs,
+        baseDelayMs,
+        appliedJitterMs
+      }
+    };
   }
 }
 

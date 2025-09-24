@@ -40,18 +40,86 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
 
 ```jsonc
 {
-  "cameras": {
-    "lobby": {
-      "channel": "video:lobby",
-      "input": "rtsp://192.168.1.10/stream1",
-      "person": { "scoreThreshold": 0.35 },
-      "motion": { "diffThreshold": 18 },
-      "ffmpeg": { "rtspTransport": "tcp" }
+  "video": {
+    "framesPerSecond": 5,
+    "ffmpeg": {
+      "rtspTransport": "tcp",
+      "idleTimeoutMs": 6000,
+      "startTimeoutMs": 4000,
+      "watchdogTimeoutMs": 8000,
+      "forceKillTimeoutMs": 5000,
+      "restartDelayMs": 500,
+      "restartMaxDelayMs": 5000,
+      "restartJitterFactor": 0.2
+    },
+    "cameras": {
+      "lobby": {
+        "id": "lobby",
+        "channel": "video:lobby",
+        "input": "rtsp://192.168.1.10/stream1",
+        "framesPerSecond": 5,
+        "motion": {
+          "diffThreshold": 18,
+          "debounceFrames": 2,
+          "backoffFrames": 4,
+          "noiseMultiplier": 1.4,
+          "noiseSmoothing": 0.2
+        },
+        "person": {
+          "score": 0.35,
+          "maxDetections": 3,
+          "minIntervalMs": 2000
+        },
+        "ffmpeg": {
+          "idleTimeoutMs": 7000,
+          "watchdogTimeoutMs": 9000,
+          "restartDelayMs": 500,
+          "restartMaxDelayMs": 6000
+        }
+      }
     }
   },
-  "retention": {
-    "events": { "days": 14 },
-    "snapshots": { "maxArchives": 10 }
+  "audio": {
+    "idleTimeoutMs": 4000,
+    "startTimeoutMs": 3000,
+    "watchdogTimeoutMs": 7000,
+    "restartDelayMs": 2000,
+    "restartMaxDelayMs": 6000,
+    "restartJitterFactor": 0.3,
+    "forceKillTimeoutMs": 4000,
+    "micFallbacks": {
+      "linux": [
+        { "device": "hw:1,0" },
+        { "device": "hw:2,0" }
+      ]
+    },
+    "anomaly": {
+      "minTriggerDurationMs": 2500,
+      "rmsWindowMs": 1200,
+      "centroidWindowMs": 1200,
+      "thresholds": {
+        "day": { "rms": 0.28, "centroidJump": 180 },
+        "night": { "rms": 0.35, "centroidJump": 220 }
+      }
+    }
+  },
+  "events": {
+    "suppression": {
+      "rules": [
+        {
+          "id": "lobby-motion-cooldown",
+          "channel": "video:lobby",
+          "detector": "motion",
+          "windowMs": 30000,
+          "maxEvents": 3
+        }
+      ]
+    },
+    "retention": {
+      "retentionDays": 14,
+      "archiveDir": "snapshots",
+      "vacuum": "auto"
+    }
   }
 }
 ```
@@ -59,16 +127,16 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
 Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kamerasını içerir. Üretimde kendi kameralarınızı tanımlamak için aşağıdaki bölümlere göz atın.
 
 ### RTSP ve çoklu kamera
-- `cameras` nesnesine her kamera için benzersiz bir anahtar ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
-- `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Dashboard filtreleri bu alanı kullanır.
-- `ffmpeg` altındaki `rtspTransport`, `inputArgs` veya `hardwareAccel` gibi seçeneklerle ağ koşullarına göre ffmpeg’i ayarlayabilirsiniz. Watchdog mekanizması kare akışı durursa yeniden başlatmayı tetikler ve metriklere `pipelines.ffmpegRestarts` olarak yansır.
-- Aynı konfigürasyon dosyasında birden fazla kamera tanımlayarak çoklu kanal akışlarını aynı guard süreç içinde izleyebilirsiniz. Her kamera kendi motion/person eşiklerini (`motion.diffThreshold`, `person.scoreThreshold`) ve suppression kurallarını kullanır.
+- `video.cameras` nesnesine her kamera için benzersiz bir anahtar ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
+- `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Dashboard filtreleri ve metriklerdeki `pipelines.ffmpeg.byChannel` haritası bu alanı kullanır.
+- `ffmpeg` altındaki `idleTimeoutMs`, `watchdogTimeoutMs`, `startTimeoutMs`, `forceKillTimeoutMs`, `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` seçenekleri boru hattının yeniden deneme davranışını ve watchdog zamanlamalarını kontrol eder.
+- Kamera bazlı `motion` ve `person` blokları debounce/backoff gibi gürültü bastırma katsayılarını içerir; aynı dosyada birden fazla kamera tanımlayarak her kanal için farklı eşikler uygulayabilirsiniz.
 
 ### Retention ve arşiv döngüsü
 Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir retention görevine sahiptir:
-- `retention.events.days`: SQLite üzerindeki olay kayıtlarının kaç gün saklanacağını belirtir. Süre dolunca kayıtlar silinir ve `VACUUM`/`VACUUM FULL` çağrıları ile dosya boyutu sıkıştırılır.
-- `retention.snapshots.days` veya `maxArchives`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`snapshots/2024-03-18/` gibi). Maksimum arşiv sayısı aşıldığında en eski klasörler silinir.
-- Guard başlatıldığında görev planlayıcısı çalışır ve her çalıştırma sonunda loglara `Retention task completed` satırını bırakır.
+- `events.retention.retentionDays`: SQLite üzerindeki olay kayıtlarının kaç gün saklanacağını belirtir. Silinen satır sayısı `VACUUM`/`VACUUM FULL` adımlarının tetiklenip tetiklenmeyeceğini belirler.
+- `events.retention.archiveDir` ve `events.retention.maxArchives`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`snapshots/2024-03-18/` gibi). Limit aşıldığında en eski klasörler taşınır ve silinir.
+- Görev her çalıştırmada loglara `Retention task completed` satırını bırakır; `archivedSnapshots` değeri 0’dan büyükse arşiv döngüsünün devrede olduğu anlaşılır.
 
 Retention ayarlarını değiştirip dosyayı kaydettiğinizde hot reload mekanizması yeni değerleri uygular.
 
@@ -89,7 +157,7 @@ pnpm exec tsx src/cli.ts --stop
 pnpm exec tsx src/cli.ts --status
 ```
 
-`--health` çıktısı `status`, `events.byDetector.motion`, `events.byDetector.person` ve `pipelines.ffmpegRestarts` gibi anahtarları içerir. Sağlık kodları; `0=ok`, `3=degraded`, `4=stopped` gibi anlamlar taşır ve Docker healthcheck tarafından kullanılır.
+`--health` çıktısı `status`, `events.byDetector.motion`, `events.byDetector.person`, `pipelines.ffmpeg.byChannel` ve `pipelines.audio.byChannel` gibi anahtarları içerir. Sağlık kodları; `0=ok`, `3=degraded`, `4=stopped` gibi anlamlar taşır ve Docker healthcheck tarafından kullanılır. Komut satırında `guardian health` alias’ı aynı JSON çıktısını verir.
 
 ## Dashboard
 `pnpm exec tsx src/server/http.ts` komutu HTTP sunucusunu başlatır. Ardından `http://localhost:3000` adresine giderek dashboard’u açabilirsiniz:
@@ -105,12 +173,12 @@ Guardian tüm metrikleri JSON olarak üretir:
 
 - CLI `--health` komutu saniyelik özet verir.
 - HTTP sunucusu `/api/metrics` uç noktasıyla Prometheus uyumlu bir çıktıyı paylaşacak şekilde genişletilebilir.
-- `metrics.events` altında dedektör başına tetik sayıları, `metrics.latency.detectors.person` altında histogramlar, `metrics.pipelines.ffmpegRestarts` altında yeniden başlatma sayaçları bulunur.
-- Log düzeyleri `metrics.logs.byLevel.error` gibi anahtarlarla etiketlenir; hata sayacının artması durumunda durum `degraded` olarak işaretlenir.
+- `metrics.events` altında dedektör başına tetik sayıları, `metrics.latency.detectors.person` altında histogramlar, `metrics.pipelines.ffmpeg.byChannel['video:lobby']` altında kanal bazlı yeniden başlatma sayaçları bulunur.
+- Log düzeyleri `metrics.logs.byLevel.error` ve `metrics.logs.byDetector.motion.warning` gibi anahtarlarla etiketlenir; suppression kuralları için `metrics.suppression.rules['rule-id'].total` değeri takip edilir.
 
 ## Video ve ses boru hatları
-- `pnpm tsx src/run-video-detectors.ts` komutu test videosunu çalıştırır ve motion/light/person dedektörlerini tetikleyerek snapshot üretir. Kare akışı 5 saniye durursa loglarda `Video source reconnecting (reason=watchdog-timeout)` mesajı görülür.
-- `pnpm tsx src/run-audio-detector.ts` komutu platforma özel ffmpeg argümanlarıyla mikrofonu okur. Cihaz bulunamadığında `Audio source recovering (reason=ffmpeg-missing)` logu yazılır ve yeniden deneme sayaçları metriklere işlenir.
+- `pnpm tsx src/run-video-detectors.ts` komutu test videosunu çalıştırır ve motion/light/person dedektörlerini tetikleyerek snapshot üretir. Kare akışı 5 saniye durursa loglarda `Video source reconnecting (reason=watchdog-timeout)` mesajı görülür; artan gecikmeli yeniden denemeler `delayMs` alanında raporlanır.
+- `pnpm tsx src/run-audio-detector.ts` komutu platforma özel ffmpeg argümanlarıyla mikrofonu okur. Cihaz bulunamadığında veya akış sessiz kaldığında `Audio source recovering (reason=ffmpeg-missing|stream-idle)` logları üretilir, watchdog zamanlayıcıları tetiklenir ve metriklerde ilgili kanalın yeniden deneme sayaçları artar.
 
 ## Docker ile çalışma
 Proje kökünde çok aşamalı bir Dockerfile bulunur:

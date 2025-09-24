@@ -7,39 +7,74 @@ import {
 } from 'node:child_process';
 import { Readable } from 'node:stream';
 import ffmpegStatic from 'ffmpeg-static';
+import type { AudioMicFallbackCandidate } from '../config/index.js';
 import metrics from '../metrics/index.js';
 
+type MicCandidate = AudioMicFallbackCandidate;
+
+type AudioTimingOptions = {
+  channel?: string;
+  idleTimeoutMs?: number;
+  startTimeoutMs?: number;
+  watchdogTimeoutMs?: number;
+  restartDelayMs?: number;
+  restartMaxDelayMs?: number;
+  restartJitterFactor?: number;
+  forceKillTimeoutMs?: number;
+  retryDelayMs?: number;
+  micFallbacks?: Record<string, MicCandidate[]>;
+  random?: () => number;
+};
+
 export type AudioSourceOptions =
-  | {
+  | (AudioTimingOptions & {
       type: 'mic';
       device?: string;
       inputFormat?: 'alsa' | 'avfoundation' | 'dshow';
       sampleRate?: number;
       channels?: number;
       frameDurationMs?: number;
-      retryDelayMs?: number;
-    }
-  | {
+    })
+  | (AudioTimingOptions & {
       type: 'ffmpeg';
       input: string;
       sampleRate?: number;
       channels?: number;
       frameDurationMs?: number;
       extraInputArgs?: string[];
-      retryDelayMs?: number;
-    };
+    });
+
+export type AudioRecoverMeta = {
+  minDelayMs: number;
+  maxDelayMs: number;
+  baseDelayMs: number;
+  appliedJitterMs: number;
+};
 
 export type AudioRecoverEvent = {
-  reason: 'ffmpeg-missing' | 'spawn-error' | 'process-exit';
+  reason:
+    | 'ffmpeg-missing'
+    | 'spawn-error'
+    | 'process-exit'
+    | 'stream-idle'
+    | 'watchdog-timeout'
+    | 'start-timeout';
   attempt: number;
   delayMs: number;
+  meta: AudioRecoverMeta;
   error?: Error;
 };
 
 const DEFAULT_SAMPLE_RATE = 16000;
 const DEFAULT_CHANNELS = 1;
 const DEFAULT_FRAME_DURATION_MS = 100;
-const DEFAULT_RETRY_DELAY_MS = 3000;
+const DEFAULT_RESTART_DELAY_MS = 3000;
+const DEFAULT_RESTART_MAX_DELAY_MS = 6000;
+const DEFAULT_RESTART_JITTER_FACTOR = 0.25;
+const DEFAULT_IDLE_TIMEOUT_MS = 5000;
+const DEFAULT_START_TIMEOUT_MS = 4000;
+const DEFAULT_WATCHDOG_TIMEOUT_MS = 6000;
+const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
@@ -48,7 +83,11 @@ export class AudioSource extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private processCleanup: (() => void) | null = null;
   private buffer = Buffer.alloc(0);
-  private retryTimer: NodeJS.Timeout | null = null;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private startTimer: NodeJS.Timeout | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private killTimer: NodeJS.Timeout | null = null;
   private retryCount = 0;
   private shouldStop = false;
   private currentBinaryIndex = 0;
@@ -57,21 +96,30 @@ export class AudioSource extends EventEmitter {
   private micCandidateIndex = 0;
   private expectedSampleBytes = 0;
   private alignChunks = false;
+  private hasReceivedChunk = false;
+  private randomFn: () => number;
 
   constructor(private readonly options: AudioSourceOptions) {
     super();
+    this.randomFn = options.random ?? Math.random;
   }
 
   start() {
-    if (this.process || this.retryTimer) {
+    if (this.process || this.restartTimer) {
       return;
     }
 
     this.shouldStop = false;
     this.retryCount = 0;
+    this.hasReceivedChunk = false;
     this.currentBinaryIndex = this.lastSuccessfulIndex;
+    this.clearAllTimers();
     if (this.options.type === 'mic') {
-      this.micInputArgs = buildMicInputArgs(process.platform, this.options);
+      this.micInputArgs = buildMicInputArgs(
+        process.platform,
+        this.options,
+        this.options.micFallbacks
+      );
       this.micCandidateIndex = 0;
     } else {
       this.micInputArgs = [];
@@ -83,12 +131,22 @@ export class AudioSource extends EventEmitter {
 
   stop() {
     this.shouldStop = true;
-    this.clearRetryTimer();
-    this.tearDownProcess();
+    this.hasReceivedChunk = false;
+    this.clearAllTimers();
+    this.terminateProcess(true, { skipForceDelay: true });
   }
 
   consume(stream: Readable, sampleRate = DEFAULT_SAMPLE_RATE, channels = DEFAULT_CHANNELS) {
     stream.on('data', chunk => {
+      if (this.process) {
+        if (!this.hasReceivedChunk) {
+          this.hasReceivedChunk = true;
+          this.retryCount = 0;
+          this.clearStartTimer();
+        }
+        this.resetIdleTimer();
+        this.resetWatchdogTimer();
+      }
       this.consumeChunk(chunk, sampleRate, channels);
     });
   }
@@ -120,6 +178,12 @@ export class AudioSource extends EventEmitter {
     if (this.shouldStop) {
       return;
     }
+
+    this.hasReceivedChunk = false;
+    this.clearStartTimer();
+    this.clearIdleTimer();
+    this.clearWatchdogTimer();
+    this.clearKillTimer();
 
     const sampleRate = this.options.sampleRate ?? DEFAULT_SAMPLE_RATE;
     const channels = this.options.channels ?? DEFAULT_CHANNELS;
@@ -198,12 +262,21 @@ export class AudioSource extends EventEmitter {
     candidateIndex: number,
     totalCandidates: number
   ) {
-    this.teardownListeners();
     this.process = proc;
     this.currentBinaryIndex = binaryIndex;
     this.lastSuccessfulIndex = binaryIndex;
+    this.buffer = Buffer.alloc(0);
+    this.hasReceivedChunk = false;
 
     const onStdout = (chunk: Buffer) => {
+      if (!this.hasReceivedChunk) {
+        this.hasReceivedChunk = true;
+        this.retryCount = 0;
+        this.clearStartTimer();
+      }
+
+      this.resetIdleTimer();
+      this.resetWatchdogTimer();
       this.consumeChunk(chunk, sampleRate, channels);
     };
 
@@ -216,7 +289,6 @@ export class AudioSource extends EventEmitter {
 
     const onError = (error: NodeJS.ErrnoException) => {
       this.emit('error', error);
-      this.teardownListeners();
 
       if (this.shouldStop) {
         return;
@@ -236,7 +308,11 @@ export class AudioSource extends EventEmitter {
 
     const onClose = (code: number | null) => {
       this.emit('close', code);
-      this.teardownListeners();
+      this.clearKillTimer();
+      this.clearStartTimer();
+      this.clearIdleTimer();
+      this.clearWatchdogTimer();
+      this.hasReceivedChunk = false;
 
       if (this.shouldStop) {
         return;
@@ -258,16 +334,12 @@ export class AudioSource extends EventEmitter {
       proc.stderr.off('data', onStderr);
       proc.off('error', onError);
       proc.off('close', onClose);
-      if (!proc.killed) {
-        try {
-          proc.kill('SIGINT');
-        } catch (error) {
-          // Ignore termination errors
-        }
-      }
-      proc.stdout.destroy();
-      proc.stderr.destroy();
     };
+
+    this.resetStartTimer();
+    this.resetIdleTimer();
+    this.resetWatchdogTimer();
+    this.emit('stream', proc.stdout);
   }
 
   private scheduleRetry(reason: AudioRecoverEvent['reason'], error?: Error) {
@@ -275,47 +347,256 @@ export class AudioSource extends EventEmitter {
       return;
     }
 
-    this.clearRetryTimer();
-    this.retryCount += 1;
-    const delay = this.options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
-
-    metrics.recordPipelineRestart('audio', reason, {
-      attempt: this.retryCount,
-      delayMs: delay
-    });
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.startProcess();
-    }, delay);
-
-    this.emit('recover', {
-      reason,
-      attempt: this.retryCount,
-      delayMs: delay,
-      error
-    } as AudioRecoverEvent);
-  }
-
-  private teardownListeners() {
-    if (!this.process) {
+    if (this.restartTimer) {
       return;
     }
 
+    this.retryCount += 1;
+    const attempt = this.retryCount;
+    const timing = this.computeRestartDelay(attempt);
+
+    metrics.recordPipelineRestart('audio', reason, {
+      attempt,
+      delayMs: timing.delayMs,
+      baseDelayMs: timing.meta.baseDelayMs,
+      minDelayMs: timing.meta.minDelayMs,
+      maxDelayMs: timing.meta.maxDelayMs,
+      jitterMs: timing.meta.appliedJitterMs,
+      channel: this.options.channel
+    });
+
+    this.emit(
+      'recover',
+      {
+        reason,
+        attempt,
+        delayMs: timing.delayMs,
+        meta: timing.meta,
+        error
+      } satisfies AudioRecoverEvent
+    );
+
+    this.clearAllTimers();
+    this.hasReceivedChunk = false;
+    this.terminateProcess(true);
+
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      this.startProcess();
+    }, Math.max(0, timing.delayMs));
+  }
+
+  private detachProcess() {
+    if (!this.process) {
+      return null;
+    }
+
+    const proc = this.process;
+    this.process = null;
     this.processCleanup?.();
     this.processCleanup = null;
-    this.process = null;
     this.buffer = Buffer.alloc(0);
+    return proc;
   }
 
-  private tearDownProcess() {
-    this.teardownListeners();
-  }
-
-  private clearRetryTimer() {
-    if (this.retryTimer) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
+  private terminateProcess(force = false, options: { skipForceDelay?: boolean } = {}) {
+    const proc = this.detachProcess();
+    if (!proc) {
+      return;
     }
+
+    try {
+      proc.stdout.destroy();
+    } catch (error) {
+      // Ignore destruction errors
+    }
+
+    try {
+      proc.stderr.destroy();
+    } catch (error) {
+      // Ignore destruction errors
+    }
+
+    if (!force) {
+      return;
+    }
+
+    try {
+      proc.kill('SIGTERM');
+    } catch (error) {
+      // Ignore termination errors
+    }
+
+    this.clearKillTimer();
+    const delay = this.options.forceKillTimeoutMs ?? DEFAULT_FORCE_KILL_TIMEOUT_MS;
+    if (options.skipForceDelay || delay <= 0) {
+      if (!proc.killed) {
+        try {
+          proc.kill('SIGKILL');
+        } catch (error) {
+          // Ignore forced kill errors
+        }
+      }
+      return;
+    }
+
+    this.killTimer = setTimeout(() => {
+      this.killTimer = null;
+      if (proc.killed) {
+        return;
+      }
+      try {
+        proc.kill('SIGKILL');
+      } catch (error) {
+        // Ignore forced kill errors
+      }
+    }, delay);
+  }
+
+  private clearRestartTimer() {
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+  }
+
+  private clearStartTimer() {
+    if (this.startTimer) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
+    }
+  }
+
+  private resetStartTimer() {
+    this.clearStartTimer();
+    const timeout = this.options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+    if (timeout <= 0) {
+      return;
+    }
+
+    this.startTimer = setTimeout(() => {
+      this.startTimer = null;
+      if (this.shouldStop || this.hasReceivedChunk) {
+        return;
+      }
+      this.emit('error', new Error('Audio source start timeout'));
+      this.scheduleRetry('start-timeout');
+    }, timeout);
+  }
+
+  private clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  private resetIdleTimer() {
+    this.clearIdleTimer();
+    const timeout = this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    if (timeout <= 0) {
+      return;
+    }
+
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (this.shouldStop) {
+        return;
+      }
+      this.emit('error', new Error('Audio source idle timeout'));
+      this.scheduleRetry('stream-idle');
+    }, timeout);
+  }
+
+  private clearWatchdogTimer() {
+    if (this.watchdogTimer) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private resetWatchdogTimer() {
+    this.clearWatchdogTimer();
+    const timeout =
+      this.options.watchdogTimeoutMs ??
+      this.options.idleTimeoutMs ??
+      DEFAULT_WATCHDOG_TIMEOUT_MS;
+
+    if (timeout <= 0) {
+      return;
+    }
+
+    this.watchdogTimer = setTimeout(() => {
+      this.watchdogTimer = null;
+      if (this.shouldStop) {
+        return;
+      }
+      this.emit('error', new Error('Audio source watchdog timeout'));
+      this.scheduleRetry('watchdog-timeout');
+    }, timeout);
+  }
+
+  private clearKillTimer() {
+    if (this.killTimer) {
+      clearTimeout(this.killTimer);
+      this.killTimer = null;
+    }
+  }
+
+  private clearAllTimers() {
+    this.clearRestartTimer();
+    this.clearStartTimer();
+    this.clearIdleTimer();
+    this.clearWatchdogTimer();
+    this.clearKillTimer();
+  }
+
+  private computeRestartDelay(attempt: number) {
+    const minDelayMs = Math.max(
+      0,
+      this.options.restartDelayMs ??
+        this.options.retryDelayMs ??
+        DEFAULT_RESTART_DELAY_MS
+    );
+
+    const maxDelayMs = Math.max(
+      minDelayMs,
+      this.options.restartMaxDelayMs ?? DEFAULT_RESTART_MAX_DELAY_MS
+    );
+
+    let baseDelayMs = minDelayMs;
+    if (attempt > 1) {
+      const exponential = minDelayMs * 2 ** (attempt - 1);
+      baseDelayMs = Math.min(maxDelayMs, Math.max(minDelayMs, Math.round(exponential)));
+    }
+
+    const factor = Math.max(0, this.options.restartJitterFactor ?? DEFAULT_RESTART_JITTER_FACTOR);
+    const jitterRange = Math.round(baseDelayMs * factor);
+    let appliedJitterMs = 0;
+
+    if (jitterRange > 0) {
+      const centered = this.randomFn() * 2 - 1;
+      appliedJitterMs = Math.round(centered * jitterRange);
+    }
+
+    let delayMs = baseDelayMs + appliedJitterMs;
+    if (delayMs > maxDelayMs) {
+      delayMs = maxDelayMs;
+    } else if (delayMs < minDelayMs) {
+      delayMs = minDelayMs;
+    }
+
+    appliedJitterMs = delayMs - baseDelayMs;
+
+    return {
+      delayMs,
+      meta: {
+        minDelayMs,
+        maxDelayMs,
+        baseDelayMs,
+        appliedJitterMs
+      }
+    } as const;
   }
 
   private consumeChunk(chunk: Buffer, sampleRate: number, channels: number) {
@@ -360,7 +641,7 @@ export class AudioSource extends EventEmitter {
     if (this.options.type === 'mic') {
       const candidates = this.micInputArgs.length
         ? this.micInputArgs
-        : buildMicInputArgs(process.platform, this.options);
+        : buildMicInputArgs(process.platform, this.options, this.options.micFallbacks);
       return candidates.map(candidate => [...candidate, ...outputArgs]);
     }
 
@@ -399,9 +680,11 @@ function defaultMicDevice(platform: NodeJS.Platform): string {
   }
 }
 
-type MicCandidate = { format?: string; device: string };
-
-function buildMicInputArgs(platform: NodeJS.Platform, options: Extract<AudioSourceOptions, { type: 'mic' }>) {
+function buildMicInputArgs(
+  platform: NodeJS.Platform,
+  options: Extract<AudioSourceOptions, { type: 'mic' }>,
+  overrides?: Record<string, MicCandidate[]>
+) {
   const candidates: string[][] = [];
   const seen = new Set<string>();
 
@@ -436,11 +719,32 @@ function buildMicInputArgs(platform: NodeJS.Platform, options: Extract<AudioSour
     device: options.device ?? defaultMicDevice(platform)
   });
 
-  for (const fallback of getMicFallbacks(platform)) {
+  for (const fallback of resolveMicFallbacks(platform, overrides)) {
     addCandidate(fallback);
   }
 
   return candidates;
+}
+
+function resolveMicFallbacks(platform: NodeJS.Platform, overrides?: Record<string, MicCandidate[]>) {
+  if (overrides) {
+    const specific = overrides[platform];
+    const wildcard = overrides.default ?? overrides['*'];
+
+    if (specific && wildcard) {
+      return [...specific, ...wildcard];
+    }
+
+    if (specific) {
+      return [...specific];
+    }
+
+    if (wildcard) {
+      return [...wildcard];
+    }
+  }
+
+  return getMicFallbacks(platform);
 }
 
 function getMicFallbacks(platform: NodeJS.Platform): MicCandidate[] {

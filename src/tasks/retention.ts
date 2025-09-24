@@ -16,6 +16,7 @@ export interface RetentionTaskOptions {
   intervalMs: number;
   archiveDir: string;
   snapshotDirs: string[];
+  maxArchivesPerCamera?: number;
   vacuumMode?: VacuumMode;
   logger?: RetentionLogger;
 }
@@ -26,6 +27,7 @@ type NormalizedOptions = {
   intervalMs: number;
   archiveDir: string;
   snapshotDirs: string[];
+  maxArchivesPerCamera?: number;
   vacuumMode: VacuumMode;
 };
 
@@ -102,17 +104,25 @@ export class RetentionTask {
       const outcome = runPolicy({
         retentionDays: this.options.retentionDays,
         archiveDir,
-        snapshotDirs
+        snapshotDirs,
+        maxArchivesPerCamera: this.options.maxArchivesPerCamera
       });
 
-      vacuumDatabase(this.options.vacuumMode);
+      for (const warning of outcome.warnings) {
+        this.logger.warn({ path: warning.path, err: warning.error }, 'Retention archive warning');
+      }
+
+      if (outcome.removedEvents > 0) {
+        vacuumDatabase(this.options.vacuumMode);
+      }
 
       this.logger.info(
         {
           removedEvents: outcome.removedEvents,
           archivedSnapshots: outcome.archivedSnapshots,
+          prunedArchives: outcome.prunedArchives,
           retentionDays: this.options.retentionDays,
-          vacuumMode: this.options.vacuumMode
+          vacuumMode: outcome.removedEvents > 0 ? this.options.vacuumMode : 'skipped'
         },
         'Retention task completed'
       );
@@ -145,6 +155,10 @@ function normalizeOptions(options: RetentionTaskOptions): NormalizedOptions {
     intervalMs,
     archiveDir,
     snapshotDirs,
+    maxArchivesPerCamera:
+      typeof options.maxArchivesPerCamera === 'number' && options.maxArchivesPerCamera >= 0
+        ? Math.floor(options.maxArchivesPerCamera)
+        : undefined,
     vacuumMode: options.vacuumMode ?? 'auto'
   };
 }
@@ -164,11 +178,13 @@ function runPolicy(options: {
   retentionDays: number;
   archiveDir: string;
   snapshotDirs: string[];
+  maxArchivesPerCamera?: number;
 }): RetentionOutcome {
   const policy: RetentionPolicyOptions = {
     retentionDays: options.retentionDays,
     archiveDir: options.archiveDir,
-    snapshotDirs: options.snapshotDirs
+    snapshotDirs: options.snapshotDirs,
+    maxArchivesPerCamera: options.maxArchivesPerCamera
   };
 
   return applyRetentionPolicy(policy);

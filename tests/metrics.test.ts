@@ -81,16 +81,60 @@ describe('MetricsCounters', () => {
     expect(snapshot.pipelines.ffmpeg.lastRestart).toEqual({
       reason: 'watchdog-timeout',
       attempt: null,
-      delayMs: null
+      delayMs: null,
+      baseDelayMs: null,
+      minDelayMs: null,
+      maxDelayMs: null,
+      jitterMs: null
     });
     expect(snapshot.pipelines.audio.restarts).toBe(1);
     expect(snapshot.pipelines.audio.lastRestart).toEqual({
       reason: 'spawn-error',
       attempt: null,
-      delayMs: null
+      delayMs: null,
+      baseDelayMs: null,
+      minDelayMs: null,
+      maxDelayMs: null,
+      jitterMs: null
     });
     expect(snapshot.suppression.total).toBe(1);
     expect(snapshot.suppression.byRule['rule-1']).toBe(1);
     expect(snapshot.suppression.byReason['cooldown']).toBe(1);
+    expect(snapshot.suppression.rules['rule-1']).toEqual({
+      total: 1,
+      byReason: { cooldown: 1 }
+    });
+  });
+
+  it('MetricsPerChannel exposes detector log levels, per-channel restarts and suppression rules', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', { channel: 'video:lobby' });
+    registry.recordPipelineRestart('ffmpeg', 'spawn-error', { channel: 'video:parking', attempt: 2 });
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', { channel: 'video:lobby', attempt: 3 });
+    registry.recordPipelineRestart('audio', 'spawn-error', { channel: 'audio:mic' });
+
+    registry.incrementLogLevel('WARN', { detector: 'motion' });
+    registry.incrementLogLevel('info', { detector: 'person' });
+    registry.incrementLogLevel('INFO', { detector: 'person' });
+
+    registry.recordSuppressedEvent('rule-1', 'cooldown');
+    registry.recordSuppressedEvent('rule-1', 'cooldown');
+    registry.recordSuppressedEvent('rule-2', 'rate-limit');
+
+    const snapshot = registry.snapshot();
+
+    expect(snapshot.logs.byDetector.motion.warn).toBe(1);
+    expect(snapshot.logs.byDetector.person.info).toBe(2);
+
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].restarts).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].byReason['watchdog-timeout']).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:parking'].restarts).toBe(1);
+    expect(snapshot.pipelines.audio.byChannel['audio:mic'].restarts).toBe(1);
+
+    expect(snapshot.suppression.rules['rule-1'].total).toBe(2);
+    expect(snapshot.suppression.rules['rule-1'].byReason['cooldown']).toBe(2);
+    expect(snapshot.suppression.rules['rule-2'].total).toBe(1);
+    expect(snapshot.suppression.rules['rule-2'].byReason['rate-limit']).toBe(1);
   });
 });

@@ -26,7 +26,7 @@ describe('EventRetention', () => {
     vi.useRealTimers();
   });
 
-  it('EventRetention removes expired records and archives snapshots into dated folders', () => {
+  it('RetentionArchiveRotation moves expired snapshots into dated folders and prunes excess', () => {
     const now = Date.UTC(2024, 0, 31);
     const recentEvent: EventRecord = {
       ts: now - 5 * dayMs,
@@ -49,23 +49,29 @@ describe('EventRetention', () => {
     storeEvent(oldEvent);
 
     const oldSnapshot = path.join(snapshotDir, 'old.jpg');
+    const olderSnapshot = path.join(snapshotDir, 'older.jpg');
     const recentSnapshot = path.join(snapshotDir, 'recent.jpg');
     fs.writeFileSync(oldSnapshot, 'old');
+    fs.writeFileSync(olderSnapshot, 'older');
     fs.writeFileSync(recentSnapshot, 'recent');
     fs.utimesSync(oldSnapshot, now / 1000 - 40 * 24 * 60 * 60, now / 1000 - 40 * 24 * 60 * 60);
+    fs.utimesSync(olderSnapshot, now / 1000 - 50 * 24 * 60 * 60, now / 1000 - 50 * 24 * 60 * 60);
     fs.utimesSync(recentSnapshot, now / 1000 - 5 * 24 * 60 * 60, now / 1000 - 5 * 24 * 60 * 60);
 
     const outcome = applyRetentionPolicy({
       retentionDays: 30,
       snapshotDir,
       archiveDir,
+      maxArchivesPerCamera: 1,
       now
     });
 
     const row = db.prepare('SELECT COUNT(*) as count FROM events').get() as { count: number };
     expect(row.count).toBe(1);
     expect(outcome.removedEvents).toBe(1);
-    expect(outcome.archivedSnapshots).toBe(1);
+    expect(outcome.archivedSnapshots).toBe(2);
+    expect(outcome.prunedArchives).toBe(1);
+    expect(outcome.warnings).toHaveLength(0);
 
     const archiveRoots = fs.readdirSync(archiveDir);
     expect(archiveRoots).toContain(path.basename(snapshotDir));
@@ -76,7 +82,9 @@ describe('EventRetention', () => {
     expect(fs.statSync(datedDir).isDirectory()).toBe(true);
     const nestedFiles = fs.readdirSync(datedDir);
     expect(nestedFiles).toContain('old.jpg');
+    expect(nestedFiles).not.toContain('older.jpg');
     expect(fs.existsSync(path.join(snapshotDir, 'old.jpg'))).toBe(false);
+    expect(fs.existsSync(path.join(snapshotDir, 'older.jpg'))).toBe(false);
     expect(fs.existsSync(path.join(snapshotDir, 'recent.jpg'))).toBe(true);
   });
 
@@ -122,6 +130,7 @@ describe('EventRetention', () => {
       intervalMs: 1000,
       archiveDir,
       snapshotDirs: [snapshotDir],
+      maxArchivesPerCamera: 5,
       vacuumMode: 'full',
       logger
     });
@@ -136,7 +145,64 @@ describe('EventRetention', () => {
       expect(execSpy).toHaveBeenCalledWith('VACUUM');
 
       const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
-      expect(infoCall?.[0]).toMatchObject({ removedEvents: 1, archivedSnapshots: 1 });
+      expect(infoCall?.[0]).toMatchObject({
+        removedEvents: 1,
+        archivedSnapshots: 1,
+        prunedArchives: 0,
+        vacuumMode: 'full'
+      });
+      expect(logger.warn).not.toHaveBeenCalled();
+    } finally {
+      task.stop();
+    }
+  });
+
+  it('RetentionScheduler skips vacuum when nothing is pruned', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 2, 1);
+    vi.setSystemTime(now);
+
+    const recentEvent: EventRecord = {
+      ts: now - 2 * dayMs,
+      source: 'sensor:fresh',
+      detector: 'motion',
+      severity: 'info',
+      message: 'still fresh',
+      meta: {}
+    };
+
+    storeEvent(recentEvent);
+
+    const execSpy = vi.spyOn(db, 'exec');
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const task = startRetentionTask({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 1000,
+      archiveDir,
+      snapshotDirs: [snapshotDir],
+      maxArchivesPerCamera: 2,
+      vacuumMode: 'full',
+      logger
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+
+      const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(infoCall?.[0]).toMatchObject({
+        removedEvents: 0,
+        archivedSnapshots: 0,
+        prunedArchives: 0,
+        vacuumMode: 'skipped'
+      });
+      expect(execSpy).not.toHaveBeenCalledWith('VACUUM');
+      expect(logger.warn).not.toHaveBeenCalled();
     } finally {
       task.stop();
     }

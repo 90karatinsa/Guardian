@@ -49,7 +49,17 @@ export type CameraPersonConfig = {
   minIntervalMs?: number;
 };
 
-export type CameraMotionConfig = {
+export type MotionTuningConfig = {
+  debounceFrames?: number;
+  backoffFrames?: number;
+  noiseMultiplier?: number;
+  noiseSmoothing?: number;
+  areaSmoothing?: number;
+  areaInflation?: number;
+  areaDeltaThreshold?: number;
+};
+
+export type CameraMotionConfig = MotionTuningConfig & {
   diffThreshold?: number;
   areaThreshold?: number;
   minIntervalMs?: number;
@@ -58,6 +68,7 @@ export type CameraMotionConfig = {
 export type CameraFfmpegConfig = {
   inputArgs?: string[];
   rtspTransport?: string;
+  idleTimeoutMs?: number;
   startTimeoutMs?: number;
   watchdogTimeoutMs?: number;
   forceKillTimeoutMs?: number;
@@ -92,10 +103,67 @@ export type PersonConfig = {
   minIntervalMs?: number;
 };
 
-export type MotionConfig = {
+export type MotionConfig = MotionTuningConfig & {
   diffThreshold: number;
   areaThreshold: number;
   minIntervalMs?: number;
+};
+
+export type LightTuningConfig = {
+  smoothingFactor?: number;
+  minIntervalMs?: number;
+  debounceFrames?: number;
+  backoffFrames?: number;
+  noiseMultiplier?: number;
+  noiseSmoothing?: number;
+};
+
+export type LightConfig = LightTuningConfig & {
+  deltaThreshold: number;
+  normalHours?: Array<{ start: number; end: number }>;
+};
+
+export type AudioMicFallbackCandidate = { format?: string; device: string };
+
+export type AudioAnomalyThresholdConfig = {
+  rms?: number;
+  centroidJump?: number;
+};
+
+export type AudioAnomalyThresholdScheduleConfig = {
+  default?: AudioAnomalyThresholdConfig;
+  day?: AudioAnomalyThresholdConfig;
+  night?: AudioAnomalyThresholdConfig;
+};
+
+export type AudioAnomalyNightHoursConfig = { start: number; end: number };
+
+export type AudioAnomalyConfig = {
+  sampleRate?: number;
+  frameDurationMs?: number;
+  hopDurationMs?: number;
+  frameSize?: number;
+  hopSize?: number;
+  rmsThreshold?: number;
+  centroidJumpThreshold?: number;
+  minIntervalMs?: number;
+  minTriggerDurationMs?: number;
+  rmsWindowMs?: number;
+  centroidWindowMs?: number;
+  thresholds?: AudioAnomalyThresholdScheduleConfig;
+  nightHours?: AudioAnomalyNightHoursConfig;
+};
+
+export type AudioConfig = {
+  idleTimeoutMs?: number;
+  startTimeoutMs?: number;
+  watchdogTimeoutMs?: number;
+  restartDelayMs?: number;
+  restartMaxDelayMs?: number;
+  restartJitterFactor?: number;
+  forceKillTimeoutMs?: number;
+  micFallbacks?: Record<string, AudioMicFallbackCandidate[]>;
+  anomaly?: AudioAnomalyConfig;
 };
 
 export type GuardianConfig = {
@@ -106,6 +174,8 @@ export type GuardianConfig = {
   video: VideoConfig;
   person: PersonConfig;
   motion: MotionConfig;
+  light?: LightConfig;
+  audio?: AudioConfig;
 };
 
 type JsonType = 'object' | 'number' | 'string' | 'boolean' | 'array';
@@ -118,6 +188,15 @@ type JsonSchema = {
   items?: JsonSchema;
   enum?: (string | number | boolean)[];
   minimum?: number;
+};
+
+const anomalyThresholdSchema: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    rms: { type: 'number', minimum: 0 },
+    centroidJump: { type: 'number', minimum: 0 }
+  }
 };
 
 const guardianConfigSchema: JsonSchema = {
@@ -206,6 +285,10 @@ const guardianConfigSchema: JsonSchema = {
                       enum: ['info', 'warning', 'critical']
                     }
                   },
+                  channel: {
+                    type: ['string', 'array'],
+                    items: { type: 'string' }
+                  },
                   suppressForMs: { type: 'number', minimum: 0 },
                   rateLimit: {
                     type: 'object',
@@ -239,6 +322,7 @@ const guardianConfigSchema: JsonSchema = {
               items: { type: 'string' }
             },
             rtspTransport: { type: 'string' },
+            idleTimeoutMs: { type: 'number', minimum: 0 },
             startTimeoutMs: { type: 'number', minimum: 0 },
             watchdogTimeoutMs: { type: 'number', minimum: 0 },
             forceKillTimeoutMs: { type: 'number', minimum: 0 },
@@ -275,7 +359,14 @@ const guardianConfigSchema: JsonSchema = {
                 properties: {
                   diffThreshold: { type: 'number' },
                   areaThreshold: { type: 'number' },
-                  minIntervalMs: { type: 'number', minimum: 0 }
+                  minIntervalMs: { type: 'number', minimum: 0 },
+                  debounceFrames: { type: 'number', minimum: 0 },
+                  backoffFrames: { type: 'number', minimum: 0 },
+                  noiseMultiplier: { type: 'number', minimum: 0 },
+                  noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+                  areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+                  areaInflation: { type: 'number', minimum: 0 },
+                  areaDeltaThreshold: { type: 'number', minimum: 0 }
                 }
               },
               ffmpeg: {
@@ -287,6 +378,7 @@ const guardianConfigSchema: JsonSchema = {
                     items: { type: 'string' }
                   },
                   rtspTransport: { type: 'string' },
+                  idleTimeoutMs: { type: 'number', minimum: 0 },
                   startTimeoutMs: { type: 'number', minimum: 0 },
                   watchdogTimeoutMs: { type: 'number', minimum: 0 },
                   forceKillTimeoutMs: { type: 'number', minimum: 0 },
@@ -320,7 +412,103 @@ const guardianConfigSchema: JsonSchema = {
       properties: {
         diffThreshold: { type: 'number' },
         areaThreshold: { type: 'number' },
-        minIntervalMs: { type: 'number', minimum: 0 }
+        minIntervalMs: { type: 'number', minimum: 0 },
+        debounceFrames: { type: 'number', minimum: 0 },
+        backoffFrames: { type: 'number', minimum: 0 },
+        noiseMultiplier: { type: 'number', minimum: 0 },
+        noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+        areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+        areaInflation: { type: 'number', minimum: 0 },
+        areaDeltaThreshold: { type: 'number', minimum: 0 }
+      }
+    },
+    light: {
+      type: 'object',
+      required: ['deltaThreshold'],
+      additionalProperties: false,
+      properties: {
+        deltaThreshold: { type: 'number' },
+        normalHours: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['start', 'end'],
+            additionalProperties: false,
+            properties: {
+              start: { type: 'number', minimum: 0, maximum: 24 },
+              end: { type: 'number', minimum: 0, maximum: 24 }
+            }
+          }
+        },
+        smoothingFactor: { type: 'number', minimum: 0, maximum: 1 },
+        minIntervalMs: { type: 'number', minimum: 0 },
+        debounceFrames: { type: 'number', minimum: 0 },
+        backoffFrames: { type: 'number', minimum: 0 },
+        noiseMultiplier: { type: 'number', minimum: 0 },
+        noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 }
+      }
+    },
+    audio: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        idleTimeoutMs: { type: 'number', minimum: 0 },
+        startTimeoutMs: { type: 'number', minimum: 0 },
+        watchdogTimeoutMs: { type: 'number', minimum: 0 },
+        restartDelayMs: { type: 'number', minimum: 0 },
+        restartMaxDelayMs: { type: 'number', minimum: 0 },
+        restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
+        forceKillTimeoutMs: { type: 'number', minimum: 0 },
+        micFallbacks: {
+          type: 'object',
+          additionalProperties: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['device'],
+              additionalProperties: false,
+              properties: {
+                format: { type: 'string' },
+                device: { type: 'string' }
+              }
+            }
+          }
+        },
+        anomaly: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            sampleRate: { type: 'number', minimum: 1 },
+            frameDurationMs: { type: 'number', minimum: 0 },
+            hopDurationMs: { type: 'number', minimum: 0 },
+            frameSize: { type: 'number', minimum: 1 },
+            hopSize: { type: 'number', minimum: 1 },
+            rmsThreshold: { type: 'number', minimum: 0 },
+            centroidJumpThreshold: { type: 'number', minimum: 0 },
+            minIntervalMs: { type: 'number', minimum: 0 },
+            minTriggerDurationMs: { type: 'number', minimum: 0 },
+            rmsWindowMs: { type: 'number', minimum: 0 },
+            centroidWindowMs: { type: 'number', minimum: 0 },
+            thresholds: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                default: anomalyThresholdSchema,
+                day: anomalyThresholdSchema,
+                night: anomalyThresholdSchema
+              }
+            },
+            nightHours: {
+              type: 'object',
+              required: ['start', 'end'],
+              additionalProperties: false,
+              properties: {
+                start: { type: 'number', minimum: 0, maximum: 24 },
+                end: { type: 'number', minimum: 0, maximum: 24 }
+              }
+            }
+          }
+        }
       }
     }
   }

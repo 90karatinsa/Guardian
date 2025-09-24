@@ -54,25 +54,26 @@ afterEach(async () => {
 });
 
 describe('GuardianCliHealthcheck', () => {
-  it('returns JSON payload for --health and embeds pipeline metrics', async () => {
+  it('CliHealthExitCodes returns JSON for health commands and propagates degraded status', async () => {
     const capture = createTestIo();
-    const code = await runCli(['--health'], capture.io);
-    const payload = JSON.parse(capture.stdout().trim());
+    const flagCode = await runCli(['--health'], capture.io);
+    const flagPayload = JSON.parse(capture.stdout().trim());
 
-    expect(code).toBe(0);
-    expect(payload.status).toBe('ok');
-    expect(payload.metrics.pipelines.ffmpeg).toBeDefined();
-    expect(payload.metrics.pipelines.audio).toBeDefined();
-  });
+    expect(flagCode).toBe(0);
+    expect(flagPayload.status).toBe('ok');
+    expect(flagPayload.metrics.pipelines.ffmpeg).toBeDefined();
+    expect(flagPayload.metrics.pipelines.audio).toBeDefined();
+    expect(flagPayload.metrics.pipelines.ffmpeg.byChannel).toBeDefined();
+    expect(flagPayload.metrics.pipelines.audio.byChannel).toBeDefined();
 
-  it('propagates degraded exit code when error logs are present', async () => {
+    metrics.reset();
     metrics.incrementLogLevel('error', { message: 'detector failure' });
-    const capture = createTestIo();
-    const code = await runCli(['--health'], capture.io);
+    const aliasCapture = createTestIo();
+    const aliasCode = await runCli(['health'], aliasCapture.io);
+    const aliasPayload = JSON.parse(aliasCapture.stdout().trim());
 
-    expect(code).toBe(1);
-    const payload = JSON.parse(capture.stdout().trim());
-    expect(payload.status).toBe('degraded');
+    expect(aliasCode).toBe(1);
+    expect(aliasPayload.status).toBe('degraded');
   });
 
   it('summarizes status output with restart counters', async () => {
@@ -98,12 +99,12 @@ describe('GuardianCliShutdown', () => {
       expect(startGuardMock).toHaveBeenCalledTimes(1);
     });
 
-    const stopIo = createTestIo();
+  const stopIo = createTestIo();
     const stopCode = await runCli(['stop'], stopIo.io);
 
     expect(stopCode).toBe(0);
     expect(stopSpy).toHaveBeenCalledTimes(1);
-    expect(stopIo.stdout()).toContain('Guardian daemon stopped');
+    expect(stopIo.stdout()).toContain('Guardian daemon stopped (status: ok)');
     await expect(startPromise).resolves.toBe(0);
   });
 });

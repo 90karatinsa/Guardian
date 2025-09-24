@@ -31,59 +31,70 @@ describe('EventSuppression', () => {
     });
   });
 
-  it('EventSuppressionConfig suppresses events within configured cooldown window', () => {
+  it('EventSuppressionChannelRateLimit filters by channel before applying rate limits', () => {
     bus.configureSuppression([
       {
-        id: 'cooldown',
+        id: 'channel-limit',
         detector: 'test-detector',
-        source: 'sensor:1',
-        suppressForMs: 1000,
-        reason: 'cooldown'
+        channel: 'alerts',
+        rateLimit: { count: 2, perMs: 1000 },
+        reason: 'alerts throttled'
       }
     ]);
 
-    const first = bus.emitEvent({ ...basePayload, ts: 0 });
-    const suppressed = bus.emitEvent({ ...basePayload, ts: 500 });
-    const allowedAgain = bus.emitEvent({ ...basePayload, ts: 1500 });
+    expect(bus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'metrics' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 50, meta: { channel: 'alerts' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'alerts' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 300, meta: { channel: 'alerts' } })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 1600, meta: { channel: 'alerts' } })).toBe(true);
 
-    expect(first).toBe(true);
-    expect(suppressed).toBe(false);
-    expect(allowedAgain).toBe(true);
-    expect(store).toHaveBeenCalledTimes(2);
-    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledWith('cooldown', 'cooldown');
+    expect(store).toHaveBeenCalledTimes(4);
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledWith('channel-limit', 'alerts throttled');
 
     const suppressionCall = log.info.mock.calls.find(([, message]) => message === 'Event suppressed');
     expect(suppressionCall?.[0]?.meta).toMatchObject({
-      suppressed: true,
-      suppressionReason: 'cooldown',
-      suppressionType: 'window',
-      suppressionRuleId: 'cooldown'
+      suppressionReason: 'alerts throttled',
+      suppressionType: 'rate-limit',
+      suppressionRuleId: 'channel-limit'
     });
+    const suppressedBy = suppressionCall?.[0]?.meta?.suppressedBy as Array<Record<string, unknown>>;
+    expect(Array.isArray(suppressedBy)).toBe(true);
+    expect(suppressedBy?.[0]).toMatchObject({ ruleId: 'channel-limit', type: 'rate-limit' });
   });
 
-  it('EventSuppressionConfig rate limits events per rule', () => {
+  it('EventSuppressionWindowCombo combines rate limit triggers with cooldown windows', () => {
     bus.configureSuppression([
       {
-        id: 'rate-limit',
+        id: 'combo',
         detector: 'test-detector',
-        rateLimit: { count: 2, perMs: 1000 },
-        reason: 'rate limit'
+        suppressForMs: 1000,
+        rateLimit: { count: 2, perMs: 500 },
+        reason: 'combo suppression'
       }
     ]);
 
-    expect(bus.emitEvent({ ...basePayload, ts: 0 })).toBe(true);
-    expect(bus.emitEvent({ ...basePayload, ts: 200 })).toBe(true);
-    expect(bus.emitEvent({ ...basePayload, ts: 400 })).toBe(false);
-    expect(bus.emitEvent({ ...basePayload, ts: 1600 })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'alerts' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'alerts' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 300, meta: { channel: 'alerts' } })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 900, meta: { channel: 'alerts' } })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 1400, meta: { channel: 'alerts' } })).toBe(true);
 
     expect(store).toHaveBeenCalledTimes(3);
-    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledWith('rate-limit', 'rate limit');
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledWith('combo', 'combo suppression');
 
-    const suppressionCall = log.info.mock.calls.find(([, message]) => message === 'Event suppressed');
-    expect(suppressionCall?.[0]?.meta).toMatchObject({
-      suppressionReason: 'rate limit',
+    const rateLimitedCall = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta);
+
+    expect(rateLimitedCall[0]).toMatchObject({
       suppressionType: 'rate-limit',
-      suppressionRuleId: 'rate-limit'
+      suppressionRuleId: 'combo'
     });
+    expect(rateLimitedCall[0]?.suppressedBy?.[0]).toMatchObject({ type: 'rate-limit' });
+    expect(rateLimitedCall[1]).toMatchObject({
+      suppressionType: 'window',
+      suppressionRuleId: 'combo'
+    });
+    expect(rateLimitedCall[1]?.suppressedBy?.[0]).toMatchObject({ type: 'window' });
   });
 });

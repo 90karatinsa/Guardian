@@ -10,7 +10,8 @@ const videoFile = ensureSampleVideo(videoConfig.testFile);
 
 const source = new VideoSource({
   file: videoFile,
-  framesPerSecond: videoConfig.framesPerSecond
+  framesPerSecond: videoConfig.framesPerSecond,
+  channel: 'video:sample'
 });
 
 logger.info({ file: videoFile, fps: videoConfig.framesPerSecond }, 'Starting video source');

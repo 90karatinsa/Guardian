@@ -122,7 +122,10 @@ export class LightDetector {
       this.lastEventTs = ts;
       this.pendingFrames = 0;
       this.backoffFrames = effectiveBackoff;
-      this.baseline = luminance;
+      const previousBaseline = this.baseline;
+      this.baseline =
+        this.baseline * (1 - effectiveSmoothing) + luminance * effectiveSmoothing;
+      const updatedBaseline = this.baseline;
 
       const payload: EventPayload = {
         ts,
@@ -131,7 +134,8 @@ export class LightDetector {
         severity: 'warning',
         message: 'Unexpected light level change detected',
         meta: {
-          baseline: this.baseline,
+          baseline: updatedBaseline,
+          previousBaseline,
           luminance,
           delta,
           deltaThreshold,
@@ -140,7 +144,8 @@ export class LightDetector {
           effectiveDebounceFrames: effectiveDebounce,
           effectiveBackoffFrames: effectiveBackoff,
           noiseSmoothing: effectiveNoiseSmoothing,
-          smoothingFactor: effectiveSmoothing
+          smoothingFactor: effectiveSmoothing,
+          noiseMultiplier
         }
       };
 

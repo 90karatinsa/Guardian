@@ -12,9 +12,17 @@ interface EventsRouterOptions {
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
 
+type StreamFilters = Omit<ListEventsOptions, 'limit' | 'offset'>;
+
+type ClientState = {
+  heartbeat: NodeJS.Timeout;
+  filters: StreamFilters;
+  retryMs: number;
+};
+
 export class EventsRouter {
   private readonly bus: EventEmitter;
-  private readonly clients = new Map<ServerResponse, NodeJS.Timeout>();
+  private readonly clients = new Map<ServerResponse, ClientState>();
   private readonly handlers: Handler[];
   private readonly heartbeatMs: number;
 
@@ -56,17 +64,21 @@ export class EventsRouter {
 
   private readonly handleBusEvent = (event: EventRecord) => {
     const payload = JSON.stringify(event);
-    for (const [client, timer] of this.clients) {
+    for (const [client, state] of this.clients) {
       if (client.writableEnded) {
-        clearInterval(timer);
+        clearInterval(state.heartbeat);
         this.clients.delete(client);
+        continue;
+      }
+
+      if (!matchesStreamFilters(event, state.filters)) {
         continue;
       }
 
       try {
         client.write(`data: ${payload}\n\n`);
       } catch (error) {
-        clearInterval(timer);
+        clearInterval(state.heartbeat);
         client.end();
         this.clients.delete(client);
       }
@@ -96,12 +108,18 @@ export class EventsRouter {
       return false;
     }
 
+    const filters = extractStreamFilters(url);
+    const retryMs = resolveRetryInterval(url.searchParams);
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive'
     });
-    res.write(': connected\n\n');
+    res.write(': connected\n');
+    res.write(`retry: ${retryMs}\n`);
+    res.write(`event: stream-status\n`);
+    res.write(`data: ${JSON.stringify({ status: 'connected', retryMs, filters })}\n\n`);
 
     const heartbeat = setInterval(() => {
       if (res.writableEnded) {
@@ -118,12 +136,12 @@ export class EventsRouter {
       }
     }, this.heartbeatMs);
 
-    this.clients.set(res, heartbeat);
+    this.clients.set(res, { heartbeat, filters, retryMs });
 
     const cleanup = () => {
-      const timer = this.clients.get(res);
-      if (timer) {
-        clearInterval(timer);
+      const client = this.clients.get(res);
+      if (client) {
+        clearInterval(client.heartbeat);
       }
       this.clients.delete(res);
     };
@@ -209,8 +227,8 @@ function parseListOptions(url: URL): ListEventsOptions {
   const options: ListEventsOptions = {};
   const limit = toNumber(params.get('limit'));
   const offset = toNumber(params.get('offset'));
-  const since = toNumber(params.get('since'));
-  const until = toNumber(params.get('until'));
+  const since = resolveDateParam(params.get('since')) ?? resolveDateParam(params.get('from'));
+  const until = resolveDateParam(params.get('until')) ?? resolveDateParam(params.get('to'));
 
   if (typeof limit === 'number') {
     options.limit = limit;
@@ -245,7 +263,45 @@ function parseListOptions(url: URL): ListEventsOptions {
     options.channel = channel;
   }
 
+  const camera = params.get('camera');
+  if (camera) {
+    options.camera = camera;
+  }
+
   return options;
+}
+
+function extractStreamFilters(url: URL): StreamFilters {
+  const parsed = parseListOptions(url);
+  const { limit: _limit, offset: _offset, ...filters } = parsed;
+  return filters;
+}
+
+function resolveRetryInterval(params: URLSearchParams): number {
+  const value = params.get('retry') ?? params.get('retryMs');
+  if (!value) {
+    return 5000;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 5000;
+  }
+  return Math.max(1000, Math.min(Math.floor(parsed), 60000));
+}
+
+function resolveDateParam(value: string | null): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return undefined;
+  }
+  return parsed;
 }
 
 function sendJson(res: ServerResponse, status: number, payload: Record<string, unknown>) {
@@ -261,6 +317,39 @@ function extractSnapshotPath(event: EventRecordWithId): string | null {
     return path.resolve(snapshot);
   }
   return null;
+}
+
+function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boolean {
+  const meta = (event.meta ?? {}) as Record<string, unknown>;
+  const metaChannel = typeof meta.channel === 'string' ? meta.channel : undefined;
+  const metaCamera = typeof meta.camera === 'string' ? meta.camera : undefined;
+
+  if (filters.detector && event.detector !== filters.detector) {
+    return false;
+  }
+  if (filters.source && event.source !== filters.source) {
+    return false;
+  }
+  if (filters.channel && metaChannel !== filters.channel) {
+    return false;
+  }
+  if (filters.camera) {
+    const cameraMatch =
+      event.source === filters.camera || metaCamera === filters.camera || metaChannel === filters.camera;
+    if (!cameraMatch) {
+      return false;
+    }
+  }
+  if (filters.severity && event.severity !== filters.severity) {
+    return false;
+  }
+  if (typeof filters.since === 'number' && event.ts < filters.since) {
+    return false;
+  }
+  if (typeof filters.until === 'number' && event.ts > filters.until) {
+    return false;
+  }
+  return true;
 }
 
 function guessMimeType(filePath: string) {

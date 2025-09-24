@@ -10,9 +10,10 @@ const MAX_EVENTS = 50;
 
 const state = {
   events: [],
-  filters: { source: '', channel: '', severity: '' },
+  filters: { source: '', camera: '', channel: '', severity: '', from: '', to: '' },
   activeId: null,
-  eventSource: null
+  eventSource: null,
+  reconnectDelayMs: 5000
 };
 
 function getEventKey(event) {
@@ -32,15 +33,40 @@ function withKey(event) {
 }
 
 function matchesFilters(event) {
+  const meta = event.meta ?? {};
+  const channel = typeof meta.channel === 'string' ? meta.channel : '';
+  const cameraMeta = typeof meta.camera === 'string' ? meta.camera : '';
+  const ts = typeof event.ts === 'number' ? event.ts : Date.now();
+
   if (state.filters.source && event.source !== state.filters.source) {
     return false;
   }
-  if (state.filters.channel && event.meta?.channel !== state.filters.channel) {
+  if (state.filters.camera) {
+    const cameraMatches =
+      event.source === state.filters.camera ||
+      cameraMeta === state.filters.camera ||
+      channel === state.filters.camera;
+    if (!cameraMatches) {
+      return false;
+    }
+  }
+  if (state.filters.channel && channel !== state.filters.channel) {
     return false;
   }
   if (state.filters.severity && event.severity !== state.filters.severity) {
     return false;
   }
+
+  const fromTs = parseDateFilter(state.filters.from);
+  if (fromTs && ts < fromTs) {
+    return false;
+  }
+
+  const toTs = parseDateFilter(state.filters.to);
+  if (toTs && ts > toTs) {
+    return false;
+  }
+
   return true;
 }
 
@@ -140,9 +166,11 @@ function showPreview(event) {
 
   if (event.meta?.snapshot) {
     if (typeof event.id === 'number') {
-      previewImage.src = `/api/events/${event.id}/snapshot?cacheBust=${Date.now()}`;
+      const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
+      previewImage.src = `/api/events/${event.id}/snapshot?cacheBust=${cacheKey}`;
     } else {
-      previewImage.src = `${event.meta.snapshot}?cacheBust=${Date.now()}`;
+      const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
+      previewImage.src = `${event.meta.snapshot}?cacheBust=${cacheKey}`;
     }
     previewImage.alt = `Snapshot for ${description}`;
     previewFigure.hidden = false;
@@ -162,11 +190,8 @@ function clearPreview() {
 }
 
 async function loadInitial() {
-  const params = new URLSearchParams();
+  const params = buildQueryParams();
   params.set('limit', String(MAX_EVENTS));
-  if (state.filters.source) params.set('source', state.filters.source);
-  if (state.filters.channel) params.set('channel', state.filters.channel);
-  if (state.filters.severity) params.set('severity', state.filters.severity);
 
   try {
     const response = await fetch(`/api/events?${params.toString()}`);
@@ -204,8 +229,21 @@ function subscribe() {
     state.eventSource.close();
   }
 
-  const source = new EventSource('/api/events/stream');
+  const params = buildQueryParams();
+  params.set('retry', String(state.reconnectDelayMs));
+  const source = new EventSource(`/api/events/stream?${params.toString()}`);
   state.eventSource = source;
+
+  source.addEventListener('stream-status', event => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload?.retryMs) {
+        state.reconnectDelayMs = payload.retryMs;
+      }
+    } catch (error) {
+      console.debug('Failed to parse stream-status payload', error);
+    }
+  });
 
   source.onmessage = event => {
     try {
@@ -222,19 +260,22 @@ function subscribe() {
   source.onerror = () => {
     source.close();
     state.eventSource = null;
-    setTimeout(subscribe, 3000);
+    setTimeout(subscribe, state.reconnectDelayMs);
   };
 }
 
 function syncFiltersFromForm() {
   const formData = new FormData(filtersForm);
   state.filters.source = (formData.get('source') ?? '').toString().trim();
+  state.filters.camera = (formData.get('camera') ?? '').toString().trim();
   state.filters.channel = (formData.get('channel') ?? '').toString().trim();
   state.filters.severity = (formData.get('severity') ?? '').toString().trim();
+  state.filters.from = (formData.get('from') ?? '').toString();
+  state.filters.to = (formData.get('to') ?? '').toString();
 }
 
 function resetFilters() {
-  state.filters = { source: '', channel: '', severity: '' };
+  state.filters = { source: '', camera: '', channel: '', severity: '', from: '', to: '' };
   filtersForm.reset();
   clearPreview();
   loadInitial();
@@ -245,13 +286,49 @@ filtersForm.addEventListener('submit', event => {
   syncFiltersFromForm();
   clearPreview();
   loadInitial();
+  subscribe();
 });
 
 resetButton.addEventListener('click', () => {
   resetFilters();
+  subscribe();
 });
 
 loadInitial().then(() => {
   renderEvents();
 });
 subscribe();
+
+function buildQueryParams() {
+  const params = new URLSearchParams();
+  if (state.filters.source) params.set('source', state.filters.source);
+  if (state.filters.camera) params.set('camera', state.filters.camera);
+  if (state.filters.channel) params.set('channel', state.filters.channel);
+  if (state.filters.severity) params.set('severity', state.filters.severity);
+  if (state.filters.from) params.set('from', state.filters.from);
+  if (state.filters.to) params.set('to', state.filters.to);
+  return params;
+}
+
+function parseDateFilter(value) {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function buildSnapshotCacheKey(event) {
+  const meta = event.meta ?? {};
+  const hash = typeof meta.snapshotHash === 'string' ? meta.snapshotHash : '';
+  const ts = typeof meta.snapshotTs === 'number' ? meta.snapshotTs : event.ts;
+  const channel = typeof meta.channel === 'string' ? meta.channel : state.filters.channel || '';
+  const camera =
+    typeof meta.camera === 'string'
+      ? meta.camera
+      : state.filters.camera || (typeof event.source === 'string' ? event.source : '');
+  return [ts, hash, camera, channel].join(':');
+}

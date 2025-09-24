@@ -39,7 +39,13 @@ describe('AudioSource resilience', () => {
       throw error;
     });
 
-    const source = new AudioSource({ type: 'ffmpeg', input: 'pipe:0', retryDelayMs: 500 });
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      retryDelayMs: 500,
+      restartJitterFactor: 0,
+      random: () => 0.5
+    });
     const recoverSpy = vi.fn();
     const errorSpy = vi.fn();
     source.on('recover', recoverSpy);
@@ -49,11 +55,63 @@ describe('AudioSource resilience', () => {
 
     expect(spawnMock).toHaveBeenCalledTimes(2);
     expect(recoverSpy).toHaveBeenCalledTimes(1);
-    expect(recoverSpy.mock.calls[0][0].reason).toBe('ffmpeg-missing');
+    const event = recoverSpy.mock.calls[0][0];
+    expect(event.reason).toBe('ffmpeg-missing');
+    expect(event.meta.baseDelayMs).toBe(500);
+    expect(event.meta.minDelayMs).toBe(500);
     expect(errorSpy).toHaveBeenCalled();
 
     vi.advanceTimersByTime(500);
     expect(spawnMock).toHaveBeenCalledTimes(4);
+
+    source.stop();
+  });
+
+  it('AudioStreamWatchdog recovers after sustained silence', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const processes: ReturnType<typeof createFakeProcess>[] = [];
+    spawnMock.mockImplementation(() => {
+      const proc = createFakeProcess();
+      processes.push(proc);
+      return proc;
+    });
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      idleTimeoutMs: 1000,
+      startTimeoutMs: 100,
+      watchdogTimeoutMs: 1500,
+      restartDelayMs: 200,
+      restartMaxDelayMs: 200,
+      restartJitterFactor: 0,
+      random: () => 0.5
+    });
+
+    const recoverSpy = vi.fn();
+    const errorSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', errorSpy);
+
+    source.start();
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const proc = processes[0];
+    expect(proc).toBeDefined();
+
+    proc.stdout.emit('data', Buffer.alloc(4));
+
+    vi.advanceTimersByTime(1000);
+
+    expect(recoverSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith(expect.any(Error));
+    const event = recoverSpy.mock.calls[0][0];
+    expect(event.reason).toBe('stream-idle');
+    expect(event.meta.baseDelayMs).toBe(200);
+
+    vi.advanceTimersByTime(200);
+    expect(spawnMock).toHaveBeenCalledTimes(2);
 
     source.stop();
   });
@@ -74,14 +132,23 @@ describe('AudioSource resilience', () => {
       return createFakeProcess();
     });
 
-    const source = new AudioSource({ type: 'mic', retryDelayMs: 10 });
+    const source = new AudioSource({
+      type: 'mic',
+      retryDelayMs: 10,
+      micFallbacks: {
+        linux: [
+          { format: 'alsa', device: 'custom0' },
+          { format: 'alsa', device: 'custom1' }
+        ]
+      }
+    });
 
     try {
       source.start();
 
       expect(spawnMock).toHaveBeenCalledTimes(2);
       expect(attempted[0]).toContain('default');
-      expect(attempted[1]).toContain('hw:0');
+      expect(attempted[1]).toContain('custom0');
     } finally {
       source.stop();
       platformSpy.mockRestore();

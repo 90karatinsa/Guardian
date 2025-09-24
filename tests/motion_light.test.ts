@@ -53,7 +53,7 @@ describe('MotionDetector', () => {
     });
   });
 
-  it('MotionAdaptiveDebounce MotionBackoff suppresses noise and emits single event for sustained motion', () => {
+  it('MotionBackoffVerification suppresses noise and emits single event for sustained motion', () => {
     const detector = new MotionDetector(
       {
         source: 'test-camera',
@@ -62,7 +62,7 @@ describe('MotionDetector', () => {
         minIntervalMs: 0,
         debounceFrames: 2,
         backoffFrames: 3,
-        noiseMultiplier: 2,
+        noiseMultiplier: 1.5,
         noiseSmoothing: 0.2,
         areaSmoothing: 0.2,
         areaInflation: 1
@@ -72,15 +72,17 @@ describe('MotionDetector', () => {
 
     const base = createUniformFrame(16, 16, 8);
     const noiseFrames = [
-      createFrame(16, 16, (x, y) => 8 + ((x + y) % 3 === 0 ? 1 : 0)),
-      createFrame(16, 16, (x, y) => 8 + ((x * y) % 4 === 0 ? -1 : 1)),
-      createFrame(16, 16, (x, y) => 8 + ((x + 2 * y) % 5 === 0 ? 2 : -1)),
-      createFrame(16, 16, (x, y) => 8 + ((2 * x + y) % 6 === 0 ? -2 : 1))
+      createFrame(16, 16, (x, y) => 8 + ((x + y) % 3 === 0 ? 1 : -1)),
+      createFrame(16, 16, (x, y) => 8 + ((x * y) % 4 === 0 ? 1 : 0)),
+      createFrame(16, 16, (x, y) => 8 + ((x + 2 * y) % 5 === 0 ? -1 : 1)),
+      createFrame(16, 16, (x, y) => 8 + ((2 * x + y) % 6 === 0 ? 0 : 1))
     ];
     const motionFrames = [
-      createFrame(16, 16, (x, y) => (x < 8 ? 180 : 8)),
-      createFrame(16, 16, (x, y) => (x < 8 ? 200 : 10)),
-      createFrame(16, 16, (x, y) => (x < 8 ? 210 : 12))
+      createFrame(16, 16, (x, y) => (x < 8 ? 220 : 5)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 235 : 6)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 245 : 7)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 250 : 8)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 10))
     ];
 
     detector.handleFrame(base, 0);
@@ -96,9 +98,13 @@ describe('MotionDetector', () => {
 
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('motion');
-    expect(events[0].meta?.areaPct as number).toBeGreaterThan(0.05);
-    expect((events[0].meta as Record<string, number>).effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
-    expect((events[0].meta as Record<string, number>).effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
+    const meta = events[0].meta as Record<string, number>;
+    expect(meta.areaPct).toBeGreaterThan(0.05);
+    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
+    expect(meta.effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
+    expect(meta.noiseMultiplier).toBe(1.5);
+    expect(meta.areaInflation).toBe(1);
+    expect(meta.areaBaseline).toBeGreaterThan(0);
 
     detector.handleFrame(motionFrames[2], 200);
     expect(events).toHaveLength(1);
@@ -117,7 +123,7 @@ describe('LightDetector', () => {
     });
   });
 
-  it('LightNoiseSuppress ignores flicker and reports deliberate change', () => {
+  it('MotionLightNoiseTuning ignores flicker and reports deliberate change', () => {
     const detector = new LightDetector(
       {
         source: 'test-camera',
@@ -158,9 +164,13 @@ describe('LightDetector', () => {
 
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('light');
-    expect(events[0].meta?.delta as number).toBeGreaterThan(150);
-    expect((events[0].meta as Record<string, number>).effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
-    expect((events[0].meta as Record<string, number>).effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
+    const meta = events[0].meta as Record<string, number>;
+    expect(meta.delta).toBeGreaterThan(150);
+    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
+    expect(meta.effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
+    expect(meta.noiseMultiplier).toBe(3);
+    expect(meta.previousBaseline).toBeLessThan(meta.baseline);
+    expect(meta.baseline).toBeGreaterThan(20);
 
     detector.handleFrame(brightShift[2], ts0 + 20000);
     expect(events).toHaveLength(1);
