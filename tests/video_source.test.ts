@@ -2,6 +2,7 @@ import type { FfmpegCommand } from 'fluent-ffmpeg';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import metrics from '../src/metrics/index.js';
 import { VideoSource } from '../src/video/source.js';
 
 const SAMPLE_PNG = Buffer.from(
@@ -12,10 +13,13 @@ const SAMPLE_PNG = Buffer.from(
 describe('VideoSource', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    metrics.reset();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
+    metrics.reset();
   });
 
   it('emits a frame for each PNG in the stream', async () => {
@@ -156,6 +160,8 @@ describe('VideoSource', () => {
     expect(stream.listenerCount('end')).toBe(0);
 
     source.stop();
+
+    expect(commands.length).toBeGreaterThanOrEqual(3);
   });
 
   it('VideoSourceRecovery surfaces guard feedback with reason', async () => {
@@ -218,10 +224,10 @@ describe('VideoSource', () => {
 
     expect(sourceInstances).toHaveLength(1);
     const instance = sourceInstances[0];
-    instance.emit('recover', { reason: 'watchdog-timeout', attempt: 2 });
+    instance.emit('recover', { reason: 'watchdog-timeout', attempt: 2, delayMs: 1234 });
 
     expect(warn).toHaveBeenCalledWith(
-      { camera: 'camera-1', attempt: 2, reason: 'watchdog-timeout' },
+      { camera: 'camera-1', attempt: 2, reason: 'watchdog-timeout', delayMs: 1234 },
       'Video source reconnecting (reason=watchdog-timeout)'
     );
 
@@ -232,6 +238,63 @@ describe('VideoSource', () => {
     vi.doUnmock('../src/video/motionDetector.js');
     vi.doUnmock('../src/video/personDetector.js');
     vi.doUnmock('../src/video/sampleVideo.js');
+  });
+
+  it('VideoSourceBackoffMetrics records restart delays with backoff', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 5,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 40,
+      restartJitterFactor: 0,
+      watchdogTimeoutMs: 0,
+      forceKillTimeoutMs: 0,
+      random: () => 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const delays: number[] = [];
+    const attempts: number[] = [];
+    source.on('recover', info => {
+      delays.push(info.delayMs);
+      attempts.push(info.attempt);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    await vi.advanceTimersByTimeAsync(6);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(6);
+    await vi.advanceTimersByTimeAsync(20);
+    await vi.advanceTimersByTimeAsync(6);
+
+    expect(delays).toEqual([10, 20, 40]);
+    expect(attempts).toEqual([1, 2, 3]);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.lastRestart).toEqual({
+      reason: 'start-timeout',
+      attempt: 3,
+      delayMs: 40
+    });
+    expect(snapshot.latencies['pipeline.ffmpeg.restart.delay'].count).toBeGreaterThanOrEqual(3);
+    expect(snapshot.histograms['pipeline.ffmpeg.restart.delay']).toMatchObject({
+      '<25': 2,
+      '25-50': 1
+    });
+
+    source.stop();
+    expect(commands.length).toBeGreaterThanOrEqual(3);
   });
 });
 

@@ -78,7 +78,17 @@ describe('MetricsCounters', () => {
     expect(snapshot.histograms['detector.motion.latency']['100-250']).toBe(1);
     expect(snapshot.pipelines.ffmpeg.restarts).toBe(2);
     expect(snapshot.pipelines.ffmpeg.byReason['watchdog-timeout']).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.lastRestart).toEqual({
+      reason: 'watchdog-timeout',
+      attempt: null,
+      delayMs: null
+    });
     expect(snapshot.pipelines.audio.restarts).toBe(1);
+    expect(snapshot.pipelines.audio.lastRestart).toEqual({
+      reason: 'spawn-error',
+      attempt: null,
+      delayMs: null
+    });
     expect(snapshot.suppression.total).toBe(1);
     expect(snapshot.suppression.byRule['rule-1']).toBe(1);
     expect(snapshot.suppression.byReason['cooldown']).toBe(1);

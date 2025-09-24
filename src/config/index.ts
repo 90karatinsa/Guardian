@@ -58,6 +58,12 @@ export type CameraMotionConfig = {
 export type CameraFfmpegConfig = {
   inputArgs?: string[];
   rtspTransport?: string;
+  startTimeoutMs?: number;
+  watchdogTimeoutMs?: number;
+  forceKillTimeoutMs?: number;
+  restartDelayMs?: number;
+  restartMaxDelayMs?: number;
+  restartJitterFactor?: number;
 };
 
 export type CameraConfig = {
@@ -232,7 +238,13 @@ const guardianConfigSchema: JsonSchema = {
               type: 'array',
               items: { type: 'string' }
             },
-            rtspTransport: { type: 'string' }
+            rtspTransport: { type: 'string' },
+            startTimeoutMs: { type: 'number', minimum: 0 },
+            watchdogTimeoutMs: { type: 'number', minimum: 0 },
+            forceKillTimeoutMs: { type: 'number', minimum: 0 },
+            restartDelayMs: { type: 'number', minimum: 0 },
+            restartMaxDelayMs: { type: 'number', minimum: 0 },
+            restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
           }
         },
         cameras: {
@@ -274,7 +286,13 @@ const guardianConfigSchema: JsonSchema = {
                     type: 'array',
                     items: { type: 'string' }
                   },
-                  rtspTransport: { type: 'string' }
+                  rtspTransport: { type: 'string' },
+                  startTimeoutMs: { type: 'number', minimum: 0 },
+                  watchdogTimeoutMs: { type: 'number', minimum: 0 },
+                  forceKillTimeoutMs: { type: 'number', minimum: 0 },
+                  restartDelayMs: { type: 'number', minimum: 0 },
+                  restartMaxDelayMs: { type: 'number', minimum: 0 },
+                  restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
                 }
               }
             }

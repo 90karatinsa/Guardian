@@ -178,7 +178,13 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       file: input,
       framesPerSecond: fps,
       rtspTransport: cameraFfmpeg.rtspTransport,
-      inputArgs: cameraFfmpeg.inputArgs
+      inputArgs: cameraFfmpeg.inputArgs,
+      startTimeoutMs: cameraFfmpeg.startTimeoutMs,
+      watchdogTimeoutMs: cameraFfmpeg.watchdogTimeoutMs,
+      forceKillTimeoutMs: cameraFfmpeg.forceKillTimeoutMs,
+      restartDelayMs: cameraFfmpeg.restartDelayMs,
+      restartMaxDelayMs: cameraFfmpeg.restartMaxDelayMs,
+      restartJitterFactor: cameraFfmpeg.restartJitterFactor
     });
 
     const motionOverrides = resolveCameraMotion(camera.motion, motionConfig);
@@ -283,7 +289,13 @@ function resolveCameraFfmpeg(
 ): CameraFfmpegConfig {
   return {
     inputArgs: camera?.inputArgs ?? defaults?.inputArgs,
-    rtspTransport: camera?.rtspTransport ?? defaults?.rtspTransport
+    rtspTransport: camera?.rtspTransport ?? defaults?.rtspTransport,
+    startTimeoutMs: camera?.startTimeoutMs ?? defaults?.startTimeoutMs,
+    watchdogTimeoutMs: camera?.watchdogTimeoutMs ?? defaults?.watchdogTimeoutMs,
+    forceKillTimeoutMs: camera?.forceKillTimeoutMs ?? defaults?.forceKillTimeoutMs,
+    restartDelayMs: camera?.restartDelayMs ?? defaults?.restartDelayMs,
+    restartMaxDelayMs: camera?.restartMaxDelayMs ?? defaults?.restartMaxDelayMs,
+    restartJitterFactor: camera?.restartJitterFactor ?? defaults?.restartJitterFactor
   };
 }
 
@@ -404,7 +416,7 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
 
   source.on('recover', event => {
     logger.warn(
-      { camera: runtime.id, attempt: event.attempt, reason: event.reason },
+      { camera: runtime.id, attempt: event.attempt, reason: event.reason, delayMs: event.delayMs },
       `Video source reconnecting (reason=${event.reason})`
     );
   });

@@ -9,6 +9,12 @@ class MockVideoSource extends EventEmitter {
       framesPerSecond: number;
       rtspTransport?: string;
       inputArgs?: string[];
+      startTimeoutMs?: number;
+      watchdogTimeoutMs?: number;
+      forceKillTimeoutMs?: number;
+      restartDelayMs?: number;
+      restartMaxDelayMs?: number;
+      restartJitterFactor?: number;
     }
   ) {
     super();
@@ -192,6 +198,96 @@ describe('run-guard multi camera orchestration', () => {
       diffThreshold: 22,
       areaThreshold: 0.018
     });
+
+    runtime.stop();
+  });
+
+  it('CameraFfmpegTimeoutConfig applies restart timing overrides and logs recoveries', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const bus = new EventEmitter();
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 5,
+          ffmpeg: {
+            startTimeoutMs: 111,
+            watchdogTimeoutMs: 222,
+            forceKillTimeoutMs: 333,
+            restartDelayMs: 444,
+            restartMaxDelayMs: 555,
+            restartJitterFactor: 0
+          },
+          cameras: [
+            {
+              id: 'cam-default',
+              input: 'rtsp://camera-default/stream'
+            },
+            {
+              id: 'cam-override',
+              input: 'rtsp://camera-override/stream',
+              ffmpeg: {
+                watchdogTimeoutMs: 777,
+                restartDelayMs: 1000,
+                restartMaxDelayMs: 1000,
+                restartJitterFactor: 0
+              }
+            }
+          ]
+        },
+        person: {
+          modelPath: 'model.onnx',
+          score: 0.4
+        },
+        motion: {
+          diffThreshold: 10,
+          areaThreshold: 0.01
+        },
+        events: {
+          thresholds: { info: 0, warning: 1, critical: 2 }
+        }
+      }
+    });
+
+    expect(MockVideoSource.instances).toHaveLength(2);
+    const [defaultSource, overrideSource] = MockVideoSource.instances;
+
+    expect(defaultSource.options).toMatchObject({
+      startTimeoutMs: 111,
+      watchdogTimeoutMs: 222,
+      forceKillTimeoutMs: 333,
+      restartDelayMs: 444,
+      restartMaxDelayMs: 555,
+      restartJitterFactor: 0
+    });
+
+    expect(overrideSource.options).toMatchObject({
+      startTimeoutMs: 111,
+      watchdogTimeoutMs: 777,
+      restartDelayMs: 1000,
+      restartMaxDelayMs: 1000,
+      restartJitterFactor: 0
+    });
+
+    defaultSource.emit('recover', { reason: 'watchdog-timeout', attempt: 2, delayMs: 444 });
+    overrideSource.emit('recover', { reason: 'start-timeout', attempt: 1, delayMs: 1000 });
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      { camera: 'cam-default', attempt: 2, reason: 'watchdog-timeout', delayMs: 444 },
+      'Video source reconnecting (reason=watchdog-timeout)'
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      { camera: 'cam-override', attempt: 1, reason: 'start-timeout', delayMs: 1000 },
+      'Video source reconnecting (reason=start-timeout)'
+    );
 
     runtime.stop();
   });
