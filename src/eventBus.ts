@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import logger from './logger.js';
+import metrics from './metrics/index.js';
 import { storeEvent } from './db.js';
 import {
   EventPayload,
@@ -39,6 +40,7 @@ class EventBus extends EventEmitter {
 
     this.on(EVENT_CHANNEL, event => {
       this.store(event);
+      metrics.recordEvent(event);
       this.log.info(
         {
           detector: event.detector,

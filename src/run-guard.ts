@@ -285,7 +285,10 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
   });
 }
 
-if (process.env.NODE_ENV !== 'test' || process.env.GUARDIAN_FORCE_GUARD === '1') {
+if (
+  (process.env.NODE_ENV !== 'test' || process.env.GUARDIAN_FORCE_GUARD === '1') &&
+  process.env.GUARDIAN_DISABLE_AUTO_START !== '1'
+) {
   const runtimePromise = startGuard().catch(error => {
     loggerModule.error({ err: error }, 'Failed to start guard pipeline');
     process.exitCode = 1;

@@ -1,0 +1,17 @@
+[Unit]
+Description=Guardian video analitik servisi
+After=network.target
+
+[Service]
+Type=simple
+Environment=NODE_ENV=production
+WorkingDirectory=/opt/guardian
+ExecStart=/usr/bin/env pnpm start
+ExecReload=/usr/bin/env pnpm health
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
