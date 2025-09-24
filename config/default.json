@@ -1,0 +1,22 @@
+{
+  "app": {
+    "name": "Guardian"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "database": {
+    "path": "data/events.sqlite"
+  },
+  "events": {
+    "thresholds": {
+      "info": 0,
+      "warning": 5,
+      "critical": 10
+    }
+  },
+  "video": {
+    "testFile": "assets/test-video.mp4",
+    "framesPerSecond": 2
+  }
+}

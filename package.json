@@ -1,0 +1,32 @@
+{
+  "name": "guardian",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/app.ts",
+    "start": "tsx src/app.ts",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "config": "^3.3.9",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "pino": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/config": "^3.3.4",
+    "@types/fluent-ffmpeg": "^2.1.24",
+    "@types/node": "^20.14.11",
+    "tsx": "^4.15.7",
+    "typescript": "^5.5.4",
+    "vitest": "^1.6.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild",
+      "ffmpeg-static"
+    ]
+  }
+}
