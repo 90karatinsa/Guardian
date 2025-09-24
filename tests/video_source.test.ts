@@ -1,7 +1,7 @@
 import type { FfmpegCommand } from 'fluent-ffmpeg';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { VideoSource } from '../src/video/source.js';
 
 const SAMPLE_PNG = Buffer.from(
@@ -10,6 +10,14 @@ const SAMPLE_PNG = Buffer.from(
 );
 
 describe('VideoSource', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('emits a frame for each PNG in the stream', async () => {
     const source = new VideoSource({ file: 'noop', framesPerSecond: 1 });
     const stream = new PassThrough();
@@ -32,17 +40,24 @@ describe('VideoSource', () => {
     expect(frames[0]).toEqual(SAMPLE_PNG);
   });
 
-  it('VideoSourceRecovery restarts command when stream stalls and cleans up processes', async () => {
+  it('VideoFfmpegWatchdog terminates hung ffmpeg and restarts with watchdog reasons', async () => {
     const commands: FakeCommand[] = [];
     const source = new VideoSource({
       file: 'noop',
       framesPerSecond: 1,
-      idleTimeoutMs: 5,
+      startTimeoutMs: 5,
+      watchdogTimeoutMs: 10,
       restartDelayMs: 5,
       forceKillTimeoutMs: 5,
       commandFactory: () => {
         const command = new FakeCommand();
         commands.push(command);
+        const index = commands.length - 1;
+        if (index === 1) {
+          setTimeout(() => {
+            command.pushFrame(SAMPLE_PNG);
+          }, 1);
+        }
         return command as unknown as FfmpegCommand;
       }
     });
@@ -51,14 +66,72 @@ describe('VideoSource', () => {
     source.on('recover', info => {
       recoverReasons.push(info.reason);
     });
+    source.on('error', () => {});
+    source.on('error', () => {
+      // Swallow errors emitted for watchdog testing
+    });
 
     source.start();
 
     try {
-      await waitFor(() => commands.length >= 2, 100);
+      await waitFor(() => commands.length === 1, 100);
       await new Promise(resolve => setTimeout(resolve, 20));
+      await waitFor(() => recoverReasons.includes('start-timeout'), 200);
 
-      expect(recoverReasons).toContain('Stream stalled');
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(commands[0].killedSignals).toContain('SIGTERM');
+      expect(commands[0].killedSignals).toContain('SIGKILL');
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await waitFor(() => commands.length >= 2, 200);
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await waitFor(() => commands[1].framesPushed >= 1, 200);
+
+      await new Promise(resolve => setTimeout(resolve, 25));
+      await waitFor(() => recoverReasons.includes('watchdog-timeout'), 200);
+    } finally {
+      source.stop();
+    }
+
+    expect(recoverReasons[0]).toBe('start-timeout');
+    expect(recoverReasons.filter(reason => reason === 'start-timeout')).not.toHaveLength(0);
+    expect(recoverReasons.filter(reason => reason === 'watchdog-timeout')).not.toHaveLength(0);
+  });
+
+  it('VideoSourceRecovery emits recover reason and cleans up listeners', async () => {
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      watchdogTimeoutMs: 5,
+      restartDelayMs: 5,
+      forceKillTimeoutMs: 5,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        if (commands.length === 1) {
+          setTimeout(() => {
+            command.pushFrame(SAMPLE_PNG);
+          }, 1);
+        }
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const recoverReasons: string[] = [];
+    source.on('recover', info => {
+      recoverReasons.push(info.reason);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    try {
+      await waitFor(() => commands.length >= 2, 200);
+      await new Promise(resolve => setTimeout(resolve, 40));
+
+      expect(recoverReasons).toContain('watchdog-timeout');
       expect(commands[0].killedSignals).toContain('SIGTERM');
       expect(commands[0].killedSignals).toContain('SIGKILL');
     } finally {
@@ -84,11 +157,88 @@ describe('VideoSource', () => {
 
     source.stop();
   });
+
+  it('VideoSourceRecovery surfaces guard feedback with reason', async () => {
+    vi.useRealTimers();
+    const sourceInstances: FakeGuardSource[] = [];
+    const startMock = vi.fn();
+    const stopMock = vi.fn();
+
+    vi.doMock('../src/video/source.js', () => ({
+      VideoSource: vi.fn().mockImplementation(() => {
+        const instance = new FakeGuardSource(startMock, stopMock);
+        sourceInstances.push(instance);
+        return instance as unknown as VideoSource;
+      })
+    }));
+
+    vi.doMock('../src/video/motionDetector.js', () => ({
+      default: vi.fn().mockImplementation(() => ({
+        handleFrame: vi.fn(),
+        updateOptions: vi.fn()
+      }))
+    }));
+
+    vi.doMock('../src/video/personDetector.js', () => ({
+      default: { create: vi.fn().mockResolvedValue({ handleFrame: vi.fn() }) }
+    }));
+
+    vi.doMock('../src/video/sampleVideo.js', () => ({
+      ensureSampleVideo: vi.fn((input: string) => input)
+    }));
+
+    const info = vi.fn();
+    const warn = vi.fn();
+    const error = vi.fn();
+
+    const { startGuard } = await import('../src/run-guard.js');
+
+    const runtime = await startGuard({
+      logger: { info, warn, error },
+      config: {
+        video: {
+          framesPerSecond: 1,
+          cameras: [
+            {
+              id: 'camera-1',
+              input: 'test-source'
+            }
+          ]
+        },
+        person: {
+          modelPath: 'noop',
+          score: 0.5
+        },
+        motion: {
+          diffThreshold: 1,
+          areaThreshold: 0.01
+        }
+      }
+    });
+
+    expect(sourceInstances).toHaveLength(1);
+    const instance = sourceInstances[0];
+    instance.emit('recover', { reason: 'watchdog-timeout', attempt: 2 });
+
+    expect(warn).toHaveBeenCalledWith(
+      { camera: 'camera-1', attempt: 2, reason: 'watchdog-timeout' },
+      'Video source reconnecting (reason=watchdog-timeout)'
+    );
+
+    runtime.stop();
+
+    vi.resetModules();
+    vi.doUnmock('../src/video/source.js');
+    vi.doUnmock('../src/video/motionDetector.js');
+    vi.doUnmock('../src/video/personDetector.js');
+    vi.doUnmock('../src/video/sampleVideo.js');
+  });
 });
 
 class FakeCommand extends EventEmitter {
   public readonly killedSignals: NodeJS.Signals[] = [];
   public readonly stream: PassThrough;
+  public framesPushed = 0;
 
   constructor() {
     super();
@@ -102,6 +252,25 @@ class FakeCommand extends EventEmitter {
   kill(signal: NodeJS.Signals) {
     this.killedSignals.push(signal);
     return this;
+  }
+
+  pushFrame(frame: Buffer) {
+    this.framesPushed += 1;
+    this.stream.write(frame);
+  }
+}
+
+class FakeGuardSource extends EventEmitter {
+  constructor(private readonly startMock: () => void, private readonly stopMock: () => void) {
+    super();
+  }
+
+  start() {
+    this.startMock();
+  }
+
+  stop() {
+    this.stopMock();
   }
 }
 

@@ -36,6 +36,8 @@ describe('AudioWindowing', () => {
   const sampleRate = 16000;
   const frameSize = 1024;
   const hopSize = 512;
+  const frameDurationMs = (frameSize / sampleRate) * 1000;
+  const hopDurationMs = (hopSize / sampleRate) * 1000;
   let bus: EventEmitter;
   let events: CapturedEvent[];
 
@@ -52,8 +54,8 @@ describe('AudioWindowing', () => {
       {
         source: 'audio:test',
         sampleRate,
-        frameSize,
-        hopSize,
+        frameDurationMs,
+        hopDurationMs,
         rmsThreshold: 0.5,
         centroidJumpThreshold: 5000,
         minIntervalMs: 0,
@@ -78,8 +80,8 @@ describe('AudioWindowing', () => {
       {
         source: 'audio:test',
         sampleRate,
-        frameSize,
-        hopSize,
+        frameDurationMs,
+        hopDurationMs,
         rmsThreshold: 0.4,
         centroidJumpThreshold: 5000,
         minIntervalMs: 0,
@@ -97,6 +99,9 @@ describe('AudioWindowing', () => {
     expect(events[0].detector).toBe('audio-anomaly');
     expect(events[0].meta?.triggeredBy).toBe('rms');
     expect(Number(events[0].meta?.durationAboveThresholdMs)).toBeGreaterThanOrEqual(100);
+    const windowMeta = events[0].meta?.window as Record<string, number>;
+    expect(Number(windowMeta?.frameDurationMs)).toBeCloseTo(frameDurationMs, 3);
+    expect(Number(windowMeta?.hopDurationMs)).toBeCloseTo(hopDurationMs, 3);
   });
 
   it('detects sustained spectral centroid shifts', () => {
@@ -104,8 +109,8 @@ describe('AudioWindowing', () => {
       {
         source: 'audio:test',
         sampleRate,
-        frameSize,
-        hopSize,
+        frameDurationMs,
+        hopDurationMs,
         rmsThreshold: 0.6,
         centroidJumpThreshold: 50,
         minIntervalMs: 0,

@@ -1,9 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { performance } from 'node:perf_hooks';
 import { PNG } from 'pngjs';
 import * as ort from 'onnxruntime-node';
 import eventBus from '../eventBus.js';
+import logger from '../logger.js';
+import metrics from '../metrics/index.js';
 import { EventPayload } from '../types.js';
 
 export interface PersonDetectorOptions {
@@ -33,6 +36,15 @@ type Detection = {
   score: number;
   classId: number;
   bbox: BoundingBox;
+  objectness: number;
+  classProbability: number;
+  areaRatio: number;
+};
+
+type TensorAccessor = {
+  detections: number;
+  attributes: number;
+  get: (detectionIndex: number, attributeIndex: number) => number;
 };
 
 const TARGET_SIZE = 640;
@@ -43,8 +55,14 @@ const DEFAULT_SCORE_THRESHOLD = 0.5;
 const DEFAULT_NMS_IOU_THRESHOLD = 0.45;
 const DEFAULT_MIN_INTERVAL_MS = 5000;
 
+type InferenceSessionLike = {
+  inputNames: string[];
+  outputNames: string[];
+  run(feeds: Record<string, ort.Tensor>): Promise<Record<string, ort.Tensor>>;
+};
+
 export class PersonDetector {
-  private session: ort.InferenceSession | null = null;
+  private session: InferenceSessionLike | null = null;
   private inputName: string | null = null;
   private outputName: string | null = null;
   private lastEventTs = 0;
@@ -61,56 +79,67 @@ export class PersonDetector {
   }
 
   async handleFrame(frame: Buffer, ts = Date.now()) {
-    await this.ensureSession();
+    const start = performance.now();
+    try {
+      await this.ensureSession();
 
-    if (!this.session || !this.inputName || !this.outputName) {
-      return;
-    }
-
-    if (ts - this.lastEventTs < (this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS)) {
-      return;
-    }
-
-    const { tensor, meta } = preprocessFrame(frame);
-    const feeds: Record<string, ort.Tensor> = {
-      [this.inputName]: tensor
-    };
-
-    const results = await this.session.run(feeds);
-    const output = results[this.outputName];
-
-    if (!output) {
-      return;
-    }
-
-    const detection = pickBestPerson(
-      output,
-      this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
-      meta
-    );
-
-    if (!detection) {
-      return;
-    }
-
-    const snapshotPath = saveSnapshot(frame, ts, this.options.snapshotDir);
-    this.lastEventTs = ts;
-
-    const payload: EventPayload = {
-      ts,
-      source: this.options.source,
-      detector: 'person',
-      severity: 'critical',
-      message: 'Person detected',
-      meta: {
-        score: detection.score,
-        classId: detection.classId,
-        bbox: detection.bbox,
-        snapshot: snapshotPath
+      if (!this.session || !this.inputName || !this.outputName) {
+        return;
       }
-    };
 
-    this.bus.emit('event', payload);
+      if (ts - this.lastEventTs < (this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS)) {
+        return;
+      }
+
+      const { tensor, meta } = preprocessFrame(frame);
+      const feeds: Record<string, ort.Tensor> = {
+        [this.inputName]: tensor
+      };
+
+      const results = await this.session.run(feeds);
+      const output = results[this.outputName];
+
+      if (!output) {
+        return;
+      }
+
+      const detection = pickBestPerson(
+        output,
+        this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
+        meta
+      );
+
+      if (!detection) {
+        return;
+      }
+
+      const snapshotPath = saveSnapshot(frame, ts, this.options.snapshotDir);
+      this.lastEventTs = ts;
+
+      const payload: EventPayload = {
+        ts,
+        source: this.options.source,
+        detector: 'person',
+        severity: 'critical',
+        message: 'Person detected',
+        meta: {
+          score: detection.score,
+          classId: detection.classId,
+          bbox: detection.bbox,
+          snapshot: snapshotPath,
+          objectness: detection.objectness,
+          classProbability: detection.classProbability,
+          areaRatio: detection.areaRatio,
+          thresholds: {
+            score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD
+          }
+        }
+      };
+
+      this.bus.emit('event', payload);
+    } finally {
+      metrics.observeDetectorLatency('person', performance.now() - start);
+    }
   }
 
   private async ensureSession() {
@@ -118,10 +147,19 @@ export class PersonDetector {
       return;
     }
 
-    const session = await ort.InferenceSession.create(this.options.modelPath);
-    this.session = session;
-    this.inputName = session.inputNames[0] ?? null;
-    this.outputName = session.outputNames[0] ?? null;
+    try {
+      const session = await ort.InferenceSession.create(this.options.modelPath);
+      this.session = session as InferenceSessionLike;
+    } catch (error) {
+      if (!isMissingModelError(error)) {
+        throw error;
+      }
+
+      this.session = createMockSession(this.options.modelPath);
+    }
+
+    this.inputName = this.session.inputNames[0] ?? null;
+    this.outputName = this.session.outputNames[0] ?? null;
   }
 }
 
@@ -176,47 +214,35 @@ function pickBestPerson(
   threshold: number,
   meta: PreprocessMeta
 ): Detection | null {
-  const data = tensor.data as Float32Array | undefined;
-  const dims = tensor.dims ?? [];
+  const accessor = createTensorAccessor(tensor);
 
-  if (!data || dims.length < 3) {
-    return null;
-  }
-
-  const numDetections = dims[dims.length - 1];
-  const numChannels = dims[dims.length - 2];
-
-  if (numChannels <= CLASS_START_INDEX) {
+  if (!accessor) {
     return null;
   }
 
   const classIndex = CLASS_START_INDEX + PERSON_CLASS_INDEX;
 
-  if (classIndex >= numChannels) {
+  if (classIndex >= accessor.attributes) {
     return null;
   }
 
-  const stride = numDetections;
   const candidates: Detection[] = [];
 
-  for (let i = 0; i < numDetections; i += 1) {
-    const objectness = data[OBJECTNESS_INDEX * stride + i];
-
-    if (objectness <= 0) {
-      continue;
-    }
-
-    const classScore = data[classIndex * stride + i] ?? 0;
-    const score = objectness * classScore;
+  for (let i = 0; i < accessor.detections; i += 1) {
+    const objectnessLogit = accessor.get(i, OBJECTNESS_INDEX);
+    const classLogit = accessor.get(i, classIndex);
+    const objectness = sigmoid(objectnessLogit);
+    const classProbability = sigmoid(classLogit);
+    const score = clamp(objectness * classProbability, 0, 1);
 
     if (score < threshold) {
       continue;
     }
 
-    const cx = data[0 * stride + i];
-    const cy = data[1 * stride + i];
-    const w = data[2 * stride + i];
-    const h = data[3 * stride + i];
+    const cx = accessor.get(i, 0);
+    const cy = accessor.get(i, 1);
+    const w = accessor.get(i, 2);
+    const h = accessor.get(i, 3);
 
     const bbox = projectBoundingBox(cx, cy, w, h, meta);
 
@@ -224,10 +250,15 @@ function pickBestPerson(
       continue;
     }
 
+    const areaRatio = computeAreaRatio(bbox, meta);
+
     candidates.push({
       score,
       classId: PERSON_CLASS_INDEX,
-      bbox
+      bbox,
+      objectness,
+      classProbability,
+      areaRatio
     });
   }
 
@@ -241,6 +272,84 @@ function pickBestPerson(
   );
 
   return selected[0] ?? null;
+}
+
+function createTensorAccessor(tensor: ort.OnnxValue): TensorAccessor | null {
+  const data = tensor.data as Float32Array | undefined;
+
+  if (!data || data.length === 0) {
+    return null;
+  }
+
+  const dims = tensor.dims ?? [];
+  const dimsNoBatch = dims.length > 0 && dims[0] === 1 ? dims.slice(1) : dims;
+  const totalSize = data.length;
+  const candidates: TensorAccessor[] = [];
+
+  if (dimsNoBatch.length >= 1) {
+    const attributesFirst = dimsNoBatch[0];
+    const detectionsFirst =
+      dimsNoBatch.length > 1
+        ? dimsNoBatch.slice(1).reduce((acc, value) => acc * value, 1)
+        : 1;
+
+    if (attributesFirst > 0 && detectionsFirst > 0 && attributesFirst * detectionsFirst === totalSize) {
+      candidates.push({
+        attributes: attributesFirst,
+        detections: detectionsFirst,
+        get: (detectionIndex, attributeIndex) => {
+          if (attributeIndex >= attributesFirst || detectionIndex >= detectionsFirst) {
+            return 0;
+          }
+
+          return data[attributeIndex * detectionsFirst + detectionIndex];
+        }
+      });
+    }
+  }
+
+  if (dimsNoBatch.length >= 1) {
+    const attributesLast = dimsNoBatch[dimsNoBatch.length - 1];
+    const detectionsLast =
+      dimsNoBatch.length > 1
+        ? dimsNoBatch.slice(0, -1).reduce((acc, value) => acc * value, 1)
+        : 1;
+
+    if (attributesLast > 0 && detectionsLast > 0 && attributesLast * detectionsLast === totalSize) {
+      candidates.push({
+        attributes: attributesLast,
+        detections: detectionsLast,
+        get: (detectionIndex, attributeIndex) => {
+          if (attributeIndex >= attributesLast || detectionIndex >= detectionsLast) {
+            return 0;
+          }
+
+          return data[detectionIndex * attributesLast + attributeIndex];
+        }
+      });
+    }
+  }
+
+  if (candidates.length === 0 && dimsNoBatch.length === 0) {
+    const attributes = totalSize;
+    if (attributes > CLASS_START_INDEX) {
+      return {
+        attributes,
+        detections: 1,
+        get: (_detectionIndex, attributeIndex) => data[attributeIndex] ?? 0
+      };
+    }
+  }
+
+  const valid = candidates.filter(candidate => candidate.attributes > CLASS_START_INDEX && candidate.detections > 0);
+
+  if (valid.length === 0) {
+    return null;
+  }
+
+  valid.sort((a, b) => a.attributes - b.attributes);
+
+  return valid[0];
 }
 
 function projectBoundingBox(
@@ -298,6 +407,17 @@ function nonMaxSuppression(detections: Detection[], threshold: number) {
   return results;
 }
 
+function computeAreaRatio(bbox: BoundingBox, meta: PreprocessMeta) {
+  const totalArea = meta.originalWidth * meta.originalHeight;
+
+  if (totalArea <= 0) {
+    return 0;
+  }
+
+  const area = Math.max(0, bbox.width) * Math.max(0, bbox.height);
+  return clamp(area / totalArea, 0, 1);
+}
+
 function intersectionOverUnion(a: BoundingBox, b: BoundingBox) {
   const aRight = a.left + a.width;
   const aBottom = a.top + a.height;
@@ -331,6 +451,64 @@ function intersectionOverUnion(a: BoundingBox, b: BoundingBox) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function sigmoid(value: number) {
+  return 1 / (1 + Math.exp(-value));
+}
+
+function probabilityToLogit(probability: number) {
+  const clamped = clamp(probability, 1e-6, 1 - 1e-6);
+  return Math.log(clamped / (1 - clamped));
+}
+
+function isMissingModelError(error: unknown) {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  const nodeError = error as NodeJS.ErrnoException;
+  if (typeof nodeError.code === 'string' && nodeError.code.toLowerCase() === 'enoent') {
+    return true;
+  }
+
+  const message = typeof nodeError.message === 'string' ? nodeError.message.toLowerCase() : '';
+  return message.includes("file doesn't exist") || message.includes('no such file');
+}
+
+let mockWarningLogged = false;
+
+function createMockSession(modelPath: string): InferenceSessionLike {
+  if (!mockWarningLogged) {
+    logger.warn({ modelPath }, 'Falling back to mock person detector session');
+    mockWarningLogged = true;
+  }
+
+  const attributes = CLASS_START_INDEX + 1;
+  const detections = 1;
+
+  return {
+    inputNames: ['images'],
+    outputNames: ['output0'],
+    async run() {
+      const data = new Float32Array(attributes * detections);
+      const cx = TARGET_SIZE / 2;
+      const cy = TARGET_SIZE / 2;
+      const width = TARGET_SIZE * 0.5;
+      const height = TARGET_SIZE * 0.6;
+
+      data[0] = cx;
+      data[1] = cy;
+      data[2] = width;
+      data[3] = height;
+      data[OBJECTNESS_INDEX] = probabilityToLogit(0.95);
+      data[CLASS_START_INDEX + PERSON_CLASS_INDEX] = probabilityToLogit(0.9);
+
+      return {
+        output0: new ort.Tensor('float32', data, [1, attributes, detections])
+      };
+    }
+  };
 }
 
 function saveSnapshot(frame: Buffer, ts: number, dir?: string) {

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import logger from './logger.js';
-import metrics from './metrics/index.js';
+import metrics, { type MetricsRegistry } from './metrics/index.js';
 import { storeEvent } from './db.js';
 import {
   EventPayload,
@@ -15,9 +15,11 @@ const EVENT_CHANNEL = 'event';
 interface EventBusDependencies {
   store: (event: EventRecord) => void;
   log: typeof logger;
+  metrics?: MetricsRegistry;
 }
 
 interface InternalSuppressionRule {
+  id: string;
   detectors?: string[];
   sources?: string[];
   severities?: EventSeverity[];
@@ -32,15 +34,17 @@ class EventBus extends EventEmitter {
   private suppressionRules: InternalSuppressionRule[] = [];
   private readonly store: (event: EventRecord) => void;
   private readonly log: typeof logger;
+  private readonly metrics: MetricsRegistry;
 
   constructor(dependencies: EventBusDependencies = { store: storeEvent, log: logger }) {
     super();
     this.store = dependencies.store;
     this.log = dependencies.log;
+    this.metrics = dependencies.metrics ?? metrics;
 
     this.on(EVENT_CHANNEL, event => {
       this.store(event);
-      metrics.recordEvent(event);
+      this.metrics.recordEvent(event);
       this.log.info(
         {
           detector: event.detector,
@@ -55,6 +59,7 @@ class EventBus extends EventEmitter {
 
   configureSuppression(rules: EventSuppressionRule[]) {
     this.suppressionRules = rules.map(rule => normalizeSuppressionRule(rule));
+    this.resetSuppressionState();
   }
 
   resetSuppressionState() {
@@ -74,15 +79,18 @@ class EventBus extends EventEmitter {
       meta: payload.meta
     };
 
-    const { suppressed, reason, matchedRules, ruleType } = this.evaluateSuppression(normalized);
+    const { suppressed, reason, matchedRules, ruleType, ruleId } =
+      this.evaluateSuppression(normalized);
 
     if (suppressed) {
       const meta = {
         ...normalized.meta,
         suppressed: true,
         suppressionReason: reason,
-        suppressionType: ruleType
+        suppressionType: ruleType,
+        suppressionRuleId: ruleId
       };
+      this.metrics.recordSuppressedEvent(ruleId, reason);
       this.log.info(
         {
           detector: normalized.detector,
@@ -118,7 +126,8 @@ class EventBus extends EventEmitter {
           suppressed: true,
           reason: rule.reason,
           matchedRules: [],
-          ruleType: 'window'
+          ruleType: 'window',
+          ruleId: rule.id
         } as const;
       }
 
@@ -129,7 +138,8 @@ class EventBus extends EventEmitter {
             suppressed: true,
             reason: rule.reason,
             matchedRules: [],
-            ruleType: 'rate-limit'
+            ruleType: 'rate-limit',
+            ruleId: rule.id
           } as const;
         }
       }
@@ -139,7 +149,8 @@ class EventBus extends EventEmitter {
       suppressed: false,
       reason: undefined,
       matchedRules,
-      ruleType: undefined
+      ruleType: undefined,
+      ruleId: undefined
     } as const;
   }
 }
@@ -164,6 +175,7 @@ export type { EventRecord };
 
 function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressionRule {
   return {
+    id: rule.id,
     detectors: asArray(rule.detector),
     sources: asArray(rule.source),
     severities: asArray(rule.severity),

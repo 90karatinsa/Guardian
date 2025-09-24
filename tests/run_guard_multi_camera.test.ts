@@ -3,7 +3,14 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
-  constructor(public readonly options: { file: string; framesPerSecond: number }) {
+  constructor(
+    public readonly options: {
+      file: string;
+      framesPerSecond: number;
+      rtspTransport?: string;
+      inputArgs?: string[];
+    }
+  ) {
     super();
     MockVideoSource.instances.push(this);
   }
@@ -28,7 +35,11 @@ class MockPersonDetector {
 }
 
 class MockMotionDetector {
-  constructor(public readonly options: Record<string, unknown>) {}
+  static instances: MockMotionDetector[] = [];
+  public updateOptions = vi.fn();
+  constructor(public readonly options: Record<string, unknown>) {
+    MockMotionDetector.instances.push(this);
+  }
   handleFrame() {}
 }
 
@@ -48,19 +59,144 @@ vi.mock('../src/video/sampleVideo.js', () => ({
   ensureSampleVideo: (input: string) => input
 }));
 
+const retentionMock = {
+  configure: vi.fn(),
+  stop: vi.fn()
+};
+
+vi.mock('../src/tasks/retention.js', () => ({
+  startRetentionTask: vi.fn(() => retentionMock),
+  RetentionTask: class {}
+}));
+
 describe('run-guard multi camera orchestration', () => {
   beforeEach(() => {
     vi.resetModules();
     MockVideoSource.instances = [];
     MockPersonDetector.instances = [];
     MockPersonDetector.calls = [];
+    MockMotionDetector.instances = [];
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    retentionMock.configure.mockReset();
+    retentionMock.stop.mockReset();
   });
 
-  it('MultiCameraConfig triggers detectors per source', async () => {
+  it('MultiCameraRtspConfig applies camera-specific ffmpeg and motion options', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const bus = new EventEmitter();
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 2,
+          ffmpeg: {
+            inputArgs: ['-re']
+          },
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream',
+              framesPerSecond: 5,
+              ffmpeg: {
+                rtspTransport: 'tcp',
+                inputArgs: ['-stimeout', '5000000']
+              },
+              person: {
+                score: 0.6,
+                checkEveryNFrames: 1,
+                maxDetections: 1
+              },
+              motion: {
+                diffThreshold: 40,
+                areaThreshold: 0.03
+              }
+            },
+            {
+              id: 'cam-2',
+              channel: 'video:cam-2',
+              input: 'http://camera-2/playlist.m3u8',
+              person: {
+                score: 0.7,
+                checkEveryNFrames: 1,
+                maxDetections: 1
+              },
+              motion: {
+                diffThreshold: 22,
+                areaThreshold: 0.018
+              }
+            }
+          ]
+        },
+        person: {
+          modelPath: 'model.onnx',
+          score: 0.5,
+          checkEveryNFrames: 3,
+          maxDetections: 2,
+          snapshotDir: 'snapshots',
+          minIntervalMs: 1000
+        },
+        motion: {
+          diffThreshold: 25,
+          areaThreshold: 0.02,
+          minIntervalMs: 1200
+        },
+        events: {
+          thresholds: { info: 0, warning: 5, critical: 10 },
+          suppression: {
+            rules: [
+              {
+                id: 'cooldown',
+                detector: 'motion',
+                source: 'video:cam-1',
+                suppressForMs: 1000,
+                reason: 'cooldown'
+              }
+            ]
+          }
+        }
+      }
+    });
+
+    expect(MockVideoSource.instances).toHaveLength(2);
+    const [rtspSource, httpSource] = MockVideoSource.instances;
+    expect(rtspSource.options).toMatchObject({
+      file: 'rtsp://camera-1/stream',
+      framesPerSecond: 5,
+      rtspTransport: 'tcp',
+      inputArgs: ['-stimeout', '5000000']
+    });
+    expect(httpSource.options).toMatchObject({
+      file: 'http://camera-2/playlist.m3u8',
+      framesPerSecond: 2,
+      inputArgs: ['-re']
+    });
+
+    expect(MockMotionDetector.instances).toHaveLength(2);
+    expect(MockMotionDetector.instances[0].options).toMatchObject({
+      diffThreshold: 40,
+      areaThreshold: 0.03
+    });
+    expect(MockMotionDetector.instances[1].options).toMatchObject({
+      diffThreshold: 22,
+      areaThreshold: 0.018
+    });
+
+    runtime.stop();
+  });
+
+  it('run-guard multi camera testi triggers detectors per source', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 
     const bus = new EventEmitter();

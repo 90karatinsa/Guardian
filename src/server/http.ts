@@ -91,27 +91,53 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, directory: strin
   }
 
   const url = new URL(req.url, 'http://localhost');
-  if (url.pathname !== '/' && url.pathname !== '/index.html') {
+  let pathname = decodeURIComponent(url.pathname);
+  if (pathname === '/' || pathname === '') {
+    pathname = '/index.html';
+  } else if (pathname.endsWith('/')) {
+    pathname = `${pathname}index.html`;
+  }
+
+  const normalized = path.normalize(pathname).replace(/^[/\\]+/, '');
+  const root = path.resolve(directory);
+  const candidatePath = path.resolve(root, normalized);
+  const rootWithSep = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  if (candidatePath !== root && !candidatePath.startsWith(rootWithSep)) {
     return false;
   }
 
-  const indexPath = path.join(directory, 'index.html');
-  if (!fs.existsSync(indexPath)) {
-    res.statusCode = 404;
-    res.end('Not Found');
-    return true;
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(candidatePath);
+  } catch {
+    return false;
   }
 
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  let resolvedPath = candidatePath;
+  if (stats.isDirectory()) {
+    resolvedPath = path.join(candidatePath, 'index.html');
+    try {
+      stats = fs.statSync(resolvedPath);
+    } catch {
+      return false;
+    }
+  }
+
+  if (!stats.isFile()) {
+    return false;
+  }
+
+  const contentType = getContentType(resolvedPath);
+  res.writeHead(200, { 'Content-Type': contentType });
 
   if (req.method === 'HEAD') {
     res.end();
     return true;
   }
 
-  const stream = fs.createReadStream(indexPath);
+  const stream = fs.createReadStream(resolvedPath);
   stream.on('error', error => {
-    logger.error({ err: error }, 'Failed to read dashboard');
+    logger.error({ err: error }, 'Failed to read static asset');
     if (!res.headersSent) {
       res.statusCode = 500;
     }
@@ -120,6 +146,29 @@ function serveStatic(req: IncomingMessage, res: ServerResponse, directory: strin
 
   stream.pipe(res);
   return true;
+}
+
+function getContentType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.html':
+      return 'text/html; charset=utf-8';
+    case '.js':
+      return 'application/javascript; charset=utf-8';
+    case '.css':
+      return 'text/css; charset=utf-8';
+    case '.json':
+      return 'application/json; charset=utf-8';
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.gif':
+      return 'image/gif';
+    default:
+      return 'application/octet-stream';
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

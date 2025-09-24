@@ -1,0 +1,257 @@
+const list = document.getElementById('events');
+const filtersForm = document.getElementById('filters');
+const resetButton = document.getElementById('reset-filters');
+const previewEmpty = document.getElementById('preview-empty');
+const previewFigure = document.getElementById('preview-figure');
+const previewImage = document.getElementById('preview-image');
+const previewCaption = document.getElementById('preview-caption');
+
+const MAX_EVENTS = 50;
+
+const state = {
+  events: [],
+  filters: { source: '', channel: '', severity: '' },
+  activeId: null,
+  eventSource: null
+};
+
+function getEventKey(event) {
+  if (typeof event.id === 'number') {
+    return `id:${event.id}`;
+  }
+  const detector = event.detector ?? 'unknown';
+  const source = event.source ?? 'unknown';
+  const ts = typeof event.ts === 'number' ? event.ts : Date.now();
+  const message = event.message ?? '';
+  return `ts:${ts}:${detector}:${source}:${message}`;
+}
+
+function withKey(event) {
+  const key = getEventKey(event);
+  return { ...event, __key: key };
+}
+
+function matchesFilters(event) {
+  if (state.filters.source && event.source !== state.filters.source) {
+    return false;
+  }
+  if (state.filters.channel && event.meta?.channel !== state.filters.channel) {
+    return false;
+  }
+  if (state.filters.severity && event.severity !== state.filters.severity) {
+    return false;
+  }
+  return true;
+}
+
+function sortEvents(events) {
+  return events.sort((a, b) => {
+    if (b.ts === a.ts) {
+      return (b.id ?? 0) - (a.id ?? 0);
+    }
+    return b.ts - a.ts;
+  });
+}
+
+function renderEvents() {
+  const filtered = state.events.filter(matchesFilters);
+  const fragment = document.createDocumentFragment();
+
+  filtered.slice(0, MAX_EVENTS).forEach(event => {
+    fragment.appendChild(renderEventCard(event));
+  });
+
+  list.replaceChildren(fragment);
+
+  if (state.activeId) {
+    const activeElement = list.querySelector(`[data-event-id="${state.activeId}"]`);
+    if (!activeElement) {
+      clearPreview();
+    }
+  }
+
+  if (filtered.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No events match the current filters yet.';
+    list.appendChild(empty);
+  }
+}
+
+function renderEventCard(event) {
+  const container = document.createElement('article');
+  container.className = 'event';
+  container.dataset.eventId = event.__key;
+  if (event.__key === state.activeId) {
+    container.classList.add('active');
+  }
+
+  const header = document.createElement('header');
+  const title = document.createElement('strong');
+  title.textContent = `${event.detector} · ${event.source}`;
+  header.appendChild(title);
+
+  const severity = document.createElement('span');
+  severity.className = `severity ${event.severity}`;
+  severity.textContent = event.severity;
+  header.appendChild(severity);
+
+  const message = document.createElement('p');
+  message.textContent = event.message;
+
+  const timestamp = document.createElement('p');
+  timestamp.className = 'meta';
+  timestamp.textContent = new Date(event.ts).toLocaleString();
+
+  container.appendChild(header);
+  container.appendChild(message);
+  container.appendChild(timestamp);
+
+  container.addEventListener('click', () => {
+    setActiveEvent(event.__key);
+  });
+
+  return container;
+}
+
+function setActiveEvent(eventKey) {
+  if (state.activeId === eventKey) {
+    return;
+  }
+
+  state.activeId = eventKey;
+  for (const element of list.querySelectorAll('.event')) {
+    element.classList.toggle('active', element.dataset.eventId === eventKey);
+  }
+
+  const event = state.events.find(item => item.__key === eventKey);
+  if (!event) {
+    clearPreview();
+    return;
+  }
+
+  showPreview(event);
+}
+
+function showPreview(event) {
+  const timestamp = new Date(event.ts).toLocaleString();
+  const description = `${event.detector} · ${event.source}`;
+  previewCaption.textContent = `${description} — ${timestamp}`;
+
+  if (event.meta?.snapshot) {
+    if (typeof event.id === 'number') {
+      previewImage.src = `/api/events/${event.id}/snapshot?cacheBust=${Date.now()}`;
+    } else {
+      previewImage.src = `${event.meta.snapshot}?cacheBust=${Date.now()}`;
+    }
+    previewImage.alt = `Snapshot for ${description}`;
+    previewFigure.hidden = false;
+    previewEmpty.hidden = true;
+  } else {
+    previewFigure.hidden = true;
+    previewEmpty.hidden = false;
+    previewEmpty.textContent = 'No snapshot is available for the selected event.';
+  }
+}
+
+function clearPreview() {
+  state.activeId = null;
+  previewFigure.hidden = true;
+  previewEmpty.hidden = false;
+  previewEmpty.textContent = 'Select an event to view the latest snapshot.';
+}
+
+async function loadInitial() {
+  const params = new URLSearchParams();
+  params.set('limit', String(MAX_EVENTS));
+  if (state.filters.source) params.set('source', state.filters.source);
+  if (state.filters.channel) params.set('channel', state.filters.channel);
+  if (state.filters.severity) params.set('severity', state.filters.severity);
+
+  try {
+    const response = await fetch(`/api/events?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(`Failed to load events (${response.status})`);
+    }
+    const payload = await response.json();
+    if (Array.isArray(payload.items)) {
+      state.events = sortEvents(payload.items.map(withKey));
+      renderEvents();
+    }
+  } catch (error) {
+    console.error('Failed to load events', error);
+  }
+}
+
+function insertEvent(event) {
+  const keyed = withKey(event);
+  const existingIndex = state.events.findIndex(item => item.__key === keyed.__key);
+  if (existingIndex >= 0) {
+    state.events.splice(existingIndex, 1, keyed);
+  } else {
+    state.events.push(keyed);
+  }
+  sortEvents(state.events);
+  if (state.events.length > MAX_EVENTS) {
+    state.events.length = MAX_EVENTS;
+  }
+  renderEvents();
+  return keyed;
+}
+
+function subscribe() {
+  if (state.eventSource) {
+    state.eventSource.close();
+  }
+
+  const source = new EventSource('/api/events/stream');
+  state.eventSource = source;
+
+  source.onmessage = event => {
+    try {
+      const payload = JSON.parse(event.data);
+      const keyed = insertEvent(payload);
+      if (!state.activeId && matchesFilters(keyed)) {
+        setActiveEvent(keyed.__key);
+      }
+    } catch (error) {
+      console.error('Failed to parse event payload', error);
+    }
+  };
+
+  source.onerror = () => {
+    source.close();
+    state.eventSource = null;
+    setTimeout(subscribe, 3000);
+  };
+}
+
+function syncFiltersFromForm() {
+  const formData = new FormData(filtersForm);
+  state.filters.source = (formData.get('source') ?? '').toString().trim();
+  state.filters.channel = (formData.get('channel') ?? '').toString().trim();
+  state.filters.severity = (formData.get('severity') ?? '').toString().trim();
+}
+
+function resetFilters() {
+  state.filters = { source: '', channel: '', severity: '' };
+  filtersForm.reset();
+  clearPreview();
+  loadInitial();
+}
+
+filtersForm.addEventListener('submit', event => {
+  event.preventDefault();
+  syncFiltersFromForm();
+  clearPreview();
+  loadInitial();
+});
+
+resetButton.addEventListener('click', () => {
+  resetFilters();
+});
+
+loadInitial().then(() => {
+  renderEvents();
+});
+subscribe();

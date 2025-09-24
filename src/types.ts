@@ -24,6 +24,7 @@ export interface RateLimitConfig {
 }
 
 export interface EventSuppressionRule {
+  id: string;
   detector?: string | string[];
   source?: string | string[];
   severity?: EventSeverity | EventSeverity[];

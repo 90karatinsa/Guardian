@@ -50,6 +50,7 @@ export interface ListEventsOptions {
   offset?: number;
   detector?: string;
   source?: string;
+  channel?: string;
   severity?: EventSeverity;
   since?: number;
   until?: number;
@@ -83,6 +84,11 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
   if (options.source) {
     filters.push('source = @source');
     params.source = options.source;
+  }
+
+  if (options.channel) {
+    filters.push("json_extract(meta, '$.channel') = @channel");
+    params.channel = options.channel;
   }
 
   if (options.severity) {
@@ -144,9 +150,12 @@ export function pruneEventsOlderThan(cutoffTs: number): number {
   return typeof result.changes === 'number' ? result.changes : 0;
 }
 
+export type VacuumMode = 'auto' | 'full';
+
 export interface RetentionPolicyOptions {
   retentionDays: number;
-  snapshotDir: string;
+  snapshotDir?: string;
+  snapshotDirs?: string[];
   archiveDir: string;
   now?: number;
 }
@@ -157,19 +166,58 @@ export interface RetentionOutcome {
 }
 
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
-  const { retentionDays, snapshotDir, archiveDir } = options;
+  const { retentionDays, archiveDir } = options;
   const now = options.now ?? Date.now();
   const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
   const cutoffTs = now - retentionMs;
 
   const removedEvents = pruneEventsOlderThan(cutoffTs);
-  const archivedSnapshots = rotateSnapshots(snapshotDir, archiveDir, cutoffTs);
+  const directories = collectSnapshotDirectories(options);
+  let archivedSnapshots = 0;
+
+  for (const { sourceDir, archiveBase } of directories) {
+    archivedSnapshots += rotateSnapshots(sourceDir, archiveBase, cutoffTs);
+  }
 
   return { removedEvents, archivedSnapshots };
 }
 
-export function vacuumDatabase() {
+export function vacuumDatabase(mode: VacuumMode = 'auto') {
+  if (mode === 'full') {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  }
+
   db.exec('VACUUM');
+}
+
+type SnapshotDirectory = {
+  sourceDir: string;
+  archiveBase: string;
+};
+
+function collectSnapshotDirectories(options: RetentionPolicyOptions): SnapshotDirectory[] {
+  const directories = new Map<string, SnapshotDirectory>();
+
+  const addDirectory = (dir: string | undefined) => {
+    if (!dir) {
+      return;
+    }
+    const resolved = path.resolve(dir);
+    if (!directories.has(resolved)) {
+      directories.set(resolved, {
+        sourceDir: resolved,
+        archiveBase: path.resolve(options.archiveDir)
+      });
+    }
+  };
+
+  addDirectory(options.snapshotDir);
+
+  for (const dir of options.snapshotDirs ?? []) {
+    addDirectory(dir);
+  }
+
+  return [...directories.values()];
 }
 
 function rotateSnapshots(snapshotDir: string, archiveDir: string, cutoffTs: number): number {
@@ -203,12 +251,21 @@ function rotateSnapshots(snapshotDir: string, archiveDir: string, cutoffTs: numb
       continue;
     }
 
-    const targetPath = ensureUniqueArchivePath(archiveDir, entry);
+    const archivePath = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
+    const targetPath = ensureUniqueArchivePath(archivePath, entry);
     fs.renameSync(sourcePath, targetPath);
     moved += 1;
   }
 
   return moved;
+}
+
+function buildArchivePath(archiveDir: string, snapshotDir: string, mtimeMs: number): string {
+  const dateFolder = formatArchiveDate(mtimeMs);
+  const cameraFolder = path.basename(snapshotDir);
+  const targetDir = path.join(archiveDir, cameraFolder, dateFolder);
+  fs.mkdirSync(targetDir, { recursive: true });
+  return targetDir;
 }
 
 function ensureUniqueArchivePath(directory: string, filename: string): string {
@@ -227,6 +284,14 @@ function ensureUniqueArchivePath(directory: string, filename: string): string {
     }
     index += 1;
   }
+}
+
+function formatArchiveDate(timestamp: number): string {
+  const date = new Date(timestamp);
+  const year = date.getUTCFullYear();
+  const month = `${date.getUTCMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getUTCDate()}`.padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function mapRow(row: EventRow): EventRecordWithId {
