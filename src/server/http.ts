@@ -13,6 +13,8 @@ export interface HttpServerOptions {
   host?: string;
   bus?: EventEmitter;
   staticDir?: string;
+  faceRegistry?: FaceRegistry;
+  createFaceRegistry?: () => Promise<FaceRegistry>;
 }
 
 export interface HttpServerRuntime {
@@ -29,8 +31,10 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
 
   const eventsRouter = createEventsRouter({
     bus,
-    createFaceRegistry: async () =>
-      FaceRegistry.create({ modelPath: path.resolve(process.cwd(), 'models/face.onnx') })
+    faceRegistry: options.faceRegistry,
+    createFaceRegistry:
+      options.createFaceRegistry ??
+      (async () => FaceRegistry.create({ modelPath: path.resolve(process.cwd(), 'models/face.onnx') }))
   });
 
   const server = http.createServer((req, res) => {

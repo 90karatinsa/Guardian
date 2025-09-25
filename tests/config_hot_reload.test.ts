@@ -59,7 +59,8 @@ vi.mock('../src/video/source.js', () => ({
 }));
 
 vi.mock('../src/video/personDetector.js', () => ({
-  default: MockPersonDetector
+  default: MockPersonDetector,
+  normalizeClassScoreThresholds: (thresholds: Record<number, number>) => thresholds
 }));
 
 vi.mock('../src/video/motionDetector.js', () => ({
@@ -97,10 +98,33 @@ describe('ConfigHotReload', () => {
     retentionMock.stop.mockReset();
   });
 
-  it('ConfigSchemaValidation rejects invalid config', () => {
-    fs.writeFileSync(configPath, JSON.stringify({ app: { name: 'test' } }));
+  it('ConfigSchemaValidationErrors enforces channel, fallback, and rate limit rules', () => {
+    const config = createConfig({ diffThreshold: 20 });
+    config.video.channels = { 'video:present': {} };
+    config.video.cameras[0].channel = 'video:missing';
+    config.audio = {
+      micFallbacks: {
+        linux: [{ device: '   ' }]
+      }
+    };
+    config.events.suppression.rules[0] = {
+      ...config.events.suppression.rules[0],
+      id: 'rate-limit',
+      reason: 'rl-test',
+      rateLimit: { count: 5, perMs: 1 }
+    };
 
-    expect(() => loadConfigFromFile(configPath)).toThrow();
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    try {
+      loadConfigFromFile(configPath);
+      throw new Error('expected validation to fail');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message).toContain('references undefined channel');
+      expect(message).toContain('device must be a non-empty string');
+      expect(message).toContain('rateLimit.perMs must be greater than or equal to count');
+    }
   });
 
   it('applies motion threshold updates to active detectors', async () => {
@@ -221,6 +245,9 @@ describe('ConfigHotReload', () => {
 
       await waitFor(() => logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded'));
 
+      const reloadCall = logger.info.mock.calls.find(([, message]) => message === 'configuration reloaded');
+      expect(reloadCall?.[0]).toMatchObject({ cameras: 1, channels: 0, audioFallbacks: 0 });
+
       const allowedAfterReload = bus.emitEvent({
         source: 'video:cam-1',
         detector: 'motion',
@@ -310,7 +337,7 @@ describe('ConfigHotReload', () => {
     }
   });
 
-  it('ConfigHotReloadValidation reverts to last known good config on invalid JSON', async () => {
+  it('ConfigHotReloadRecovery reverts to last known good config on invalid JSON', async () => {
     const initialConfig = createConfig({ diffThreshold: 20 });
     const serialized = JSON.stringify(initialConfig, null, 2);
     fs.writeFileSync(configPath, serialized);
@@ -343,6 +370,8 @@ describe('ConfigHotReload', () => {
       expect(logger.error).not.toHaveBeenCalled();
       const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
       expect(warnCall).toBeDefined();
+      expect(warnCall?.[0]).toMatchObject({ configPath, action: 'reload', restored: true });
+      expect(warnCall?.[0]?.err).toBeInstanceOf(Error);
     } finally {
       runtime.stop();
     }
@@ -353,7 +382,7 @@ function createConfig(overrides: {
   diffThreshold: number;
   suppressionRules?: Record<string, unknown>[];
   cameras?: CameraConfig[];
-}) {
+}): GuardianConfig {
   const base = {
     app: { name: 'Guardian Test' },
     logging: { level: 'silent' },
@@ -415,7 +444,7 @@ function createConfig(overrides: {
     }
   };
 
-  return base;
+  return base as GuardianConfig;
 }
 
 async function waitFor(predicate: () => boolean, timeout = 2000) {

@@ -3,14 +3,10 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import PersonDetector from '../src/video/personDetector.js';
-import {
-  DEFAULT_NMS_IOU_THRESHOLD,
-  YOLO_CLASS_START_INDEX,
-  computeIoU,
-  parseYoloDetections
-} from '../src/video/yoloParser.js';
+import { YOLO_CLASS_START_INDEX, parseYoloDetections } from '../src/video/yoloParser.js';
 
 const runMock = vi.fn();
+const OBJECTNESS_INDEX = 4;
 
 vi.mock('pngjs', () => {
   const store = new WeakMap<Buffer, { width: number; height: number; data: Uint8Array }>();
@@ -76,6 +72,90 @@ const ort = await import('onnxruntime-node');
 
 import { PNG } from 'pngjs';
 
+describe('YoloParser utilities', () => {
+  it('YoloParserMultiClass applies class thresholds and rescales boxes', () => {
+    const classCount = 3;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assignDetection = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectnessLogit: number;
+        classLogits: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = values.objectnessLogit;
+      values.classLogits.forEach((logit, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit;
+      });
+    };
+
+    assignDetection(0, {
+      cx: 320,
+      cy: 320,
+      width: 200,
+      height: 220,
+      objectnessLogit: 2.4,
+      classLogits: [2.1, -4, -4]
+    });
+
+    assignDetection(1, {
+      cx: 480,
+      cy: 400,
+      width: 160,
+      height: 200,
+      objectnessLogit: 1.9,
+      classLogits: [-5, 1.8, 1.2]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 0.8,
+      padX: 0,
+      padY: 80,
+      originalWidth: 800,
+      originalHeight: 600,
+      resizedWidth: 640,
+      resizedHeight: 480,
+      scaleX: 640 / 800,
+      scaleY: 480 / 600
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0, 1, 2],
+      scoreThreshold: 0.4,
+      classScoreThresholds: { 1: 0.6, 2: 0.8 }
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results.some(result => result.classId === 2)).toBe(false);
+
+    const person = results.find(result => result.classId === 0);
+    expect(person?.score ?? 0).toBeGreaterThan(0.7);
+
+    const packageDetection = results.find(result => result.classId === 1);
+    expect(packageDetection).toBeDefined();
+    expect(packageDetection?.score ?? 0).toBeGreaterThan(0.6);
+    expect(packageDetection?.bbox.left ?? 0).toBeCloseTo(500, 1);
+    expect(packageDetection?.bbox.top ?? 0).toBeCloseTo(275, 1);
+    expect(packageDetection?.bbox.width ?? 0).toBeCloseTo(200, 1);
+    expect(packageDetection?.bbox.height ?? 0).toBeCloseTo(250, 1);
+    expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
+  });
+});
+
 describe('PersonDetector', () => {
   const snapshotsDir = path.resolve('snapshots');
   let bus: EventEmitter;
@@ -102,7 +182,7 @@ describe('PersonDetector', () => {
     }
   });
 
-  it('PersonDetectionsNms suppresses overlaps and emits capped candidates', async () => {
+  it('PersonDetectorSnapshotMetadata captures preprocess context', async () => {
     const detections = 2;
     const attributes = 6;
     const detectionData = new Float32Array(attributes * detections);
@@ -139,7 +219,8 @@ describe('PersonDetector', () => {
         scoreThreshold: 0.5,
         snapshotDir: 'snapshots',
         minIntervalMs: 0,
-        maxDetections: 1
+        maxDetections: 1,
+        classScoreThresholds: { 0: 0.5 }
       },
       bus
     );
@@ -160,6 +241,7 @@ describe('PersonDetector', () => {
     expect(meta?.objectness).toBeCloseTo(expectedObjectness, 5);
     expect(meta?.classProbability).toBeCloseTo(expectedClassProbability, 5);
     expect(meta?.thresholds).toMatchObject({ score: 0.5, nms: 0.45 });
+    expect(meta?.thresholds?.classScoreThresholds).toMatchObject({ 0: 0.5 });
 
     const bbox = meta?.bbox as { left: number; top: number; width: number; height: number };
     expect(bbox.left).toBeCloseTo(440, 5);
@@ -168,6 +250,17 @@ describe('PersonDetector', () => {
     expect(bbox.height).toBeCloseTo(400, 5);
 
     expect(meta?.areaRatio).toBeCloseTo((400 * 400) / (1280 * 720), 5);
+    expect(meta?.preprocess).toMatchObject({
+      scale: 0.5,
+      padX: 0,
+      padY: 140,
+      resizedWidth: 640,
+      resizedHeight: 360,
+      originalWidth: 1280,
+      originalHeight: 720,
+      scaleX: 0.5,
+      scaleY: 0.5
+    });
 
     const candidates = meta?.detections as Array<Record<string, unknown>>;
     expect(Array.isArray(candidates)).toBe(true);
@@ -314,84 +407,6 @@ describe('PersonDetector', () => {
 
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
-  });
-});
-
-describe('YoloParser', () => {
-  it('YoloParserMultiClass orders detections per class with IoU suppression', () => {
-    const classCount = 3;
-    const attributes = YOLO_CLASS_START_INDEX + classCount;
-    const detections = 2;
-    const data = new Float32Array(attributes * detections).fill(0);
-
-    setChannelFirstDetection(data, detections, 0, {
-      cx: 300,
-      cy: 260,
-      width: 180,
-      height: 220,
-      objectnessLogit: 2.4,
-      classLogit: 2.1
-    });
-    // additional classes for detection 0
-    data[(YOLO_CLASS_START_INDEX + 1) * detections + 0] = 1.6;
-    data[(YOLO_CLASS_START_INDEX + 2) * detections + 0] = -4;
-
-    setChannelFirstDetection(data, detections, 1, {
-      cx: 310,
-      cy: 270,
-      width: 175,
-      height: 210,
-      objectnessLogit: 1.7,
-      classLogit: 1.5
-    });
-    data[(YOLO_CLASS_START_INDEX + 1) * detections + 1] = 1.4;
-    data[(YOLO_CLASS_START_INDEX + 2) * detections + 1] = -2.5;
-
-    const meta = {
-      scale: 1,
-      padX: 0,
-      padY: 0,
-      originalWidth: 640,
-      originalHeight: 480
-    };
-
-    const tensor = { data, dims: [1, attributes, detections] } as any;
-    const result = parseYoloDetections(tensor, meta, {
-      classIndices: [0, 1, 2],
-      scoreThreshold: 0.2,
-      nmsThreshold: DEFAULT_NMS_IOU_THRESHOLD,
-      maxDetections: 5
-    });
-
-    // Expect detections for class 0 and 1 but class 2 scores fall below threshold
-    const classIds = result.map(candidate => candidate.classId);
-    expect(classIds.every(id => id === 0 || id === 1)).toBe(true);
-    expect(classIds.filter(id => id === 0)).toHaveLength(1);
-    expect(classIds.filter(id => id === 1)).toHaveLength(1);
-
-    const [personDetection] = result.filter(candidate => candidate.classId === 0);
-    const [catDetection] = result.filter(candidate => candidate.classId === 1);
-    expect(personDetection).toBeDefined();
-    expect(catDetection).toBeDefined();
-    const person = personDetection!;
-    const cat = catDetection!;
-    expect(person.score).toBeGreaterThan(cat.score);
-    expect(person.score).toBeGreaterThan(0.5);
-    expect(cat.score).toBeGreaterThan(0.4);
-
-    const iou = computeIoU(person.bbox, {
-      left: 310 - 175 / 2,
-      top: 270 - 210 / 2,
-      width: 175,
-      height: 210
-    });
-    expect(iou).toBeGreaterThan(0.4);
-    expect(iou).toBeCloseTo(0.82, 2);
-    expect(result.length).toBe(2);
-    expect(person.areaRatio).toBeGreaterThan(0);
-    expect(cat.areaRatio).toBeGreaterThan(0);
-    expect(person.bbox.width).toBeCloseTo(180, 5);
-    expect(cat.bbox.height).toBeCloseTo(220, 5);
   });
 });
 

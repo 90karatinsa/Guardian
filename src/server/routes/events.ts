@@ -3,7 +3,13 @@ import fs from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { URL } from 'node:url';
-import { EventRecordWithId, getEventById, listEvents, ListEventsOptions } from '../../db.js';
+import {
+  EventRecordWithId,
+  FaceRecord,
+  getEventById,
+  listEvents,
+  ListEventsOptions
+} from '../../db.js';
 import FaceRegistry, { IdentifyResult } from '../../video/faceRegistry.js';
 import logger from '../../logger.js';
 import { EventRecord } from '../../types.js';
@@ -22,6 +28,8 @@ type ClientState = {
   heartbeat: NodeJS.Timeout;
   filters: StreamFilters;
   retryMs: number;
+  includeFaces: boolean;
+  facesQuery: string | null;
 };
 
 export class EventsRouter {
@@ -120,6 +128,7 @@ export class EventsRouter {
 
     const filters = extractStreamFilters(url);
     const retryMs = resolveRetryInterval(url.searchParams);
+    const facesRequest = resolveFacesRequest(url.searchParams);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -147,7 +156,17 @@ export class EventsRouter {
       }
     }, this.heartbeatMs);
 
-    this.clients.set(res, { heartbeat, filters, retryMs });
+    this.clients.set(res, {
+      heartbeat,
+      filters,
+      retryMs,
+      includeFaces: facesRequest.includeFaces,
+      facesQuery: facesRequest.query
+    });
+
+    if (facesRequest.includeFaces) {
+      void this.pushFacesSnapshot(res, facesRequest.query);
+    }
 
     const cleanup = () => {
       const client = this.clients.get(res);
@@ -167,13 +186,13 @@ export class EventsRouter {
       return false;
     }
 
-    const snapshotMatch = url.pathname.match(/^\/api\/events\/(\d+)\/snapshot$/);
+    const snapshotMatch = url.pathname.match(/^\/api\/events\/([^/]+)\/snapshot$/);
     if (!snapshotMatch) {
       return false;
     }
 
     const eventId = Number(snapshotMatch[1]);
-    if (!Number.isFinite(eventId)) {
+    if (!Number.isFinite(eventId) || !Number.isInteger(eventId) || eventId < 0) {
       sendJson(res, 400, { error: 'Invalid event id' });
       return true;
     }
@@ -226,7 +245,8 @@ export class EventsRouter {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/faces') {
-      void this.handleFaceList(res);
+      const search = (url.searchParams.get('search') ?? url.searchParams.get('q')) || null;
+      void this.handleFaceList(res, search);
       return true;
     }
 
@@ -256,14 +276,14 @@ export class EventsRouter {
     return false;
   }
 
-  private async handleFaceList(res: ServerResponse) {
+  private async handleFaceList(res: ServerResponse, search: string | null) {
     const registry = await this.ensureFaceRegistry();
     if (!registry) {
       this.respondFaceUnavailable(res);
       return;
     }
 
-    const faces = registry.list();
+    const faces = filterFaces(registry.list(), search);
     sendJson(res, 200, { faces });
   }
 
@@ -314,6 +334,7 @@ export class EventsRouter {
     try {
       const face = await registry.enroll(buffer, label, metadata);
       sendJson(res, 201, { face });
+      void this.broadcastFacesSnapshot();
     } catch (error) {
       logger.error({ err: error }, 'Failed to enroll face');
       sendJson(res, 500, { error: 'Failed to enroll face' });
@@ -390,6 +411,7 @@ export class EventsRouter {
     }
 
     sendJson(res, 200, { deleted: true });
+    void this.broadcastFacesSnapshot();
   }
 
   private async ensureFaceRegistry(): Promise<FaceRegistry | null> {
@@ -425,6 +447,59 @@ export class EventsRouter {
 
   private respondFaceUnavailable(res: ServerResponse) {
     sendJson(res, 503, { error: 'Face registry unavailable' });
+  }
+
+  private async pushFacesSnapshot(target: ServerResponse, query: string | null) {
+    const registry = await this.ensureFaceRegistry();
+    if (!registry) {
+      try {
+        target.write(`event: faces\n`);
+        target.write(`data: ${JSON.stringify({ status: 'unavailable', query })}\n\n`);
+      } catch (error) {
+        logger.debug({ err: error }, 'Failed to write faces snapshot');
+      }
+      return;
+    }
+
+    const faces = filterFaces(registry.list(), query);
+    const payload = faces.map(face => ({
+      id: face.id,
+      label: face.label,
+      metadata: face.metadata ?? null,
+      createdAt: face.createdAt
+    }));
+
+    try {
+      target.write(`event: faces\n`);
+      target.write(
+        `data: ${JSON.stringify({
+          status: 'ok',
+          query,
+          count: payload.length,
+          faces: payload
+        })}\n\n`
+      );
+    } catch (error) {
+      logger.debug({ err: error }, 'Failed to dispatch faces snapshot');
+    }
+  }
+
+  private async broadcastFacesSnapshot() {
+    if (this.clients.size === 0) {
+      return;
+    }
+
+    const tasks: Array<Promise<void>> = [];
+    for (const [client, state] of this.clients) {
+      if (!state.includeFaces) {
+        continue;
+      }
+      tasks.push(this.pushFacesSnapshot(client, state.facesQuery));
+    }
+
+    if (tasks.length > 0) {
+      await Promise.allSettled(tasks);
+    }
   }
 }
 
@@ -664,4 +739,44 @@ function guessMimeType(filePath: string) {
     default:
       return 'image/png';
   }
+}
+
+function resolveFacesRequest(params: URLSearchParams): { includeFaces: boolean; query: string | null } {
+  const raw = params.get('faces');
+  if (!raw) {
+    return { includeFaces: false, query: null };
+  }
+
+  const normalized = raw.trim();
+  if (!normalized) {
+    return { includeFaces: false, query: null };
+  }
+
+  if (normalized === '1' || normalized.toLowerCase() === 'true') {
+    return { includeFaces: true, query: null };
+  }
+
+  return { includeFaces: true, query: normalized };
+}
+
+function filterFaces(faces: FaceRecord[], search: string | null): FaceRecord[] {
+  if (!search) {
+    return faces;
+  }
+
+  const query = search.trim().toLowerCase();
+  if (!query) {
+    return faces;
+  }
+
+  return faces.filter(face => {
+    if (face.label.toLowerCase().includes(query)) {
+      return true;
+    }
+    if (face.metadata) {
+      const metadataString = JSON.stringify(face.metadata).toLowerCase();
+      return metadataString.includes(query);
+    }
+    return false;
+  });
 }

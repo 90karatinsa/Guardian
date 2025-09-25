@@ -1,10 +1,52 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 import { EventEmitter } from 'node:events';
-import { JSDOM } from 'jsdom';
 import { clearEvents, listEvents, storeEvent } from '../src/db.js';
-import { startHttpServer, HttpServerRuntime } from '../src/server/http.js';
+import { startHttpServer, type HttpServerRuntime, type HttpServerOptions } from '../src/server/http.js';
+
+type StubFace = {
+  id: number;
+  label: string;
+  createdAt: number;
+  metadata?: Record<string, unknown> | null;
+  embedding: number[];
+};
+
+class StubFaceRegistry {
+  constructor(private readonly faces: StubFace[]) {}
+
+  list() {
+    return this.faces.map(face => ({ ...face }));
+  }
+
+  async enroll(_buffer: Buffer, label: string, metadata?: Record<string, unknown>) {
+    const nextId = this.faces.length > 0 ? Math.max(...this.faces.map(face => face.id)) + 1 : 1;
+    const record: StubFace = {
+      id: nextId,
+      label,
+      createdAt: Date.now(),
+      metadata: metadata ?? null,
+      embedding: []
+    };
+    this.faces.push(record);
+    return { ...record };
+  }
+
+  async identify() {
+    return { embedding: [], match: null };
+  }
+
+  remove(id: number) {
+    const index = this.faces.findIndex(face => face.id === id);
+    if (index >= 0) {
+      this.faces.splice(index, 1);
+      return true;
+    }
+    return false;
+  }
+}
 
 describe('RestApiEvents', () => {
   let runtime: HttpServerRuntime | null = null;
@@ -27,9 +69,9 @@ describe('RestApiEvents', () => {
     fs.rmSync(snapshotDir, { recursive: true, force: true });
   });
 
-  async function ensureServer() {
+  async function ensureServer(overrides: Partial<HttpServerOptions> = {}) {
     if (!runtime) {
-      runtime = await startHttpServer({ port: 0, bus });
+      runtime = await startHttpServer({ port: 0, bus, ...overrides });
     }
     return runtime;
   }
@@ -120,7 +162,7 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
   });
 
-  it('serves snapshot files for events', async () => {
+  it('HttpApiSnapshotDelivery handles snapshot errors and streams face registry results', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'snapshot.png');
     fs.writeFileSync(snapshotPath, Buffer.from([0, 1, 2, 3]));
@@ -134,7 +176,19 @@ describe('RestApiEvents', () => {
       meta: { snapshot: snapshotPath }
     });
 
-    const { port } = await ensureServer();
+    const faces = [
+      {
+        id: 7,
+        label: 'Lobby Guard',
+        createdAt: Date.now() - 1_000,
+        metadata: { camera: 'video:lobby' },
+        embedding: []
+      }
+    ];
+
+    const stubRegistry = new StubFaceRegistry(faces);
+
+    const { port } = await ensureServer({ faceRegistry: stubRegistry as any });
 
     const events = listEvents({ limit: 1 });
     const event = events.items[0];
@@ -144,9 +198,73 @@ describe('RestApiEvents', () => {
     expect(response.headers.get('content-type')).toMatch(/image/);
     const buffer = Buffer.from(await response.arrayBuffer());
     expect(buffer.length).toBeGreaterThan(0);
+
+    const invalidId = await fetch(`http://localhost:${port}/api/events/not-a-number/snapshot`);
+    expect(invalidId.status).toBe(400);
+
+    const missingEvent = await fetch(`http://localhost:${port}/api/events/${event.id + 999}/snapshot`);
+    expect(missingEvent.status).toBe(404);
+
+    fs.rmSync(snapshotPath);
+    const missingFile = await fetch(`http://localhost:${port}/api/events/${event.id}/snapshot`);
+    expect(missingFile.status).toBe(404);
+
+    const controller = new AbortController();
+    const facesResponse = await fetch(
+      `http://localhost:${port}/api/events/stream?faces=${encodeURIComponent('Lobby')}`,
+      {
+        signal: controller.signal
+      }
+    );
+
+    expect(facesResponse.status).toBe(200);
+    const reader = facesResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    let payload: unknown = null;
+    let bufferText = '';
+
+    await new Promise<void>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              resolve();
+              return;
+            }
+
+            bufferText += decoder.decode(value, { stream: true });
+            const match = bufferText.match(/event: faces\ndata: ([^\n]+)\n\n/);
+            if (match) {
+              payload = JSON.parse(match[1]);
+              resolve();
+              return;
+            }
+
+            readNext();
+          })
+          .catch(reject);
+      };
+
+      readNext();
+    });
+
+    controller.abort();
+    expect(payload && typeof payload === 'object').toBe(true);
+    const facesPayload = payload as { faces: Array<{ label: string }>; count: number; query: string };
+    expect(facesPayload.count).toBe(1);
+    expect(facesPayload.query).toBe('Lobby');
+    expect(facesPayload.faces[0]?.label).toBe('Lobby Guard');
   });
 
-  it('HttpDashboardStream updates widget counts on SSE events', async () => {
+  it('DashboardChannelFilter updates widget counts on SSE events', async () => {
     const originalWindow = globalThis.window;
     const originalDocument = globalThis.document;
     const originalEventSource = globalThis.EventSource;
@@ -155,6 +273,7 @@ describe('RestApiEvents', () => {
     const originalMessageEvent = globalThis.MessageEvent;
     const originalNavigator = globalThis.navigator;
 
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
     const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
     const dom = new JSDOM(html, { url: 'http://localhost/' });
     const { window } = dom;
@@ -171,7 +290,31 @@ describe('RestApiEvents', () => {
     globalThis.HTMLElement = window.HTMLElement;
     globalThis.MessageEvent = window.MessageEvent;
 
-    const fetchMock = vi.fn(async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events')) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 1,
+                ts: 1700000000100,
+                source: 'video:lobby',
+                detector: 'motion',
+                severity: 'warning',
+                message: 'initial event',
+                meta: { channel: 'video:lobby', camera: 'video:lobby', snapshot: '/snapshots/1.jpg' }
+              }
+            ],
+            total: 1
+          }),
+          {
+            headers: { 'Content-Type': 'application/json' },
+            status: 200
+          }
+        );
+      }
+
       return new Response(JSON.stringify({ items: [], total: 0 }), {
         headers: { 'Content-Type': 'application/json' },
         status: 200
@@ -226,6 +369,11 @@ describe('RestApiEvents', () => {
 
     await import('../public/dashboard.js');
     await Promise.resolve();
+    await vi.waitFor(() => {
+      const state = (window as any).__guardianDashboardState;
+      if (!state) throw new Error('dashboard state unavailable');
+      expect(Array.isArray(state.events) && state.events.length > 0).toBe(true);
+    });
 
     const instance = MockEventSource.instances[0];
     expect(instance).toBeDefined();
@@ -233,6 +381,14 @@ describe('RestApiEvents', () => {
 
     instance!.dispatch('stream-status', JSON.stringify({ status: 'connected', retryMs: 1500 }));
     instance!.dispatch('heartbeat', JSON.stringify({ ts: 1700000000000 }));
+    instance!.dispatch('faces', JSON.stringify({
+      status: 'ok',
+      query: null,
+      faces: [
+        { id: 1, label: 'Lobby Guard', metadata: { camera: 'video:lobby' } },
+        { id: 2, label: 'Backdoor', metadata: { camera: 'video:backdoor' } }
+      ]
+    }));
     const eventPayload = {
       id: 42,
       ts: 1700000000500,
@@ -240,20 +396,50 @@ describe('RestApiEvents', () => {
       detector: 'motion',
       severity: 'warning',
       message: 'stream event',
-      meta: { channel: 'video:stream', camera: 'cam-stream' }
+      meta: { channel: 'video:stream', camera: 'cam-stream', snapshot: '/snapshots/42.jpg' }
     };
     instance!.emitMessage(JSON.stringify(eventPayload));
+
+    const channelChips = window.document.querySelectorAll('#channel-filter input[type="checkbox"]');
+    expect(channelChips.length).toBeGreaterThan(0);
+    const streamChannelInput = window.document.querySelector(
+      '#channel-filter input[value="video:stream"]'
+    ) as HTMLInputElement | null;
+    expect(streamChannelInput).not.toBeNull();
+    streamChannelInput!.checked = true;
+    streamChannelInput!.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    instance!.emitMessage(
+      JSON.stringify({
+        id: 43,
+        ts: 1700000000600,
+        source: 'video:other',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'other channel',
+        meta: { channel: 'video:lobby', camera: 'video:lobby', snapshot: '/snapshots/43.jpg' }
+      })
+    );
 
     const stateText = window.document.getElementById('stream-state')?.textContent;
     expect(stateText).toBe('Connected');
     expect(window.document.getElementById('stream-heartbeats')?.textContent).toBe('1');
-    expect(window.document.getElementById('stream-events')?.textContent).toBe('1');
+    expect(window.document.getElementById('stream-events')?.textContent).toBe('2');
     const updatedText = window.document.getElementById('stream-updated')?.textContent ?? '';
     expect(updatedText).not.toBe('—');
+
+    const dashboardState = (window as any).__guardianDashboardState;
+    expect(dashboardState).toBeTruthy();
+    expect(Array.from(dashboardState.filters.channels)).toContain('video:stream');
 
     const eventCards = window.document.querySelectorAll('#events .event');
     expect(eventCards.length).toBe(1);
     expect(eventCards[0].textContent).toContain('stream event');
+
+    const previewImg = window.document.getElementById('preview-image') as HTMLImageElement;
+    expect(previewImg.src).toContain('/api/events/42/snapshot');
+    expect(previewImg.dataset.channel).toBe('video:stream');
 
     await new Promise(resolve => setTimeout(resolve, 0));
 

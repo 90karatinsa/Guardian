@@ -2,6 +2,7 @@ import config from 'config';
 import { fileURLToPath } from 'node:url';
 import eventBus from './eventBus.js';
 import logger from './logger.js';
+import metrics, { type MetricsSnapshot } from './metrics/index.js';
 
 type HealthStatus = 'ok' | 'starting' | 'stopping' | 'degraded';
 
@@ -10,6 +11,7 @@ export type HealthIndicatorContext = {
     status: string;
     startedAt: number | null;
   };
+  metrics?: MetricsSnapshot;
 };
 
 export type HealthIndicatorResult = {
@@ -60,9 +62,14 @@ export function registerHealthIndicator(name: string, indicator: HealthIndicator
 
 export async function collectHealthChecks(context: HealthIndicatorContext) {
   const results: Array<{ name: string; status: HealthStatus; details?: Record<string, unknown> }> = [];
+  const metricsSnapshot = context.metrics ?? metrics.snapshot();
+  const enrichedContext: HealthIndicatorContext = {
+    ...context,
+    metrics: metricsSnapshot
+  };
   for (const entry of healthIndicators) {
     try {
-      const result = await entry.indicator(context);
+      const result = await entry.indicator(enrichedContext);
       results.push({ name: entry.name, status: result.status, details: result.details });
     } catch (error) {
       const err = error as Error;

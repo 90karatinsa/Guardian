@@ -285,6 +285,7 @@ export type SnapshotRotationMode = 'archive' | 'delete' | 'ignore';
 export interface SnapshotRotationOptions {
   mode?: SnapshotRotationMode;
   retentionDays?: number;
+  perCameraMax?: Record<string, number>;
 }
 
 export interface VacuumOptions {
@@ -294,6 +295,7 @@ export interface VacuumOptions {
   reindex?: boolean;
   optimize?: boolean;
   pragmas?: string[];
+  run?: 'always' | 'on-change';
 }
 
 export interface RetentionPolicyOptions {
@@ -310,7 +312,7 @@ export interface RetentionOutcome {
   removedEvents: number;
   archivedSnapshots: number;
   prunedArchives: number;
-  warnings: Array<{ path: string; error: Error }>;
+  warnings: Array<{ path: string; error: Error; camera: string }>;
 }
 
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
@@ -324,15 +326,22 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   const directories = snapshotOptions.mode === 'ignore' ? [] : collectSnapshotDirectories(options);
   let archivedSnapshots = 0;
   let prunedArchives = 0;
-  const warnings: Array<{ path: string; error: Error }> = [];
+  const warnings: Array<{ path: string; error: Error; camera: string }> = [];
 
   for (const { sourceDir, archiveBase } of directories) {
+    const cameraId = path.basename(sourceDir);
+    const perCameraLimit = snapshotOptions.perCameraMax?.[cameraId];
+    const resolvedLimit =
+      typeof perCameraLimit === 'number' && Number.isFinite(perCameraLimit)
+        ? Math.max(0, Math.floor(perCameraLimit))
+        : options.maxArchivesPerCamera;
     const rotation = rotateSnapshots(
       sourceDir,
       archiveBase,
       snapshotOptions.cutoffTs,
       snapshotOptions.mode,
-      options.maxArchivesPerCamera
+      resolvedLimit,
+      cameraId
     );
     archivedSnapshots += rotation.moved;
     prunedArchives += rotation.pruned;
@@ -344,27 +353,28 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
 
 export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto') {
   const normalized = normalizeVacuumOptions(options);
+  const { run: _run, ...vacuum } = normalized;
 
-  if (normalized.mode === 'full') {
+  if (vacuum.mode === 'full') {
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
 
-  if (normalized.reindex) {
+  if (vacuum.reindex) {
     db.exec('REINDEX');
   }
 
-  if (normalized.analyze) {
+  if (vacuum.analyze) {
     db.exec('ANALYZE');
   }
 
-  const target = normalized.target ? ` ${normalized.target}` : '';
+  const target = vacuum.target ? ` ${vacuum.target}` : '';
   db.exec(`VACUUM${target}`.trim());
 
-  if (normalized.optimize) {
+  if (vacuum.optimize) {
     db.exec('PRAGMA optimize');
   }
 
-  for (const pragma of normalized.pragmas ?? []) {
+  for (const pragma of vacuum.pragmas ?? []) {
     const trimmed = typeof pragma === 'string' ? pragma.trim() : '';
     if (trimmed) {
       db.exec(trimmed);
@@ -405,7 +415,7 @@ function collectSnapshotDirectories(options: RetentionPolicyOptions): SnapshotDi
 type RotationOutcome = {
   moved: number;
   pruned: number;
-  warnings: Array<{ path: string; error: Error }>;
+  warnings: Array<{ path: string; error: Error; camera: string }>;
 };
 
 function rotateSnapshots(
@@ -413,7 +423,8 @@ function rotateSnapshots(
   archiveDir: string,
   cutoffTs: number,
   mode: SnapshotRotationMode,
-  maxArchivesPerCamera?: number
+  maxArchivesPerCamera: number | undefined,
+  cameraId: string
 ): RotationOutcome {
   if (mode === 'ignore' || !fs.existsSync(snapshotDir)) {
     return { moved: 0, pruned: 0, warnings: [] };
@@ -425,7 +436,7 @@ function rotateSnapshots(
 
   const entries = fs.readdirSync(snapshotDir);
   let moved = 0;
-  const warnings: Array<{ path: string; error: Error }> = [];
+  const warnings: Array<{ path: string; error: Error; camera: string }> = [];
 
   for (const entry of entries) {
     const sourcePath = path.join(snapshotDir, entry);
@@ -437,7 +448,7 @@ function rotateSnapshots(
     try {
       stats = fs.statSync(sourcePath);
     } catch (error) {
-      warnings.push({ path: sourcePath, error: toError(error) });
+      warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
       continue;
     }
 
@@ -460,16 +471,20 @@ function rotateSnapshots(
         moved += 1;
       }
     } catch (error) {
-      warnings.push({ path: sourcePath, error: toError(error) });
+      warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
     }
   }
 
   let pruned = 0;
-  if (mode === 'archive' && typeof maxArchivesPerCamera === 'number' && maxArchivesPerCamera >= 0) {
+  if (mode === 'archive') {
     try {
       pruned = pruneArchiveLimit(archiveDir, snapshotDir, maxArchivesPerCamera);
     } catch (error) {
-      warnings.push({ path: path.join(archiveDir, path.basename(snapshotDir)), error: toError(error) });
+      warnings.push({
+        path: path.join(archiveDir, path.basename(snapshotDir)),
+        error: toError(error),
+        camera: cameraId
+      });
     }
   }
 
@@ -484,9 +499,17 @@ function buildArchivePath(archiveDir: string, snapshotDir: string, mtimeMs: numb
   return targetDir;
 }
 
-function pruneArchiveLimit(archiveDir: string, snapshotDir: string, limit: number): number {
+function pruneArchiveLimit(
+  archiveDir: string,
+  snapshotDir: string,
+  limit: number | undefined
+): number {
   const cameraRoot = path.join(archiveDir, path.basename(snapshotDir));
   if (!fs.existsSync(cameraRoot)) {
+    return 0;
+  }
+
+  if (typeof limit !== 'number' || limit < 0) {
     return 0;
   }
 
@@ -496,7 +519,7 @@ function pruneArchiveLimit(archiveDir: string, snapshotDir: string, limit: numbe
   }
 
   const sorted = files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  const excess = sorted.slice(Math.max(limit, 0));
+  const excess = sorted.slice(limit);
   let removed = 0;
 
   for (const file of excess) {
@@ -696,22 +719,43 @@ function normalizeSnapshotOptions(options: RetentionPolicyOptions, now: number) 
   const days = typeof snapshot.retentionDays === 'number' ? snapshot.retentionDays : options.retentionDays;
   const retentionMs = Math.max(days, 0) * 24 * 60 * 60 * 1000;
   const cutoffTs = now - retentionMs;
-  return { mode, cutoffTs } as const;
+  const perCameraMax = snapshot.perCameraMax
+    ? Object.fromEntries(
+        Object.entries(snapshot.perCameraMax)
+          .filter(([camera, value]) => typeof camera === 'string' && camera.trim() && typeof value === 'number' && Number.isFinite(value) && value >= 0)
+          .map(([camera, value]) => [camera, Math.floor(value)])
+      )
+    : undefined;
+  return { mode, cutoffTs, perCameraMax } as const;
 }
 
 function normalizeVacuumOptions(options: VacuumOptions | VacuumMode): Required<VacuumOptions> {
   if (typeof options === 'string') {
-    return { mode: options, target: undefined, analyze: false, reindex: false, optimize: false, pragmas: undefined };
+    return {
+      mode: options,
+      target: undefined,
+      analyze: false,
+      reindex: false,
+      optimize: false,
+      pragmas: undefined,
+      run: 'on-change'
+    };
   }
 
   const mode = options.mode ?? 'auto';
+  const pragmas = Array.isArray(options.pragmas)
+    ? options.pragmas
+        .map(entry => (typeof entry === 'string' ? entry.trim() : ''))
+        .filter(entry => entry.length > 0)
+    : undefined;
   return {
     mode,
     target: options.target?.trim() || undefined,
     analyze: options.analyze === true,
     reindex: options.reindex === true,
     optimize: options.optimize === true,
-    pragmas: options.pragmas?.slice()
+    pragmas,
+    run: options.run === 'always' ? 'always' : 'on-change'
   };
 }
 

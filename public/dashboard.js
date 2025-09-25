@@ -9,12 +9,33 @@ const streamState = document.getElementById('stream-state');
 const streamHeartbeats = document.getElementById('stream-heartbeats');
 const streamEvents = document.getElementById('stream-events');
 const streamUpdated = document.getElementById('stream-updated');
+const channelFilter = document.getElementById('channel-filter');
+const channelFilterOptions = document.getElementById('channel-filter-options');
+const channelFilterEmpty = document.getElementById('channel-filter-empty');
+
+if (previewImage) {
+  previewImage.addEventListener('load', () => {
+    previewImage.dataset.state = 'loaded';
+  });
+  previewImage.addEventListener('error', () => {
+    previewImage.dataset.state = 'error';
+  });
+}
 
 const MAX_EVENTS = 50;
 
 const state = {
   events: [],
-  filters: { source: '', camera: '', channel: '', severity: '', from: '', to: '', search: '', snapshot: '' },
+  filters: {
+    source: '',
+    camera: '',
+    severity: '',
+    from: '',
+    to: '',
+    search: '',
+    snapshot: '',
+    channels: new Set()
+  },
   activeId: null,
   eventSource: null,
   reconnectDelayMs: 5000,
@@ -23,8 +44,16 @@ const state = {
     events: 0,
     lastUpdate: null,
     status: 'connecting'
-  }
+  },
+  channelStats: new Map()
 };
+
+function getSelectedChannels() {
+  if (!(state.filters.channels instanceof Set)) {
+    state.filters.channels = new Set();
+  }
+  return state.filters.channels;
+}
 
 function getEventKey(event) {
   if (typeof event.id === 'number') {
@@ -42,12 +71,28 @@ function withKey(event) {
   return { ...event, __key: key };
 }
 
+function getEventChannel(event) {
+  const meta = event.meta ?? {};
+  if (typeof meta.channel === 'string' && meta.channel) {
+    return meta.channel;
+  }
+  if (typeof meta.camera === 'string' && meta.camera) {
+    return meta.camera;
+  }
+  if (typeof event.source === 'string' && event.source) {
+    return event.source;
+  }
+  return '';
+}
+
 function matchesFilters(event) {
   const meta = event.meta ?? {};
-  const channel = typeof meta.channel === 'string' ? meta.channel : '';
+  const resolvedChannel = getEventChannel(event);
+  const metaChannel = typeof meta.channel === 'string' ? meta.channel : '';
   const cameraMeta = typeof meta.camera === 'string' ? meta.camera : '';
   const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : '';
   const ts = typeof event.ts === 'number' ? event.ts : Date.now();
+  const selectedChannels = getSelectedChannels();
 
   if (state.filters.source && event.source !== state.filters.source) {
     return false;
@@ -56,13 +101,15 @@ function matchesFilters(event) {
     const cameraMatches =
       event.source === state.filters.camera ||
       cameraMeta === state.filters.camera ||
-      channel === state.filters.camera;
+      resolvedChannel === state.filters.camera;
     if (!cameraMatches) {
       return false;
     }
   }
-  if (state.filters.channel && channel !== state.filters.channel) {
-    return false;
+  if (selectedChannels instanceof Set && selectedChannels.size > 0) {
+    if (!resolvedChannel || !selectedChannels.has(resolvedChannel)) {
+      return false;
+    }
   }
   if (state.filters.severity && event.severity !== state.filters.severity) {
     return false;
@@ -80,7 +127,8 @@ function matchesFilters(event) {
       event.message,
       event.detector,
       event.source,
-      channel,
+      metaChannel,
+      resolvedChannel,
       cameraMeta,
       snapshotPath
     ]
@@ -207,6 +255,8 @@ function showPreview(event) {
       const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
       previewImage.src = `${event.meta.snapshot}?cacheBust=${cacheKey}`;
     }
+    previewImage.dataset.channel = getEventChannel(event) || '';
+    previewImage.dataset.state = 'loading';
     previewImage.alt = `Snapshot for ${description}`;
     previewFigure.hidden = false;
     previewEmpty.hidden = true;
@@ -222,6 +272,11 @@ function clearPreview() {
   previewFigure.hidden = true;
   previewEmpty.hidden = false;
   previewEmpty.textContent = 'Select an event to view the latest snapshot.';
+  if (previewImage) {
+    previewImage.dataset.channel = '';
+    previewImage.dataset.state = 'idle';
+    previewImage.removeAttribute('src');
+  }
 }
 
 function updateStreamWidget() {
@@ -279,6 +334,7 @@ async function loadInitial() {
     const payload = await response.json();
     if (Array.isArray(payload.items)) {
       state.events = sortEvents(payload.items.map(withKey));
+      rebuildChannelsFromEvents();
       renderEvents();
     }
   } catch (error) {
@@ -298,8 +354,123 @@ function insertEvent(event) {
   if (state.events.length > MAX_EVENTS) {
     state.events.length = MAX_EVENTS;
   }
+  const ts = typeof keyed.ts === 'number' ? keyed.ts : Date.now();
+  registerChannel(getEventChannel(keyed), ts);
   renderEvents();
   return keyed;
+}
+
+function registerChannel(channel, timestamp = Date.now()) {
+  if (!channel) {
+    return;
+  }
+
+  const stats = state.channelStats.get(channel);
+  if (stats) {
+    if (timestamp > stats.lastSeen) {
+      stats.lastSeen = timestamp;
+      updateChannelFilterControls();
+    }
+    return;
+  }
+
+  state.channelStats.set(channel, { firstSeen: timestamp, lastSeen: timestamp });
+  updateChannelFilterControls();
+}
+
+function pruneSelectedChannels() {
+  const selected = getSelectedChannels();
+  let changed = false;
+  for (const channel of Array.from(selected)) {
+    if (!state.channelStats.has(channel)) {
+      selected.delete(channel);
+      changed = true;
+    }
+  }
+  if (changed) {
+    renderEvents();
+  }
+}
+
+function rebuildChannelsFromEvents() {
+  const stats = new Map();
+  state.events.forEach(event => {
+    const channel = getEventChannel(event);
+    if (!channel) {
+      return;
+    }
+    const ts = typeof event.ts === 'number' ? event.ts : Date.now();
+    const existing = stats.get(channel);
+    if (existing) {
+      if (ts < existing.firstSeen) {
+        existing.firstSeen = ts;
+      }
+      if (ts > existing.lastSeen) {
+        existing.lastSeen = ts;
+      }
+    } else {
+      stats.set(channel, { firstSeen: ts, lastSeen: ts });
+    }
+  });
+  state.channelStats = stats;
+  pruneSelectedChannels();
+  updateChannelFilterControls();
+}
+
+function updateChannelFilterControls() {
+  if (!channelFilterOptions || !channelFilterEmpty) {
+    return;
+  }
+
+  const selected = getSelectedChannels();
+  const channels = Array.from(state.channelStats.entries()).sort(
+    (a, b) => b[1].lastSeen - a[1].lastSeen
+  );
+  channelFilterOptions.textContent = '';
+
+  if (channels.length === 0) {
+    channelFilterEmpty.hidden = false;
+    channelFilter?.setAttribute('aria-busy', 'false');
+    return;
+  }
+
+  channelFilterEmpty.hidden = true;
+  channelFilter?.setAttribute('aria-busy', 'false');
+
+  const fragment = document.createDocumentFragment();
+  channels.forEach(([channel]) => {
+    const label = document.createElement('label');
+    label.className = 'channel-chip';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.name = 'channel-filter-item';
+    input.value = channel;
+    input.checked = selected.has(channel);
+    input.setAttribute('aria-label', `Filter events for channel ${channel}`);
+
+    input.addEventListener('change', () => {
+      if (input.checked) {
+        selected.add(channel);
+      } else {
+        selected.delete(channel);
+      }
+      renderEvents();
+      const active = state.events.find(item => item.__key === state.activeId);
+      if (!active || !matchesFilters(active)) {
+        clearPreview();
+      }
+    });
+
+    const text = document.createElement('span');
+    text.textContent = channel;
+
+    label.appendChild(input);
+    label.appendChild(text);
+    fragment.appendChild(label);
+  });
+
+  channelFilterOptions.appendChild(fragment);
 }
 
 function subscribe() {
@@ -309,9 +480,11 @@ function subscribe() {
 
   resetStreamStats();
   setConnectionState('connecting');
+  channelFilter?.setAttribute('aria-busy', 'true');
 
   const params = buildQueryParams();
   params.set('retry', String(state.reconnectDelayMs));
+  params.set('faces', '1');
   const source = new EventSource(`/api/events/stream?${params.toString()}`);
   state.eventSource = source;
 
@@ -343,6 +516,41 @@ function subscribe() {
     }
   });
 
+  source.addEventListener('faces', event => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (!payload || typeof payload !== 'object') {
+        return;
+      }
+      const faces = Array.isArray(payload.faces) ? payload.faces : [];
+      let touched = false;
+      faces.forEach(face => {
+        if (!face || typeof face !== 'object') {
+          return;
+        }
+        const metadata = face.metadata && typeof face.metadata === 'object' ? face.metadata : null;
+        if (!metadata) {
+          return;
+        }
+        const candidate =
+          typeof metadata.channel === 'string'
+            ? metadata.channel
+            : typeof metadata.camera === 'string'
+            ? metadata.camera
+            : '';
+        if (candidate) {
+          touched = true;
+          registerChannel(candidate);
+        }
+      });
+      if (!touched) {
+        updateChannelFilterControls();
+      }
+    } catch (error) {
+      console.debug('Failed to parse faces payload', error);
+    }
+  });
+
   source.onmessage = event => {
     try {
       const payload = JSON.parse(event.data);
@@ -360,6 +568,7 @@ function subscribe() {
     setConnectionState('disconnected');
     source.close();
     state.eventSource = null;
+    channelFilter?.setAttribute('aria-busy', 'false');
     setTimeout(() => {
       setConnectionState('reconnecting');
       subscribe();
@@ -371,7 +580,6 @@ function syncFiltersFromForm() {
   const formData = new FormData(filtersForm);
   state.filters.source = (formData.get('source') ?? '').toString().trim();
   state.filters.camera = (formData.get('camera') ?? '').toString().trim();
-  state.filters.channel = (formData.get('channel') ?? '').toString().trim();
   state.filters.severity = (formData.get('severity') ?? '').toString().trim();
   state.filters.search = (formData.get('search') ?? '').toString().trim();
   const snapshot = (formData.get('snapshot') ?? '').toString().trim();
@@ -381,18 +589,17 @@ function syncFiltersFromForm() {
 }
 
 function resetFilters() {
-  state.filters = {
-    source: '',
-    camera: '',
-    channel: '',
-    severity: '',
-    from: '',
-    to: '',
-    search: '',
-    snapshot: ''
-  };
+  state.filters.source = '';
+  state.filters.camera = '';
+  state.filters.severity = '';
+  state.filters.from = '';
+  state.filters.to = '';
+  state.filters.search = '';
+  state.filters.snapshot = '';
+  getSelectedChannels().clear();
   filtersForm.reset();
   clearPreview();
+  rebuildChannelsFromEvents();
   loadInitial();
 }
 
@@ -416,11 +623,16 @@ loadInitial().then(() => {
 });
 subscribe();
 
+if (typeof window !== 'undefined') {
+  // Expose state for test harness assertions.
+  // @ts-expect-error augment window for dashboard introspection
+  window.__guardianDashboardState = state;
+}
+
 function buildQueryParams() {
   const params = new URLSearchParams();
   if (state.filters.source) params.set('source', state.filters.source);
   if (state.filters.camera) params.set('camera', state.filters.camera);
-  if (state.filters.channel) params.set('channel', state.filters.channel);
   if (state.filters.severity) params.set('severity', state.filters.severity);
   if (state.filters.search) params.set('search', state.filters.search);
   if (state.filters.snapshot) params.set('snapshot', state.filters.snapshot);
@@ -444,7 +656,12 @@ function buildSnapshotCacheKey(event) {
   const meta = event.meta ?? {};
   const hash = typeof meta.snapshotHash === 'string' ? meta.snapshotHash : '';
   const ts = typeof meta.snapshotTs === 'number' ? meta.snapshotTs : event.ts;
-  const channel = typeof meta.channel === 'string' ? meta.channel : state.filters.channel || '';
+  const channel =
+    typeof meta.channel === 'string'
+      ? meta.channel
+      : typeof meta.camera === 'string'
+      ? meta.camera
+      : '';
   const camera =
     typeof meta.camera === 'string'
       ? meta.camera

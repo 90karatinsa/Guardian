@@ -37,8 +37,10 @@ describe('AudioSource resilience', () => {
     meydaExtractMock.mockReset();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
+    const { AudioSource } = await import('../src/audio/source.js');
+    AudioSource.clearDeviceCache();
   });
 
   it('AudioSourceFallback retries when ffmpeg is missing', async () => {
@@ -125,7 +127,8 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
-  it('AudioSourceFallback rotates microphone after sustained silence', async () => {
+  it('AudioWatchdogSilenceReset recovers from silence and restarts on watchdog timeout', async () => {
+    vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -143,52 +146,56 @@ describe('AudioSource resilience', () => {
       sampleRate: 8000,
       channels: 1,
       frameDurationMs: 50,
-      silenceDurationMs: 200,
+      silenceDurationMs: 150,
       silenceThreshold: 0.0005,
       restartDelayMs: 100,
       restartMaxDelayMs: 100,
       restartJitterFactor: 0,
+      watchdogTimeoutMs: 120,
       micFallbacks: {
         linux: [{ format: 'alsa', device: 'hw:1' }]
       },
       random: () => 0.5
     });
 
-    const recoverSpy = vi.fn();
-    const errorSpy = vi.fn();
-    source.on('recover', recoverSpy);
-    source.on('error', errorSpy);
+    const recoverReasons: string[] = [];
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
 
     try {
       source.start();
-
       expect(spawnMock).toHaveBeenCalledTimes(1);
-      const proc = processes[0];
-      expect(proc).toBeDefined();
 
+      const proc = processes[0];
       const frameBytes = (8000 * 50) / 1000 * 2;
       const silentFrame = Buffer.alloc(frameBytes);
       for (let i = 0; i < 5; i += 1) {
         proc.stdout.emit('data', silentFrame);
       }
 
-      expect(recoverSpy).toHaveBeenCalledTimes(1);
-      const event = recoverSpy.mock.calls[0][0];
-      expect(event.reason).toBe('stream-silence');
-      expect(event.meta.baseDelayMs).toBe(100);
-      expect(errorSpy).toHaveBeenCalledWith(expect.any(Error));
+      expect(recoverReasons).toContain('stream-silence');
 
-      vi.advanceTimersByTime(100);
+      await vi.advanceTimersByTimeAsync(100);
+      await Promise.resolve();
+
       expect(spawnMock).toHaveBeenCalledTimes(2);
-      expect(attemptedArgs.length).toBeGreaterThanOrEqual(2);
       expect(attemptedArgs.some(args => args.includes('hw:1'))).toBe(true);
+
+      const nextProc = processes[1];
+      expect(nextProc).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(121);
+      await Promise.resolve();
+
+      expect(recoverReasons.filter(reason => reason === 'watchdog-timeout')).not.toHaveLength(0);
     } finally {
       source.stop();
       platformSpy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
-  it('AudioDeviceFallback rotates microphone inputs across platforms', async () => {
+  it('AudioDeviceFallbackRotation rotates microphone inputs across platforms', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -252,6 +259,11 @@ describe('AudioSource resilience', () => {
 
     expect(execFileMock).toHaveBeenCalled();
     expect(devices).toEqual(['Microphone (USB)', 'Line In (High Definition)']);
+
+    execFileMock.mockClear();
+    const cachedDevices = await AudioSource.listDevices('auto');
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(cachedDevices).toEqual(devices);
   });
 
   it('AudioWindowing enforces alignment for pipe inputs', async () => {

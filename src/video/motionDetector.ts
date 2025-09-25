@@ -42,6 +42,7 @@ export class MotionDetector {
   private lastEventTs = 0;
   private noiseLevel = 0;
   private areaBaseline = 0;
+  private areaTrendMomentum = 0;
   private activationFrames = 0;
   private backoffFrames = 0;
   private suppressedFrames = 0;
@@ -67,6 +68,7 @@ export class MotionDetector {
         this.baselineFrame = smoothed;
         this.areaBaseline = 0;
         this.noiseLevel = 0;
+        this.areaTrendMomentum = 0;
         this.activationFrames = 0;
         this.backoffFrames = 0;
         this.suppressedFrames = 0;
@@ -129,10 +131,20 @@ export class MotionDetector {
       const areaPct = changedPixels / stats.totalPixels;
       const previousBaseline = this.areaBaseline;
       const areaTrend = previousBaseline === 0 ? areaPct : areaPct - previousBaseline;
+      const trendSmoothing = clamp(
+        (this.options.areaSmoothing ?? DEFAULT_AREA_SMOOTHING) * 0.65,
+        0.05,
+        0.35
+      );
+      this.areaTrendMomentum =
+        previousBaseline === 0
+          ? areaTrend
+          : this.areaTrendMomentum * (1 - trendSmoothing) + areaTrend * trendSmoothing;
+      const stabilizedAreaTrend = previousBaseline === 0 ? areaTrend : this.areaTrendMomentum;
       const normalizedAreaTrend = clamp(
         previousBaseline === 0
           ? areaPct / Math.max(areaThreshold, 0.01)
-          : areaTrend / Math.max(areaThreshold, 0.01),
+          : stabilizedAreaTrend / Math.max(areaThreshold, 0.01),
         -2,
         2
       );
@@ -156,7 +168,7 @@ export class MotionDetector {
         (noiseSuppressionFactor > 1.5 ? Math.min(noiseSuppressionFactor, 2.5) : 1);
 
       const hasSignificantArea =
-        areaPct >= adaptiveAreaThreshold || areaTrend >= adjustedAreaDeltaThreshold;
+        areaPct >= adaptiveAreaThreshold || stabilizedAreaTrend >= adjustedAreaDeltaThreshold;
 
       const debounceMultiplier = clamp(
         noiseSuppressionFactor > 1 ? 1 + (noiseSuppressionFactor - 1) * 0.7 : 1,
@@ -190,11 +202,19 @@ export class MotionDetector {
           this.backoffFrames -= 1;
         }
         this.suppressedFrames += 1;
+        metrics.incrementDetectorCounter('motion', 'suppressedFrames', 1);
         return;
       }
 
       const suppressedFramesSnapshot = this.suppressedFrames;
       this.suppressedFrames = 0;
+      if (suppressedFramesSnapshot > 0) {
+        metrics.incrementDetectorCounter(
+          'motion',
+          'suppressedFramesBeforeTrigger',
+          suppressedFramesSnapshot
+        );
+      }
 
       if (this.backoffFrames > 0) {
         this.backoffFrames -= 1;
@@ -234,6 +254,7 @@ export class MotionDetector {
           noiseRatio,
           noiseSuppressionFactor,
           areaTrend,
+          stabilizedAreaTrend,
           areaDeltaThreshold: adjustedAreaDeltaThreshold,
           normalizedAreaTrend,
           effectiveDebounceFrames,

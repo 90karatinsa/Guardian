@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import metrics from '../src/metrics/index.js';
 
 interface CapturedEvent {
   detector: string;
@@ -51,9 +52,10 @@ describe('MotionDetector', () => {
     bus.on('event', payload => {
       events.push({ detector: payload.detector, meta: payload.meta });
     });
+    metrics.reset();
   });
 
-  it('MotionLightNoiseBackoff suppresses noise and emits single event for sustained motion', () => {
+  it('MotionLightAdaptiveBackoff suppresses noise bursts and tracks suppression metrics', () => {
     const detector = new MotionDetector(
       {
         source: 'test-camera',
@@ -108,9 +110,16 @@ describe('MotionDetector', () => {
     expect(meta.noiseSuppressionFactor).toBeGreaterThan(0);
     expect(meta.suppressedFramesBeforeTrigger).toBeGreaterThanOrEqual(0);
     expect(meta.noiseFloor).toBeGreaterThanOrEqual(0);
+    expect(meta.stabilizedAreaTrend).toBeDefined();
 
     detector.handleFrame(motionFrames[2], 200);
     expect(events).toHaveLength(1);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.counters?.suppressedFrames).toBeGreaterThan(0);
+    expect(
+      snapshot.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0
+    ).toBeGreaterThanOrEqual(meta.suppressedFramesBeforeTrigger ?? 0);
   });
 });
 
@@ -124,9 +133,10 @@ describe('LightDetector', () => {
     bus.on('event', payload => {
       events.push({ detector: payload.detector, meta: payload.meta });
     });
+    metrics.reset();
   });
 
-  it('MotionLightNoiseBackoff ignores flicker and reports deliberate change', () => {
+  it('LightFlickerImmunity ignores flicker and records suppression counters', () => {
     const detector = new LightDetector(
       {
         source: 'test-camera',
@@ -182,9 +192,16 @@ describe('LightDetector', () => {
     expect(meta.noiseSuppressionFactor).toBeGreaterThanOrEqual(1);
     expect(meta.previousBaseline).toBeLessThan(meta.baseline);
     expect(meta.baseline).toBeGreaterThan(20);
+    expect(meta.stabilizedDelta).toBeGreaterThan(0);
 
     detector.handleFrame(brightShift[2], ts0 + 20000);
     expect(events).toHaveLength(1);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.counters?.suppressedFrames).toBeGreaterThan(0);
+    expect(
+      snapshot.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0
+    ).toBeGreaterThanOrEqual(meta.suppressedFramesBeforeTrigger ?? 0);
   });
 });
 

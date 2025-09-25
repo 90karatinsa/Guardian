@@ -81,7 +81,7 @@ const setRunMock = (ort as unknown as { __setRunMock: (modelPath: string, run: R
 const Tensor = ort.Tensor as typeof import('onnxruntime-node').Tensor;
 const { PNG } = await import('pngjs');
 
-describe('ObjectClassifierThreatTag', () => {
+describe('ObjectThreatClassification', () => {
   const snapshotsDir = path.resolve('snapshots');
   beforeEach(() => {
     runMocks.clear();
@@ -96,7 +96,7 @@ describe('ObjectClassifierThreatTag', () => {
     }
   });
 
-  it('annotates person events with classified threat metadata', async () => {
+  it('ObjectThreatClassification annotates person events with classified threat metadata', async () => {
     const detectionRun = vi.fn(async () => {
       const classCount = 3;
       const attributes = YOLO_CLASS_START_INDEX + classCount;
@@ -175,7 +175,10 @@ describe('ObjectClassifierThreatTag', () => {
     expect(objects[0].label).toBe('threat');
     expect(objects[0].threat).toBe(true);
     expect(objects[0].threatScore).toBeGreaterThan(0.6);
+    expect(objects[0].confidence).toBeGreaterThan(0);
+    expect(objects[0].confidence).toBeLessThanOrEqual(1);
     expect((meta.threat as Record<string, unknown>).label).toBe('threat');
+    expect((meta.threat as Record<string, unknown>).confidence).toBe(objects[0].confidence);
   });
 });
 

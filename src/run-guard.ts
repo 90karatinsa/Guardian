@@ -23,9 +23,11 @@ import PoseEstimator from './video/poseEstimator.js';
 import ObjectClassifier from './video/objectClassifier.js';
 import { ensureSampleVideo } from './video/sampleVideo.js';
 import { VideoSource } from './video/source.js';
+import type { RecoverEventMeta } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
-import PersonDetector from './video/personDetector.js';
+import PersonDetector, { normalizeClassScoreThresholds } from './video/personDetector.js';
 import { RetentionTask, RetentionTaskOptions, startRetentionTask } from './tasks/retention.js';
+import metrics from './metrics/index.js';
 
 type CameraPipelineState = {
   channel: string;
@@ -37,6 +39,7 @@ type CameraPipelineState = {
     snapshotDir?: string;
     minIntervalMs?: number;
     classIndices?: number[];
+    classScoreThresholds?: Record<number, number>;
   };
   pose?: PoseConfig;
   objects?: ObjectsConfig;
@@ -47,6 +50,7 @@ type CameraRestartEvent = {
   attempt: number;
   delayMs: number;
   at: number;
+  meta: RecoverEventMeta;
 };
 
 type CameraRestartStats = {
@@ -54,6 +58,7 @@ type CameraRestartStats = {
   byReason: Map<string, number>;
   last: CameraRestartEvent | null;
   history: CameraRestartEvent[];
+  watchdogBackoffMs: number;
 };
 
 type CameraRuntime = {
@@ -210,6 +215,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         minIntervalMs:
           context.pipelineState.person.minIntervalMs ?? config.person.minIntervalMs ?? 2000,
         classIndices: context.pipelineState.person.classIndices,
+        classScoreThresholds: context.pipelineState.person.classScoreThresholds,
         objectClassifier: objectClassifier ?? undefined
       },
       bus
@@ -246,7 +252,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         total: 0,
         byReason: new Map(),
         last: null,
-        history: []
+        history: [],
+        watchdogBackoffMs: 0
       },
       cleanup
     };
@@ -367,7 +374,14 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         diffThreshold: activeConfig.motion?.diffThreshold,
         areaThreshold: activeConfig.motion?.areaThreshold,
         minIntervalMs: activeConfig.motion?.minIntervalMs,
-        suppressionRules: activeConfig.events?.suppression?.rules?.length ?? 0
+        suppressionRules: activeConfig.events?.suppression?.rules?.length ?? 0,
+        cameras: Array.isArray(next.video.cameras) ? next.video.cameras.length : 0,
+        channels: next.video.channels ? Object.keys(next.video.channels).length : 0,
+        audioFallbacks: next.audio?.micFallbacks
+          ? Object.values(next.audio.micFallbacks).reduce((total, devices) => {
+              return total + (Array.isArray(devices) ? devices.length : 0);
+            }, 0)
+          : 0
       },
       'configuration reloaded'
     );
@@ -378,7 +392,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     manager.on('reload', handleReload);
     handleConfigError = error => {
       const err = error instanceof Error ? error : new Error(String(error));
-      logger.warn({ err }, 'configuration reload failed');
+      logger.warn(
+        { err, configPath: manager.getPath(), action: 'reload', restored: true },
+        'configuration reload failed'
+      );
     };
     manager.on('error', handleConfigError);
   }
@@ -431,6 +448,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
 function buildCameraList(videoConfig: VideoConfig) {
   if (Array.isArray(videoConfig.cameras) && videoConfig.cameras.length > 0) {
+    for (const camera of videoConfig.cameras) {
+      if (!camera.channel) {
+        throw new Error(`Camera "${camera.id}" is missing a channel`);
+      }
+    }
     return videoConfig.cameras;
   }
 
@@ -505,7 +527,10 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
     throw new Error('Motion configuration is required');
   }
 
-  const channel = camera.channel ?? `video:${camera.id}`;
+  if (!camera.channel) {
+    throw new Error(`Camera "${camera.id}" is missing a channel`);
+  }
+  const channel = camera.channel;
   const channelConfig = resolveVideoChannel(config.video, channel);
   const input = resolveCameraInput(camera, config.video);
   const framesPerSecond =
@@ -517,6 +542,13 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
     channelConfig?.person?.minIntervalMs ??
     config.person.minIntervalMs ??
     2000;
+  const classScoreThresholds = normalizeClassScoreThresholds(
+    mergeClassScoreThresholds(
+      config.person.classScoreThresholds,
+      channelConfig?.person?.classScoreThresholds,
+      camera.person?.classScoreThresholds
+    )
+  );
 
   const pipelineState: CameraPipelineState = {
     channel,
@@ -533,7 +565,8 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
       classIndices:
         camera.person?.classIndices ??
         channelConfig?.person?.classIndices ??
-        config.person.classIndices
+        config.person.classIndices,
+      classScoreThresholds
     },
     pose: config.pose,
     objects: config.objects
@@ -596,6 +629,10 @@ function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelin
     return true;
   }
 
+  if (!classScoreThresholdsEqual(previous.person.classScoreThresholds, next.person.classScoreThresholds)) {
+    return true;
+  }
+
   if (!poseConfigsEqual(previous.pose, next.pose)) {
     return true;
   }
@@ -605,6 +642,63 @@ function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelin
   }
 
   return false;
+}
+
+function mergeClassScoreThresholds(
+  ...maps: Array<Record<number, number> | undefined>
+): Record<number, number> | undefined {
+  let hasValue = false;
+  const result: Record<number, number> = {};
+
+  for (const map of maps) {
+    if (!map) {
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(map)) {
+      const classId = Number(key);
+      const threshold = Number(value);
+      if (!Number.isFinite(classId) || classId < 0 || !Number.isFinite(threshold)) {
+        continue;
+      }
+      result[classId] = threshold;
+      hasValue = true;
+    }
+  }
+
+  return hasValue ? result : undefined;
+}
+
+function classScoreThresholdsEqual(
+  a?: Record<number, number>,
+  b?: Record<number, number>
+): boolean {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+
+  const aEntries = Object.entries(a).sort(([aKey], [bKey]) => Number(aKey) - Number(bKey));
+  const bEntries = Object.entries(b).sort(([aKey], [bKey]) => Number(aKey) - Number(bKey));
+
+  if (aEntries.length !== bEntries.length) {
+    return false;
+  }
+
+  for (let i = 0; i < aEntries.length; i += 1) {
+    const [aKey, aValue] = aEntries[i];
+    const [bKey, bValue] = bEntries[i];
+    if (Number(aKey) !== Number(bKey)) {
+      return false;
+    }
+    if (Math.abs(Number(aValue) - Number(bValue)) > 1e-6) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
@@ -803,11 +897,35 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
     const stats = runtime.restartStats;
     stats.total += 1;
     stats.byReason.set(event.reason, (stats.byReason.get(event.reason) ?? 0) + 1);
-    const record = { reason: event.reason, attempt: event.attempt, delayMs: event.delayMs, at: now };
+    const record = {
+      reason: event.reason,
+      attempt: event.attempt,
+      delayMs: event.delayMs,
+      at: now,
+      meta: event.meta
+    };
     stats.last = record;
     stats.history.push(record);
+    if (event.reason === 'watchdog-timeout' && typeof event.delayMs === 'number') {
+      stats.watchdogBackoffMs += event.delayMs;
+    }
+    metrics.recordPipelineRestart('ffmpeg', event.reason, {
+      attempt: event.attempt,
+      delayMs: event.delayMs,
+      baseDelayMs: event.meta?.baseDelayMs,
+      minDelayMs: event.meta?.minDelayMs,
+      maxDelayMs: event.meta?.maxDelayMs,
+      jitterMs: event.meta?.appliedJitterMs,
+      channel: runtime.channel
+    });
     logger.warn(
-      { camera: runtime.id, attempt: event.attempt, reason: event.reason, delayMs: event.delayMs },
+      {
+        camera: runtime.id,
+        attempt: event.attempt,
+        reason: event.reason,
+        delayMs: event.delayMs,
+        meta: event.meta
+      },
       `Video source reconnecting (reason=${event.reason})`
     );
   });

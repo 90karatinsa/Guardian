@@ -6,6 +6,10 @@ export type PreprocessMeta = {
   padY: number;
   originalWidth: number;
   originalHeight: number;
+  resizedWidth: number;
+  resizedHeight: number;
+  scaleX: number;
+  scaleY: number;
 };
 
 export type BoundingBox = {
@@ -27,7 +31,8 @@ export type YoloDetection = {
 export interface ParseYoloDetectionsOptions {
   classIndex?: number;
   classIndices?: number[];
-  scoreThreshold: number;
+  scoreThreshold?: number;
+  classScoreThresholds?: Record<number, number>;
   nmsThreshold?: number;
   maxDetections?: number;
 }
@@ -54,6 +59,8 @@ export function parseYoloDetections(
   }
 
   const detections: YoloDetection[] = [];
+
+  const resolveThreshold = createThresholdResolver(options);
 
   for (let detectionIndex = 0; detectionIndex < accessor.detections; detectionIndex += 1) {
     const objectnessLogit = accessor.get(detectionIndex, OBJECTNESS_INDEX);
@@ -86,7 +93,8 @@ export function parseYoloDetections(
       const classProbability = sigmoid(classLogit);
       const score = clamp(objectness * classProbability, 0, 1);
 
-      if (score < options.scoreThreshold) {
+      const threshold = resolveThreshold(classId);
+      if (score < threshold) {
         continue;
       }
 
@@ -244,12 +252,13 @@ function projectBoundingBox(
   const right = cx + width / 2;
   const bottom = cy + height / 2;
 
-  const scale = meta.scale || 1;
+  const scaleX = resolveScale(meta.scaleX, meta.scale);
+  const scaleY = resolveScale(meta.scaleY, meta.scale);
 
-  const mappedLeft = (left - meta.padX) / scale;
-  const mappedTop = (top - meta.padY) / scale;
-  const mappedRight = (right - meta.padX) / scale;
-  const mappedBottom = (bottom - meta.padY) / scale;
+  const mappedLeft = (left - meta.padX) / scaleX;
+  const mappedTop = (top - meta.padY) / scaleY;
+  const mappedRight = (right - meta.padX) / scaleX;
+  const mappedBottom = (bottom - meta.padY) / scaleY;
 
   const clampedLeft = clamp(mappedLeft, 0, meta.originalWidth);
   const clampedTop = clamp(mappedTop, 0, meta.originalHeight);
@@ -273,6 +282,34 @@ function computeAreaRatio(bbox: BoundingBox, meta: PreprocessMeta) {
 
   const area = Math.max(0, bbox.width) * Math.max(0, bbox.height);
   return clamp(area / totalArea, 0, 1);
+}
+
+function createThresholdResolver(options: ParseYoloDetectionsOptions) {
+  const defaultThreshold = Math.max(0, Math.min(1, options.scoreThreshold ?? 0));
+  const classThresholds = new Map<number, number>();
+  if (options.classScoreThresholds) {
+    for (const [key, value] of Object.entries(options.classScoreThresholds)) {
+      const classId = Number(key);
+      const threshold = Number(value);
+      if (!Number.isFinite(classId) || classId < 0) {
+        continue;
+      }
+      if (!Number.isFinite(threshold)) {
+        continue;
+      }
+      classThresholds.set(classId, Math.max(0, Math.min(1, threshold)));
+    }
+  }
+
+  return (classId: number) => classThresholds.get(classId) ?? defaultThreshold;
+}
+
+function resolveScale(primary?: number, fallback?: number) {
+  const scale = typeof primary === 'number' && Number.isFinite(primary) ? primary : fallback;
+  if (typeof scale !== 'number' || !Number.isFinite(scale) || scale === 0) {
+    return 1;
+  }
+  return scale;
 }
 
 function nonMaxSuppression(detections: YoloDetection[], threshold: number) {

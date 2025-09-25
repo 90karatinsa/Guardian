@@ -37,6 +37,7 @@ export class LightDetector {
   private pendingFrames = 0;
   private backoffFrames = 0;
   private suppressedFrames = 0;
+  private deltaTrend = 0;
 
   constructor(
     private readonly options: LightDetectorOptions,
@@ -57,6 +58,7 @@ export class LightDetector {
         this.pendingFrames = 0;
         this.backoffFrames = 0;
         this.suppressedFrames = 0;
+        this.deltaTrend = 0;
         return;
       }
 
@@ -70,6 +72,12 @@ export class LightDetector {
       const delta = Math.abs(luminance - this.baseline);
       const noiseFloor = this.noiseLevel === 0 ? delta : this.noiseLevel;
       const noiseRatio = noiseFloor === 0 ? 1 : delta / Math.max(noiseFloor, 1);
+      const deltaTrendSmoothing = clamp(baseNoiseSmoothing * 1.2, 0.05, 0.35);
+      this.deltaTrend =
+        this.deltaTrend === 0
+          ? delta
+          : this.deltaTrend * (1 - deltaTrendSmoothing) + delta * deltaTrendSmoothing;
+      const stabilizedDelta = Math.max(delta, this.deltaTrend);
 
       const effectiveNoiseSmoothing = clamp(
         baseNoiseSmoothing * (noiseRatio > 1 ? 1 + Math.min(noiseRatio - 1, 1) * 0.6 : 0.65),
@@ -89,7 +97,7 @@ export class LightDetector {
         3
       );
       const adaptiveThreshold = baseAdaptiveThreshold * noiseSuppressionFactor;
-      const intensityRatio = adaptiveThreshold === 0 ? 0 : delta / adaptiveThreshold;
+      const intensityRatio = adaptiveThreshold === 0 ? 0 : stabilizedDelta / adaptiveThreshold;
 
       const effectiveSmoothing = clamp(
         delta < adaptiveThreshold
@@ -123,7 +131,7 @@ export class LightDetector {
         return;
       }
 
-      if (delta < adaptiveThreshold) {
+      if (stabilizedDelta < adaptiveThreshold) {
         this.updateBaseline(luminance, effectiveSmoothing);
         if (this.pendingFrames > 0) {
           this.pendingFrames = Math.max(0, this.pendingFrames - 1);
@@ -133,13 +141,24 @@ export class LightDetector {
         }
         this.noiseLevel = updatedNoiseFloor;
         this.suppressedFrames += 1;
+        metrics.incrementDetectorCounter('light', 'suppressedFrames', 1);
         return;
       }
 
       const suppressedFramesSnapshot = this.suppressedFrames;
       this.suppressedFrames = 0;
+      if (suppressedFramesSnapshot > 0) {
+        metrics.incrementDetectorCounter(
+          'light',
+          'suppressedFramesBeforeTrigger',
+          suppressedFramesSnapshot
+        );
+      }
 
-      this.noiseLevel = Math.max(this.noiseLevel * (1 - effectiveNoiseSmoothing), deltaThreshold);
+      this.noiseLevel = Math.max(
+        this.noiseLevel * (1 - effectiveNoiseSmoothing),
+        Math.min(deltaThreshold, stabilizedDelta)
+      );
 
       if (this.backoffFrames > 0) {
         this.backoffFrames -= 1;
@@ -177,6 +196,7 @@ export class LightDetector {
           previousBaseline,
           luminance,
           delta,
+          stabilizedDelta,
           deltaThreshold,
           adaptiveThreshold,
           rawAdaptiveThreshold: baseAdaptiveThreshold,

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigManager, GuardianConfig } from '../src/config/index.js';
+import metrics from '../src/metrics/index.js';
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
@@ -77,7 +78,8 @@ vi.mock('../src/video/source.js', () => ({
 }));
 
 vi.mock('../src/video/personDetector.js', () => ({
-  default: MockPersonDetector
+  default: MockPersonDetector,
+  normalizeClassScoreThresholds: (thresholds?: Record<number, number>) => thresholds
 }));
 
 vi.mock('../src/video/motionDetector.js', () => ({
@@ -105,6 +107,7 @@ describe('run-guard multi camera orchestration', () => {
     MockPersonDetector.instances = [];
     MockPersonDetector.calls = [];
     MockMotionDetector.instances = [];
+    metrics.reset();
   });
 
   afterEach(() => {
@@ -113,7 +116,7 @@ describe('run-guard multi camera orchestration', () => {
     retentionMock.stop.mockReset();
   });
 
-  it('MultiCameraRtspConfig applies camera-specific ffmpeg and motion options', async () => {
+  it('MultiCameraRtspWatchdog applies camera-specific ffmpeg and motion options', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 
     const bus = new EventEmitter();
@@ -198,6 +201,10 @@ describe('run-guard multi camera orchestration', () => {
       }
     });
 
+    await Promise.resolve();
+
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(runtime.pipelines.size).toBe(2);
     expect(MockVideoSource.instances).toHaveLength(2);
     const [rtspSource, httpSource] = MockVideoSource.instances;
     expect(rtspSource.options).toMatchObject({
@@ -223,6 +230,29 @@ describe('run-guard multi camera orchestration', () => {
     });
 
     runtime.stop();
+  });
+
+  it('CameraChannelOverrideValidation rejects cameras without channels', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    await expect(
+      startGuard({
+        config: {
+          video: {
+            framesPerSecond: 5,
+            cameras: [
+              {
+                id: 'cam-missing',
+                input: 'rtsp://camera-missing/stream'
+              }
+            ]
+          },
+          person: { modelPath: 'model.onnx', score: 0.5 },
+          motion: { diffThreshold: 10, areaThreshold: 0.02 },
+          events: { thresholds: { info: 0, warning: 1, critical: 2 } }
+        }
+      })
+    ).rejects.toThrow(/channel/i);
   });
 
   it('CameraFfmpegTimeoutConfig applies restart timing overrides and logs recoveries', async () => {
@@ -253,10 +283,12 @@ describe('run-guard multi camera orchestration', () => {
           cameras: [
             {
               id: 'cam-default',
+              channel: 'video:cam-default',
               input: 'rtsp://camera-default/stream'
             },
             {
               id: 'cam-override',
+              channel: 'video:cam-override',
               input: 'rtsp://camera-override/stream',
               ffmpeg: {
                 watchdogTimeoutMs: 777,
@@ -324,6 +356,11 @@ describe('run-guard multi camera orchestration', () => {
       { camera: 'cam-override', attempt: 1, reason: 'start-timeout', delayMs: 1000 },
       'Video source reconnecting (reason=start-timeout)'
     );
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.restarts).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-default']?.restarts).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-override']?.restarts).toBe(1);
 
     runtime.stop();
   });
@@ -496,8 +533,10 @@ describe('run-guard multi camera orchestration', () => {
       expect(cam1Runtime?.restartStats.total).toBe(1);
       expect(cam1Runtime?.restartStats.byReason.get('watchdog-timeout')).toBe(1);
       expect(cam1Runtime?.restartStats.last?.reason).toBe('watchdog-timeout');
+      expect(cam1Runtime?.restartStats.watchdogBackoffMs).toBe(300);
       expect(cam2Runtime?.restartStats.total).toBe(1);
       expect(cam2Runtime?.restartStats.byReason.get('start-timeout')).toBe(1);
+      expect(cam2Runtime?.restartStats.watchdogBackoffMs).toBe(0);
 
       expect(logger.warn).toHaveBeenCalledWith(
         { camera: 'cam-1', attempt: 1, reason: 'watchdog-timeout', delayMs: 300 },
@@ -551,6 +590,13 @@ describe('run-guard multi camera orchestration', () => {
       expect(reloadedCam1?.restartStats.total).toBe(0);
       expect(runtime.pipelines.get('video:cam-2')).toBe(cam2Runtime);
       expect(cam2Runtime?.restartStats.total).toBe(1);
+
+      const metricsSnapshot = metrics.snapshot();
+      expect(metricsSnapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBe(1);
+      expect(
+        metricsSnapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.byReason['watchdog-timeout']
+      ).toBe(1);
+      expect(metricsSnapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.restarts).toBe(1);
     } finally {
       runtime.stop();
     }

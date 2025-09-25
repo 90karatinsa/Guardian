@@ -112,6 +112,50 @@
         color: #243b53;
       }
 
+      .channel-filter {
+        background: #fff;
+        border-radius: 0.75rem;
+        padding: 1rem 1.25rem;
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        border: 1px solid #d9e2ec;
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .channel-filter h2 {
+        margin: 0;
+        font-size: 1.05rem;
+        color: #243b53;
+      }
+
+      .channel-options {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      .channel-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.35rem 0.6rem;
+        border-radius: 999px;
+        background: #f0f4f8;
+        border: 1px solid #d9e2ec;
+        font-size: 0.85rem;
+        color: #364152;
+      }
+
+      .channel-chip input[type='checkbox'] {
+        accent-color: #127fbf;
+        width: 0.95rem;
+        height: 0.95rem;
+      }
+
+      .channel-chip span {
+        white-space: nowrap;
+      }
+
       .stream-widget dl {
         margin: 0;
         display: grid;
@@ -260,10 +304,6 @@
           Camera
           <input type="text" name="camera" placeholder="video:test-camera" />
         </label>
-        <label>
-          Channel
-          <input type="text" name="channel" placeholder="video:default" />
-        </label>
         <label class="wide">
           Search
           <input type="text" name="search" placeholder="message or detector" />
@@ -311,6 +351,16 @@
             <dt>Last update</dt>
             <dd id="stream-updated">—</dd>
           </dl>
+        </section>
+        <section
+          id="channel-filter"
+          class="channel-filter"
+          aria-label="Channel filters"
+          aria-live="polite"
+        >
+          <h2>Channels</h2>
+          <p id="channel-filter-empty" class="meta">No channels observed yet.</p>
+          <div id="channel-filter-options" class="channel-options" role="group"></div>
         </section>
         <section aria-live="polite" aria-label="Live events" id="events"></section>
       </div>

@@ -71,6 +71,8 @@ export class VideoSource extends EventEmitter {
   private restartTimer: NodeJS.Timeout | null = null;
   private killTimer: NodeJS.Timeout | null = null;
   private commandExitPromise: Promise<void> | null = null;
+  private commandExitResolve: (() => void) | null = null;
+  private terminatingCommand: ffmpeg.FfmpegCommand | null = null;
   private shouldStop = false;
   private recovering = false;
   private restartCount = 0;
@@ -166,8 +168,20 @@ export class VideoSource extends EventEmitter {
     const command = this.createCommand();
     this.command = command;
 
+    this.commandExitPromise = new Promise<void>(resolve => {
+      let resolved = false;
+      this.commandExitResolve = () => {
+        if (resolved) {
+          return;
+        }
+        resolved = true;
+        resolve();
+        this.commandExitPromise = null;
+      };
+    });
+
     const onError = (err: Error) => {
-      this.clearKillTimer();
+      this.finalizeCommandLifecycle();
       if (this.shouldStop || this.recovering) {
         return;
       }
@@ -176,7 +190,7 @@ export class VideoSource extends EventEmitter {
     };
 
     const onEnd = () => {
-      this.clearKillTimer();
+      this.finalizeCommandLifecycle();
       if (this.shouldStop || this.recovering) {
         return;
       }
@@ -184,8 +198,13 @@ export class VideoSource extends EventEmitter {
       this.scheduleRecovery('ffmpeg-ended');
     };
 
+    const onClose = () => {
+      this.finalizeCommandLifecycle();
+    };
+
     command.once('error', onError);
     command.once('end', onEnd);
+    command.once('close', onClose);
     const onStart = () => {
       this.clearStartTimer();
     };
@@ -194,6 +213,7 @@ export class VideoSource extends EventEmitter {
     this.commandCleanup = () => {
       command.off('error', onError);
       command.off('end', onEnd);
+      command.off('close', onClose);
       command.off('start', onStart);
     };
 
@@ -201,6 +221,7 @@ export class VideoSource extends EventEmitter {
       const stream = command.pipe();
       this.consume(stream);
     } catch (error) {
+      this.finalizeCommandLifecycle();
       this.emit('error', error as Error);
       this.scheduleRecovery('start-error');
     }
@@ -322,7 +343,7 @@ export class VideoSource extends EventEmitter {
     this.clearWatchdogTimer();
     this.cleanupStream();
     const termination = this.terminateCommand(true);
-    const waitForTermination = termination ?? this.commandExitPromise ?? Promise.resolve();
+    const waitForTermination = termination ?? Promise.resolve();
 
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
@@ -337,6 +358,25 @@ export class VideoSource extends EventEmitter {
     }, Math.max(0, timing.delayMs));
   }
 
+  private finalizeCommandLifecycle() {
+    this.commandCleanup?.();
+    this.commandCleanup = null;
+    this.clearKillTimer();
+    this.terminatingCommand = null;
+    this.resolveCommandExit();
+  }
+
+  private resolveCommandExit() {
+    if (this.commandExitResolve) {
+      const resolve = this.commandExitResolve;
+      this.commandExitResolve = null;
+      resolve();
+      this.commandExitPromise = null;
+    } else if (this.commandExitPromise) {
+      this.commandExitPromise = null;
+    }
+  }
+
   private clearAllTimers() {
     this.clearRestartTimer();
     this.clearStartTimer();
@@ -348,81 +388,53 @@ export class VideoSource extends EventEmitter {
     force = false,
     options: { skipForceDelay?: boolean } = {}
   ): Promise<void> | null {
-    if (!this.command) {
+    const command = this.command ?? this.terminatingCommand;
+    if (!command) {
       return this.commandExitPromise;
     }
 
-    const command = this.command;
-    this.command = null;
+    const wasActive = command === this.command;
+    if (wasActive) {
+      this.command = null;
+      this.terminatingCommand = command;
+    }
 
-    this.commandCleanup?.();
-    this.commandCleanup = null;
+    const exitPromise = this.commandExitPromise ?? Promise.resolve();
 
     if (!force) {
-      return this.commandExitPromise;
+      return exitPromise;
     }
 
-    const resolveExit = (promise: Promise<void>) =>
-      promise.finally(() => {
-        if (this.commandExitPromise === promise) {
-          this.commandExitPromise = null;
-        }
-      });
+    try {
+      command.kill('SIGTERM');
+    } catch (error) {
+      // Swallow errors from already terminated processes
+    }
 
     const delay = this.options.forceKillTimeoutMs ?? DEFAULT_FORCE_KILL_TIMEOUT_MS;
     if (options.skipForceDelay || delay <= 0) {
-      try {
-        command.kill('SIGTERM');
-      } catch (error) {
-        // Swallow errors from already terminated processes
-      }
+      this.clearKillTimer();
       try {
         command.kill('SIGKILL');
       } catch (error) {
         // Ignore
       }
-      const resolved = Promise.resolve();
-      this.commandExitPromise = resolveExit(resolved);
-      return this.commandExitPromise;
+      this.finalizeCommandLifecycle();
+      return exitPromise;
     }
 
-    const exitPromise = new Promise<void>(resolve => {
-      const finalize = () => {
-        if (this.killTimer) {
-          clearTimeout(this.killTimer);
-          this.killTimer = null;
-        }
-        command.off('end', finalize);
-        command.off('error', finalize);
-        resolve();
-      };
-
-      command.once('end', finalize);
-      command.once('error', finalize);
-
+    this.clearKillTimer();
+    this.killTimer = setTimeout(() => {
+      this.killTimer = null;
       try {
-        command.kill('SIGTERM');
+        command.kill('SIGKILL');
       } catch (error) {
-        // Swallow errors from already terminated processes
+        // Ignore forced kill errors
       }
+      this.finalizeCommandLifecycle();
+    }, delay);
 
-      this.clearKillTimer();
-      this.killTimer = setTimeout(() => {
-        this.killTimer = null;
-        command.off('end', finalize);
-        command.off('error', finalize);
-        try {
-          command.kill('SIGKILL');
-        } catch (error) {
-          // Ignore
-        }
-        resolve();
-      }, delay);
-    });
-
-    const tracked = resolveExit(exitPromise);
-    this.commandExitPromise = tracked;
-    return tracked;
+    return exitPromise;
   }
 
   private clearStartTimer() {
