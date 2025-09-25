@@ -144,20 +144,20 @@ Retention ayarlarını değiştirip dosyayı kaydettiğinizde hot reload mekaniz
 Guardian CLI, servis kontrolü ve sağlık kontrollerini yönetir:
 
 ```bash
-# Guard boru hattını başlatır
+# Guard boru hattını başlatır (arka planda çalışır)
 pnpm start
 
-# Çalışan sürecin sağlık özetini yazdırır
+# Çalışan sürecin sağlık özetini JSON olarak yazdırır
 pnpm exec tsx src/cli.ts --health
 
-# systemd veya Docker konteyneri içinden zarif şekilde durdurur
-pnpm exec tsx src/cli.ts --stop
+# Graceful shutdown tetikler
+pnpm exec tsx src/cli.ts stop
 
 # Servis durumunu exit kodlarıyla raporlar
-pnpm exec tsx src/cli.ts --status
+pnpm exec tsx src/cli.ts status
 ```
 
-`--health` çıktısı `status`, `events.byDetector.motion`, `events.byDetector.person`, `pipelines.ffmpeg.byChannel` ve `pipelines.audio.byChannel` gibi anahtarları içerir. Sağlık kodları; `0=ok`, `3=degraded`, `4=stopped` gibi anlamlar taşır ve Docker healthcheck tarafından kullanılır. Komut satırında `guardian health` alias’ı aynı JSON çıktısını verir.
+`--health` çıktısı `status`, `events.byDetector.motion`, `pipelines.ffmpeg.byChannel`, `metrics.detectors.pose.counters.forecasts` gibi anahtarları içerir. Sağlık kodları; `0=ok`, `1=degraded`, `2=starting`, `3=stopping` olarak döner ve Docker/systemd healthcheck tarafından kullanılır. Komut satırında `guardian health` alias’ı aynı JSON çıktısını verir.
 
 ## Dashboard
 `pnpm exec tsx src/server/http.ts` komutu HTTP sunucusunu başlatır. Ardından `http://localhost:3000` adresine giderek dashboard’u açabilirsiniz:
@@ -173,7 +173,8 @@ Guardian tüm metrikleri JSON olarak üretir:
 
 - CLI `--health` komutu saniyelik özet verir.
 - HTTP sunucusu `/api/metrics` uç noktasıyla Prometheus uyumlu bir çıktıyı paylaşacak şekilde genişletilebilir.
-- `metrics.events` altında dedektör başına tetik sayıları, `metrics.latency.detectors.person` altında histogramlar, `metrics.pipelines.ffmpeg.byChannel['video:lobby']` altında kanal bazlı yeniden başlatma sayaçları bulunur.
+- `metrics.events` altında dedektör başına tetik sayıları, `metrics.detectors.pose.counters.forecasts` / `metrics.detectors.face.counters.matches` / `metrics.detectors.object.counters.threats` gibi değerler gerçek zamanlı çıkarımları raporlar.
+- `metrics.latency.detector.person` altında histogramlar, `metrics.pipelines.ffmpeg.byChannel['video:lobby']` altında kanal bazlı yeniden başlatma sayaçları bulunur.
 - Log düzeyleri `metrics.logs.byLevel.error` ve `metrics.logs.byDetector.motion.warning` gibi anahtarlarla etiketlenir; suppression kuralları için `metrics.suppression.rules['rule-id'].total` değeri takip edilir.
 
 ## Video ve ses boru hatları
@@ -188,26 +189,26 @@ docker build -t guardian:latest .
 docker run --rm -p 3000:3000 -v $(pwd)/config:/app/config guardian:latest
 ```
 
-İmaj derlemesi sırasında `ffmpeg` ve `onnxruntime-node` varlığı doğrulanır; eksik olduklarında build başarısız olur. Container sağlık kontrolü `pnpm exec tsx src/cli.ts --health` komutuyla çalışır ve `status: "ok"` bekler.
+İmaj derlemesi sırasında `ffmpeg` ve `onnxruntime-node` varlığı doğrulanır; eksik olduklarında build başarısız olur. Runner katmanı CLI’yi başlatır ve healthcheck `pnpm exec tsx src/cli.ts --health` komutunu çağırarak `status: "ok"` bekler.
 
 Guard’ı donanım hızlandırma veya RTSP kimlik bilgileriyle çalıştırmak için `config/` klasörünü volume olarak bağlayabilirsiniz.
 
 ## systemd servisi
-`deploy/guardian.service` unit dosyası aşağıdaki adımlarla devreye alınabilir:
+`deploy/systemd.service` unit dosyası aşağıdaki adımlarla devreye alınabilir:
 
 ```bash
-sudo cp deploy/guardian.service /etc/systemd/system/guardian.service
+sudo cp deploy/systemd.service /etc/systemd/system/guardian.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now guardian
 ```
 
-Servis, ortam değişkenlerini unit dosyasındaki `Environment=` satırlarından alır ve stop komutunda CLI’nın graceful shutdown yolunu kullanır.
+Servis, ortam değişkenlerini unit dosyasındaki `Environment=` satırlarından alır ve `ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop` satırı sayesinde CLI’nın graceful shutdown yolunu kullanır.
 
 ## Sorun giderme
 ### ffmpeg / onnxruntime hatası
 1. Sistem paketlerini kurun: Debian/Ubuntu için `sudo apt-get install -y ffmpeg libgomp1`, macOS için `brew install ffmpeg`, Windows için resmi ffmpeg paketini PATH’e ekleyin.
 2. ONNX modeli için doğru mimariye uygun dosyayı indirin (`models/yolov8n.onnx`). Yanlış bir dosya `onnxruntime: Failed to load model` hatasına yol açar.
-3. Değişikliklerden sonra `pnpm install` komutunu yeniden çalıştırıp CLI’yi `pnpm exec tsx src/cli.ts --health` ile doğrulayın; sağlık çıktısında `status: "ok"` görülmelidir.
+3. Değişikliklerden sonra `pnpm install` komutunu yeniden çalıştırıp CLI’yi `pnpm exec tsx src/cli.ts --health` ile doğrulayın; sağlık çıktısında `status: "ok"` ve `checks` bölümünde hook sonuçları görülmelidir.
 
 ### RTSP akışı bağlanmıyor
 - `ffmpeg -rtsp_transport tcp -i rtsp://...` komutunu elle çalıştırarak ağ gecikmesini test edin.

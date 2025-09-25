@@ -22,6 +22,8 @@ type AudioTimingOptions = {
   restartJitterFactor?: number;
   forceKillTimeoutMs?: number;
   retryDelayMs?: number;
+  silenceThreshold?: number;
+  silenceDurationMs?: number;
   micFallbacks?: Record<string, MicCandidate[]>;
   random?: () => number;
 };
@@ -57,6 +59,7 @@ export type AudioRecoverEvent = {
     | 'spawn-error'
     | 'process-exit'
     | 'stream-idle'
+    | 'stream-silence'
     | 'watchdog-timeout'
     | 'start-timeout';
   attempt: number;
@@ -75,6 +78,8 @@ const DEFAULT_IDLE_TIMEOUT_MS = 5000;
 const DEFAULT_START_TIMEOUT_MS = 4000;
 const DEFAULT_WATCHDOG_TIMEOUT_MS = 6000;
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
+const DEFAULT_SILENCE_THRESHOLD = 0.0025;
+const DEFAULT_SILENCE_DURATION_MS = 2000;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
@@ -98,6 +103,10 @@ export class AudioSource extends EventEmitter {
   private alignChunks = false;
   private hasReceivedChunk = false;
   private randomFn: () => number;
+  private activeMicCandidateIndex: number | null = null;
+  private lastSuccessfulMicIndex: number | null = null;
+  private silenceAccumulatedMs = 0;
+  private silenceRestartPending = false;
 
   constructor(private readonly options: AudioSourceOptions) {
     super();
@@ -112,15 +121,18 @@ export class AudioSource extends EventEmitter {
     this.shouldStop = false;
     this.retryCount = 0;
     this.hasReceivedChunk = false;
+    this.activeMicCandidateIndex = null;
     this.currentBinaryIndex = this.lastSuccessfulIndex;
     this.clearAllTimers();
+    this.resetSilenceState();
     if (this.options.type === 'mic') {
       this.micInputArgs = buildMicInputArgs(
         process.platform,
         this.options,
         this.options.micFallbacks
       );
-      this.micCandidateIndex = 0;
+      this.micCandidateIndex =
+        this.lastSuccessfulMicIndex !== null ? this.lastSuccessfulMicIndex : 0;
     } else {
       this.micInputArgs = [];
       this.micCandidateIndex = 0;
@@ -132,7 +144,9 @@ export class AudioSource extends EventEmitter {
   stop() {
     this.shouldStop = true;
     this.hasReceivedChunk = false;
+    this.activeMicCandidateIndex = null;
     this.clearAllTimers();
+    this.resetSilenceState();
     this.terminateProcess(true, { skipForceDelay: true });
   }
 
@@ -180,6 +194,8 @@ export class AudioSource extends EventEmitter {
     }
 
     this.hasReceivedChunk = false;
+    this.activeMicCandidateIndex = null;
+    this.resetSilenceState();
     this.clearStartTimer();
     this.clearIdleTimer();
     this.clearWatchdogTimer();
@@ -267,6 +283,9 @@ export class AudioSource extends EventEmitter {
     this.lastSuccessfulIndex = binaryIndex;
     this.buffer = Buffer.alloc(0);
     this.hasReceivedChunk = false;
+    this.resetSilenceState();
+    this.activeMicCandidateIndex =
+      this.options.type === 'mic' ? candidateIndex : null;
 
     const onStdout = (chunk: Buffer) => {
       if (!this.hasReceivedChunk) {
@@ -313,6 +332,8 @@ export class AudioSource extends EventEmitter {
       this.clearIdleTimer();
       this.clearWatchdogTimer();
       this.hasReceivedChunk = false;
+      this.activeMicCandidateIndex = null;
+      this.resetSilenceState();
 
       if (this.shouldStop) {
         return;
@@ -364,6 +385,18 @@ export class AudioSource extends EventEmitter {
       jitterMs: timing.meta.appliedJitterMs,
       channel: this.options.channel
     });
+
+    if (
+      reason === 'stream-silence' &&
+      this.options.type === 'mic' &&
+      this.micInputArgs.length > 1
+    ) {
+      const currentIndex =
+        this.activeMicCandidateIndex !== null
+          ? this.activeMicCandidateIndex
+          : this.micCandidateIndex;
+      this.micCandidateIndex = (currentIndex + 1) % this.micInputArgs.length;
+    }
 
     this.emit(
       'recover',
@@ -551,6 +584,11 @@ export class AudioSource extends EventEmitter {
     this.clearKillTimer();
   }
 
+  private resetSilenceState() {
+    this.silenceAccumulatedMs = 0;
+    this.silenceRestartPending = false;
+  }
+
   private computeRestartDelay(attempt: number) {
     const minDelayMs = Math.max(
       0,
@@ -611,11 +649,37 @@ export class AudioSource extends EventEmitter {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     const frameSizeSamples = this.calculateFrameSize(sampleRate, channels);
     const frameSizeBytes = frameSizeSamples * 2;
+    const frameDurationMs = calculateFrameDurationMs(frameSizeSamples, sampleRate, channels);
+    const silenceThreshold = this.options.silenceThreshold ?? DEFAULT_SILENCE_THRESHOLD;
+    const silenceDurationTarget = this.options.silenceDurationMs ?? DEFAULT_SILENCE_DURATION_MS;
+    const monitorSilence =
+      frameDurationMs > 0 && silenceDurationTarget > 0 && !Number.isNaN(frameDurationMs);
 
     while (this.buffer.length >= frameSizeBytes) {
       const frame = this.buffer.subarray(0, frameSizeBytes);
       this.buffer = this.buffer.subarray(frameSizeBytes);
-      const samples = bufferToInt16(frame);
+      const { samples, rms, peak } = bufferToSamples(frame);
+
+      if (monitorSilence) {
+        const silent = rms <= silenceThreshold && peak <= silenceThreshold * 2;
+        if (!silent) {
+          this.silenceAccumulatedMs = 0;
+          this.silenceRestartPending = false;
+          if (this.options.type === 'mic' && this.activeMicCandidateIndex !== null) {
+            this.lastSuccessfulMicIndex = this.activeMicCandidateIndex;
+            this.micCandidateIndex = this.activeMicCandidateIndex;
+          }
+        } else if (!this.silenceRestartPending) {
+          this.silenceAccumulatedMs += frameDurationMs;
+          if (this.silenceAccumulatedMs >= silenceDurationTarget) {
+            this.silenceRestartPending = true;
+            this.emit('error', new Error('Audio source silence detected'));
+            this.scheduleRetry('stream-silence');
+            continue;
+          }
+        }
+      }
+
       this.emit('data', samples);
     }
   }
@@ -650,12 +714,44 @@ export class AudioSource extends EventEmitter {
   }
 }
 
-function bufferToInt16(buffer: Buffer): Int16Array {
-  const samples = new Int16Array(buffer.length / 2);
-  for (let i = 0; i < samples.length; i += 1) {
-    samples[i] = buffer.readInt16LE(i * 2);
+function bufferToSamples(buffer: Buffer): { samples: Int16Array; rms: number; peak: number } {
+  const length = buffer.length / 2;
+  const samples = new Int16Array(length);
+
+  if (length === 0) {
+    return { samples, rms: 0, peak: 0 };
   }
-  return samples;
+
+  let sumSquares = 0;
+  let peak = 0;
+
+  for (let i = 0; i < length; i += 1) {
+    const value = buffer.readInt16LE(i * 2);
+    samples[i] = value;
+    sumSquares += value * value;
+    const abs = Math.abs(value);
+    if (abs > peak) {
+      peak = abs;
+    }
+  }
+
+  const rms = Math.sqrt(sumSquares / length) / 32768;
+  const normalizedPeak = peak / 32768;
+
+  return { samples, rms, peak: normalizedPeak };
+}
+
+function calculateFrameDurationMs(totalSamples: number, sampleRate: number, channels: number) {
+  if (sampleRate <= 0 || channels <= 0) {
+    return 0;
+  }
+
+  const perChannelSamples = totalSamples / Math.max(1, channels);
+  if (!Number.isFinite(perChannelSamples) || perChannelSamples <= 0) {
+    return 0;
+  }
+
+  return (perChannelSamples / sampleRate) * 1000;
 }
 
 function defaultMicFormat(platform: NodeJS.Platform): AudioSourceOptions['inputFormat'] {

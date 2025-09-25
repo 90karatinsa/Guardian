@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import db, { applyRetentionPolicy, clearEvents, storeEvent } from '../src/db.js';
+import db, { applyRetentionPolicy, clearEvents, storeEvent, vacuumDatabase } from '../src/db.js';
 import { startRetentionTask } from '../src/tasks/retention.js';
 import { EventRecord } from '../src/types.js';
 
@@ -26,7 +26,7 @@ describe('EventRetention', () => {
     vi.useRealTimers();
   });
 
-  it('RetentionArchiveRotation moves expired snapshots into dated folders and prunes excess', () => {
+  it('RetentionVacuumRotation rotates snapshots and enforces maintenance order', () => {
     const now = Date.UTC(2024, 0, 31);
     const recentEvent: EventRecord = {
       ts: now - 5 * dayMs,
@@ -63,6 +63,7 @@ describe('EventRetention', () => {
       snapshotDir,
       archiveDir,
       maxArchivesPerCamera: 1,
+      snapshot: { mode: 'archive', retentionDays: 35 },
       now
     });
 
@@ -86,6 +87,26 @@ describe('EventRetention', () => {
     expect(fs.existsSync(path.join(snapshotDir, 'old.jpg'))).toBe(false);
     expect(fs.existsSync(path.join(snapshotDir, 'older.jpg'))).toBe(false);
     expect(fs.existsSync(path.join(snapshotDir, 'recent.jpg'))).toBe(true);
+
+    const execSpy = vi.spyOn(db, 'exec');
+    vacuumDatabase({
+      mode: 'full',
+      analyze: true,
+      reindex: true,
+      optimize: true,
+      target: 'main',
+      pragmas: ['PRAGMA incremental_vacuum']
+    });
+
+    expect(execSpy.mock.calls.map(call => call[0])).toEqual([
+      'PRAGMA wal_checkpoint(TRUNCATE)',
+      'REINDEX',
+      'ANALYZE',
+      'VACUUM main',
+      'PRAGMA optimize',
+      'PRAGMA incremental_vacuum'
+    ]);
+    execSpy.mockRestore();
   });
 
   it('RetentionScheduler prunes events and triggers vacuum maintenance', async () => {
@@ -149,7 +170,13 @@ describe('EventRetention', () => {
         removedEvents: 1,
         archivedSnapshots: 1,
         prunedArchives: 0,
-        vacuumMode: 'full'
+        vacuumMode: 'full',
+        vacuumTasks: {
+          analyze: false,
+          reindex: false,
+          optimize: false,
+          target: undefined
+        }
       });
       expect(logger.warn).not.toHaveBeenCalled();
     } finally {

@@ -59,6 +59,7 @@ export class AudioAnomalyDetector {
   private readonly centroidWindowFrames: number;
   private readonly rmsValues: number[] = [];
   private readonly centroidValues: number[] = [];
+  private processedFrames = 0;
 
   constructor(
     private readonly options: AudioAnomalyOptions,
@@ -104,6 +105,7 @@ export class AudioAnomalyDetector {
     const minTriggerDuration =
       this.options.minTriggerDurationMs ?? DEFAULT_MIN_TRIGGER_DURATION_MS;
     const frameDurationMs = this.frameDurationMs;
+    const hopDurationMs = this.hopDurationMs;
 
     while (this.buffer.length >= this.frameSize) {
       const frame = this.buffer.slice(0, this.frameSize);
@@ -121,6 +123,8 @@ export class AudioAnomalyDetector {
       const rms = features.rms ?? 0;
       const centroid = features.spectralCentroid ?? 0;
 
+      this.processedFrames += 1;
+
       const thresholds = this.resolveThresholds(ts);
       const baselineRms = computeAverage(this.rmsValues);
       const baselineCentroid = computeAverage(this.centroidValues);
@@ -130,15 +134,15 @@ export class AudioAnomalyDetector {
       const triggeredByCentroid = centroidDelta >= thresholds.centroidJump;
 
       if (triggeredByRms) {
-        this.rmsDurationMs += frameDurationMs;
+        this.rmsDurationMs += hopDurationMs;
       } else {
-        this.rmsDurationMs = 0;
+        this.rmsDurationMs = Math.max(0, this.rmsDurationMs - hopDurationMs);
       }
 
       if (triggeredByCentroid) {
-        this.centroidDurationMs += frameDurationMs;
+        this.centroidDurationMs += hopDurationMs;
       } else {
-        this.centroidDurationMs = 0;
+        this.centroidDurationMs = Math.max(0, this.centroidDurationMs - hopDurationMs);
       }
 
       this.buffer.splice(0, this.hopSize);
@@ -164,6 +168,10 @@ export class AudioAnomalyDetector {
 
       const triggeredBy = rmsExceeded ? 'rms' : 'centroid';
       const triggeredDurationMs = rmsExceeded ? this.rmsDurationMs : this.centroidDurationMs;
+      const accumulationSnapshot = {
+        rmsMs: this.rmsDurationMs,
+        centroidMs: this.centroidDurationMs
+      };
 
       this.lastEventTs = ts;
       this.rmsDurationMs = 0;
@@ -194,9 +202,11 @@ export class AudioAnomalyDetector {
             frameSize: this.frameSize,
             hopSize: this.hopSize,
             frameDurationMs: this.frameDurationMs,
-            hopDurationMs: this.hopDurationMs
+            hopDurationMs: this.hopDurationMs,
+            processedFrames: this.processedFrames
           },
-          durationAboveThresholdMs: triggeredDurationMs
+          durationAboveThresholdMs: triggeredDurationMs,
+          accumulationMs: accumulationSnapshot
         }
       };
 

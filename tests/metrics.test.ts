@@ -137,4 +137,38 @@ describe('MetricsCounters', () => {
     expect(snapshot.suppression.rules['rule-2'].total).toBe(1);
     expect(snapshot.suppression.rules['rule-2'].byReason['rate-limit']).toBe(1);
   });
+
+  it('MetricsDetectorCounters tracks pose, face and object detector counters', () => {
+    const registry = new MetricsRegistry();
+
+    registry.incrementDetectorCounter('pose', 'forecasts');
+    registry.incrementDetectorCounter('pose', 'forecasts', 2);
+    registry.recordDetectorError('pose', 'forecast-failed');
+
+    registry.incrementDetectorCounter('face', 'enrollments', 3);
+    registry.incrementDetectorCounter('face', 'matches');
+    registry.incrementDetectorCounter('face', 'misses', 2);
+    registry.recordDetectorError('face', 'empty-embedding');
+
+    registry.incrementDetectorCounter('object', 'classifications', 5);
+    registry.incrementDetectorCounter('object', 'threats', 2);
+    registry.incrementDetectorCounter('object', 'detections', 7);
+
+    const snapshot = registry.snapshot();
+
+    expect(snapshot.detectors.pose.counters.forecasts).toBe(3);
+    expect(snapshot.detectors.pose.counters.errors).toBe(1);
+    expect(snapshot.detectors.pose.lastErrorMessage).toBe('forecast-failed');
+
+    expect(snapshot.detectors.face.counters.enrollments).toBe(3);
+    expect(snapshot.detectors.face.counters.matches).toBe(1);
+    expect(snapshot.detectors.face.counters.misses).toBe(2);
+    expect(snapshot.detectors.face.counters.errors).toBe(1);
+    expect(snapshot.detectors.face.lastErrorMessage).toBe('empty-embedding');
+
+    expect(snapshot.detectors.object.counters.classifications).toBe(5);
+    expect(snapshot.detectors.object.counters.threats).toBe(2);
+    expect(snapshot.detectors.object.counters.detections).toBe(7);
+    expect(snapshot.detectors.object.lastRunAt).not.toBeNull();
+  });
 });

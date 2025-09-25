@@ -310,7 +310,7 @@ describe('ConfigHotReload', () => {
     }
   });
 
-  it('ConfigHotReload reverts to last known good config on invalid JSON', async () => {
+  it('ConfigHotReloadValidation reverts to last known good config on invalid JSON', async () => {
     const initialConfig = createConfig({ diffThreshold: 20 });
     const serialized = JSON.stringify(initialConfig, null, 2);
     fs.writeFileSync(configPath, serialized);
@@ -341,6 +341,8 @@ describe('ConfigHotReload', () => {
       const current = manager.getConfig();
       expect(current.motion.diffThreshold).toBe(20);
       expect(logger.error).not.toHaveBeenCalled();
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      expect(warnCall).toBeDefined();
     } finally {
       runtime.stop();
     }
@@ -365,9 +367,11 @@ function createConfig(overrides: {
       retention: {
         retentionDays: 30,
         intervalMinutes: 60,
-        vacuum: 'auto',
         archiveDir: path.join(os.tmpdir(), 'guardian-archive'),
-        enabled: false
+        enabled: false,
+        maxArchivesPerCamera: 2,
+        snapshot: { mode: 'archive', retentionDays: 20 },
+        vacuum: { mode: 'auto', analyze: true }
       },
       suppression: {
         rules:

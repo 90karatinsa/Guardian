@@ -25,7 +25,8 @@ export type YoloDetection = {
 };
 
 export interface ParseYoloDetectionsOptions {
-  classIndex: number;
+  classIndex?: number;
+  classIndices?: number[];
   scoreThreshold: number;
   nmsThreshold?: number;
   maxDetections?: number;
@@ -46,9 +47,9 @@ export function parseYoloDetections(
     return [];
   }
 
-  const classAttributeIndex = CLASS_START_INDEX + options.classIndex;
+  const classIndices = resolveClassIndices(options, accessor.attributes);
 
-  if (classAttributeIndex >= accessor.attributes) {
+  if (classIndices.length === 0) {
     return [];
   }
 
@@ -56,12 +57,9 @@ export function parseYoloDetections(
 
   for (let detectionIndex = 0; detectionIndex < accessor.detections; detectionIndex += 1) {
     const objectnessLogit = accessor.get(detectionIndex, OBJECTNESS_INDEX);
-    const classLogit = accessor.get(detectionIndex, classAttributeIndex);
     const objectness = sigmoid(objectnessLogit);
-    const classProbability = sigmoid(classLogit);
-    const score = clamp(objectness * classProbability, 0, 1);
 
-    if (score < options.scoreThreshold) {
+    if (!Number.isFinite(objectness) || objectness <= 0) {
       continue;
     }
 
@@ -78,25 +76,76 @@ export function parseYoloDetections(
 
     const areaRatio = computeAreaRatio(bbox, meta);
 
-    detections.push({
-      score,
-      classId: options.classIndex,
-      bbox,
-      objectness,
-      classProbability,
-      areaRatio
-    });
+    for (const classId of classIndices) {
+      const attributeIndex = CLASS_START_INDEX + classId;
+      if (attributeIndex >= accessor.attributes) {
+        continue;
+      }
+
+      const classLogit = accessor.get(detectionIndex, attributeIndex);
+      const classProbability = sigmoid(classLogit);
+      const score = clamp(objectness * classProbability, 0, 1);
+
+      if (score < options.scoreThreshold) {
+        continue;
+      }
+
+      detections.push({
+        score,
+        classId,
+        bbox,
+        objectness,
+        classProbability,
+        areaRatio
+      });
+    }
   }
 
   if (detections.length === 0) {
     return [];
   }
 
+  const perClass = new Map<number, YoloDetection[]>();
+  for (const detection of detections) {
+    const existing = perClass.get(detection.classId);
+    if (existing) {
+      existing.push(detection);
+    } else {
+      perClass.set(detection.classId, [detection]);
+    }
+  }
+
   const nmsThreshold = options.nmsThreshold ?? DEFAULT_NMS_IOU_THRESHOLD;
-  const filtered = nonMaxSuppression(detections, nmsThreshold);
+  const filtered: YoloDetection[] = [];
+  for (const [, candidates] of perClass) {
+    filtered.push(...nonMaxSuppression(candidates, nmsThreshold));
+  }
+
+  filtered.sort((a, b) => b.score - a.score);
+
   const maxDetections = options.maxDetections ?? filtered.length;
 
   return filtered.slice(0, Math.max(1, maxDetections));
+}
+
+function resolveClassIndices(options: ParseYoloDetectionsOptions, attributeCount: number): number[] {
+  const indices = options.classIndices ??
+    (typeof options.classIndex === 'number' ? [options.classIndex] : [0]);
+
+  const upperBound = Math.max(0, attributeCount - CLASS_START_INDEX);
+  const sanitized = indices
+    .map(value => Math.trunc(value))
+    .filter(value => Number.isFinite(value) && value >= 0 && value < upperBound);
+
+  if (sanitized.length > 0) {
+    return Array.from(new Set(sanitized)).sort((a, b) => a - b);
+  }
+
+  const fallback = Math.min(upperBound - 1, 0);
+  if (upperBound <= 0) {
+    return [];
+  }
+  return [fallback];
 }
 
 function createTensorAccessor(tensor: ort.OnnxValue): TensorAccessor | null {
@@ -278,6 +327,10 @@ function intersectionOverUnion(a: BoundingBox, b: BoundingBox) {
   }
 
   return interArea / union;
+}
+
+export function computeIoU(a: BoundingBox, b: BoundingBox) {
+  return intersectionOverUnion(a, b);
 }
 
 function clamp(value: number, min: number, max: number) {

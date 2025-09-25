@@ -103,6 +103,125 @@ describe('VideoSource', () => {
     expect(recoverReasons.filter(reason => reason === 'watchdog-timeout')).not.toHaveLength(0);
   });
 
+  it('VideoSourceWatchdogRecovery enforces sequential restarts with jittered delays', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: Array<{ reason: string; delayMs: number; attempt: number; meta: RecoverEventMeta }>
+      = [];
+    const randomValues = [0.9, 0.1];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:test',
+      startTimeoutMs: 20,
+      watchdogTimeoutMs: 30,
+      restartDelayMs: 100,
+      restartMaxDelayMs: 400,
+      restartJitterFactor: 0.5,
+      forceKillTimeoutMs: 40,
+      random: () => (randomValues.shift() ?? 0.5),
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverEvents.push({
+        reason: event.reason,
+        delayMs: event.delayMs,
+        attempt: event.attempt,
+        meta: event.meta
+      });
+    });
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(21);
+      await Promise.resolve();
+      expect(commands).toHaveLength(1);
+      expect(commands[0].killedSignals).toContain('SIGTERM');
+      expect(commands[0].killedSignals).not.toContain('SIGKILL');
+
+      const firstRecovery = recoverEvents[0];
+      expect(firstRecovery).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(40);
+      expect(commands[0].killedSignals).toContain('SIGKILL');
+
+      const remainingToRestart = Math.max(0, (firstRecovery?.delayMs ?? 0) - 40);
+      await vi.advanceTimersByTimeAsync(remainingToRestart);
+      await Promise.resolve();
+      expect(commands).toHaveLength(2);
+
+      const activeCommand = commands[1];
+      activeCommand.emit('start');
+      activeCommand.pushFrame(SAMPLE_PNG);
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(31);
+      expect(activeCommand.killedSignals).toContain('SIGTERM');
+
+      await vi.advanceTimersByTimeAsync(40);
+      expect(activeCommand.killedSignals).toContain('SIGKILL');
+
+      await vi.advanceTimersByTimeAsync(120);
+
+      const snapshot = metrics.snapshot();
+      const lastEvent = recoverEvents[recoverEvents.length - 1];
+      expect(lastEvent).toBeDefined();
+      expect(snapshot.pipelines.ffmpeg.lastRestart).toMatchObject({
+        reason: lastEvent?.reason ?? '',
+        attempt: lastEvent?.attempt ?? 0,
+        delayMs: lastEvent?.delayMs ?? 0,
+        baseDelayMs: lastEvent?.meta.baseDelayMs ?? 0,
+        minDelayMs: lastEvent?.meta.minDelayMs ?? 0,
+        maxDelayMs: lastEvent?.meta.maxDelayMs ?? 0,
+        jitterMs: lastEvent?.meta.appliedJitterMs ?? 0
+      });
+
+      const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:test'];
+      expect(channelStats.restarts).toBeGreaterThanOrEqual(2);
+      expect(channelStats.byReason['start-timeout']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.byReason['watchdog-timeout']).toBeGreaterThanOrEqual(1);
+
+      expect(recoverEvents.length).toBeGreaterThanOrEqual(2);
+
+      expect(recoverEvents[0]).toMatchObject({
+        reason: 'start-timeout',
+        attempt: 1,
+        delayMs: 140,
+        meta: {
+          baseDelayMs: 100,
+          minDelayMs: 100,
+          maxDelayMs: 400,
+          appliedJitterMs: 40
+        }
+      });
+
+      expect(recoverEvents[1]).toMatchObject({
+        reason: 'watchdog-timeout',
+        attempt: 1,
+        meta: {
+          baseDelayMs: 100,
+          minDelayMs: 100,
+          maxDelayMs: 400
+        }
+      });
+      expect(recoverEvents[1].delayMs).toBeGreaterThanOrEqual(100);
+      expect(recoverEvents[1].delayMs).toBeLessThanOrEqual(400);
+    } finally {
+      source.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('VideoSourceRecovery emits recover reason and cleans up listeners', async () => {
     const commands: FakeCommand[] = [];
     const source = new VideoSource({

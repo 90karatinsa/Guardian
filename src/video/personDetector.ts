@@ -14,6 +14,7 @@ import {
   parseYoloDetections
 } from './yoloParser.js';
 import type { PreprocessMeta, YoloDetection } from './yoloParser.js';
+import ObjectClassifier, { ClassifiedObject } from './objectClassifier.js';
 
 export interface PersonDetectorOptions {
   source: string;
@@ -22,6 +23,8 @@ export interface PersonDetectorOptions {
   snapshotDir?: string;
   minIntervalMs?: number;
   maxDetections?: number;
+  classIndices?: number[];
+  objectClassifier?: ObjectClassifier;
 }
 
 const TARGET_SIZE = 640;
@@ -40,11 +43,20 @@ export class PersonDetector {
   private inputName: string | null = null;
   private outputName: string | null = null;
   private lastEventTs = 0;
+  private readonly classIndices: number[];
+  private readonly objectClassifier?: ObjectClassifier;
 
   private constructor(
     private readonly options: PersonDetectorOptions,
     private readonly bus: EventEmitter
-  ) {}
+  ) {
+    const indices = Array.isArray(options.classIndices) ? options.classIndices : [PERSON_CLASS_INDEX];
+    const sanitized = indices
+      .map(value => Math.max(0, Math.trunc(value)))
+      .filter(value => Number.isFinite(value));
+    this.classIndices = Array.from(new Set(sanitized.length > 0 ? sanitized : [PERSON_CLASS_INDEX]));
+    this.objectClassifier = options.objectClassifier;
+  }
 
   static async create(options: PersonDetectorOptions, bus: EventEmitter = eventBus) {
     const detector = new PersonDetector(options, bus);
@@ -78,19 +90,27 @@ export class PersonDetector {
       }
 
       const detections = parseYoloDetections(output, meta, {
-        classIndex: PERSON_CLASS_INDEX,
+        classIndices: this.classIndices,
         scoreThreshold: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
         nmsThreshold: DEFAULT_NMS_IOU_THRESHOLD,
         maxDetections: this.options.maxDetections
       });
 
-      if (detections.length === 0) {
+      const personDetections = detections.filter(candidate => candidate.classId === PERSON_CLASS_INDEX);
+      const nonPersonDetections = detections.filter(candidate => candidate.classId !== PERSON_CLASS_INDEX);
+
+      if (personDetections.length === 0) {
         return;
       }
 
-      const primaryDetection = detections[0];
+      const primaryDetection = personDetections[0];
       const snapshotPath = saveSnapshot(frame, ts, this.options.snapshotDir);
       this.lastEventTs = ts;
+
+      let classifiedObjects: ClassifiedObject[] = [];
+      if (this.objectClassifier && nonPersonDetections.length > 0) {
+        classifiedObjects = await this.objectClassifier.classify(nonPersonDetections);
+      }
 
       const payload: EventPayload = {
         ts,
@@ -110,9 +130,28 @@ export class PersonDetector {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
             nms: DEFAULT_NMS_IOU_THRESHOLD
           },
-          detections: detections.map(serializeDetection)
+          detections: personDetections.map(serializeDetection)
         }
       };
+
+      if (classifiedObjects.length > 0) {
+        const objects = classifiedObjects.map(object => ({
+          label: object.label,
+          score: object.score,
+          threat: object.isThreat,
+          threatScore: object.threatScore,
+          detection: serializeDetection(object.detection),
+          probabilities: object.probabilities
+        }));
+        const threat = classifiedObjects.find(object => object.isThreat);
+        payload.meta!.objects = objects;
+        if (threat) {
+          payload.meta!.threat = {
+            label: threat.label,
+            score: threat.threatScore
+          };
+        }
+      }
 
       this.bus.emit('event', payload);
     } finally {

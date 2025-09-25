@@ -36,6 +36,7 @@ export class LightDetector {
   private noiseLevel = 0;
   private pendingFrames = 0;
   private backoffFrames = 0;
+  private suppressedFrames = 0;
 
   constructor(
     private readonly options: LightDetectorOptions,
@@ -53,6 +54,9 @@ export class LightDetector {
       if (this.baseline === null) {
         this.baseline = luminance;
         this.noiseLevel = 0;
+        this.pendingFrames = 0;
+        this.backoffFrames = 0;
+        this.suppressedFrames = 0;
         return;
       }
 
@@ -64,47 +68,82 @@ export class LightDetector {
 
       const deltaThreshold = this.options.deltaThreshold ?? DEFAULT_DELTA_THRESHOLD;
       const delta = Math.abs(luminance - this.baseline);
-      const currentNoiseLevel = this.noiseLevel === 0 ? delta : this.noiseLevel;
-      const adaptiveThreshold = Math.max(deltaThreshold, currentNoiseLevel * noiseMultiplier);
+      const noiseFloor = this.noiseLevel === 0 ? delta : this.noiseLevel;
+      const noiseRatio = noiseFloor === 0 ? 1 : delta / Math.max(noiseFloor, 1);
+
       const effectiveNoiseSmoothing = clamp(
-        delta > adaptiveThreshold ? baseNoiseSmoothing * 1.2 : baseNoiseSmoothing * 0.8,
+        baseNoiseSmoothing * (noiseRatio > 1 ? 1 + Math.min(noiseRatio - 1, 1) * 0.6 : 0.65),
         0.05,
         0.5
       );
+
+      const updatedNoiseFloor =
+        noiseFloor === 0
+          ? delta
+          : noiseFloor * (1 - effectiveNoiseSmoothing) + delta * effectiveNoiseSmoothing;
+
+      const baseAdaptiveThreshold = Math.max(deltaThreshold, noiseFloor * noiseMultiplier);
+      const noiseSuppressionFactor = clamp(
+        noiseRatio > 1 ? 1 + (noiseRatio - 1) * 0.7 : 1 - Math.min(0.35, (1 - noiseRatio) * 0.5),
+        0.6,
+        3
+      );
+      const adaptiveThreshold = baseAdaptiveThreshold * noiseSuppressionFactor;
       const intensityRatio = adaptiveThreshold === 0 ? 0 : delta / adaptiveThreshold;
-      const effectiveDebounce = intensityRatio >= 1.5 ? baseDebounce : Math.max(baseDebounce, Math.round(baseDebounce * 1.5));
-      const effectiveBackoff = intensityRatio >= 2 ? baseBackoff : Math.max(baseBackoff, Math.round(baseBackoff * 1.5));
+
       const effectiveSmoothing = clamp(
-        delta < adaptiveThreshold ? smoothing * 0.8 : smoothing * 1.05,
+        delta < adaptiveThreshold
+          ? smoothing * 0.75
+          : smoothing * (1 + Math.min(noiseRatio - 1, 1) * 0.25),
         0.01,
         0.5
       );
 
+      const debounceMultiplier = clamp(noiseSuppressionFactor, 1, 1.5);
+      const effectiveDebounce = Math.max(
+        baseDebounce,
+        Math.round(baseDebounce * debounceMultiplier)
+      );
+      const backoffMultiplier = clamp(
+        noiseSuppressionFactor > 1 ? 1 + (noiseSuppressionFactor - 1) * 0.5 : 1.2,
+        1,
+        3
+      );
+      const effectiveBackoff = Math.max(
+        baseBackoff,
+        Math.round(baseBackoff * backoffMultiplier)
+      );
+
       if (this.isWithinNormalHours(ts)) {
         this.updateBaseline(luminance, effectiveSmoothing);
-        this.resetDebounce();
+        this.pendingFrames = 0;
+        this.backoffFrames = 0;
+        this.suppressedFrames = 0;
+        this.noiseLevel = updatedNoiseFloor;
         return;
       }
 
       if (delta < adaptiveThreshold) {
-        if (this.noiseLevel === 0) {
-          this.noiseLevel = delta;
-        } else {
-          this.noiseLevel =
-            this.noiseLevel * (1 - effectiveNoiseSmoothing) + delta * effectiveNoiseSmoothing;
-        }
         this.updateBaseline(luminance, effectiveSmoothing);
-        this.resetDebounce(false);
+        if (this.pendingFrames > 0) {
+          this.pendingFrames = Math.max(0, this.pendingFrames - 1);
+        }
         if (this.backoffFrames > 0) {
           this.backoffFrames -= 1;
         }
+        this.noiseLevel = updatedNoiseFloor;
+        this.suppressedFrames += 1;
         return;
       }
+
+      const suppressedFramesSnapshot = this.suppressedFrames;
+      this.suppressedFrames = 0;
 
       this.noiseLevel = Math.max(this.noiseLevel * (1 - effectiveNoiseSmoothing), deltaThreshold);
 
       if (this.backoffFrames > 0) {
         this.backoffFrames -= 1;
+        this.pendingFrames = 0;
         return;
       }
 
@@ -116,6 +155,7 @@ export class LightDetector {
       const minInterval = this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
       if (ts - this.lastEventTs < minInterval) {
         this.pendingFrames = 0;
+        this.backoffFrames = Math.max(this.backoffFrames, Math.ceil(effectiveBackoff / 2));
         return;
       }
 
@@ -123,8 +163,7 @@ export class LightDetector {
       this.pendingFrames = 0;
       this.backoffFrames = effectiveBackoff;
       const previousBaseline = this.baseline;
-      this.baseline =
-        this.baseline * (1 - effectiveSmoothing) + luminance * effectiveSmoothing;
+      this.baseline = this.baseline * (1 - effectiveSmoothing) + luminance * effectiveSmoothing;
       const updatedBaseline = this.baseline;
 
       const payload: EventPayload = {
@@ -140,12 +179,20 @@ export class LightDetector {
           delta,
           deltaThreshold,
           adaptiveThreshold,
+          rawAdaptiveThreshold: baseAdaptiveThreshold,
+          intensityRatio,
           noiseLevel: this.noiseLevel,
+          noiseFloor: updatedNoiseFloor,
+          noiseRatio,
+          noiseSuppressionFactor,
           effectiveDebounceFrames: effectiveDebounce,
           effectiveBackoffFrames: effectiveBackoff,
           noiseSmoothing: effectiveNoiseSmoothing,
           smoothingFactor: effectiveSmoothing,
-          noiseMultiplier
+          noiseMultiplier,
+          debounceMultiplier,
+          backoffMultiplier,
+          suppressedFramesBeforeTrigger: suppressedFramesSnapshot
         }
       };
 
@@ -157,14 +204,6 @@ export class LightDetector {
 
   private updateBaseline(luminance: number, smoothing: number) {
     this.baseline = this.baseline! * (1 - smoothing) + luminance * smoothing;
-  }
-
-  private resetDebounce(fullReset = true) {
-    if (fullReset) {
-      this.pendingFrames = 0;
-    } else if (this.pendingFrames > 0) {
-      this.pendingFrames -= 1;
-    }
   }
 
   private isWithinNormalHours(ts: number) {

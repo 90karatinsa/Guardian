@@ -8,6 +8,7 @@ class MockVideoSource extends EventEmitter {
     public readonly options: {
       file: string;
       framesPerSecond: number;
+      channel?: string;
       rtspTransport?: string;
       inputArgs?: string[];
       idleTimeoutMs?: number;
@@ -325,6 +326,234 @@ describe('run-guard multi camera orchestration', () => {
     );
 
     runtime.stop();
+  });
+
+  it('GuardRtspPerCamera applies channel overrides and tracks recoveries independently', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      app: { name: 'Guardian Test' },
+      logging: { level: 'silent' },
+      database: { path: 'guardian-test.sqlite' },
+      events: {
+        thresholds: { info: 0, warning: 1, critical: 2 },
+        suppression: { rules: [] }
+      },
+      video: {
+        framesPerSecond: 4,
+        ffmpeg: {
+          idleTimeoutMs: 750,
+          startTimeoutMs: 500,
+          watchdogTimeoutMs: 900,
+          restartDelayMs: 150,
+          restartMaxDelayMs: 600,
+          restartJitterFactor: 0
+        },
+        channels: {
+          'video:cam-1': {
+            framesPerSecond: 12,
+            ffmpeg: {
+              watchdogTimeoutMs: 1500,
+              restartDelayMs: 300,
+              restartMaxDelayMs: 800
+            },
+            motion: {
+              diffThreshold: 35,
+              areaThreshold: 0.05
+            },
+            person: {
+              checkEveryNFrames: 2,
+              maxDetections: 3,
+              minIntervalMs: 1700
+            }
+          },
+          'video:cam-2': {
+            framesPerSecond: 6,
+            ffmpeg: {
+              restartDelayMs: 600,
+              restartMaxDelayMs: 1200
+            },
+            person: {
+              score: 0.65,
+              maxDetections: 2
+            }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            ffmpeg: {
+              startTimeoutMs: 1200
+            },
+            person: {
+              score: 0.6
+            }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://camera-2/stream',
+            motion: {
+              areaThreshold: 0.025
+            },
+            person: {
+              checkEveryNFrames: 5
+            }
+          }
+        ]
+      },
+      person: {
+        modelPath: 'model.onnx',
+        score: 0.55,
+        checkEveryNFrames: 4,
+        maxDetections: 4,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 2100
+      },
+      motion: {
+        diffThreshold: 22,
+        areaThreshold: 0.03,
+        minIntervalMs: 1800
+      }
+    };
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(MockVideoSource.instances).toHaveLength(2);
+      const [cam1Source, cam2Source] = MockVideoSource.instances;
+
+      expect(cam1Source.options).toMatchObject({
+        file: 'rtsp://camera-1/stream',
+        channel: 'video:cam-1',
+        framesPerSecond: 12,
+        startTimeoutMs: 1200,
+        watchdogTimeoutMs: 1500,
+        restartDelayMs: 300,
+        restartMaxDelayMs: 800
+      });
+
+      expect(cam2Source.options).toMatchObject({
+        file: 'rtsp://camera-2/stream',
+        channel: 'video:cam-2',
+        framesPerSecond: 6,
+        restartDelayMs: 600,
+        restartMaxDelayMs: 1200
+      });
+
+      const cam1Runtime = runtime.pipelines.get('video:cam-1');
+      const cam2Runtime = runtime.pipelines.get('video:cam-2');
+
+      expect(cam1Runtime).toBeDefined();
+      expect(cam2Runtime).toBeDefined();
+
+      expect((cam1Runtime?.motionDetector as MockMotionDetector).options).toMatchObject({
+        diffThreshold: 35,
+        areaThreshold: 0.05
+      });
+      expect(cam1Runtime?.checkEvery).toBe(2);
+      expect(cam1Runtime?.maxDetections).toBe(3);
+      expect(cam1Runtime?.pipelineState.person.minIntervalMs).toBe(1700);
+
+      expect((cam2Runtime?.motionDetector as MockMotionDetector).options).toMatchObject({
+        areaThreshold: 0.025
+      });
+      expect(cam2Runtime?.checkEvery).toBe(5);
+      expect(cam2Runtime?.maxDetections).toBe(2);
+      expect(cam2Runtime?.pipelineState.person.score).toBeCloseTo(0.65);
+
+      expect(cam1Runtime?.restartStats.total).toBe(0);
+      expect(cam2Runtime?.restartStats.total).toBe(0);
+
+      cam1Source.emit('recover', {
+        reason: 'watchdog-timeout',
+        attempt: 1,
+        delayMs: 300,
+        meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+      });
+      cam2Source.emit('recover', {
+        reason: 'start-timeout',
+        attempt: 2,
+        delayMs: 600,
+        meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+      });
+
+      await Promise.resolve();
+
+      expect(cam1Runtime?.restartStats.total).toBe(1);
+      expect(cam1Runtime?.restartStats.byReason.get('watchdog-timeout')).toBe(1);
+      expect(cam1Runtime?.restartStats.last?.reason).toBe('watchdog-timeout');
+      expect(cam2Runtime?.restartStats.total).toBe(1);
+      expect(cam2Runtime?.restartStats.byReason.get('start-timeout')).toBe(1);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        { camera: 'cam-1', attempt: 1, reason: 'watchdog-timeout', delayMs: 300 },
+        'Video source reconnecting (reason=watchdog-timeout)'
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        { camera: 'cam-2', attempt: 2, reason: 'start-timeout', delayMs: 600 },
+        'Video source reconnecting (reason=start-timeout)'
+      );
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          channels: {
+            ...initialConfig.video.channels,
+            'video:cam-1': {
+              ...initialConfig.video.channels?.['video:cam-1'],
+              framesPerSecond: 10,
+              ffmpeg: {
+                ...(initialConfig.video.channels?.['video:cam-1']?.ffmpeg ?? {}),
+                restartDelayMs: 450,
+                restartMaxDelayMs: 900
+              },
+              person: {
+                ...(initialConfig.video.channels?.['video:cam-1']?.person ?? {}),
+                maxDetections: 4
+              }
+            }
+          }
+        }
+      };
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(
+        () => runtime.pipelines.get('video:cam-1')?.pipelineState.framesPerSecond === 10
+      );
+
+      expect(MockVideoSource.instances).toHaveLength(3);
+      const newCam1Source = MockVideoSource.instances[2];
+      expect(newCam1Source.options).toMatchObject({
+        framesPerSecond: 10,
+        restartDelayMs: 450,
+        restartMaxDelayMs: 900
+      });
+
+      const reloadedCam1 = runtime.pipelines.get('video:cam-1');
+      expect(reloadedCam1).toBeDefined();
+      expect(reloadedCam1).not.toBe(cam1Runtime);
+      expect(reloadedCam1?.restartStats.total).toBe(0);
+      expect(runtime.pipelines.get('video:cam-2')).toBe(cam2Runtime);
+      expect(cam2Runtime?.restartStats.total).toBe(1);
+    } finally {
+      runtime.stop();
+    }
   });
 
   it('GuardCameraHotReload orchestrates dynamic camera pipelines', async () => {

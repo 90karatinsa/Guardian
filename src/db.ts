@@ -19,12 +19,21 @@ db.exec(`
     severity TEXT NOT NULL,
     message TEXT NOT NULL,
     meta TEXT
-  )
+  );
+
+  CREATE TABLE IF NOT EXISTS faces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    embedding TEXT NOT NULL,
+    metadata TEXT,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
   CREATE INDEX IF NOT EXISTS idx_events_source_detector ON events (source, detector);
+  CREATE INDEX IF NOT EXISTS idx_faces_label ON faces (label);
 `);
 
 const insertStatement = db.prepare(
@@ -32,6 +41,16 @@ const insertStatement = db.prepare(
 );
 
 const deleteOlderThanStatement = db.prepare('DELETE FROM events WHERE ts < @cutoff');
+
+const insertFaceStatement = db.prepare(
+  'INSERT INTO faces (label, embedding, metadata, created_at) VALUES (@label, @embedding, @metadata, @createdAt)'
+);
+
+const listFacesStatement = db.prepare('SELECT id, label, embedding, metadata, created_at AS createdAt FROM faces');
+
+const getFaceStatement = db.prepare('SELECT id, label, embedding, metadata, created_at AS createdAt FROM faces WHERE id = @id');
+
+const deleteFaceStatement = db.prepare('DELETE FROM faces WHERE id = @id');
 
 type EventRow = {
   id: number;
@@ -45,6 +64,22 @@ type EventRow = {
 
 export type EventRecordWithId = EventRecord & { id: number };
 
+type FaceRow = {
+  id: number;
+  label: string;
+  embedding: string;
+  metadata: string | null;
+  createdAt: number;
+};
+
+export type FaceRecord = {
+  id: number;
+  label: string;
+  embedding: number[];
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+};
+
 export interface ListEventsOptions {
   limit?: number;
   offset?: number;
@@ -55,11 +90,18 @@ export interface ListEventsOptions {
   severity?: EventSeverity;
   since?: number;
   until?: number;
+  search?: string;
+  snapshot?: 'with' | 'without';
 }
 
 export interface PaginatedEvents {
   items: EventRecordWithId[];
   total: number;
+}
+
+export interface FaceMatchResult {
+  face: FaceRecord;
+  distance: number;
 }
 
 export function storeEvent(event: EventRecord) {
@@ -71,6 +113,63 @@ export function storeEvent(event: EventRecord) {
     message: event.message,
     meta: event.meta ? JSON.stringify(event.meta) : null
   });
+}
+
+export interface StoreFaceOptions {
+  label: string;
+  embedding: number[];
+  metadata?: Record<string, unknown>;
+  createdAt?: number;
+}
+
+export function storeFace(options: StoreFaceOptions): FaceRecord {
+  const embedding = JSON.stringify(options.embedding);
+  insertFaceStatement.run({
+    label: options.label,
+    embedding,
+    metadata: options.metadata ? JSON.stringify(options.metadata) : null,
+    createdAt: options.createdAt ?? Date.now()
+  });
+
+  const row = db.prepare('SELECT last_insert_rowid() as id').get() as { id: number };
+  const fetched = getFaceStatement.get({ id: row.id }) as FaceRow | undefined;
+  if (!fetched) {
+    throw new Error('Failed to insert face record');
+  }
+  return mapFaceRow(fetched);
+}
+
+export function listFaces(): FaceRecord[] {
+  const rows = listFacesStatement.all() as FaceRow[];
+  return rows.map(row => mapFaceRow(row));
+}
+
+export function deleteFace(id: number): boolean {
+  const result = deleteFaceStatement.run({ id });
+  return typeof result.changes === 'number' && result.changes > 0;
+}
+
+export function findNearestFace(embedding: number[], threshold: number): FaceMatchResult | null {
+  const faces = listFaces();
+  if (faces.length === 0) {
+    return null;
+  }
+
+  const normalized = normalizeEmbedding(embedding);
+  let best: FaceMatchResult | null = null;
+
+  for (const face of faces) {
+    const distance = euclideanDistance(normalized, face.embedding);
+    if (best === null || distance < best.distance) {
+      best = { face, distance };
+    }
+  }
+
+  if (!best || best.distance > threshold) {
+    return null;
+  }
+
+  return best;
 }
 
 export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
@@ -112,6 +211,23 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
   if (typeof options.until === 'number') {
     filters.push('ts <= @until');
     params.until = options.until;
+  }
+
+  if (options.search) {
+    filters.push(
+      `(
+        LOWER(message) LIKE @search ESCAPE '\\' OR
+        LOWER(detector) LIKE @search ESCAPE '\\' OR
+        LOWER(source) LIKE @search ESCAPE '\\'
+      )`
+    );
+    params.search = `%${escapeLike(options.search.toLowerCase())}%`;
+  }
+
+  if (options.snapshot === 'with') {
+    filters.push("COALESCE(json_extract(meta, '$.snapshot'), '') <> ''");
+  } else if (options.snapshot === 'without') {
+    filters.push("COALESCE(json_extract(meta, '$.snapshot'), '') = ''");
   }
 
   const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
@@ -158,7 +274,27 @@ export function pruneEventsOlderThan(cutoffTs: number): number {
   return typeof result.changes === 'number' ? result.changes : 0;
 }
 
+export function clearFaces() {
+  db.prepare('DELETE FROM faces').run();
+}
+
 export type VacuumMode = 'auto' | 'full';
+
+export type SnapshotRotationMode = 'archive' | 'delete' | 'ignore';
+
+export interface SnapshotRotationOptions {
+  mode?: SnapshotRotationMode;
+  retentionDays?: number;
+}
+
+export interface VacuumOptions {
+  mode?: VacuumMode;
+  target?: string;
+  analyze?: boolean;
+  reindex?: boolean;
+  optimize?: boolean;
+  pragmas?: string[];
+}
 
 export interface RetentionPolicyOptions {
   retentionDays: number;
@@ -166,6 +302,7 @@ export interface RetentionPolicyOptions {
   snapshotDirs?: string[];
   archiveDir: string;
   maxArchivesPerCamera?: number;
+  snapshot?: SnapshotRotationOptions;
   now?: number;
 }
 
@@ -179,17 +316,24 @@ export interface RetentionOutcome {
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
   const { retentionDays, archiveDir } = options;
   const now = options.now ?? Date.now();
-  const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
+  const retentionMs = Math.max(retentionDays, 0) * 24 * 60 * 60 * 1000;
   const cutoffTs = now - retentionMs;
 
   const removedEvents = pruneEventsOlderThan(cutoffTs);
-  const directories = collectSnapshotDirectories(options);
+  const snapshotOptions = normalizeSnapshotOptions(options, now);
+  const directories = snapshotOptions.mode === 'ignore' ? [] : collectSnapshotDirectories(options);
   let archivedSnapshots = 0;
   let prunedArchives = 0;
   const warnings: Array<{ path: string; error: Error }> = [];
 
   for (const { sourceDir, archiveBase } of directories) {
-    const rotation = rotateSnapshots(sourceDir, archiveBase, cutoffTs, options.maxArchivesPerCamera);
+    const rotation = rotateSnapshots(
+      sourceDir,
+      archiveBase,
+      snapshotOptions.cutoffTs,
+      snapshotOptions.mode,
+      options.maxArchivesPerCamera
+    );
     archivedSnapshots += rotation.moved;
     prunedArchives += rotation.pruned;
     warnings.push(...rotation.warnings);
@@ -198,12 +342,34 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   return { removedEvents, archivedSnapshots, prunedArchives, warnings };
 }
 
-export function vacuumDatabase(mode: VacuumMode = 'auto') {
-  if (mode === 'full') {
+export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto') {
+  const normalized = normalizeVacuumOptions(options);
+
+  if (normalized.mode === 'full') {
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
 
-  db.exec('VACUUM');
+  if (normalized.reindex) {
+    db.exec('REINDEX');
+  }
+
+  if (normalized.analyze) {
+    db.exec('ANALYZE');
+  }
+
+  const target = normalized.target ? ` ${normalized.target}` : '';
+  db.exec(`VACUUM${target}`.trim());
+
+  if (normalized.optimize) {
+    db.exec('PRAGMA optimize');
+  }
+
+  for (const pragma of normalized.pragmas ?? []) {
+    const trimmed = typeof pragma === 'string' ? pragma.trim() : '';
+    if (trimmed) {
+      db.exec(trimmed);
+    }
+  }
 }
 
 type SnapshotDirectory = {
@@ -246,13 +412,16 @@ function rotateSnapshots(
   snapshotDir: string,
   archiveDir: string,
   cutoffTs: number,
+  mode: SnapshotRotationMode,
   maxArchivesPerCamera?: number
 ): RotationOutcome {
-  if (!fs.existsSync(snapshotDir)) {
+  if (mode === 'ignore' || !fs.existsSync(snapshotDir)) {
     return { moved: 0, pruned: 0, warnings: [] };
   }
 
-  fs.mkdirSync(archiveDir, { recursive: true });
+  if (mode === 'archive') {
+    fs.mkdirSync(archiveDir, { recursive: true });
+  }
 
   const entries = fs.readdirSync(snapshotDir);
   let moved = 0;
@@ -281,17 +450,22 @@ function rotateSnapshots(
     }
 
     try {
-      const archivePath = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
-      const targetPath = ensureUniqueArchivePath(archivePath, entry);
-      fs.renameSync(sourcePath, targetPath);
-      moved += 1;
+      if (mode === 'delete') {
+        fs.rmSync(sourcePath, { force: true });
+        moved += 1;
+      } else {
+        const archivePath = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
+        const targetPath = ensureUniqueArchivePath(archivePath, entry);
+        fs.renameSync(sourcePath, targetPath);
+        moved += 1;
+      }
     } catch (error) {
       warnings.push({ path: sourcePath, error: toError(error) });
     }
   }
 
   let pruned = 0;
-  if (typeof maxArchivesPerCamera === 'number' && maxArchivesPerCamera >= 0) {
+  if (mode === 'archive' && typeof maxArchivesPerCamera === 'number' && maxArchivesPerCamera >= 0) {
     try {
       pruned = pruneArchiveLimit(archiveDir, snapshotDir, maxArchivesPerCamera);
     } catch (error) {
@@ -452,6 +626,56 @@ function safeParseMeta(raw: string): Record<string, unknown> | undefined {
   return undefined;
 }
 
+function mapFaceRow(row: FaceRow): FaceRecord {
+  let embedding: number[] = [];
+  try {
+    const parsed = JSON.parse(row.embedding);
+    if (Array.isArray(parsed)) {
+      embedding = parsed.map(value => Number(value)).filter(value => Number.isFinite(value));
+    }
+  } catch (error) {
+    embedding = [];
+  }
+
+  let metadata: Record<string, unknown> | undefined;
+  if (row.metadata) {
+    try {
+      const parsedMetadata = JSON.parse(row.metadata);
+      if (parsedMetadata && typeof parsedMetadata === 'object') {
+        metadata = parsedMetadata as Record<string, unknown>;
+      }
+    } catch (error) {
+      metadata = undefined;
+    }
+  }
+
+  return {
+    id: row.id,
+    label: row.label,
+    embedding,
+    metadata,
+    createdAt: row.createdAt
+  };
+}
+
+function normalizeEmbedding(values: number[]) {
+  const length = Math.sqrt(values.reduce((acc, value) => acc + value * value, 0));
+  if (!Number.isFinite(length) || length === 0) {
+    return values.map(() => 0);
+  }
+  return values.map(value => value / length);
+}
+
+function euclideanDistance(a: number[], b: number[]) {
+  const max = Math.max(a.length, b.length);
+  let sum = 0;
+  for (let i = 0; i < max; i += 1) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    sum += diff * diff;
+  }
+  return Math.sqrt(sum);
+}
+
 function clampLimit(limit?: number) {
   if (typeof limit !== 'number' || Number.isNaN(limit)) {
     return 25;
@@ -464,6 +688,35 @@ function clampOffset(offset?: number) {
     return 0;
   }
   return Math.max(Math.floor(offset), 0);
+}
+
+function normalizeSnapshotOptions(options: RetentionPolicyOptions, now: number) {
+  const snapshot = options.snapshot ?? {};
+  const mode = snapshot.mode ?? 'archive';
+  const days = typeof snapshot.retentionDays === 'number' ? snapshot.retentionDays : options.retentionDays;
+  const retentionMs = Math.max(days, 0) * 24 * 60 * 60 * 1000;
+  const cutoffTs = now - retentionMs;
+  return { mode, cutoffTs } as const;
+}
+
+function normalizeVacuumOptions(options: VacuumOptions | VacuumMode): Required<VacuumOptions> {
+  if (typeof options === 'string') {
+    return { mode: options, target: undefined, analyze: false, reindex: false, optimize: false, pragmas: undefined };
+  }
+
+  const mode = options.mode ?? 'auto';
+  return {
+    mode,
+    target: options.target?.trim() || undefined,
+    analyze: options.analyze === true,
+    reindex: options.reindex === true,
+    optimize: options.optimize === true,
+    pragmas: options.pragmas?.slice()
+  };
+}
+
+function escapeLike(value: string) {
+  return value.replace(/([_%\\])/g, '\\$1');
 }
 
 export default db;

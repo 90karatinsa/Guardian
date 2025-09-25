@@ -53,7 +53,7 @@ describe('MotionDetector', () => {
     });
   });
 
-  it('MotionBackoffVerification suppresses noise and emits single event for sustained motion', () => {
+  it('MotionLightNoiseBackoff suppresses noise and emits single event for sustained motion', () => {
     const detector = new MotionDetector(
       {
         source: 'test-camera',
@@ -105,6 +105,9 @@ describe('MotionDetector', () => {
     expect(meta.noiseMultiplier).toBe(1.5);
     expect(meta.areaInflation).toBe(1);
     expect(meta.areaBaseline).toBeGreaterThan(0);
+    expect(meta.noiseSuppressionFactor).toBeGreaterThan(0);
+    expect(meta.suppressedFramesBeforeTrigger).toBeGreaterThanOrEqual(0);
+    expect(meta.noiseFloor).toBeGreaterThanOrEqual(0);
 
     detector.handleFrame(motionFrames[2], 200);
     expect(events).toHaveLength(1);
@@ -123,7 +126,7 @@ describe('LightDetector', () => {
     });
   });
 
-  it('MotionLightNoiseTuning ignores flicker and reports deliberate change', () => {
+  it('MotionLightNoiseBackoff ignores flicker and reports deliberate change', () => {
     const detector = new LightDetector(
       {
         source: 'test-camera',
@@ -147,7 +150,8 @@ describe('LightDetector', () => {
     const brightShift = [
       createUniformFrame(12, 12, 190),
       createUniformFrame(12, 12, 205),
-      createUniformFrame(12, 12, 210)
+      createUniformFrame(12, 12, 210),
+      createUniformFrame(12, 12, 215)
     ];
 
     const ts0 = new Date('2024-01-01T03:00:00Z').getTime();
@@ -166,9 +170,16 @@ describe('LightDetector', () => {
     expect(events[0].detector).toBe('light');
     const meta = events[0].meta as Record<string, number>;
     expect(meta.delta).toBeGreaterThan(150);
+    expect(meta.rawAdaptiveThreshold).toBeGreaterThanOrEqual(meta.deltaThreshold);
+    expect(meta.adaptiveThreshold).toBeGreaterThan(meta.deltaThreshold);
     expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
     expect(meta.effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
     expect(meta.noiseMultiplier).toBe(3);
+    expect(meta.debounceMultiplier).toBeGreaterThanOrEqual(1);
+    expect(meta.backoffMultiplier).toBeGreaterThanOrEqual(1);
+    expect(meta.suppressedFramesBeforeTrigger).toBeGreaterThanOrEqual(0);
+    expect(meta.noiseFloor).toBeGreaterThanOrEqual(0);
+    expect(meta.noiseSuppressionFactor).toBeGreaterThanOrEqual(1);
     expect(meta.previousBaseline).toBeLessThan(meta.baseline);
     expect(meta.baseline).toBeGreaterThan(20);
 

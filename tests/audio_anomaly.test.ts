@@ -100,14 +100,17 @@ describe('AudioAnomalyAdaptiveWindow', () => {
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('audio-anomaly');
     expect(events[0].meta?.triggeredBy).toBe('rms');
-    expect(Number(events[0].meta?.durationAboveThresholdMs)).toBeGreaterThanOrEqual(100);
+    expect(Number(events[0].meta?.durationAboveThresholdMs)).toBeGreaterThanOrEqual(hopDurationMs);
     const windowMeta = events[0].meta?.window as Record<string, number>;
     expect(Number(windowMeta?.frameDurationMs)).toBeCloseTo(frameDurationMs, 3);
     expect(Number(windowMeta?.hopDurationMs)).toBeCloseTo(hopDurationMs, 3);
+    expect(Number(windowMeta?.processedFrames ?? 0)).toBeGreaterThanOrEqual(2);
     const thresholds = events[0].meta?.thresholds as Record<string, number>;
     expect(Number(thresholds?.rms)).toBeCloseTo(0.4, 3);
     const baselines = events[0].meta?.baselines as Record<string, number>;
     expect(Number(baselines?.rms)).toBeLessThan(Number(events[0].meta?.rms));
+    const accumulation = events[0].meta?.accumulationMs as Record<string, number>;
+    expect(Number(accumulation?.rmsMs ?? 0)).toBeGreaterThan(0);
   });
 
   it('AudioAnomalyAdaptiveWindow applies night thresholds to centroid jumps', () => {
@@ -143,6 +146,8 @@ describe('AudioAnomalyAdaptiveWindow', () => {
     expect(events[0].meta?.triggeredBy).toBe('centroid');
     const thresholds = events[0].meta?.thresholds as Record<string, number>;
     expect(Number(thresholds?.centroidJump)).toBeCloseTo(40, 3);
+    const accumulation = events[0].meta?.accumulationMs as Record<string, number>;
+    expect(Number(accumulation?.centroidMs ?? 0)).toBeGreaterThanOrEqual(0);
   });
 });
 
