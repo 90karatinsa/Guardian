@@ -33,7 +33,20 @@ Projeyi klonladıktan sonra bağımlılıkları yükleyin:
 pnpm install
 ```
 
-İlk çalıştırmada Guardian, örnek konfigürasyon ve veri dizinlerini otomatik oluşturur. `config/default.json` dosyası guard'ın varsayılan akışını tanımlar.
+> 🛠️ `pnpm` komutu tanınmıyorsa `corepack enable` komutuyla pnpm'i etkinleştirin ve `pnpm --version` çıktısının en az 8 olduğunu doğrulayın.
+
+İlk çalıştırmada Guardian, örnek konfigürasyon ve veri dizinlerini otomatik oluşturur. `config/default.json` dosyası guard'ın varsayılan akışını tanımlar. Kendi model dosyalarınızı (`models/yolov8n.onnx` vb.) ve RTSP kimlik bilgilerinizi ekledikten sonra aşağıdaki hızlı doğrulamaları yapın:
+
+```bash
+# ffmpeg ve onnxruntime erişimini doğrulayın
+ffmpeg -version | head -n 1
+pnpm exec node -e "require('onnxruntime-node'); console.log('onnxruntime hazır');"
+
+# Guardian CLI kurulumunu test edin
+pnpm exec tsx src/cli.ts --help
+```
+
+Bu adımlar tamamlandıktan sonra Guardian boru hattını çalıştırmaya hazırsınız.
 
 ## Konfigürasyon
 Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve retention politikalarını yapılandırır. Hot reload mekanizması, dosya değişikliklerini izler ve geçersiz JSON bulunduğunda son bilinen iyi yapılandırmaya geri döner.
@@ -131,6 +144,7 @@ Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kam
 - `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Dashboard filtreleri ve metriklerdeki `pipelines.ffmpeg.byChannel` haritası bu alanı kullanır.
 - `ffmpeg` altındaki `idleTimeoutMs`, `watchdogTimeoutMs`, `startTimeoutMs`, `forceKillTimeoutMs`, `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` seçenekleri boru hattının yeniden deneme davranışını ve watchdog zamanlamalarını kontrol eder.
 - Kamera bazlı `motion` ve `person` blokları debounce/backoff gibi gürültü bastırma katsayılarını içerir; aynı dosyada birden fazla kamera tanımlayarak her kanal için farklı eşikler uygulayabilirsiniz.
+- Her kamera için tanımlanan `channel` değerinin `video.channels` altında karşılığı bulunmalıdır. Ayrıca `audio.micFallbacks` dizilerindeki `device` alanları boş bırakılamaz ve oran sınırlayıcı (`rateLimit`) tanımlarında `perMs` değeri `count` değerinden küçük olamaz; aksi halde konfigürasyon yüklenmez.
 
 ### Retention ve arşiv döngüsü
 Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir retention görevine sahiptir:
@@ -148,23 +162,75 @@ Guardian CLI, servis kontrolü ve sağlık kontrollerini yönetir:
 pnpm start
 
 # Çalışan sürecin sağlık özetini JSON olarak yazdırır
-pnpm exec tsx src/cli.ts --health
+guardian health
 
 # Graceful shutdown tetikler
-pnpm exec tsx src/cli.ts stop
+guardian stop
 
 # Servis durumunu exit kodlarıyla raporlar
-pnpm exec tsx src/cli.ts status
+guardian status
 ```
 
-`--health` çıktısı `status`, `events.byDetector.motion`, `pipelines.ffmpeg.byChannel`, `metrics.detectors.pose.counters.forecasts` gibi anahtarları içerir. Sağlık kodları; `0=ok`, `1=degraded`, `2=starting`, `3=stopping` olarak döner ve Docker/systemd healthcheck tarafından kullanılır. Komut satırında `guardian health` alias’ı aynı JSON çıktısını verir.
+- `guardian health` çıktısı `metrics` anlık görüntüsüne ek olarak `runtime.pipelines.videoChannels`, `runtime.pipelines.audioChannels` ve her boru hattının yeniden başlatma sayaçlarını (`videoRestarts`, `audioRestarts`) içerir. Sağlık kodları; `0=ok`, `1=degraded`, `2=starting`, `3=stopping` olarak döner ve Docker/systemd healthcheck tarafından kullanılır. Komut satırında `pnpm exec tsx src/cli.ts --health` aynı JSON çıktısını verir.
+
+Örnek bir sağlık çıktısı aşağıdaki gibidir:
+
+```jsonc
+{
+  "status": "ok",
+  "state": "idle",
+  "runtime": {
+    "pipelines": {
+      "videoChannels": 0,
+      "audioChannels": 0,
+      "videoRestarts": 0,
+      "audioRestarts": 0
+    }
+  },
+  "metrics": {
+    "logs": {
+      "byLevel": {},
+      "histogram": {}
+    },
+    "pipelines": {
+      "ffmpeg": { "restarts": 0, "attempts": {} },
+      "audio": { "restarts": 0, "attempts": {} }
+    }
+  }
+}
+```
+
+`guardian status` komutu ise kısa bir özet döndürür:
+
+```text
+Guardian status: idle
+Health: ok
+```
+
+Servis arka planda çalışırken logları `pnpm exec tsx src/cli.ts --health --pretty` gibi komutlarla veya `logs/guardian.log` dosyasından takip edebilirsiniz.
+
+### REST API örnekleri
+HTTP sunucusu (`pnpm exec tsx src/server/http.ts`) aşağıdaki uç noktaları sağlar:
+
+```bash
+# Son olayları listeleyin
+curl -s http://localhost:3000/api/events?limit=5 | jq '.[].detector'
+
+# Belirli bir olayın snapshot'ını indirin
+curl -o snapshot.jpg http://localhost:3000/api/events/<event-id>/snapshot
+
+# Canlı SSE akışını test edin
+curl -N http://localhost:3000/api/events/stream
+```
+
+REST API cevapları, pose tahminleri ve suppress edilmiş olayları `metrics.suppression.rules` alanlarıyla birlikte döndürerek dashboard’da kullanılan aynı veriyi sunar.
 
 ## Dashboard
 `pnpm exec tsx src/server/http.ts` komutu HTTP sunucusunu başlatır. Ardından `http://localhost:3000` adresine giderek dashboard’u açabilirsiniz:
 
-- Üstteki filtre alanları kaynak, kanal veya şiddete göre REST API istekleri yapar (`/api/events?channel=video:lobby`).
-- Sağ taraftaki snapshot önizlemesi seçilen olayın en güncel görüntüsünü `/snapshots/<id>.jpg` üzerinden yükler.
-- SSE akışı (`/api/events/stream`) heartbeat ile açık tutulur; bağlantı koptuğunda istemci otomatik yeniden bağlanır ve son filtreleri uygular.
+- Üstteki filtre alanları kaynak, kamera veya şiddete göre REST API istekleri yapar (`/api/events?camera=video:lobby`). Canlı akıştan gelen kanallar ve yüz kayıtları, filtre panelinin altındaki rozetlere (`Channels` bölümündeki onay kutuları) otomatik eklenir.
+- Sağ taraftaki snapshot önizlemesi seçilen olayın en güncel görüntüsünü `/api/events/<id>/snapshot` üzerinden yükler ve görüntünün ait olduğu kanal bilgisi `data-channel` niteliğinde tutulur.
+- SSE akışı (`/api/events/stream`) heartbeat ile açık tutulur; bağlantı koptuğunda istemci otomatik yeniden bağlanır ve son filtreleri uygular. Aynı akış, `faces` olaylarıyla yüz kayıtlarının etiketlerini de yayınlar.
 
 Bu sayfa, guard’ın gerçek zamanlı olaylarını izlemenin en hızlı yoludur.
 
@@ -189,12 +255,14 @@ docker build -t guardian:latest .
 docker run --rm -p 3000:3000 -v $(pwd)/config:/app/config guardian:latest
 ```
 
-İmaj derlemesi sırasında `ffmpeg` ve `onnxruntime-node` varlığı doğrulanır; eksik olduklarında build başarısız olur. Runner katmanı CLI’yi başlatır ve healthcheck `pnpm exec tsx src/cli.ts --health` komutunu çağırarak `status: "ok"` bekler.
+- İmaj derlemesi sırasında `ffmpeg` ve `onnxruntime-node` varlığı doğrulanır; eksik olduklarında build başarısız olur. Runner katmanı `pnpm start` ile CLI’yi başlatır, `SIGTERM/SIGQUIT` sinyallerini yakalayıp graceful shutdown tetikler ve healthcheck `pnpm exec tsx src/cli.ts --health` komutunu çağırarak `status: "ok"` bekler.
+- Konfigürasyon ve model dosyalarını volume olarak bağlayın: `-v $(pwd)/models:/app/models -v $(pwd)/snapshots:/app/snapshots`. Böylece container yeniden başladığında guard geçmişi ve ONNX modeli korunur.
+- Docker healthcheck çıktısı `guardian status` ile uyumlu olduğundan Kubernetes veya docker-compose liveness tanımlarına doğrudan eklenebilir. `docker inspect --format='{{json .State.Health}}' guardian` ile son sağlık denetimlerini görebilirsiniz.
 
 Guard’ı donanım hızlandırma veya RTSP kimlik bilgileriyle çalıştırmak için `config/` klasörünü volume olarak bağlayabilirsiniz.
 
 ## systemd servisi
-`deploy/systemd.service` unit dosyası aşağıdaki adımlarla devreye alınabilir:
+- `deploy/systemd.service` unit dosyası aşağıdaki adımlarla devreye alınabilir (çalışan servis `guardian stop` komutuyla ve `SIGTERM/SIGQUIT` sinyalleriyle aynı shutdown hook’larını çağırır):
 
 ```bash
 sudo cp deploy/systemd.service /etc/systemd/system/guardian.service
@@ -203,6 +271,8 @@ sudo systemctl enable --now guardian
 ```
 
 Servis, ortam değişkenlerini unit dosyasındaki `Environment=` satırlarından alır ve `ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop` satırı sayesinde CLI’nın graceful shutdown yolunu kullanır.
+
+`systemctl status guardian` çıktısında `Main PID` bölümündeki süreç Guardian CLI’yı gösterir. Unit dosyası `KillSignal=SIGTERM` kullanır ve `TimeoutStopSec=30` değerine kadar shutdown hook’larının tamamlanmasını bekler. Journal’da sağlık tetiklerinin sonuçlarını `journalctl -u guardian` komutuyla takip edebilirsiniz.
 
 ## Sorun giderme
 ### ffmpeg / onnxruntime hatası
@@ -214,6 +284,8 @@ Servis, ortam değişkenlerini unit dosyasındaki `Environment=` satırlarından
 - `ffmpeg -rtsp_transport tcp -i rtsp://...` komutunu elle çalıştırarak ağ gecikmesini test edin.
 - Konfigürasyonda `ffmpeg.inputArgs` içerisine `-stimeout 5000000` gibi değerler ekleyerek bağlantı süresini kısaltın.
 - Watchdog yeniden bağlanmayı tetikliyorsa loglar ve `pipelines.ffmpegRestarts` metriği artacaktır; çok sık artıyorsa ağ veya kamera ayarlarını gözden geçirin.
+- RTSP sunucusunun temel kimlik doğrulaması gerekiyorsa URL'yi `rtsp://user:pass@host/stream` şeklinde yazın ve parolada özel karakter varsa URL encode edin.
+- GPU hızlandırmalı kartlar için `ffmpeg.inputArgs` kısmına `-hwaccel cuda` gibi argümanlar ekleyerek sistem kaynaklarını dengeleyebilirsiniz.
 
 ### Retention beklenen dosyaları silmiyor
 - `config/default.json` içindeki `retention` alanında gün sayısını ve `maxArchives` değerini doğrulayın.

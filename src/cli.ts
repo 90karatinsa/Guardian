@@ -32,6 +32,14 @@ type HealthPayload = {
     details?: Record<string, unknown>;
   }>;
   metrics: MetricsSnapshot;
+  runtime: {
+    pipelines: {
+      videoChannels: number;
+      audioChannels: number;
+      videoRestarts: number;
+      audioRestarts: number;
+    };
+  };
   application: {
     name: string;
     version: string;
@@ -75,6 +83,11 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const fatalCount = snapshot.logs.byLevel.fatal ?? 0;
   const degraded = errorCount > 0 || fatalCount > 0;
 
+  const videoChannels = Object.keys(snapshot.pipelines.ffmpeg.byChannel ?? {}).length;
+  const audioChannels = Object.keys(snapshot.pipelines.audio.byChannel ?? {}).length;
+  const videoRestarts = snapshot.pipelines.ffmpeg.restarts;
+  const audioRestarts = snapshot.pipelines.audio.restarts;
+
   let status: HealthStatus = 'ok';
   if (state.status === 'starting') {
     status = 'starting';
@@ -102,6 +115,14 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
     application: {
       name: packageJson.name ?? 'guardian',
       version: packageJson.version ?? '0.0.0'
+    },
+    runtime: {
+      pipelines: {
+        videoChannels,
+        audioChannels,
+        videoRestarts,
+        audioRestarts
+      }
     },
     checks: [
       {
@@ -261,7 +282,7 @@ function registerSignalHandlers() {
     void performShutdown('signal', signal);
   };
 
-  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
+  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT', 'SIGQUIT'];
   for (const signal of signals) {
     process.once(signal, handleSignal);
   }

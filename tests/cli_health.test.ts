@@ -56,7 +56,7 @@ afterEach(async () => {
 });
 
 describe('GuardianCliHealthcheck', () => {
-  it('CliHealthExitCodes returns JSON for health commands and propagates degraded status', async () => {
+  it('HealthcheckMetricsSnapshot includes runtime fields and degraded status', async () => {
     const capture = createTestIo();
     const flagCode = await runCli(['--health'], capture.io);
     const flagPayload = JSON.parse(capture.stdout().trim());
@@ -67,6 +67,10 @@ describe('GuardianCliHealthcheck', () => {
     expect(flagPayload.metrics.pipelines.audio).toBeDefined();
     expect(flagPayload.metrics.pipelines.ffmpeg.byChannel).toBeDefined();
     expect(flagPayload.metrics.pipelines.audio.byChannel).toBeDefined();
+    expect(flagPayload.runtime.pipelines.videoChannels).toBeTypeOf('number');
+    expect(flagPayload.runtime.pipelines.audioChannels).toBeTypeOf('number');
+    expect(flagPayload.runtime.pipelines.videoRestarts).toBe(0);
+    expect(flagPayload.runtime.pipelines.audioRestarts).toBe(0);
 
     metrics.reset();
     metrics.incrementLogLevel('error', { message: 'detector failure' });
@@ -78,7 +82,7 @@ describe('GuardianCliHealthcheck', () => {
     expect(aliasPayload.status).toBe('degraded');
   });
 
-  it('summarizes status output with restart counters', async () => {
+  it('CliDaemonLifecycle summarizes status output with restart counters', async () => {
     metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout');
     metrics.recordPipelineRestart('audio', 'spawn-error');
     const capture = createTestIo();
@@ -90,7 +94,7 @@ describe('GuardianCliHealthcheck', () => {
 });
 
 describe('GuardianCliShutdown', () => {
-  it('stops the running guard runtime and reports graceful shutdown', async () => {
+  it('CliDaemonLifecycle stops the running guard runtime and reports graceful shutdown', async () => {
     const stopSpy = vi.fn();
     startGuardMock.mockResolvedValue({ stop: stopSpy });
 

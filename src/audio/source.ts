@@ -83,6 +83,7 @@ const DEFAULT_SILENCE_DURATION_MS = 2000;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
+const DEVICE_DISCOVERY_CACHE = new Map<string, Promise<string[]>>();
 
 export class AudioSource extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
@@ -93,6 +94,8 @@ export class AudioSource extends EventEmitter {
   private idleTimer: NodeJS.Timeout | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
   private killTimer: NodeJS.Timeout | null = null;
+  private processExitPromise: Promise<void> | null = null;
+  private processExitResolve: (() => void) | null = null;
   private retryCount = 0;
   private shouldStop = false;
   private currentBinaryIndex = 0;
@@ -166,26 +169,60 @@ export class AudioSource extends EventEmitter {
   }
 
   static async listDevices(format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto') {
-    const formats = resolveDeviceFormats(format, process.platform);
-    let lastError: Error | null = null;
-
-    for (const fmt of formats) {
-      const args = ['-hide_banner', '-loglevel', 'info', '-f', fmt, '-list_devices', 'true', '-i', 'dummy'];
-
-      for (const command of FFPROBE_CANDIDATES) {
-        try {
-          const { stdout, stderr } = await execFileAsync(command, args);
-          const parsed = parseDeviceList(`${stdout}\n${stderr}`);
-          if (parsed.length > 0) {
-            return parsed;
-          }
-        } catch (error) {
-          lastError = error as Error;
-        }
-      }
+    const cacheKey = `${process.platform}:${format}`;
+    const cached = DEVICE_DISCOVERY_CACHE.get(cacheKey);
+    if (cached) {
+      const devices = await cached;
+      return [...devices];
     }
 
-    throw lastError ?? new Error('Unable to list audio devices');
+    const discovery = (async () => {
+      const formats = resolveDeviceFormats(format, process.platform);
+      let lastError: Error | null = null;
+
+      for (const fmt of formats) {
+        const args = [
+          '-hide_banner',
+          '-loglevel',
+          'info',
+          '-f',
+          fmt,
+          '-list_devices',
+          'true',
+          '-i',
+          'dummy'
+        ];
+
+        for (const command of FFPROBE_CANDIDATES) {
+          try {
+            const { stdout, stderr } = await execFileAsync(command, args);
+            const parsed = parseDeviceList(`${stdout}\n${stderr}`);
+            if (parsed.length > 0) {
+              return [...parsed];
+            }
+          } catch (error) {
+            lastError = error as Error;
+          }
+        }
+      }
+
+      throw lastError ?? new Error('Unable to list audio devices');
+    })();
+
+    DEVICE_DISCOVERY_CACHE.set(cacheKey, discovery);
+
+    try {
+      const devices = await discovery;
+      DEVICE_DISCOVERY_CACHE.set(cacheKey, Promise.resolve([...devices]));
+      return [...devices];
+    } catch (error) {
+      DEVICE_DISCOVERY_CACHE.delete(cacheKey);
+      throw error;
+    }
+  }
+
+  static clearDeviceCache() {
+    DEVICE_DISCOVERY_CACHE.clear();
   }
 
   private startProcess() {
@@ -287,6 +324,17 @@ export class AudioSource extends EventEmitter {
     this.activeMicCandidateIndex =
       this.options.type === 'mic' ? candidateIndex : null;
 
+    this.processExitPromise = new Promise<void>(resolve => {
+      this.processExitResolve = () => {
+        if (!this.processExitResolve) {
+          return;
+        }
+        this.processExitResolve = null;
+        resolve();
+        this.processExitPromise = null;
+      };
+    });
+
     const onStdout = (chunk: Buffer) => {
       if (!this.hasReceivedChunk) {
         this.hasReceivedChunk = true;
@@ -334,6 +382,7 @@ export class AudioSource extends EventEmitter {
       this.hasReceivedChunk = false;
       this.activeMicCandidateIndex = null;
       this.resetSilenceState();
+      this.resolveProcessExit();
 
       if (this.shouldStop) {
         return;
@@ -354,7 +403,6 @@ export class AudioSource extends EventEmitter {
       proc.stdout.off('data', onStdout);
       proc.stderr.off('data', onStderr);
       proc.off('error', onError);
-      proc.off('close', onClose);
     };
 
     this.resetStartTimer();
@@ -411,11 +459,20 @@ export class AudioSource extends EventEmitter {
 
     this.clearAllTimers();
     this.hasReceivedChunk = false;
-    this.terminateProcess(true);
+    this.resetSilenceState();
+    const termination = this.terminateProcess(true);
+    const waitForTermination = termination ?? Promise.resolve();
 
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      this.startProcess();
+      waitForTermination
+        .catch(() => {})
+        .then(() => {
+          if (this.shouldStop) {
+            return;
+          }
+          this.startProcess();
+        });
     }, Math.max(0, timing.delayMs));
   }
 
@@ -432,10 +489,13 @@ export class AudioSource extends EventEmitter {
     return proc;
   }
 
-  private terminateProcess(force = false, options: { skipForceDelay?: boolean } = {}) {
+  private terminateProcess(
+    force = false,
+    options: { skipForceDelay?: boolean } = {}
+  ): Promise<void> | null {
     const proc = this.detachProcess();
     if (!proc) {
-      return;
+      return this.processExitPromise;
     }
 
     try {
@@ -450,8 +510,10 @@ export class AudioSource extends EventEmitter {
       // Ignore destruction errors
     }
 
+    const exitPromise = this.processExitPromise ?? Promise.resolve();
+
     if (!force) {
-      return;
+      return exitPromise;
     }
 
     try {
@@ -470,20 +532,23 @@ export class AudioSource extends EventEmitter {
           // Ignore forced kill errors
         }
       }
-      return;
+      this.resolveProcessExit();
+      return exitPromise;
     }
 
     this.killTimer = setTimeout(() => {
       this.killTimer = null;
-      if (proc.killed) {
-        return;
+      if (!proc.killed) {
+        try {
+          proc.kill('SIGKILL');
+        } catch (error) {
+          // Ignore forced kill errors
+        }
       }
-      try {
-        proc.kill('SIGKILL');
-      } catch (error) {
-        // Ignore forced kill errors
-      }
+      this.resolveProcessExit();
     }, delay);
+
+    return exitPromise;
   }
 
   private clearRestartTimer() {
@@ -582,6 +647,17 @@ export class AudioSource extends EventEmitter {
     this.clearIdleTimer();
     this.clearWatchdogTimer();
     this.clearKillTimer();
+  }
+
+  private resolveProcessExit() {
+    if (this.processExitResolve) {
+      const resolve = this.processExitResolve;
+      this.processExitResolve = null;
+      resolve();
+      this.processExitPromise = null;
+    } else if (this.processExitPromise) {
+      this.processExitPromise = null;
+    }
   }
 
   private resetSilenceState() {

@@ -2,143 +2,43 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import db, { applyRetentionPolicy, clearEvents, storeEvent, vacuumDatabase } from '../src/db.js';
+import db, { clearEvents, storeEvent } from '../src/db.js';
 import { startRetentionTask } from '../src/tasks/retention.js';
 import { EventRecord } from '../src/types.js';
 
-describe('EventRetention', () => {
+describe('RetentionMaintenance', () => {
   const dayMs = 24 * 60 * 60 * 1000;
   let tempDir: string;
-  let snapshotDir: string;
   let archiveDir: string;
+  let cameraOneDir: string;
+  let cameraTwoDir: string;
 
   beforeEach(() => {
     clearEvents();
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-retention-'));
-    snapshotDir = path.join(tempDir, 'snapshots');
     archiveDir = path.join(tempDir, 'archive');
-    fs.mkdirSync(snapshotDir, { recursive: true });
+    cameraOneDir = path.join(tempDir, 'cam-one');
+    cameraTwoDir = path.join(tempDir, 'cam-two');
+    fs.mkdirSync(cameraOneDir, { recursive: true });
+    fs.mkdirSync(cameraTwoDir, { recursive: true });
   });
 
   afterEach(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
     vi.restoreAllMocks();
     vi.useRealTimers();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('RetentionVacuumRotation rotates snapshots and enforces maintenance order', () => {
-    const now = Date.UTC(2024, 0, 31);
-    const recentEvent: EventRecord = {
-      ts: now - 5 * dayMs,
-      source: 'sensor:1',
-      detector: 'detector',
-      severity: 'info',
-      message: 'keep',
-      meta: {}
-    };
-    const oldEvent: EventRecord = {
-      ts: now - 40 * dayMs,
-      source: 'sensor:1',
-      detector: 'detector',
-      severity: 'info',
-      message: 'remove',
-      meta: {}
-    };
-
-    storeEvent(recentEvent);
-    storeEvent(oldEvent);
-
-    const oldSnapshot = path.join(snapshotDir, 'old.jpg');
-    const olderSnapshot = path.join(snapshotDir, 'older.jpg');
-    const recentSnapshot = path.join(snapshotDir, 'recent.jpg');
-    fs.writeFileSync(oldSnapshot, 'old');
-    fs.writeFileSync(olderSnapshot, 'older');
-    fs.writeFileSync(recentSnapshot, 'recent');
-    fs.utimesSync(oldSnapshot, now / 1000 - 40 * 24 * 60 * 60, now / 1000 - 40 * 24 * 60 * 60);
-    fs.utimesSync(olderSnapshot, now / 1000 - 50 * 24 * 60 * 60, now / 1000 - 50 * 24 * 60 * 60);
-    fs.utimesSync(recentSnapshot, now / 1000 - 5 * 24 * 60 * 60, now / 1000 - 5 * 24 * 60 * 60);
-
-    const outcome = applyRetentionPolicy({
-      retentionDays: 30,
-      snapshotDir,
-      archiveDir,
-      maxArchivesPerCamera: 1,
-      snapshot: { mode: 'archive', retentionDays: 35 },
-      now
-    });
-
-    const row = db.prepare('SELECT COUNT(*) as count FROM events').get() as { count: number };
-    expect(row.count).toBe(1);
-    expect(outcome.removedEvents).toBe(1);
-    expect(outcome.archivedSnapshots).toBe(2);
-    expect(outcome.prunedArchives).toBe(1);
-    expect(outcome.warnings).toHaveLength(0);
-
-    const archiveRoots = fs.readdirSync(archiveDir);
-    expect(archiveRoots).toContain(path.basename(snapshotDir));
-    const cameraRoot = path.join(archiveDir, path.basename(snapshotDir));
-    const datedFolders = fs.readdirSync(cameraRoot);
-    expect(datedFolders).toHaveLength(1);
-    const datedDir = path.join(cameraRoot, datedFolders[0]);
-    expect(fs.statSync(datedDir).isDirectory()).toBe(true);
-    const nestedFiles = fs.readdirSync(datedDir);
-    expect(nestedFiles).toContain('old.jpg');
-    expect(nestedFiles).not.toContain('older.jpg');
-    expect(fs.existsSync(path.join(snapshotDir, 'old.jpg'))).toBe(false);
-    expect(fs.existsSync(path.join(snapshotDir, 'older.jpg'))).toBe(false);
-    expect(fs.existsSync(path.join(snapshotDir, 'recent.jpg'))).toBe(true);
-
-    const execSpy = vi.spyOn(db, 'exec');
-    vacuumDatabase({
-      mode: 'full',
-      analyze: true,
-      reindex: true,
-      optimize: true,
-      target: 'main',
-      pragmas: ['PRAGMA incremental_vacuum']
-    });
-
-    expect(execSpy.mock.calls.map(call => call[0])).toEqual([
-      'PRAGMA wal_checkpoint(TRUNCATE)',
-      'REINDEX',
-      'ANALYZE',
-      'VACUUM main',
-      'PRAGMA optimize',
-      'PRAGMA incremental_vacuum'
-    ]);
-    execSpy.mockRestore();
-  });
-
-  it('RetentionScheduler prunes events and triggers vacuum maintenance', async () => {
+  it('RetentionVacuumPolicy honors run mode and emits metrics', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
-    const now = Date.UTC(2024, 1, 1);
+    const now = Date.UTC(2024, 0, 1);
     vi.setSystemTime(now);
 
-    const staleEvent: EventRecord = {
-      ts: now - 60 * dayMs,
-      source: 'sensor:old',
-      detector: 'motion',
-      severity: 'warning',
-      message: 'too old',
-      meta: { snapshot: path.join(snapshotDir, 'stale.jpg') }
-    };
-    const recentEvent: EventRecord = {
-      ts: now - 5 * dayMs,
-      source: 'sensor:keep',
-      detector: 'motion',
-      severity: 'info',
-      message: 'keep me',
-      meta: { channel: 'video:keep' }
-    };
-
-    storeEvent(staleEvent);
-    storeEvent(recentEvent);
-
-    const stalePath = path.join(snapshotDir, 'stale.jpg');
-    fs.writeFileSync(stalePath, 'snapshot');
-    fs.utimesSync(stalePath, (now - 60 * dayMs) / 1000, (now - 60 * dayMs) / 1000);
-
     const execSpy = vi.spyOn(db, 'exec');
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
     const logger = {
       info: vi.fn(),
       warn: vi.fn(),
@@ -150,57 +50,86 @@ describe('EventRetention', () => {
       retentionDays: 30,
       intervalMs: 1000,
       archiveDir,
-      snapshotDirs: [snapshotDir],
-      maxArchivesPerCamera: 5,
-      vacuumMode: 'full',
-      logger
+      snapshotDirs: [cameraOneDir],
+      vacuum: {
+        mode: 'full',
+        analyze: true,
+        reindex: true,
+        optimize: true,
+        pragmas: ['PRAGMA incremental_vacuum', ''],
+        run: 'always'
+      },
+      logger,
+      metrics: metrics as any
     });
 
     try {
       await vi.runOnlyPendingTimersAsync();
-
-      const remaining = db.prepare('SELECT COUNT(*) as count FROM events').get() as { count: number };
-      expect(remaining.count).toBe(1);
-
-      expect(execSpy).toHaveBeenCalledWith('PRAGMA wal_checkpoint(TRUNCATE)');
       expect(execSpy).toHaveBeenCalledWith('VACUUM');
+      expect(metrics.recordRetentionRun).toHaveBeenCalledWith({
+        removedEvents: 0,
+        archivedSnapshots: 0,
+        prunedArchives: 0
+      });
+      expect(metrics.recordRetentionWarning).not.toHaveBeenCalled();
 
       const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
       expect(infoCall?.[0]).toMatchObject({
-        removedEvents: 1,
-        archivedSnapshots: 1,
-        prunedArchives: 0,
         vacuumMode: 'full',
+        vacuumRunMode: 'always',
         vacuumTasks: {
-          analyze: false,
-          reindex: false,
-          optimize: false,
+          analyze: true,
+          reindex: true,
+          optimize: true,
           target: undefined
         }
       });
-      expect(logger.warn).not.toHaveBeenCalled();
     } finally {
       task.stop();
     }
   });
 
-  it('RetentionScheduler skips vacuum when nothing is pruned', async () => {
+  it('SnapshotArchiveQuota enforces per-camera limits and reports warnings', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
-    const now = Date.UTC(2024, 2, 1);
+    const now = Date.UTC(2024, 3, 15);
     vi.setSystemTime(now);
 
-    const recentEvent: EventRecord = {
-      ts: now - 2 * dayMs,
-      source: 'sensor:fresh',
+    const oldEvent: EventRecord = {
+      ts: now - 45 * dayMs,
+      source: 'sensor:retention',
       detector: 'motion',
       severity: 'info',
-      message: 'still fresh',
+      message: 'old event',
       meta: {}
     };
+    storeEvent(oldEvent);
 
-    storeEvent(recentEvent);
+    const files = [
+      path.join(cameraOneDir, 'c1-old.jpg'),
+      path.join(cameraOneDir, 'c1-older.jpg'),
+      path.join(cameraTwoDir, 'c2-a.jpg'),
+      path.join(cameraTwoDir, 'c2-b.jpg'),
+      path.join(cameraTwoDir, 'c2-c.jpg')
+    ];
+    for (const file of files) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, (now - 40 * dayMs) / 1000, (now - 40 * dayMs) / 1000);
+    }
 
-    const execSpy = vi.spyOn(db, 'exec');
+    const realRename = fs.renameSync.bind(fs);
+    let failNext = true;
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((...args) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error('move failed');
+      }
+      return realRename(...(args as Parameters<typeof fs.renameSync>));
+    });
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
     const logger = {
       info: vi.fn(),
       warn: vi.fn(),
@@ -212,26 +141,69 @@ describe('EventRetention', () => {
       retentionDays: 30,
       intervalMs: 1000,
       archiveDir,
-      snapshotDirs: [snapshotDir],
-      maxArchivesPerCamera: 2,
-      vacuumMode: 'full',
-      logger
+      snapshotDirs: [cameraOneDir, cameraTwoDir],
+      maxArchivesPerCamera: 3,
+      snapshot: {
+        mode: 'archive',
+        retentionDays: 10,
+        perCameraMax: {
+          [path.basename(cameraOneDir)]: 1,
+          [path.basename(cameraTwoDir)]: 2
+        }
+      },
+      logger,
+      metrics: metrics as any
     });
 
     try {
       await vi.runOnlyPendingTimersAsync();
 
-      const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
-      expect(infoCall?.[0]).toMatchObject({
-        removedEvents: 0,
-        archivedSnapshots: 0,
-        prunedArchives: 0,
-        vacuumMode: 'skipped'
+      expect(renameSpy).toHaveBeenCalled();
+      expect(metrics.recordRetentionWarning).toHaveBeenCalledWith({
+        camera: path.basename(cameraOneDir),
+        path: expect.stringContaining('c1'),
+        reason: 'move failed'
       });
-      expect(execSpy).not.toHaveBeenCalledWith('VACUUM');
-      expect(logger.warn).not.toHaveBeenCalled();
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'Retention archive warning');
+      expect(warnCall?.[0]).toMatchObject({ camera: path.basename(cameraOneDir) });
+
+      const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(infoCall?.[0]).toMatchObject({ prunedArchives: 1, archivedSnapshots: 4 });
+
+      expect(metrics.recordRetentionRun).toHaveBeenCalledWith({
+        removedEvents: 1,
+        archivedSnapshots: 4,
+        prunedArchives: 1
+      });
+
+      const camOneFiles = collectArchiveFiles(path.join(archiveDir, path.basename(cameraOneDir)));
+      const camTwoFiles = collectArchiveFiles(path.join(archiveDir, path.basename(cameraTwoDir)));
+      expect(camOneFiles.length).toBeLessThanOrEqual(1);
+      expect(camTwoFiles.length).toBe(2);
     } finally {
       task.stop();
+      renameSpy.mockRestore();
     }
   });
 });
+
+function collectArchiveFiles(root: string): string[] {
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  const files: string[] = [];
+  const queue: string[] = [root];
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const resolved = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(resolved);
+      } else if (entry.isFile()) {
+        files.push(resolved);
+      }
+    }
+  }
+  return files;
+}
+

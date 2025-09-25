@@ -25,6 +25,7 @@ export interface PersonDetectorOptions {
   maxDetections?: number;
   classIndices?: number[];
   objectClassifier?: ObjectClassifier;
+  classScoreThresholds?: Record<number, number>;
 }
 
 const TARGET_SIZE = 640;
@@ -45,6 +46,7 @@ export class PersonDetector {
   private lastEventTs = 0;
   private readonly classIndices: number[];
   private readonly objectClassifier?: ObjectClassifier;
+  private readonly classScoreThresholds?: Record<number, number>;
 
   private constructor(
     private readonly options: PersonDetectorOptions,
@@ -56,6 +58,7 @@ export class PersonDetector {
       .filter(value => Number.isFinite(value));
     this.classIndices = Array.from(new Set(sanitized.length > 0 ? sanitized : [PERSON_CLASS_INDEX]));
     this.objectClassifier = options.objectClassifier;
+    this.classScoreThresholds = normalizeClassScoreThresholds(options.classScoreThresholds);
   }
 
   static async create(options: PersonDetectorOptions, bus: EventEmitter = eventBus) {
@@ -92,6 +95,7 @@ export class PersonDetector {
       const detections = parseYoloDetections(output, meta, {
         classIndices: this.classIndices,
         scoreThreshold: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
+        classScoreThresholds: this.classScoreThresholds,
         nmsThreshold: DEFAULT_NMS_IOU_THRESHOLD,
         maxDetections: this.options.maxDetections
       });
@@ -128,9 +132,21 @@ export class PersonDetector {
           areaRatio: primaryDetection.areaRatio,
           thresholds: {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
-            nms: DEFAULT_NMS_IOU_THRESHOLD
+            nms: DEFAULT_NMS_IOU_THRESHOLD,
+            classScoreThresholds: this.classScoreThresholds
           },
-          detections: personDetections.map(serializeDetection)
+          detections: personDetections.map(serializeDetection),
+          preprocess: {
+            scale: meta.scale,
+            scaleX: meta.scaleX,
+            scaleY: meta.scaleY,
+            padX: meta.padX,
+            padY: meta.padY,
+            resizedWidth: meta.resizedWidth,
+            resizedHeight: meta.resizedHeight,
+            originalWidth: meta.originalWidth,
+            originalHeight: meta.originalHeight
+          }
         }
       };
 
@@ -138,6 +154,7 @@ export class PersonDetector {
         const objects = classifiedObjects.map(object => ({
           label: object.label,
           score: object.score,
+          confidence: object.detection.score,
           threat: object.isThreat,
           threatScore: object.threatScore,
           detection: serializeDetection(object.detection),
@@ -148,7 +165,8 @@ export class PersonDetector {
         if (threat) {
           payload.meta!.threat = {
             label: threat.label,
-            score: threat.threatScore
+            score: threat.threatScore,
+            confidence: threat.detection.score
           };
         }
       }
@@ -200,6 +218,8 @@ function preprocessFrame(frame: Buffer): { tensor: ort.Tensor; meta: PreprocessM
   const resizedHeight = Math.round(height * scale);
   const padX = Math.floor((TARGET_SIZE - resizedWidth) / 2);
   const padY = Math.floor((TARGET_SIZE - resizedHeight) / 2);
+  const scaleX = resizedWidth / width;
+  const scaleY = resizedHeight / height;
 
   const pixels = TARGET_SIZE * TARGET_SIZE;
   const chw = new Float32Array(3 * pixels).fill(0);
@@ -232,7 +252,11 @@ function preprocessFrame(frame: Buffer): { tensor: ort.Tensor; meta: PreprocessM
       padX,
       padY,
       originalWidth: width,
-      originalHeight: height
+      originalHeight: height,
+      resizedWidth,
+      resizedHeight,
+      scaleX,
+      scaleY
     }
   };
 }
@@ -301,6 +325,30 @@ function saveSnapshot(frame: Buffer, ts: number, dir?: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+export function normalizeClassScoreThresholds(
+  thresholds?: Record<number, number>
+): Record<number, number> | undefined {
+  if (!thresholds) {
+    return undefined;
+  }
+
+  const entries = Object.entries(thresholds)
+    .map(([key, value]) => [Number(key), Number(value)] as const)
+    .filter(([classId, score]) => Number.isFinite(classId) && classId >= 0 && Number.isFinite(score));
+
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  entries.sort((a, b) => a[0] - b[0]);
+  const normalized: Record<number, number> = {};
+  for (const [classId, score] of entries) {
+    normalized[classId] = Math.max(0, Math.min(1, score));
+  }
+
+  return normalized;
 }
 
 export default PersonDetector;

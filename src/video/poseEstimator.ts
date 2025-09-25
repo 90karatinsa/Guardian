@@ -5,6 +5,7 @@ import eventBus from '../eventBus.js';
 import logger from '../logger.js';
 import metrics from '../metrics/index.js';
 import { EventPayload } from '../types.js';
+import { summarizeThreatMetadata, type ThreatSummary } from './objectClassifier.js';
 
 export type PoseKeypoint = {
   x: number;
@@ -24,6 +25,9 @@ export type PoseForecast = {
   acceleration: number[];
   movementFlags: boolean[];
   confidence: number;
+  movingJointCount?: number;
+  dominantJoint?: number | null;
+  threatSummary?: ThreatSummary | null;
 };
 
 export interface PoseEstimatorOptions {
@@ -54,6 +58,8 @@ export class PoseEstimator {
   private readonly history: PoseFrame[] = [];
   private readonly bus: EventEmitter;
   private lastForecast: PoseForecast | null = null;
+  private lastMotionSnapshot: Record<string, unknown> | null = null;
+  private lastThreatSummary: ThreatSummary | null = null;
 
   private constructor(private readonly options: PoseEstimatorOptions) {
     this.bus = options.bus ?? eventBus;
@@ -108,8 +114,13 @@ export class PoseEstimator {
         horizonMs: this.options.forecastHorizonMs ?? DEFAULT_HORIZON_MS,
         minMovement: this.options.minMovement ?? DEFAULT_MIN_MOVEMENT
       });
+      const threatSummary = summarizeThreatMetadata(motionMeta);
+      const enrichedForecast = enrichForecast(forecast, threatSummary);
+      const combinedMotion = mergeMotionMeta(motionMeta, enrichedForecast, threatSummary);
 
-      this.lastForecast = forecast;
+      this.lastForecast = enrichedForecast;
+      this.lastMotionSnapshot = combinedMotion;
+      this.lastThreatSummary = threatSummary;
       metrics.incrementDetectorCounter('pose', 'forecasts');
       metrics.incrementDetectorCounter('pose', 'frames', history.length);
       const movementCount = forecast.movementFlags.filter(Boolean).length;
@@ -124,18 +135,21 @@ export class PoseEstimator {
         severity: 'info',
         message: 'Pose forecast generated',
         meta: {
-          horizonMs: forecast.horizonMs,
-          velocity: forecast.velocity,
-          acceleration: forecast.acceleration,
-          movementFlags: forecast.movementFlags,
-          confidence: forecast.confidence,
-          motion: motionMeta,
+          horizonMs: enrichedForecast.horizonMs,
+          velocity: enrichedForecast.velocity,
+          acceleration: enrichedForecast.acceleration,
+          movementFlags: enrichedForecast.movementFlags,
+          confidence: enrichedForecast.confidence,
+          movingJointCount: enrichedForecast.movingJointCount,
+          dominantJoint: enrichedForecast.dominantJoint,
+          motion: combinedMotion,
+          threats: threatSummary,
           frames: history.map(frame => ({ ts: frame.ts, keypoints: frame.keypoints.length }))
         }
       };
 
       this.bus.emit('event', payload);
-      return forecast;
+      return enrichedForecast;
     } catch (error) {
       metrics.recordDetectorError('pose', (error as Error).message ?? 'forecast-failed');
       throw error;
@@ -148,8 +162,19 @@ export class PoseEstimator {
     if (!this.lastForecast) {
       return meta;
     }
-    const merged = { ...(meta ?? {}), poseForecast: this.lastForecast };
-    return merged;
+    const base = meta && typeof meta === 'object' ? { ...meta } : {};
+    if (this.lastMotionSnapshot) {
+      const motionMeta =
+        base.motion && typeof base.motion === 'object'
+          ? { ...(base.motion as Record<string, unknown>) }
+          : {};
+      base.motion = { ...motionMeta, ...this.lastMotionSnapshot };
+    }
+    base.poseForecast = { ...this.lastForecast };
+    if (this.lastThreatSummary) {
+      base.poseThreatSummary = this.lastThreatSummary;
+    }
+    return base;
   }
 
   private async ensureSession() {
@@ -225,6 +250,56 @@ function interpretForecast(
     movementFlags,
     confidence
   };
+}
+
+function enrichForecast(forecast: PoseForecast, threatSummary: ThreatSummary | null): PoseForecast {
+  const movementFlags = [...forecast.movementFlags];
+  const movingJointCount = movementFlags.filter(Boolean).length;
+  let dominantJoint: number | null = null;
+  let dominantMagnitude = -Infinity;
+  for (let i = 0; i < movementFlags.length; i += 1) {
+    const velocity = Math.abs(forecast.velocity[i] ?? 0);
+    const acceleration = Math.abs(forecast.acceleration[i] ?? 0);
+    const magnitude = velocity + acceleration;
+    if (magnitude > dominantMagnitude) {
+      dominantMagnitude = magnitude;
+      dominantJoint = magnitude > 0 ? i : dominantJoint;
+    }
+  }
+
+  return {
+    ...forecast,
+    movementFlags,
+    movingJointCount,
+    dominantJoint: typeof dominantJoint === 'number' ? dominantJoint : null,
+    threatSummary
+  };
+}
+
+function mergeMotionMeta(
+  motionMeta: Record<string, unknown> | undefined,
+  forecast: PoseForecast,
+  threatSummary: ThreatSummary | null
+) {
+  const base = motionMeta && typeof motionMeta === 'object' ? { ...motionMeta } : {};
+  const snapshot: Record<string, unknown> = {
+    ...base,
+    futureMovementFlags: [...forecast.movementFlags],
+    movingJointCount: forecast.movingJointCount ?? forecast.movementFlags.filter(Boolean).length,
+    dominantJoint: typeof forecast.dominantJoint === 'number' ? forecast.dominantJoint : null,
+    forecastConfidence: forecast.confidence,
+    horizonMs: forecast.horizonMs
+  };
+
+  if (threatSummary) {
+    snapshot.threatCorrelation = {
+      maxThreatScore: threatSummary.maxThreatScore,
+      maxThreatLabel: threatSummary.maxThreatLabel,
+      totalDetections: threatSummary.totalDetections
+    };
+  }
+
+  return snapshot;
 }
 
 function createMockSession(): InferenceSessionLike {

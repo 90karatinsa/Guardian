@@ -66,6 +66,7 @@ export type CameraPersonConfig = {
   maxDetections?: number;
   snapshotDir?: string;
   minIntervalMs?: number;
+  classScoreThresholds?: Record<number, number>;
 };
 
 export type MotionTuningConfig = {
@@ -105,7 +106,7 @@ export type CameraFfmpegConfig = {
 
 export type CameraConfig = {
   id: string;
-  channel?: string;
+  channel: string;
   input?: string;
   framesPerSecond?: number;
   person?: CameraPersonConfig;
@@ -129,6 +130,7 @@ export type PersonConfig = {
   snapshotDir?: string;
   minIntervalMs?: number;
   classIndices?: number[];
+  classScoreThresholds?: Record<number, number>;
 };
 
 export type MotionConfig = MotionTuningConfig & {
@@ -236,10 +238,20 @@ type JsonSchema = {
   type: JsonType | JsonType[];
   properties?: Record<string, JsonSchema>;
   required?: string[];
-  additionalProperties?: boolean;
+  additionalProperties?: boolean | JsonSchema;
   items?: JsonSchema;
   enum?: (string | number | boolean)[];
   minimum?: number;
+  maximum?: number;
+};
+
+const classScoreThresholdSchema: JsonSchema = {
+  type: 'object',
+  additionalProperties: {
+    type: 'number',
+    minimum: 0,
+    maximum: 1
+  }
 };
 
 const anomalyThresholdSchema: JsonSchema = {
@@ -461,7 +473,8 @@ const guardianConfigSchema: JsonSchema = {
                   classIndices: {
                     type: 'array',
                     items: { type: 'number', minimum: 0 }
-                  }
+                  },
+                  classScoreThresholds: classScoreThresholdSchema
                 }
               }
             }
@@ -471,7 +484,7 @@ const guardianConfigSchema: JsonSchema = {
           type: 'array',
           items: {
             type: 'object',
-            required: ['id'],
+            required: ['id', 'channel'],
             additionalProperties: false,
             properties: {
               id: { type: 'string' },
@@ -490,7 +503,8 @@ const guardianConfigSchema: JsonSchema = {
                   classIndices: {
                     type: 'array',
                     items: { type: 'number', minimum: 0 }
-                  }
+                  },
+                  classScoreThresholds: classScoreThresholdSchema
                 }
               },
               motion: {
@@ -546,7 +560,8 @@ const guardianConfigSchema: JsonSchema = {
         classIndices: {
           type: 'array',
           items: { type: 'number', minimum: 0 }
-        }
+        },
+        classScoreThresholds: classScoreThresholdSchema
       }
     },
     motion: {
@@ -734,12 +749,25 @@ function validateAgainstSchemaForType(
       }
     }
 
+    const definedProperties = new Set(Object.keys(schema.properties ?? {}));
     if (schema.additionalProperties === false) {
-      const allowed = new Set(Object.keys(schema.properties ?? {}));
       for (const key of Object.keys(obj)) {
-        if (!allowed.has(key)) {
+        if (!definedProperties.has(key)) {
           errors.push(`${pathLabel}.${key} is not allowed`);
         }
+      }
+    } else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+      for (const key of Object.keys(obj)) {
+        if (definedProperties.has(key)) {
+          continue;
+        }
+        errors.push(
+          ...validateAgainstSchema(
+            schema.additionalProperties,
+            obj[key],
+            `${pathLabel}.${key}`
+          )
+        );
       }
     }
 
@@ -813,6 +841,7 @@ export function validateConfig(config: unknown): asserts config is GuardianConfi
   if (errors.length > 0) {
     throw new Error(errors.join('; '));
   }
+  validateLogicalConfig(config as GuardianConfig);
 }
 
 export function parseConfig(contents: string): GuardianConfig {
@@ -832,6 +861,60 @@ export function loadConfigFromFile(filePath: string): GuardianConfig {
   const resolvedPath = path.resolve(filePath);
   const contents = fs.readFileSync(resolvedPath, 'utf-8');
   return parseConfig(contents);
+}
+
+function validateLogicalConfig(config: GuardianConfig) {
+  const messages: string[] = [];
+
+  const channelDefinitions = config.video.channels ? new Set(Object.keys(config.video.channels)) : null;
+  if (channelDefinitions && Array.isArray(config.video.cameras)) {
+    config.video.cameras.forEach((camera, index) => {
+      if (!channelDefinitions.has(camera.channel)) {
+        const label = camera.id ?? `#${index}`;
+        messages.push(`config.video.cameras[${label}] references undefined channel "${camera.channel}"`);
+      }
+    });
+  }
+
+  const micFallbacks = config.audio?.micFallbacks;
+  if (micFallbacks && typeof micFallbacks === 'object') {
+    for (const [platform, fallbacks] of Object.entries(micFallbacks)) {
+      if (!Array.isArray(fallbacks) || fallbacks.length === 0) {
+        messages.push(`config.audio.micFallbacks.${platform} must define at least one device`);
+        continue;
+      }
+      fallbacks.forEach((candidate, index) => {
+        const device = typeof candidate.device === 'string' ? candidate.device.trim() : '';
+        if (!device) {
+          messages.push(`config.audio.micFallbacks.${platform}[${index}].device must be a non-empty string`);
+        }
+      });
+    }
+  }
+
+  const suppressionRules = config.events?.suppression?.rules ?? [];
+  suppressionRules.forEach((rule, index) => {
+    const rateLimit = rule.rateLimit;
+    if (!rateLimit) {
+      return;
+    }
+    const { count, perMs } = rateLimit;
+    if (!Number.isInteger(count) || count <= 0) {
+      messages.push(`config.events.suppression.rules[${index}].rateLimit.count must be a positive integer`);
+    }
+    if (!Number.isInteger(perMs) || perMs <= 0) {
+      messages.push(`config.events.suppression.rules[${index}].rateLimit.perMs must be a positive integer`);
+    }
+    if (Number.isInteger(count) && Number.isInteger(perMs) && perMs < count) {
+      messages.push(
+        `config.events.suppression.rules[${index}].rateLimit.perMs must be greater than or equal to count`
+      );
+    }
+  });
+
+  if (messages.length > 0) {
+    throw new Error(messages.join('; '));
+  }
 }
 
 export type ConfigReloadEvent = {
@@ -859,6 +942,10 @@ export class ConfigManager extends EventEmitter {
 
   getConfig(): GuardianConfig {
     return this.currentConfig;
+  }
+
+  getPath(): string {
+    return this.filePath;
   }
 
   reload(): GuardianConfig {

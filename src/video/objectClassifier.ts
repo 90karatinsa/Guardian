@@ -25,6 +25,20 @@ export interface ClassifiedObject {
   isThreat: boolean;
 }
 
+export type ThreatSummaryEntry = {
+  label: string | null;
+  threatScore: number;
+  isThreat: boolean;
+};
+
+export type ThreatSummary = {
+  objects: ThreatSummaryEntry[];
+  maxThreatScore: number;
+  maxThreatLabel: string | null;
+  averageThreatScore: number;
+  totalDetections: number;
+};
+
 const DEFAULT_THREAT_THRESHOLD = 0.6;
 
 export class ObjectClassifier {
@@ -213,6 +227,65 @@ function createMockSession(labelCount: number): InferenceSessionLike {
       };
     }
   };
+}
+
+export function summarizeThreatMetadata(meta: Record<string, unknown> | undefined): ThreatSummary | null {
+  if (!meta || typeof meta !== 'object') {
+    return null;
+  }
+
+  const objectsRaw = Array.isArray((meta as { objects?: unknown }).objects)
+    ? ((meta as { objects?: unknown }).objects as unknown[])
+    : [];
+  const normalized: ThreatSummaryEntry[] = [];
+
+  for (const entry of objectsRaw) {
+    const normalizedEntry = normalizeThreatEntry(entry);
+    if (normalizedEntry) {
+      normalized.push(normalizedEntry);
+    }
+  }
+
+  const explicitThreat = normalizeThreatEntry((meta as { threat?: unknown }).threat);
+  if (explicitThreat) {
+    normalized.push(explicitThreat);
+  }
+
+  if (normalized.length === 0) {
+    return null;
+  }
+
+  let total = 0;
+  let max = normalized[0];
+  for (const entry of normalized) {
+    total += entry.threatScore;
+    if (entry.threatScore > max.threatScore) {
+      max = entry;
+    }
+  }
+
+  return {
+    objects: normalized,
+    maxThreatScore: max.threatScore,
+    maxThreatLabel: max.label,
+    averageThreatScore: total / normalized.length,
+    totalDetections: normalized.length
+  };
+}
+
+function normalizeThreatEntry(value: unknown): ThreatSummaryEntry | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const threatScoreCandidate = record.threatScore ?? record.score ?? record.confidence;
+  const threatScore = typeof threatScoreCandidate === 'number' ? threatScoreCandidate : null;
+  if (threatScore === null) {
+    return null;
+  }
+  const label = typeof record.label === 'string' ? record.label : null;
+  const isThreat = typeof record.threat === 'boolean' ? record.threat : threatScore >= 0.5;
+  return { label, threatScore, isThreat };
 }
 
 export default ObjectClassifier;

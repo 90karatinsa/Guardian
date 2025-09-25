@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import logger from './logger.js';
-import metrics, { type MetricsRegistry } from './metrics/index.js';
+import metrics, { type MetricsRegistry, type SuppressedEventMetric } from './metrics/index.js';
 import { storeEvent } from './db.js';
 import {
   EventPayload,
@@ -96,7 +96,7 @@ class EventBus extends EventEmitter {
 
     if (evaluation.suppressed) {
       const primary = evaluation.hits[0];
-      const historyWithSuppressedEvent = buildSuppressionHistory(primary, normalized.ts);
+      const combinedHistory = mergeSuppressionHistory(evaluation.hits, normalized.ts);
       const suppressedBy = evaluation.hits.map(hit => ({
         ruleId: hit.rule.id,
         reason: hit.reason,
@@ -116,12 +116,29 @@ class EventBus extends EventEmitter {
         suppressionRuleId: primary?.rule.id,
         suppressionWindowExpiresAt: primary?.windowExpiresAt,
         rateLimitWindowMs: primary?.rateLimit?.perMs,
-        suppressionHistory: historyWithSuppressedEvent,
-        suppressionHistoryCount: historyWithSuppressedEvent.length,
+        suppressionHistory: combinedHistory,
+        suppressionHistoryCount: combinedHistory.length,
         suppressedBy
       };
+      normalized.meta = meta;
+      if (payload.meta && typeof payload.meta === 'object') {
+        Object.assign(payload.meta, meta);
+      } else {
+        payload.meta = meta;
+      }
+
       for (const hit of evaluation.hits) {
-        this.metrics.recordSuppressedEvent(hit.rule.id, hit.reason);
+        const detail: SuppressedEventMetric = {
+          ruleId: hit.rule.id,
+          reason: hit.reason,
+          type: hit.type,
+          historyCount: hit.history.length,
+          history: [...hit.history],
+          windowExpiresAt: hit.windowExpiresAt,
+          rateLimit: hit.rateLimit,
+          combinedHistoryCount: combinedHistory.length
+        };
+        this.metrics.recordSuppressedEvent(detail);
       }
       this.log.info(
         {
@@ -184,9 +201,7 @@ class EventBus extends EventEmitter {
           historyLimit && historyLimit > 0
             ? historySnapshot.slice(-historyLimit)
             : [...historySnapshot];
-        const rateLimitHistory = rule.suppressForMs
-          ? [...relevantSnapshot]
-          : [...relevantSnapshot, event.ts];
+        const rateLimitHistory = [...relevantSnapshot, event.ts];
         if (rule.suppressForMs) {
           const windowUntil = Math.max(rule.suppressedUntil, event.ts + rule.suppressForMs);
           rule.suppressedUntil = windowUntil;
@@ -345,16 +360,22 @@ function extractEventChannels(meta: Record<string, unknown> | undefined): string
   return [];
 }
 
-function buildSuppressionHistory(hit: SuppressionHit | undefined, eventTs: number): number[] {
-  if (!hit) {
+function mergeSuppressionHistory(hits: SuppressionHit[], eventTs: number): number[] {
+  if (hits.length === 0) {
     return [];
   }
 
-  const baseHistory = [...hit.history];
+  const merged = new Set<number>();
 
-  if (hit.type === 'rate-limit' && hit.rule.suppressForMs) {
-    return [...baseHistory, eventTs];
+  for (const hit of hits) {
+    for (const entry of hit.history) {
+      merged.add(entry);
+    }
+
+    if (!hit.history.includes(eventTs)) {
+      merged.add(eventTs);
+    }
   }
 
-  return baseHistory;
+  return [...merged].sort((a, b) => a - b);
 }

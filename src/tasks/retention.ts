@@ -1,5 +1,6 @@
 import path from 'node:path';
 import loggerModule from '../logger.js';
+import metricsModule, { MetricsRegistry } from '../metrics/index.js';
 import {
   applyRetentionPolicy,
   RetentionOutcome,
@@ -23,6 +24,7 @@ export interface RetentionTaskOptions {
   vacuum?: VacuumMode | VacuumOptions;
   snapshot?: SnapshotRotationOptions;
   logger?: RetentionLogger;
+  metrics?: MetricsRegistry;
 }
 
 type NormalizedOptions = {
@@ -32,13 +34,14 @@ type NormalizedOptions = {
   archiveDir: string;
   snapshotDirs: string[];
   maxArchivesPerCamera?: number;
-  vacuum: VacuumOptions;
+  vacuum: Required<VacuumOptions>;
   snapshot?: SnapshotRotationOptions;
 };
 
 export class RetentionTask {
   private options: NormalizedOptions;
   private readonly logger: RetentionLogger;
+  private readonly metrics: MetricsRegistry;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private stopped = false;
@@ -46,6 +49,7 @@ export class RetentionTask {
   constructor(options: RetentionTaskOptions) {
     this.options = normalizeOptions(options);
     this.logger = options.logger ?? loggerModule;
+    this.metrics = options.metrics ?? metricsModule;
   }
 
   start() {
@@ -114,13 +118,31 @@ export class RetentionTask {
         snapshot: this.options.snapshot
       });
 
+      const shouldVacuum =
+        this.options.vacuum.run === 'always' ||
+        (this.options.vacuum.run !== 'always' && outcome.removedEvents > 0);
+
       for (const warning of outcome.warnings) {
-        this.logger.warn({ path: warning.path, err: warning.error }, 'Retention archive warning');
+        this.logger.warn(
+          { path: warning.path, camera: warning.camera, err: warning.error },
+          'Retention archive warning'
+        );
+        this.metrics.recordRetentionWarning({
+          camera: warning.camera,
+          path: warning.path,
+          reason: warning.error.message ?? warning.error.name
+        });
       }
 
-      if (outcome.removedEvents > 0) {
+      if (shouldVacuum) {
         vacuumDatabase(this.options.vacuum);
       }
+
+      this.metrics.recordRetentionRun({
+        removedEvents: outcome.removedEvents,
+        archivedSnapshots: outcome.archivedSnapshots,
+        prunedArchives: outcome.prunedArchives
+      });
 
       this.logger.info(
         {
@@ -128,9 +150,10 @@ export class RetentionTask {
           archivedSnapshots: outcome.archivedSnapshots,
           prunedArchives: outcome.prunedArchives,
           retentionDays: this.options.retentionDays,
-          vacuumMode: outcome.removedEvents > 0 ? this.options.vacuum.mode ?? 'auto' : 'skipped',
+          vacuumMode: shouldVacuum ? this.options.vacuum.mode ?? 'auto' : 'skipped',
+          vacuumRunMode: this.options.vacuum.run,
           vacuumTasks:
-            outcome.removedEvents > 0
+            shouldVacuum
               ? {
                   analyze: this.options.vacuum.analyze === true,
                   reindex: this.options.vacuum.reindex === true,
@@ -219,20 +242,31 @@ function normalizeSnapshotConfig(snapshot?: SnapshotRotationOptions): SnapshotRo
   if (typeof snapshot.retentionDays === 'number' && Number.isFinite(snapshot.retentionDays)) {
     normalized.retentionDays = Math.max(0, Math.floor(snapshot.retentionDays));
   }
+  if (snapshot.perCameraMax && typeof snapshot.perCameraMax === 'object') {
+    const entries = Object.entries(snapshot.perCameraMax)
+      .filter(([camera, value]) => typeof camera === 'string' && camera.trim().length > 0)
+      .filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+      .map(([camera, value]) => [camera, Math.floor(value)] as const);
+    if (entries.length > 0) {
+      normalized.perCameraMax = Object.fromEntries(entries);
+    }
+  }
   return normalized;
 }
 
-function normalizeVacuumConfig(options: RetentionTaskOptions): VacuumOptions {
+function normalizeVacuumConfig(options: RetentionTaskOptions): Required<VacuumOptions> {
   const base = options.vacuum;
   const legacyMode = options.vacuumMode;
 
   if (typeof base === 'string') {
-    return { mode: base };
+    return normalizeVacuumConfig({ ...options, vacuum: { mode: base } });
   }
 
   if (base && typeof base === 'object') {
     const pragmas = Array.isArray(base.pragmas)
-      ? base.pragmas.filter((entry): entry is string => typeof entry === 'string')
+      ? base.pragmas
+          .map(entry => (typeof entry === 'string' ? entry.trim() : ''))
+          .filter(entry => entry.length > 0)
       : undefined;
 
     return {
@@ -241,13 +275,30 @@ function normalizeVacuumConfig(options: RetentionTaskOptions): VacuumOptions {
       analyze: base.analyze === true,
       reindex: base.reindex === true,
       optimize: base.optimize === true,
-      pragmas
-    } satisfies VacuumOptions;
+      pragmas,
+      run: base.run === 'always' ? 'always' : 'on-change'
+    } satisfies Required<VacuumOptions>;
   }
 
   if (legacyMode) {
-    return { mode: legacyMode };
+    return {
+      mode: legacyMode,
+      target: undefined,
+      analyze: false,
+      reindex: false,
+      optimize: false,
+      pragmas: undefined,
+      run: 'on-change'
+    };
   }
 
-  return { mode: 'auto' };
+  return {
+    mode: 'auto',
+    target: undefined,
+    analyze: false,
+    reindex: false,
+    optimize: false,
+    pragmas: undefined,
+    run: 'on-change'
+  };
 }

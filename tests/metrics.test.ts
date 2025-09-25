@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { EventBus } from '../src/eventBus.js';
-import { MetricsRegistry } from '../src/metrics/index.js';
+import metrics, { MetricsRegistry } from '../src/metrics/index.js';
+import { collectHealthChecks, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
 
 function createBus() {
   const metrics = {
@@ -170,5 +171,115 @@ describe('MetricsCounters', () => {
     expect(snapshot.detectors.object.counters.threats).toBe(2);
     expect(snapshot.detectors.object.counters.detections).toBe(7);
     expect(snapshot.detectors.object.lastRunAt).not.toBeNull();
+  });
+});
+
+describe('MetricsSnapshotEnrichment', () => {
+  beforeEach(() => {
+    metrics.reset();
+    resetAppLifecycle();
+  });
+
+  afterEach(() => {
+    metrics.reset();
+    resetAppLifecycle();
+  });
+
+  it('MetricsSuppressionCounters aggregates suppression history and exposes health context metrics', async () => {
+    metrics.incrementLogLevel('info');
+    metrics.incrementLogLevel('ERROR', { message: 'pipeline crash' });
+
+    metrics.recordSuppressedEvent({
+      ruleId: 'window-1',
+      reason: 'cooldown',
+      type: 'window',
+      historyCount: 3
+    });
+    metrics.recordSuppressedEvent({
+      ruleId: 'rate-1',
+      reason: 'rate-limit',
+      type: 'rate-limit',
+      historyCount: 2,
+      combinedHistoryCount: 5,
+      rateLimit: { count: 4, perMs: 1000 }
+    });
+    metrics.recordSuppressedEvent({
+      ruleId: 'window-1',
+      reason: 'cooldown',
+      type: 'window',
+      historyCount: 4,
+      combinedHistoryCount: 4
+    });
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.logs.histogram.info).toBe(1);
+    expect(snapshot.logs.histogram.error).toBe(1);
+    expect(snapshot.suppression.byType.window).toBe(2);
+    expect(snapshot.suppression.byType['rate-limit']).toBe(1);
+    expect(snapshot.suppression.historyTotals.historyCount).toBe(9);
+    expect(snapshot.suppression.historyTotals.combinedHistoryCount).toBe(9);
+    expect(snapshot.suppression.rules['window-1'].history.total).toBe(7);
+    expect(snapshot.suppression.rules['window-1'].history.lastType).toBe('window');
+    expect(snapshot.suppression.lastEvent?.ruleId).toBe('window-1');
+
+    const unregister = registerHealthIndicator('metrics-snapshot', context => {
+      expect(context.metrics?.suppression.total).toBe(3);
+      expect(context.metrics?.logs.byLevel.error).toBe(1);
+      return {
+        status: 'ok',
+        details: {
+          lastSuppressed: context.metrics?.suppression.lastEvent
+        }
+      };
+    });
+
+    const checks = await collectHealthChecks({
+      service: { status: 'running', startedAt: Date.now() }
+    });
+    unregister();
+    const metricsCheck = checks.find(check => check.name === 'metrics-snapshot');
+    expect(metricsCheck?.details?.lastSuppressed?.ruleId).toBe('window-1');
+  });
+
+  it('MetricsPipelineRestartHistogram tracks restart attempts and detector latency histograms', () => {
+    metrics.recordPipelineRestart('ffmpeg', 'watchdog', {
+      delayMs: 1200,
+      attempt: 3,
+      channel: 'video:front-door'
+    });
+    metrics.recordPipelineRestart('ffmpeg', 'spawn-error', {
+      delayMs: 80,
+      attempt: 1
+    });
+    metrics.recordPipelineRestart('audio', 'spawn-error', {
+      delayMs: 300,
+      attempt: 2,
+      channel: 'audio:lobby'
+    });
+
+    metrics.observeDetectorLatency('pose', 75);
+    metrics.observeDetectorLatency('audio-anomaly', 180);
+    metrics.observeDetectorLatency('audio-anomaly', 40);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.attempts['3']).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.attempts['1']).toBe(1);
+    expect(snapshot.pipelines.audio.attempts['2']).toBe(1);
+
+    const attemptHistogram = snapshot.histograms['pipeline.ffmpeg.restart.attempt'];
+    expect(attemptHistogram?.['3']).toBe(1);
+    expect(attemptHistogram?.['1']).toBe(1);
+
+    const delayHistogram = snapshot.histograms['pipeline.ffmpeg.restart.delay'];
+    expect(delayHistogram).toBeDefined();
+
+    const poseLatency = snapshot.detectors.pose.latency;
+    expect(poseLatency?.count).toBe(1);
+    expect(snapshot.detectors.pose.latencyHistogram['50-100']).toBe(1);
+
+    const anomalyLatency = snapshot.detectors['audio-anomaly'].latency;
+    expect(anomalyLatency?.count).toBe(2);
+    expect(snapshot.detectors['audio-anomaly'].latencyHistogram['25-50']).toBe(1);
+    expect(snapshot.detectors['audio-anomaly'].latencyHistogram['100-250']).toBe(1);
   });
 });
