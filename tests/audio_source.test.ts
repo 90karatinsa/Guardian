@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ChildProcess, ExecFileCallback, ExecFileException } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import metrics from '../src/metrics/index.js';
 
 const spawnMock = vi.fn();
 const execFileMock = vi.fn();
@@ -35,6 +36,7 @@ describe('AudioSource resilience', () => {
     spawnMock.mockReset();
     execFileMock.mockReset();
     meydaExtractMock.mockReset();
+    metrics.reset();
   });
 
   afterEach(async () => {
@@ -266,6 +268,41 @@ describe('AudioSource resilience', () => {
     expect(cachedDevices).toEqual(devices);
   });
 
+  it('AudioDeviceDiscoveryTimeout records timeouts and falls back to alternate probes', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const output = `
+[dshow @ 000002] DirectShow audio devices
+[dshow @ 000002]  "Microphone (USB)"
+[dshow @ 000002]  "Line In (High Definition)"
+`;
+
+    const hangingChild = createExecFileChild();
+    execFileMock.mockImplementation((command: string, args: string[], callback: ExecFileCallback) => {
+      if (command === 'ffprobe') {
+        // Simulate a hung ffprobe invocation that requires a timeout
+        return hangingChild;
+      }
+
+      const child = createExecFileChild();
+      setTimeout(() => callback(null, '', output), 10);
+      return child;
+    });
+
+    const promise = AudioSource.listDevices('auto', { timeoutMs: 500, channel: 'audio:mic' });
+
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(promise).resolves.toEqual(['Microphone (USB)', 'Line In (High Definition)']);
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+    expect(hangingChild.kill).toHaveBeenCalled();
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.audio.deviceDiscovery['device-discovery-timeout']).toBe(1);
+  });
+
   it('AudioWindowing enforces alignment for pipe inputs', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
     const source = new AudioSource({ type: 'ffmpeg', input: 'pipe:0', sampleRate: 8000, channels: 1 });
@@ -298,4 +335,10 @@ function createFakeProcess() {
     return true;
   });
   return proc;
+}
+
+function createExecFileChild() {
+  const child = new EventEmitter() as unknown as ChildProcess & { kill: ReturnType<typeof vi.fn> };
+  (child as any).kill = vi.fn(() => true);
+  return child;
 }

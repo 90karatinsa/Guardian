@@ -31,6 +31,7 @@ const DEFAULT_NOISE_MULTIPLIER = 2.5;
 const DEFAULT_NOISE_SMOOTHING = 0.1;
 
 export class LightDetector {
+  private options: LightDetectorOptions;
   private baseline: number | null = null;
   private lastEventTs = 0;
   private noiseLevel = 0;
@@ -39,10 +40,49 @@ export class LightDetector {
   private suppressedFrames = 0;
   private deltaTrend = 0;
 
-  constructor(
-    private readonly options: LightDetectorOptions,
-    private readonly bus: EventEmitter = eventBus
-  ) {}
+  constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
+    this.options = {
+      ...options,
+      normalHours: options.normalHours?.map(range => ({ ...range }))
+    };
+  }
+
+  updateOptions(options: Partial<Omit<LightDetectorOptions, 'source'>>) {
+    const next: LightDetectorOptions = {
+      ...this.options,
+      ...options,
+      normalHours: options.normalHours
+        ? options.normalHours.map(range => ({ ...range }))
+        : this.options.normalHours
+    };
+
+    const baselineResetNeeded =
+      (typeof options.deltaThreshold === 'number' &&
+        options.deltaThreshold !== this.options.deltaThreshold) ||
+      (typeof options.smoothingFactor === 'number' &&
+        options.smoothingFactor !== this.options.smoothingFactor) ||
+      (typeof options.noiseMultiplier === 'number' &&
+        options.noiseMultiplier !== this.options.noiseMultiplier) ||
+      (typeof options.noiseSmoothing === 'number' &&
+        options.noiseSmoothing !== this.options.noiseSmoothing) ||
+      (options.normalHours !== undefined &&
+        !lightHoursEqual(this.options.normalHours, options.normalHours));
+
+    const countersResetNeeded =
+      baselineResetNeeded ||
+      (typeof options.debounceFrames === 'number' &&
+        options.debounceFrames !== this.options.debounceFrames) ||
+      (typeof options.backoffFrames === 'number' &&
+        options.backoffFrames !== this.options.backoffFrames);
+
+    this.options = next;
+
+    if (baselineResetNeeded) {
+      this.resetAdaptiveState(false);
+    } else if (countersResetNeeded) {
+      this.resetAdaptiveState(true);
+    }
+  }
 
   handleFrame(frame: Buffer, ts = Date.now()) {
     const start = performance.now();
@@ -137,6 +177,8 @@ export class LightDetector {
           this.pendingFrames = Math.max(0, this.pendingFrames - 1);
         }
         if (this.backoffFrames > 0) {
+          metrics.incrementDetectorCounter('light', 'backoffFrames', 1);
+          metrics.incrementDetectorCounter('light', 'backoffSuppressedFrames', 1);
           this.backoffFrames -= 1;
         }
         this.noiseLevel = updatedNoiseFloor;
@@ -161,6 +203,8 @@ export class LightDetector {
       );
 
       if (this.backoffFrames > 0) {
+        metrics.incrementDetectorCounter('light', 'backoffFrames', 1);
+        metrics.incrementDetectorCounter('light', 'backoffSuppressedFrames', 1);
         this.backoffFrames -= 1;
         this.pendingFrames = 0;
         return;
@@ -181,6 +225,8 @@ export class LightDetector {
       this.lastEventTs = ts;
       this.pendingFrames = 0;
       this.backoffFrames = effectiveBackoff;
+      metrics.incrementDetectorCounter('light', 'backoffActivations', 1);
+      metrics.incrementDetectorCounter('light', 'backoffFrameBudget', effectiveBackoff);
       const previousBaseline = this.baseline;
       this.baseline = this.baseline * (1 - effectiveSmoothing) + luminance * effectiveSmoothing;
       const updatedBaseline = this.baseline;
@@ -223,7 +269,22 @@ export class LightDetector {
   }
 
   private updateBaseline(luminance: number, smoothing: number) {
-    this.baseline = this.baseline! * (1 - smoothing) + luminance * smoothing;
+    if (this.baseline === null) {
+      this.baseline = luminance;
+      return;
+    }
+    this.baseline = this.baseline * (1 - smoothing) + luminance * smoothing;
+  }
+
+  private resetAdaptiveState(preserveBaseline: boolean) {
+    if (!preserveBaseline) {
+      this.baseline = null;
+    }
+    this.noiseLevel = 0;
+    this.pendingFrames = 0;
+    this.backoffFrames = 0;
+    this.suppressedFrames = 0;
+    this.deltaTrend = 0;
   }
 
   private isWithinNormalHours(ts: number) {
@@ -257,6 +318,31 @@ function normalizeHour(hour: number) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function lightHoursEqual(
+  a?: Array<{ start: number; end: number }> | null,
+  b?: Array<{ start: number; end: number }> | null
+) {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  for (let i = 0; i < a.length; i += 1) {
+    const lhs = a[i];
+    const rhs = b[i];
+    if (lhs.start !== rhs.start || lhs.end !== rhs.end) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 export default LightDetector;

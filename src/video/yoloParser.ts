@@ -91,6 +91,11 @@ export function parseYoloDetections(
 
       const classLogit = accessor.get(detectionIndex, attributeIndex);
       const classProbability = sigmoid(classLogit);
+
+      if (!Number.isFinite(classProbability) || classProbability <= 0) {
+        continue;
+      }
+
       const score = clamp(objectness * classProbability, 0, 1);
 
       const threshold = resolveThreshold(classId);

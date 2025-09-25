@@ -53,6 +53,15 @@ class MockMotionDetector {
   handleFrame() {}
 }
 
+class MockLightDetector {
+  static instances: MockLightDetector[] = [];
+  public updateOptions = vi.fn();
+  public handleFrame = vi.fn();
+  constructor(public readonly options: Record<string, unknown>) {
+    MockLightDetector.instances.push(this);
+  }
+}
+
 class MockConfigManager extends EventEmitter {
   constructor(private current: GuardianConfig) {
     super();
@@ -86,6 +95,10 @@ vi.mock('../src/video/motionDetector.js', () => ({
   default: MockMotionDetector
 }));
 
+vi.mock('../src/video/lightDetector.js', () => ({
+  default: MockLightDetector
+}));
+
 vi.mock('../src/video/sampleVideo.js', () => ({
   ensureSampleVideo: (input: string) => input
 }));
@@ -107,6 +120,7 @@ describe('run-guard multi camera orchestration', () => {
     MockPersonDetector.instances = [];
     MockPersonDetector.calls = [];
     MockMotionDetector.instances = [];
+    MockLightDetector.instances = [];
     metrics.reset();
   });
 
@@ -349,11 +363,27 @@ describe('run-guard multi camera orchestration', () => {
     });
 
     expect(logger.warn).toHaveBeenCalledWith(
-      { camera: 'cam-default', attempt: 2, reason: 'watchdog-timeout', delayMs: 444 },
+      expect.objectContaining({
+        camera: 'cam-default',
+        attempt: 2,
+        reason: 'watchdog-timeout',
+        delayMs: 444,
+        channel: 'video:cam-default',
+        errorCode: null,
+        exitCode: null
+      }),
       'Video source reconnecting (reason=watchdog-timeout)'
     );
     expect(logger.warn).toHaveBeenCalledWith(
-      { camera: 'cam-override', attempt: 1, reason: 'start-timeout', delayMs: 1000 },
+      expect.objectContaining({
+        camera: 'cam-override',
+        attempt: 1,
+        reason: 'start-timeout',
+        delayMs: 1000,
+        channel: 'video:cam-override',
+        errorCode: null,
+        exitCode: null
+      }),
       'Video source reconnecting (reason=start-timeout)'
     );
 
@@ -539,11 +569,27 @@ describe('run-guard multi camera orchestration', () => {
       expect(cam2Runtime?.restartStats.watchdogBackoffMs).toBe(0);
 
       expect(logger.warn).toHaveBeenCalledWith(
-        { camera: 'cam-1', attempt: 1, reason: 'watchdog-timeout', delayMs: 300 },
+        expect.objectContaining({
+          camera: 'cam-1',
+          attempt: 1,
+          reason: 'watchdog-timeout',
+          delayMs: 300,
+          channel: 'video:cam-1',
+          errorCode: null,
+          exitCode: null
+        }),
         'Video source reconnecting (reason=watchdog-timeout)'
       );
       expect(logger.warn).toHaveBeenCalledWith(
-        { camera: 'cam-2', attempt: 2, reason: 'start-timeout', delayMs: 600 },
+        expect.objectContaining({
+          camera: 'cam-2',
+          attempt: 2,
+          reason: 'start-timeout',
+          delayMs: 600,
+          channel: 'video:cam-2',
+          errorCode: null,
+          exitCode: null
+        }),
         'Video source reconnecting (reason=start-timeout)'
       );
 
@@ -836,6 +882,108 @@ describe('run-guard multi camera orchestration', () => {
     expect(MockPersonDetector.calls).toEqual(['video:cam-1', 'video:cam-2']);
 
     runtime.stop();
+  });
+
+  it('LightPipelineActivation enables light detectors per camera and applies hot reload updates', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      app: { name: 'Guardian Test' },
+      logging: { level: 'silent' },
+      database: { path: 'guardian-test.sqlite' },
+      events: {
+        thresholds: { info: 0, warning: 1, critical: 2 },
+        suppression: { rules: [] }
+      },
+      video: {
+        framesPerSecond: 6,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream'
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://camera-2/stream',
+            light: { deltaThreshold: 45, debounceFrames: 4 }
+          }
+        ]
+      },
+      person: { modelPath: 'model.onnx', score: 0.4 },
+      motion: { diffThreshold: 10, areaThreshold: 0.01 },
+      light: { deltaThreshold: 30, debounceFrames: 3, backoffFrames: 4, smoothingFactor: 0.25 }
+    };
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      expect(MockLightDetector.instances).toHaveLength(2);
+      expect(MockLightDetector.instances[0].options).toMatchObject({
+        source: 'video:cam-1',
+        deltaThreshold: 30,
+        debounceFrames: 3,
+        backoffFrames: 4
+      });
+      expect(MockLightDetector.instances[1].options).toMatchObject({
+        source: 'video:cam-2',
+        deltaThreshold: 45,
+        debounceFrames: 4
+      });
+
+      const [sourceOne, sourceTwo] = MockVideoSource.instances;
+      sourceOne.emit('frame', Buffer.alloc(0));
+      sourceTwo.emit('frame', Buffer.alloc(0));
+      expect(MockLightDetector.instances[0].handleFrame).toHaveBeenCalled();
+      expect(MockLightDetector.instances[1].handleFrame).toHaveBeenCalled();
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        light: {
+          ...initialConfig.light!,
+          deltaThreshold: 28,
+          debounceFrames: 6
+        },
+        video: {
+          ...initialConfig.video,
+          cameras: [
+            initialConfig.video.cameras![0],
+            {
+              ...initialConfig.video.cameras![1],
+              light: { deltaThreshold: 35, debounceFrames: 5, noiseMultiplier: 3 }
+            }
+          ]
+        }
+      };
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(
+        () =>
+          MockLightDetector.instances.every(instance => instance.updateOptions.mock.calls.length > 0)
+      );
+
+      expect(MockLightDetector.instances[0].updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({ deltaThreshold: 28, debounceFrames: 6 })
+      );
+      expect(MockLightDetector.instances[1].updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({ deltaThreshold: 35, debounceFrames: 5, noiseMultiplier: 3 })
+      );
+    } finally {
+      runtime.stop();
+    }
   });
 });
 

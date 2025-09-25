@@ -159,6 +159,71 @@ describe('AudioAnomalyWindowing', () => {
     expect(Number(state?.rms?.recoveryMs ?? 0)).toBeGreaterThanOrEqual(0);
     expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(320, 1);
   });
+
+  it('AudioAnomalyHotReload resets buffers and applies new window lengths', () => {
+    const detector = new AudioAnomalyDetector(
+      {
+        source: 'audio:test',
+        sampleRate,
+        frameDurationMs,
+        hopDurationMs,
+        minIntervalMs: 500,
+        rmsThreshold: 0.25,
+        centroidJumpThreshold: 200,
+        minTriggerDurationMs: 160,
+        rmsWindowMs: 240,
+        centroidWindowMs: 260
+      },
+      bus
+    );
+
+    const warmFrame = createConstantFrame(frameSize, 0.18);
+    const loudFrame = createConstantFrame(frameSize, 0.45);
+
+    detector.handleChunk(warmFrame, dayTs);
+    for (let i = 1; i <= 6; i += 1) {
+      detector.handleChunk(loudFrame, dayTs + i * hopDurationMs);
+    }
+
+    expect(events.length).toBe(1);
+    events.length = 0;
+
+    detector.updateOptions({
+      rmsWindowMs: 480,
+      centroidWindowMs: 520,
+      minTriggerDurationMs: 320,
+      thresholds: {
+        night: { rms: 0.12, centroidJump: 140, rmsWindowMs: 520 }
+      },
+      nightHours: { start: 22, end: 6 }
+    });
+
+    const nightTs = new Date(2024, 0, 2, 1, 0).getTime();
+    const quietFrame = createConstantFrame(frameSize, 0.05);
+    const burstFrame = createConstantFrame(frameSize, 0.4);
+
+    detector.handleChunk(quietFrame, nightTs);
+    for (let i = 1; i <= 9; i += 1) {
+      detector.handleChunk(burstFrame, nightTs + i * hopDurationMs);
+      if (i < 9) {
+        expect(events.length).toBe(0);
+      }
+    }
+
+    for (let i = 10; i <= 12; i += 1) {
+      detector.handleChunk(burstFrame, nightTs + i * hopDurationMs);
+    }
+
+    expect(events.length).toBe(1);
+    const meta = events[0].meta as Record<string, any>;
+    expect(meta.thresholds?.profile).toBe('night');
+    expect(Number(meta.thresholds?.rmsWindowMs)).toBeCloseTo(520, 1);
+    expect(Number(meta.durationAboveThresholdMs)).toBeGreaterThanOrEqual(320);
+    const state = meta.state as Record<string, any>;
+    expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(520, 1);
+    const accumulation = meta.accumulationMs as Record<string, number>;
+    expect(Number(accumulation?.rmsMs ?? 0)).toBeGreaterThanOrEqual(320);
+  });
 });
 
 function createConstantFrame(length: number, amplitude: number): Int16Array {

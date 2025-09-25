@@ -21,6 +21,7 @@ export interface EventRecord {
 export interface RateLimitConfig {
   count: number;
   perMs: number;
+  cooldownMs?: number;
 }
 
 export interface EventSuppressionRule {

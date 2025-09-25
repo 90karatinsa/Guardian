@@ -17,7 +17,10 @@ import configManager, {
   RetentionConfig,
   PoseConfig,
   FaceConfig,
-  ObjectsConfig
+  ObjectsConfig,
+  LightConfig,
+  CameraLightConfig,
+  AudioConfig
 } from './config/index.js';
 import PoseEstimator from './video/poseEstimator.js';
 import ObjectClassifier from './video/objectClassifier.js';
@@ -26,8 +29,11 @@ import { VideoSource } from './video/source.js';
 import type { RecoverEventMeta } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector, { normalizeClassScoreThresholds } from './video/personDetector.js';
+import LightDetector from './video/lightDetector.js';
 import { RetentionTask, RetentionTaskOptions, startRetentionTask } from './tasks/retention.js';
 import metrics from './metrics/index.js';
+import { AudioSource } from './audio/source.js';
+import AudioAnomalyDetector from './audio/anomaly.js';
 
 type CameraPipelineState = {
   channel: string;
@@ -43,6 +49,7 @@ type CameraPipelineState = {
   };
   pose?: PoseConfig;
   objects?: ObjectsConfig;
+  light?: LightConfig | null;
 };
 
 type CameraRestartEvent = {
@@ -51,6 +58,10 @@ type CameraRestartEvent = {
   delayMs: number;
   at: number;
   meta: RecoverEventMeta;
+  channel: string | null;
+  errorCode: string | number | null;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
 };
 
 type CameraRestartStats = {
@@ -66,6 +77,7 @@ type CameraRuntime = {
   channel: string;
   source: VideoSource;
   motionDetector: MotionDetector;
+  lightDetector: LightDetector | null;
   personDetector: PersonDetector;
   poseEstimator?: PoseEstimator | null;
   objectClassifier?: ObjectClassifier | null;
@@ -78,6 +90,15 @@ type CameraRuntime = {
   cleanup: Array<() => void>;
 };
 
+type AudioRuntime = {
+  source: AudioSource;
+  detector: AudioAnomalyDetector | null;
+  channel: string;
+  cleanup: Array<() => void>;
+  dataListener: ((samples: Int16Array) => void) | null;
+  applyConfig: (config: AudioConfig) => void;
+};
+
 type GuardConfig = {
   video: VideoConfig;
   person: PersonConfig;
@@ -86,6 +107,8 @@ type GuardConfig = {
   pose?: PoseConfig;
   face?: FaceConfig;
   objects?: ObjectsConfig;
+  light?: LightConfig;
+  audio?: AudioConfig;
 };
 
 type GuardLogger = Pick<typeof loggerModule, 'info' | 'warn' | 'error'>;
@@ -139,6 +162,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   let retentionTask: RetentionTask | null = null;
   let syncPromise: Promise<void> = Promise.resolve();
   let handleConfigError: ((error: unknown) => void) | null = null;
+  let audioRuntime: AudioRuntime | null = null;
 
   const configureRetention = (config: GuardConfig) => {
     const retentionOptions = buildRetentionOptions({
@@ -163,7 +187,177 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     }
   };
 
+  const stopAudioRuntime = (runtime: AudioRuntime | null) => {
+    if (!runtime) {
+      return;
+    }
+
+    for (const fn of runtime.cleanup) {
+      try {
+        fn();
+      } catch (error) {
+        logger.warn({ err: error, channel: runtime.channel }, 'Audio cleanup failed');
+      }
+    }
+    runtime.cleanup.length = 0;
+    runtime.source.stop();
+  };
+
+  const createAudioPipeline = (audioConfig: AudioConfig): AudioRuntime => {
+    const channel =
+      typeof audioConfig.channel === 'string' && audioConfig.channel.trim().length > 0
+        ? audioConfig.channel
+        : 'audio:microphone';
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel,
+      idleTimeoutMs: audioConfig.idleTimeoutMs,
+      startTimeoutMs: audioConfig.startTimeoutMs,
+      watchdogTimeoutMs: audioConfig.watchdogTimeoutMs,
+      restartDelayMs: audioConfig.restartDelayMs,
+      restartMaxDelayMs: audioConfig.restartMaxDelayMs,
+      restartJitterFactor: audioConfig.restartJitterFactor,
+      forceKillTimeoutMs: audioConfig.forceKillTimeoutMs,
+      micFallbacks: audioConfig.micFallbacks
+    });
+
+    const runtime: AudioRuntime = {
+      source,
+      detector: null,
+      channel,
+      cleanup: [],
+      dataListener: null,
+      applyConfig: () => {}
+    };
+
+    const handleError = (error: Error) => {
+      logger.error({ err: error, channel }, 'Audio source error');
+    };
+    source.on('error', handleError);
+    runtime.cleanup.push(() => source.off('error', handleError));
+
+    const handleRecover = (event: { reason: string; attempt: number; delayMs: number }) => {
+      logger.warn({ channel, reason: event.reason, attempt: event.attempt, delayMs: event.delayMs }, 'Audio source recovering');
+    };
+    source.on('recover', handleRecover);
+    runtime.cleanup.push(() => source.off('recover', handleRecover));
+
+    runtime.cleanup.push(() => {
+      if (runtime.dataListener) {
+        source.off('data', runtime.dataListener);
+      }
+    });
+
+    const configureAnomaly = (anomalyConfig?: AudioConfig['anomaly']) => {
+      if (!anomalyConfig) {
+        if (runtime.dataListener) {
+          source.off('data', runtime.dataListener);
+          runtime.dataListener = null;
+        }
+        runtime.detector = null;
+        return;
+      }
+
+      if (runtime.detector) {
+        runtime.detector.updateOptions({
+          sampleRate: anomalyConfig.sampleRate,
+          frameDurationMs: anomalyConfig.frameDurationMs,
+          hopDurationMs: anomalyConfig.hopDurationMs,
+          frameSize: anomalyConfig.frameSize,
+          hopSize: anomalyConfig.hopSize,
+          rmsThreshold: anomalyConfig.rmsThreshold,
+          centroidJumpThreshold: anomalyConfig.centroidJumpThreshold,
+          minIntervalMs: anomalyConfig.minIntervalMs,
+          minTriggerDurationMs: anomalyConfig.minTriggerDurationMs,
+          rmsWindowMs: anomalyConfig.rmsWindowMs,
+          centroidWindowMs: anomalyConfig.centroidWindowMs,
+          thresholds: anomalyConfig.thresholds,
+          nightHours: anomalyConfig.nightHours
+        });
+        return;
+      }
+
+      const detector = new AudioAnomalyDetector(
+        {
+          source: channel,
+          sampleRate: anomalyConfig.sampleRate,
+          frameDurationMs: anomalyConfig.frameDurationMs,
+          hopDurationMs: anomalyConfig.hopDurationMs,
+          frameSize: anomalyConfig.frameSize,
+          hopSize: anomalyConfig.hopSize,
+          rmsThreshold: anomalyConfig.rmsThreshold,
+          centroidJumpThreshold: anomalyConfig.centroidJumpThreshold,
+          minIntervalMs: anomalyConfig.minIntervalMs,
+          minTriggerDurationMs: anomalyConfig.minTriggerDurationMs,
+          rmsWindowMs: anomalyConfig.rmsWindowMs,
+          centroidWindowMs: anomalyConfig.centroidWindowMs,
+          thresholds: anomalyConfig.thresholds,
+          nightHours: anomalyConfig.nightHours
+        },
+        bus
+      );
+      runtime.detector = detector;
+      const handleData = (samples: Int16Array) => {
+        detector.handleChunk(samples);
+      };
+      runtime.dataListener = handleData;
+      source.on('data', handleData);
+    };
+
+    runtime.applyConfig = config => {
+      source.updateOptions({
+        idleTimeoutMs: config.idleTimeoutMs,
+        startTimeoutMs: config.startTimeoutMs,
+        watchdogTimeoutMs: config.watchdogTimeoutMs,
+        restartDelayMs: config.restartDelayMs,
+        restartMaxDelayMs: config.restartMaxDelayMs,
+        restartJitterFactor: config.restartJitterFactor,
+        forceKillTimeoutMs: config.forceKillTimeoutMs,
+        micFallbacks: config.micFallbacks
+      });
+      configureAnomaly(config.anomaly);
+    };
+
+    runtime.applyConfig(audioConfig);
+    source.start();
+    logger.info({ channel }, 'Starting audio pipeline');
+    return runtime;
+  };
+
+  const syncAudioRuntime = (config: GuardConfig) => {
+    const audioConfig = config.audio;
+    if (!audioConfig) {
+      if (audioRuntime) {
+        logger.info({ channel: audioRuntime.channel }, 'Stopping audio pipeline');
+        stopAudioRuntime(audioRuntime);
+        audioRuntime = null;
+      }
+      return;
+    }
+
+    const desiredChannel =
+      typeof audioConfig.channel === 'string' && audioConfig.channel.trim().length > 0
+        ? audioConfig.channel
+        : 'audio:microphone';
+
+    if (!audioRuntime) {
+      audioRuntime = createAudioPipeline(audioConfig);
+      return;
+    }
+
+    if (audioRuntime.channel !== desiredChannel) {
+      logger.info({ previous: audioRuntime.channel, next: desiredChannel }, 'Restarting audio pipeline after channel change');
+      stopAudioRuntime(audioRuntime);
+      audioRuntime = createAudioPipeline(audioConfig);
+      return;
+    }
+
+    audioRuntime.applyConfig(audioConfig);
+  };
+
   configureRetention(activeConfig);
+  syncAudioRuntime(activeConfig);
 
   const createPipeline = async (camera: CameraConfig, config: GuardConfig) => {
     const context = buildCameraContext(camera, config);
@@ -196,6 +390,20 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       areaInflation: context.motion.areaInflation,
       areaDeltaThreshold: context.motion.areaDeltaThreshold
     });
+
+    const lightDetector = context.pipelineState.light
+      ? new LightDetector({
+          source: context.pipelineState.channel,
+          deltaThreshold: context.pipelineState.light.deltaThreshold,
+          normalHours: context.pipelineState.light.normalHours,
+          smoothingFactor: context.pipelineState.light.smoothingFactor,
+          minIntervalMs: context.pipelineState.light.minIntervalMs,
+          debounceFrames: context.pipelineState.light.debounceFrames,
+          backoffFrames: context.pipelineState.light.backoffFrames,
+          noiseMultiplier: context.pipelineState.light.noiseMultiplier,
+          noiseSmoothing: context.pipelineState.light.noiseSmoothing
+        })
+      : null;
 
     const objectClassifier = context.pipelineState.objects
       ? await ObjectClassifier.create({
@@ -240,6 +448,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       channel: context.pipelineState.channel,
       source,
       motionDetector,
+      lightDetector,
       personDetector,
       poseEstimator,
       objectClassifier,
@@ -343,8 +552,43 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       existing.motionDetector.updateOptions({
         diffThreshold: context.motion.diffThreshold,
         areaThreshold: context.motion.areaThreshold,
-        minIntervalMs: context.motion.minIntervalMs
+        minIntervalMs: context.motion.minIntervalMs,
+        debounceFrames: context.motion.debounceFrames,
+        backoffFrames: context.motion.backoffFrames,
+        noiseMultiplier: context.motion.noiseMultiplier,
+        noiseSmoothing: context.motion.noiseSmoothing,
+        areaSmoothing: context.motion.areaSmoothing,
+        areaInflation: context.motion.areaInflation,
+        areaDeltaThreshold: context.motion.areaDeltaThreshold
       });
+      if (context.pipelineState.light) {
+        if (existing.lightDetector) {
+          existing.lightDetector.updateOptions({
+            deltaThreshold: context.pipelineState.light.deltaThreshold,
+            normalHours: context.pipelineState.light.normalHours,
+            smoothingFactor: context.pipelineState.light.smoothingFactor,
+            minIntervalMs: context.pipelineState.light.minIntervalMs,
+            debounceFrames: context.pipelineState.light.debounceFrames,
+            backoffFrames: context.pipelineState.light.backoffFrames,
+            noiseMultiplier: context.pipelineState.light.noiseMultiplier,
+            noiseSmoothing: context.pipelineState.light.noiseSmoothing
+          });
+        } else {
+          existing.lightDetector = new LightDetector({
+            source: existing.channel,
+            deltaThreshold: context.pipelineState.light.deltaThreshold,
+            normalHours: context.pipelineState.light.normalHours,
+            smoothingFactor: context.pipelineState.light.smoothingFactor,
+            minIntervalMs: context.pipelineState.light.minIntervalMs,
+            debounceFrames: context.pipelineState.light.debounceFrames,
+            backoffFrames: context.pipelineState.light.backoffFrames,
+            noiseMultiplier: context.pipelineState.light.noiseMultiplier,
+            noiseSmoothing: context.pipelineState.light.noiseSmoothing
+          });
+        }
+      } else if (existing.lightDetector) {
+        existing.lightDetector = null;
+      }
     }
   };
 
@@ -368,6 +612,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     }
 
     configureRetention(activeConfig);
+    syncAudioRuntime(activeConfig);
 
     logger.info(
       {
@@ -427,6 +672,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       }
       stopWatching?.();
     }
+    stopAudioRuntime(audioRuntime);
+    audioRuntime = null;
     for (const runtime of pipelinesById.values()) {
       runtime.cleanup.forEach(fn => {
         try {
@@ -522,6 +769,73 @@ function resolveCameraMotion(
   };
 }
 
+function resolveLightConfig(
+  globalLight: LightConfig | undefined,
+  channelLight: CameraLightConfig | undefined,
+  cameraLight: CameraLightConfig | undefined
+): LightConfig | null {
+  const layers: Array<LightConfig | CameraLightConfig | undefined> = [
+    globalLight,
+    channelLight,
+    cameraLight
+  ];
+
+  let deltaThreshold: number | undefined;
+  let normalHours: LightConfig['normalHours'];
+  let smoothingFactor: number | undefined;
+  let minIntervalMs: number | undefined;
+  let debounceFrames: number | undefined;
+  let backoffFrames: number | undefined;
+  let noiseMultiplier: number | undefined;
+  let noiseSmoothing: number | undefined;
+
+  for (const layer of layers) {
+    if (!layer) {
+      continue;
+    }
+
+    if (typeof layer.deltaThreshold === 'number') {
+      deltaThreshold = layer.deltaThreshold;
+    }
+    if (Array.isArray(layer.normalHours)) {
+      normalHours = layer.normalHours;
+    }
+    if (typeof layer.smoothingFactor === 'number') {
+      smoothingFactor = layer.smoothingFactor;
+    }
+    if (typeof layer.minIntervalMs === 'number') {
+      minIntervalMs = layer.minIntervalMs;
+    }
+    if (typeof layer.debounceFrames === 'number') {
+      debounceFrames = layer.debounceFrames;
+    }
+    if (typeof layer.backoffFrames === 'number') {
+      backoffFrames = layer.backoffFrames;
+    }
+    if (typeof layer.noiseMultiplier === 'number') {
+      noiseMultiplier = layer.noiseMultiplier;
+    }
+    if (typeof layer.noiseSmoothing === 'number') {
+      noiseSmoothing = layer.noiseSmoothing;
+    }
+  }
+
+  if (typeof deltaThreshold !== 'number') {
+    return null;
+  }
+
+  return {
+    deltaThreshold,
+    normalHours,
+    smoothingFactor,
+    minIntervalMs,
+    debounceFrames,
+    backoffFrames,
+    noiseMultiplier,
+    noiseSmoothing
+  };
+}
+
 function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   if (!config.motion) {
     throw new Error('Motion configuration is required');
@@ -549,6 +863,7 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
       camera.person?.classScoreThresholds
     )
   );
+  const light = resolveLightConfig(config.light, channelConfig?.light, camera.light);
 
   const pipelineState: CameraPipelineState = {
     channel,
@@ -569,7 +884,8 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
       classScoreThresholds
     },
     pose: config.pose,
-    objects: config.objects
+    objects: config.objects,
+    light
   };
 
   const motionDefaults = channelConfig?.motion
@@ -772,7 +1088,9 @@ function pickGuardConfig(config: GuardianConfig): GuardConfig {
     events: config.events,
     pose: config.pose,
     face: config.face,
-    objects: config.objects
+    objects: config.objects,
+    light: config.light,
+    audio: config.audio
   };
 }
 
@@ -784,7 +1102,9 @@ function mergeGuardConfig(injected: GuardConfig, fallback: GuardianConfig): Guar
     events: injected.events ?? fallback.events,
     pose: injected.pose ?? fallback.pose,
     face: injected.face ?? fallback.face,
-    objects: injected.objects ?? fallback.objects
+    objects: injected.objects ?? fallback.objects,
+    light: injected.light ?? fallback.light,
+    audio: injected.audio ?? fallback.audio
   };
 }
 
@@ -846,6 +1166,13 @@ function collectSnapshotDirectories(video: VideoConfig, person: PersonConfig): s
     directories.add(path.resolve(person.snapshotDir));
   }
 
+  for (const channelConfig of Object.values(video.channels ?? {})) {
+    const snapshotDir = channelConfig.person?.snapshotDir;
+    if (snapshotDir) {
+      directories.add(path.resolve(snapshotDir));
+    }
+  }
+
   for (const camera of video.cameras ?? []) {
     const snapshotDir = camera.person?.snapshotDir;
     if (snapshotDir) {
@@ -856,16 +1183,30 @@ function collectSnapshotDirectories(video: VideoConfig, person: PersonConfig): s
   return [...directories];
 }
 
+export const __test__ = {
+  collectSnapshotDirectories
+};
+
 function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
-  const { source, motionDetector, personDetector } = runtime;
+  const { source } = runtime;
+  const personDetector = runtime.personDetector;
 
   source.on('frame', async frame => {
     const ts = Date.now();
 
     try {
-      motionDetector.handleFrame(frame, ts);
+      runtime.motionDetector.handleFrame(frame, ts);
     } catch (error) {
       logger.error({ err: error, camera: runtime.id }, 'Motion detector failed');
+    }
+
+    const activeLightDetector = runtime.lightDetector;
+    if (activeLightDetector) {
+      try {
+        activeLightDetector.handleFrame(frame, ts);
+      } catch (error) {
+        logger.error({ err: error, camera: runtime.id }, 'Light detector failed');
+      }
     }
 
     if (runtime.framesSinceMotion !== null) {
@@ -897,18 +1238,23 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
     const stats = runtime.restartStats;
     stats.total += 1;
     stats.byReason.set(event.reason, (stats.byReason.get(event.reason) ?? 0) + 1);
-    const record = {
+    const record: CameraRestartEvent = {
       reason: event.reason,
       attempt: event.attempt,
       delayMs: event.delayMs,
       at: now,
-      meta: event.meta
+      meta: event.meta,
+      channel: event.channel ?? runtime.channel ?? null,
+      errorCode: event.errorCode ?? null,
+      exitCode: event.exitCode ?? null,
+      signal: event.signal ?? null
     };
     stats.last = record;
     stats.history.push(record);
     if (event.reason === 'watchdog-timeout' && typeof event.delayMs === 'number') {
       stats.watchdogBackoffMs += event.delayMs;
     }
+    const restartChannel = record.channel ?? runtime.channel;
     metrics.recordPipelineRestart('ffmpeg', event.reason, {
       attempt: event.attempt,
       delayMs: event.delayMs,
@@ -916,7 +1262,10 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
       minDelayMs: event.meta?.minDelayMs,
       maxDelayMs: event.meta?.maxDelayMs,
       jitterMs: event.meta?.appliedJitterMs,
-      channel: runtime.channel
+      channel: restartChannel,
+      errorCode: record.errorCode ?? undefined,
+      exitCode: record.exitCode ?? undefined,
+      signal: record.signal ?? undefined
     });
     logger.warn(
       {
@@ -924,6 +1273,10 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
         attempt: event.attempt,
         reason: event.reason,
         delayMs: event.delayMs,
+        channel: restartChannel,
+        errorCode: record.errorCode,
+        exitCode: record.exitCode,
+        signal: record.signal ?? undefined,
         meta: event.meta
       },
       `Video source reconnecting (reason=${event.reason})`

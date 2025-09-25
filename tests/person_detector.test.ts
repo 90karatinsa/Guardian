@@ -73,6 +73,10 @@ const ort = await import('onnxruntime-node');
 import { PNG } from 'pngjs';
 
 describe('YoloParser utilities', () => {
+  const logit = (probability: number) => {
+    return Math.log(probability / (1 - probability));
+  };
+
   it('YoloParserMultiClass applies class thresholds and rescales boxes', () => {
     const classCount = 3;
     const attributes = YOLO_CLASS_START_INDEX + classCount;
@@ -153,6 +157,95 @@ describe('YoloParser utilities', () => {
     expect(packageDetection?.bbox.width ?? 0).toBeCloseTo(200, 1);
     expect(packageDetection?.bbox.height ?? 0).toBeCloseTo(250, 1);
     expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
+  });
+
+  it('YoloParserNmsChannelLast suppresses overlapping boxes in channel-last tensors', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(detections * attributes).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      data[index * attributes + 0] = values.cx;
+      data[index * attributes + 1] = values.cy;
+      data[index * attributes + 2] = values.width;
+      data[index * attributes + 3] = values.height;
+      data[index * attributes + OBJECTNESS_INDEX] = logit(values.objectness);
+      values.classProbabilities.forEach((prob, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[index * attributes + attributeIndex] = logit(prob);
+      });
+    };
+
+    assign(0, {
+      cx: 320,
+      cy: 260,
+      width: 180,
+      height: 200,
+      objectness: 0.95,
+      classProbabilities: [0.9, 0.25]
+    });
+
+    assign(1, {
+      cx: 330,
+      cy: 270,
+      width: 170,
+      height: 210,
+      objectness: 0.9,
+      classProbabilities: [0.85, 0.3]
+    });
+
+    assign(2, {
+      cx: 520,
+      cy: 300,
+      width: 150,
+      height: 180,
+      objectness: 0.88,
+      classProbabilities: [0.1, 0.9]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, detections, attributes]);
+    const meta = {
+      scale: 1,
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 480,
+      scaleX: 1,
+      scaleY: 1
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0, 1],
+      scoreThreshold: 0.3,
+      classScoreThresholds: { 0: 0.6, 1: 0.75 },
+      nmsThreshold: 0.4
+    });
+
+    expect(results).toHaveLength(2);
+    const person = results.find(result => result.classId === 0);
+    const packageDetection = results.find(result => result.classId === 1);
+
+    expect(person).toBeDefined();
+    expect(person?.score ?? 0).toBeCloseTo(0.95 * 0.9, 5);
+    expect(packageDetection).toBeDefined();
+    expect(packageDetection?.score ?? 0).toBeGreaterThan(0.7);
+
+    const duplicate = results.filter(result => result.classId === 0);
+    expect(duplicate).toHaveLength(1);
+    expect(results[0].score).toBeGreaterThan(results[1].score ?? 0);
   });
 });
 

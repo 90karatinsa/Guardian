@@ -85,11 +85,17 @@ export type CameraMotionConfig = MotionTuningConfig & {
   minIntervalMs?: number;
 };
 
+export type CameraLightConfig = LightTuningConfig & {
+  deltaThreshold?: number;
+  normalHours?: Array<{ start: number; end: number }>;
+};
+
 export type VideoChannelConfig = {
   framesPerSecond?: number;
   ffmpeg?: CameraFfmpegConfig;
   motion?: CameraMotionConfig;
   person?: CameraPersonConfig;
+  light?: CameraLightConfig;
 };
 
 export type CameraFfmpegConfig = {
@@ -112,6 +118,7 @@ export type CameraConfig = {
   person?: CameraPersonConfig;
   motion?: CameraMotionConfig;
   ffmpeg?: CameraFfmpegConfig;
+  light?: CameraLightConfig;
 };
 
 export type VideoConfig = {
@@ -206,6 +213,7 @@ export type AudioAnomalyConfig = {
 };
 
 export type AudioConfig = {
+  channel?: string;
   idleTimeoutMs?: number;
   startTimeoutMs?: number;
   watchdogTimeoutMs?: number;
@@ -260,6 +268,34 @@ const anomalyThresholdSchema: JsonSchema = {
   properties: {
     rms: { type: 'number', minimum: 0 },
     centroidJump: { type: 'number', minimum: 0 }
+  }
+};
+
+const lightNormalHoursSchema: JsonSchema = {
+  type: 'array',
+  items: {
+    type: 'object',
+    required: ['start', 'end'],
+    additionalProperties: false,
+    properties: {
+      start: { type: 'number', minimum: 0, maximum: 24 },
+      end: { type: 'number', minimum: 0, maximum: 24 }
+    }
+  }
+};
+
+const cameraLightConfigSchema: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    deltaThreshold: { type: 'number' },
+    normalHours: lightNormalHoursSchema,
+    smoothingFactor: { type: 'number', minimum: 0, maximum: 1 },
+    minIntervalMs: { type: 'number', minimum: 0 },
+    debounceFrames: { type: 'number', minimum: 0 },
+    backoffFrames: { type: 'number', minimum: 0 },
+    noiseMultiplier: { type: 'number', minimum: 0 },
+    noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 }
   }
 };
 
@@ -461,6 +497,7 @@ const guardianConfigSchema: JsonSchema = {
                   areaDeltaThreshold: { type: 'number', minimum: 0 }
                 }
               },
+              light: cameraLightConfigSchema,
               person: {
                 type: 'object',
                 additionalProperties: false,
@@ -523,6 +560,7 @@ const guardianConfigSchema: JsonSchema = {
                   areaDeltaThreshold: { type: 'number', minimum: 0 }
                 }
               },
+              light: cameraLightConfigSchema,
               ffmpeg: {
                 type: 'object',
                 additionalProperties: false,
@@ -629,18 +667,7 @@ const guardianConfigSchema: JsonSchema = {
       additionalProperties: false,
       properties: {
         deltaThreshold: { type: 'number' },
-        normalHours: {
-          type: 'array',
-          items: {
-            type: 'object',
-            required: ['start', 'end'],
-            additionalProperties: false,
-            properties: {
-              start: { type: 'number', minimum: 0, maximum: 24 },
-              end: { type: 'number', minimum: 0, maximum: 24 }
-            }
-          }
-        },
+        normalHours: lightNormalHoursSchema,
         smoothingFactor: { type: 'number', minimum: 0, maximum: 1 },
         minIntervalMs: { type: 'number', minimum: 0 },
         debounceFrames: { type: 'number', minimum: 0 },
@@ -653,6 +680,7 @@ const guardianConfigSchema: JsonSchema = {
       type: 'object',
       additionalProperties: false,
       properties: {
+        channel: { type: 'string' },
         idleTimeoutMs: { type: 'number', minimum: 0 },
         startTimeoutMs: { type: 'number', minimum: 0 },
         watchdogTimeoutMs: { type: 'number', minimum: 0 },
@@ -867,11 +895,36 @@ function validateLogicalConfig(config: GuardianConfig) {
   const messages: string[] = [];
 
   const channelDefinitions = config.video.channels ? new Set(Object.keys(config.video.channels)) : null;
-  if (channelDefinitions && Array.isArray(config.video.cameras)) {
+  const cameraIdMap = new Map<string, { index: number; label: string }>();
+  const channelMap = new Map<string, { id: string; label: string }>();
+  if (Array.isArray(config.video.cameras)) {
     config.video.cameras.forEach((camera, index) => {
-      if (!channelDefinitions.has(camera.channel)) {
-        const label = camera.id ?? `#${index}`;
+      const label = camera.id ?? `#${index}`;
+
+      if (channelDefinitions && !channelDefinitions.has(camera.channel)) {
         messages.push(`config.video.cameras[${label}] references undefined channel "${camera.channel}"`);
+      }
+
+      if (camera.id) {
+        const existing = cameraIdMap.get(camera.id);
+        if (existing) {
+          messages.push(
+            `config.video.cameras[${label}] duplicates camera id "${camera.id}" already used by config.video.cameras[${existing.label}]`
+          );
+        } else {
+          cameraIdMap.set(camera.id, { index, label });
+        }
+      }
+
+      if (camera.channel) {
+        const existingChannel = channelMap.get(camera.channel);
+        if (existingChannel) {
+          messages.push(
+            `config.video.cameras[${label}] reuses channel "${camera.channel}" already assigned to camera "${existingChannel.id}"`
+          );
+        } else {
+          channelMap.set(camera.channel, { id: camera.id ?? label, label });
+        }
       }
     });
   }
@@ -909,6 +962,13 @@ function validateLogicalConfig(config: GuardianConfig) {
       messages.push(
         `config.events.suppression.rules[${index}].rateLimit.perMs must be greater than or equal to count`
       );
+    }
+    if (typeof rateLimit.cooldownMs !== 'undefined') {
+      if (!Number.isInteger(rateLimit.cooldownMs) || rateLimit.cooldownMs < 0) {
+        messages.push(
+          `config.events.suppression.rules[${index}].rateLimit.cooldownMs must be a non-negative integer`
+        );
+      }
     }
   });
 

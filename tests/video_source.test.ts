@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import metrics from '../src/metrics/index.js';
-import { VideoSource, type RecoverEventMeta } from '../src/video/source.js';
+import { VideoSource, type RecoverEventMeta, type RecoverEvent } from '../src/video/source.js';
 
 const SAMPLE_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAAZuX6kAAAAASUVORK5CYII=',
@@ -180,6 +180,135 @@ describe('VideoSource', () => {
       expect(channelStats.byReason['watchdog-timeout']).toBeGreaterThanOrEqual(1);
     } finally {
       source.stop();
+    }
+  });
+
+  it('VideoFfmpegSpawnFallbacks recovers when ffmpeg binary is missing', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:spawn-test',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        if (commands.length === 1) {
+          const error = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException;
+          command.setPipeError(error);
+        } else {
+          setTimeout(() => {
+            command.emit('start');
+            command.pushFrame(SAMPLE_PNG);
+          }, 1);
+        }
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const recoverEvents: RecoverEvent[] = [];
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      expect(commands).toHaveLength(1);
+      expect(recoverEvents).toHaveLength(1);
+      const first = recoverEvents[0];
+      expect(first.reason).toBe('ffmpeg-missing');
+      expect(first.errorCode).toBe('ENOENT');
+      expect(first.exitCode).toBeNull();
+      expect(first.channel).toBe('video:spawn-test');
+
+      await vi.runOnlyPendingTimersAsync();
+      expect(commands).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(2);
+      await Promise.resolve();
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart).toMatchObject({
+        reason: 'ffmpeg-missing',
+        errorCode: 'ENOENT',
+        exitCode: null,
+        channel: 'video:spawn-test'
+      });
+      expect(commands[1].framesPushed).toBeGreaterThanOrEqual(1);
+    } finally {
+      source.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoFfmpegExitBackoff escalates delays when ffmpeg exits unexpectedly', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:exit-test',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 20,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => {
+          command.emit('start');
+          command.pushFrame(SAMPLE_PNG);
+          setTimeout(() => {
+            command.emitClose(-1, null);
+          }, 2);
+        }, 1);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const recoverEvents: RecoverEvent[] = [];
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      const expectedDelays = [5, 10, 20];
+      for (let i = 0; i < expectedDelays.length; i += 1) {
+        await vi.advanceTimersByTimeAsync(3);
+        expect(recoverEvents.length).toBeGreaterThan(i);
+        const event = recoverEvents[i];
+        expect(event.reason).toBe('ffmpeg-exit');
+        expect(event.exitCode).toBe(-1);
+        expect(event.errorCode).toBe(-1);
+        expect(event.channel).toBe('video:exit-test');
+        expect(event.delayMs).toBe(expectedDelays[i]);
+        if (i < expectedDelays.length - 1) {
+          await vi.advanceTimersByTimeAsync(expectedDelays[i]);
+        }
+      }
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart).toMatchObject({
+        reason: 'ffmpeg-exit',
+        attempt: 3,
+        delayMs: 20,
+        exitCode: -1,
+        errorCode: -1,
+        channel: 'video:exit-test'
+      });
+    } finally {
+      source.stop();
+      vi.useRealTimers();
     }
   });
 
@@ -400,14 +529,18 @@ describe('VideoSource', () => {
     expect(metas.map(meta => meta.maxDelayMs)).toEqual([40, 40, 40]);
 
     const snapshot = metrics.snapshot();
-    expect(snapshot.pipelines.ffmpeg.lastRestart).toEqual({
+    expect(snapshot.pipelines.ffmpeg.lastRestart).toMatchObject({
       reason: 'start-timeout',
       attempt: 3,
       delayMs: 40,
       baseDelayMs: 40,
       minDelayMs: 10,
       maxDelayMs: 40,
-      jitterMs: 0
+      jitterMs: 0,
+      errorCode: null,
+      exitCode: null,
+      signal: null,
+      channel: null
     });
     expect(snapshot.latencies['pipeline.ffmpeg.restart.delay'].count).toBeGreaterThanOrEqual(3);
     expect(snapshot.histograms['pipeline.ffmpeg.restart.delay']).toMatchObject({
@@ -463,6 +596,8 @@ class FakeCommand extends EventEmitter {
   public readonly killedSignals: NodeJS.Signals[] = [];
   public readonly stream: PassThrough;
   public framesPushed = 0;
+  public pipeCalls = 0;
+  private pipeError: NodeJS.ErrnoException | null = null;
 
   constructor() {
     super();
@@ -470,6 +605,12 @@ class FakeCommand extends EventEmitter {
   }
 
   pipe() {
+    this.pipeCalls += 1;
+    if (this.pipeError) {
+      const error = this.pipeError;
+      this.pipeError = null;
+      throw error;
+    }
     return this.stream;
   }
 
@@ -481,6 +622,14 @@ class FakeCommand extends EventEmitter {
   pushFrame(frame: Buffer) {
     this.framesPushed += 1;
     this.stream.write(frame);
+  }
+
+  setPipeError(error: NodeJS.ErrnoException) {
+    this.pipeError = error;
+  }
+
+  emitClose(code: number | null, signal: NodeJS.Signals | null = null) {
+    this.emit('close', code, signal);
   }
 }
 

@@ -44,12 +44,13 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('"restartJitterFactor"');
     expect(readme).toContain('Audio source recovering (reason=ffmpeg-missing|stream-idle)');
     expect(readme).toContain('pipelines.ffmpeg.byChannel');
+    expect(readme).toContain('guardian status --json');
     expect(readme).toContain('guardian health');
-    expect(readme).toContain('pnpm exec tsx src/cli.ts --health');
+    expect(readme).toContain('pnpm exec tsx src/cli.ts status --json');
 
     metrics.reset();
     const capture = createIo();
-    const exitCode = await runCli(['health'], capture.io);
+    const exitCode = await runCli(['status', '--json'], capture.io);
 
     expect(exitCode).toBe(0);
     const payload = JSON.parse(capture.stdout().trim());

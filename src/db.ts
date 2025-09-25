@@ -313,6 +313,7 @@ export interface RetentionOutcome {
   archivedSnapshots: number;
   prunedArchives: number;
   warnings: Array<{ path: string; error: Error; camera: string }>;
+  perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number }>;
 }
 
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
@@ -326,6 +327,7 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   const directories = snapshotOptions.mode === 'ignore' ? [] : collectSnapshotDirectories(options);
   let archivedSnapshots = 0;
   let prunedArchives = 0;
+  const perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number }> = {};
   const warnings: Array<{ path: string; error: Error; camera: string }> = [];
 
   for (const { sourceDir, archiveBase } of directories) {
@@ -346,9 +348,13 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
     archivedSnapshots += rotation.moved;
     prunedArchives += rotation.pruned;
     warnings.push(...rotation.warnings);
+    const cameraStats = perCamera[cameraId] ?? { archivedSnapshots: 0, prunedArchives: 0 };
+    cameraStats.archivedSnapshots += rotation.moved;
+    cameraStats.prunedArchives += rotation.pruned;
+    perCamera[cameraId] = cameraStats;
   }
 
-  return { removedEvents, archivedSnapshots, prunedArchives, warnings };
+  return { removedEvents, archivedSnapshots, prunedArchives, warnings, perCamera };
 }
 
 export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto') {

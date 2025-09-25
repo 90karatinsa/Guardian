@@ -61,7 +61,8 @@ export type AudioRecoverEvent = {
     | 'stream-idle'
     | 'stream-silence'
     | 'watchdog-timeout'
-    | 'start-timeout';
+    | 'start-timeout'
+    | 'device-discovery-timeout';
   attempt: number;
   delayMs: number;
   meta: AudioRecoverMeta;
@@ -80,6 +81,7 @@ const DEFAULT_WATCHDOG_TIMEOUT_MS = 6000;
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
 const DEFAULT_SILENCE_THRESHOLD = 0.0025;
 const DEFAULT_SILENCE_DURATION_MS = 2000;
+const DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS = 2000;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
@@ -111,7 +113,7 @@ export class AudioSource extends EventEmitter {
   private silenceAccumulatedMs = 0;
   private silenceRestartPending = false;
 
-  constructor(private readonly options: AudioSourceOptions) {
+  constructor(private options: AudioSourceOptions) {
     super();
     this.randomFn = options.random ?? Math.random;
   }
@@ -144,6 +146,45 @@ export class AudioSource extends EventEmitter {
     this.startProcess();
   }
 
+  updateOptions(
+    options: Partial<Omit<AudioTimingOptions, 'micFallbacks'>> & {
+      micFallbacks?: Record<string, MicCandidate[]>;
+      random?: () => number;
+    }
+  ) {
+    const next: AudioSourceOptions = {
+      ...(this.options as AudioSourceOptions),
+      ...options,
+      micFallbacks: options.micFallbacks ?? this.options.micFallbacks
+    } as AudioSourceOptions;
+
+    this.options = next;
+
+    if (typeof options.random === 'function') {
+      this.randomFn = options.random;
+    }
+
+    if (options.micFallbacks !== undefined) {
+      if (next.type === 'mic') {
+        this.micInputArgs = buildMicInputArgs(process.platform, next, next.micFallbacks);
+      } else {
+        this.micInputArgs = [];
+      }
+      this.micCandidateIndex = 0;
+      this.activeMicCandidateIndex = null;
+      this.lastSuccessfulMicIndex = null;
+      this.silenceRestartPending = false;
+    }
+
+    if (this.process) {
+      if (!this.hasReceivedChunk) {
+        this.resetStartTimer();
+      }
+      this.resetIdleTimer();
+      this.resetWatchdogTimer();
+    }
+  }
+
   stop() {
     this.shouldStop = true;
     this.hasReceivedChunk = false;
@@ -168,7 +209,10 @@ export class AudioSource extends EventEmitter {
     });
   }
 
-  static async listDevices(format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto') {
+  static async listDevices(
+    format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto',
+    options: { timeoutMs?: number; channel?: string } = {}
+  ) {
     const cacheKey = `${process.platform}:${format}`;
     const cached = DEVICE_DISCOVERY_CACHE.get(cacheKey);
     if (cached) {
@@ -179,6 +223,7 @@ export class AudioSource extends EventEmitter {
     const discovery = (async () => {
       const formats = resolveDeviceFormats(format, process.platform);
       let lastError: Error | null = null;
+      const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS);
 
       for (const fmt of formats) {
         const args = [
@@ -195,13 +240,19 @@ export class AudioSource extends EventEmitter {
 
         for (const command of FFPROBE_CANDIDATES) {
           try {
-            const { stdout, stderr } = await execFileAsync(command, args);
+            const { stdout, stderr } = await execFileAsync(command, args, { timeoutMs });
             const parsed = parseDeviceList(`${stdout}\n${stderr}`);
             if (parsed.length > 0) {
               return [...parsed];
             }
           } catch (error) {
             lastError = error as Error;
+            if (isTimeoutError(lastError)) {
+              metrics.recordAudioDeviceDiscovery('device-discovery-timeout', {
+                channel: options.channel
+              });
+              continue;
+            }
           }
         }
       }
@@ -960,9 +1011,30 @@ function buildFfprobeCandidates() {
   return Array.from(candidates);
 }
 
-function execFileAsync(command: string, args: string[]) {
+function execFileAsync(
+  command: string,
+  args: string[],
+  options: { timeoutMs?: number } = {}
+) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    execFile(command, args, (error: ExecFileException | null, stdout: string, stderr: string) => {
+    let finished = false;
+    let timeout: NodeJS.Timeout | null = null;
+    let child: ReturnType<typeof execFile> | null = null;
+
+    const onComplete = (
+      error: ExecFileException | null,
+      stdout: string,
+      stderr: string
+    ) => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+
       if (error) {
         const err = error as ExecFileException & { stdout?: string; stderr?: string };
         err.stdout = stdout;
@@ -970,9 +1042,53 @@ function execFileAsync(command: string, args: string[]) {
         reject(err);
         return;
       }
+
       resolve({ stdout, stderr });
-    });
+    };
+
+    try {
+      child = execFile(command, args, onComplete);
+    } catch (error) {
+      finished = true;
+      reject(error as ExecFileException);
+      return;
+    }
+
+    const timeoutMs = options.timeoutMs ?? 0;
+    if (timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        try {
+          child?.kill('SIGKILL');
+        } catch (error) {
+          // Ignore kill errors
+        }
+        const err = new Error(
+          `Command "${command}" timed out after ${timeoutMs}ms`
+        ) as ExecFileException & { code?: string; stdout?: string; stderr?: string; timedOut?: boolean };
+        err.code = 'ETIME';
+        err.stdout = '';
+        err.stderr = '';
+        err.timedOut = true;
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+        reject(err);
+      }, timeoutMs);
+    }
   });
+}
+
+function isTimeoutError(error: unknown) {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const err = error as { code?: string | number; timedOut?: boolean };
+  return err.code === 'ETIME' || err.timedOut === true;
 }
 
 function parseDeviceList(output: string) {

@@ -12,6 +12,8 @@ const streamUpdated = document.getElementById('stream-updated');
 const channelFilter = document.getElementById('channel-filter');
 const channelFilterOptions = document.getElementById('channel-filter-options');
 const channelFilterEmpty = document.getElementById('channel-filter-empty');
+const pipelineMetricsContainer = document.getElementById('pipeline-metrics');
+const pipelineMetricsEmpty = document.getElementById('pipeline-metrics-empty');
 
 if (previewImage) {
   previewImage.addEventListener('load', () => {
@@ -45,7 +47,12 @@ const state = {
     lastUpdate: null,
     status: 'connecting'
   },
-  channelStats: new Map()
+  channelStats: new Map(),
+  metrics: {
+    pending: false,
+    lastFetched: null,
+    data: null
+  }
 };
 
 function getSelectedChannels() {
@@ -69,6 +76,33 @@ function getEventKey(event) {
 function withKey(event) {
   const key = getEventKey(event);
   return { ...event, __key: key };
+}
+
+function formatRelativeTime(input) {
+  if (!input) {
+    return 'never';
+  }
+  const timestamp = typeof input === 'number' ? input : Date.parse(String(input));
+  if (!Number.isFinite(timestamp)) {
+    return 'unknown';
+  }
+  const delta = Date.now() - timestamp;
+  if (delta < 30_000) {
+    return 'just now';
+  }
+  const minutes = Math.floor(delta / 60_000);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) {
+    return `${days}d ago`;
+  }
+  return new Date(timestamp).toLocaleString();
 }
 
 function getEventChannel(event) {
@@ -378,6 +412,223 @@ function registerChannel(channel, timestamp = Date.now()) {
   updateChannelFilterControls();
 }
 
+function renderMetricsMessage(message) {
+  if (!pipelineMetricsContainer) {
+    return;
+  }
+  pipelineMetricsContainer.innerHTML = '';
+  const note = document.createElement('p');
+  note.className = 'meta';
+  note.textContent = message;
+  pipelineMetricsContainer.appendChild(note);
+}
+
+function renderPipelineSection(label, snapshot) {
+  if (!snapshot) {
+    return null;
+  }
+  const section = document.createElement('section');
+  section.className = 'metrics-section';
+  const heading = document.createElement('h3');
+  heading.textContent = label;
+  section.appendChild(heading);
+
+  const summary = document.createElement('div');
+  summary.className = 'metrics-summary';
+  const total = document.createElement('strong');
+  const restartLabel = snapshot.restarts === 1 ? 'restart' : 'restarts';
+  total.textContent = `${snapshot.restarts} ${restartLabel}`;
+  summary.appendChild(total);
+  const last = document.createElement('span');
+  last.textContent = snapshot.lastRestartAt
+    ? `Last restart ${formatRelativeTime(snapshot.lastRestartAt)}`
+    : 'No restarts yet';
+  summary.appendChild(last);
+  section.appendChild(summary);
+
+  const channels = Object.entries(snapshot.byChannel ?? {});
+  if (channels.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No channel restarts recorded yet.';
+    section.appendChild(empty);
+    return section;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'metrics-channels';
+  channels
+    .sort((a, b) => {
+      const restartDiff = (b[1].restarts ?? 0) - (a[1].restarts ?? 0);
+      if (restartDiff !== 0) {
+        return restartDiff;
+      }
+      const lastA = a[1].lastRestartAt ? Date.parse(a[1].lastRestartAt) : 0;
+      const lastB = b[1].lastRestartAt ? Date.parse(b[1].lastRestartAt) : 0;
+      if (lastB !== lastA) {
+        return lastB - lastA;
+      }
+      return a[0].localeCompare(b[0]);
+    })
+    .slice(0, 5)
+    .forEach(([channel, info]) => {
+      const item = document.createElement('div');
+      item.className = 'metrics-channel';
+      const name = document.createElement('span');
+      name.textContent = channel;
+      const details = document.createElement('small');
+      if (info.restarts > 0) {
+        const reason = info.lastRestart?.reason ?? 'unknown reason';
+        const when = formatRelativeTime(info.lastRestartAt);
+        details.textContent = `${info.restarts} ${info.restarts === 1 ? 'restart' : 'restarts'}, last ${when} (${reason})`;
+      } else {
+        details.textContent = 'No restarts yet';
+      }
+      item.append(name, details);
+      list.appendChild(item);
+    });
+  section.appendChild(list);
+  return section;
+}
+
+function renderRetentionSection(retention) {
+  if (!retention) {
+    return null;
+  }
+  const section = document.createElement('section');
+  section.className = 'metrics-section';
+  const heading = document.createElement('h3');
+  heading.textContent = 'Retention';
+  section.appendChild(heading);
+
+  const summary = document.createElement('div');
+  summary.className = 'metrics-summary';
+  const totals = retention.totals ?? { archivedSnapshots: 0, prunedArchives: 0, removedEvents: 0 };
+  const totalsLine = document.createElement('strong');
+  totalsLine.textContent = `${totals.archivedSnapshots} archived · ${totals.prunedArchives} pruned`;
+  summary.appendChild(totalsLine);
+  const runsLine = document.createElement('span');
+  if (retention.runs > 0) {
+    const runLabel = retention.runs === 1 ? 'run' : 'runs';
+    const lastRun = retention.lastRunAt ? `, last ${formatRelativeTime(retention.lastRunAt)}` : '';
+    runsLine.textContent = `${retention.runs} ${runLabel}${lastRun}`;
+  } else {
+    runsLine.textContent = 'No retention runs yet';
+  }
+  summary.appendChild(runsLine);
+  section.appendChild(summary);
+
+  const cameras = Object.entries(retention.totalsByCamera ?? {});
+  if (cameras.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No snapshot archives recorded yet.';
+    section.appendChild(empty);
+    return section;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'metrics-channels';
+  cameras
+    .sort((a, b) => {
+      const archivedDiff = (b[1].archivedSnapshots ?? 0) - (a[1].archivedSnapshots ?? 0);
+      if (archivedDiff !== 0) {
+        return archivedDiff;
+      }
+      const prunedDiff = (b[1].prunedArchives ?? 0) - (a[1].prunedArchives ?? 0);
+      if (prunedDiff !== 0) {
+        return prunedDiff;
+      }
+      return a[0].localeCompare(b[0]);
+    })
+    .slice(0, 4)
+    .forEach(([camera, totals]) => {
+      const item = document.createElement('div');
+      item.className = 'metrics-channel';
+      const name = document.createElement('span');
+      name.textContent = camera;
+      const details = document.createElement('small');
+      const parts = [`${totals.archivedSnapshots} archived`];
+      if ((totals.prunedArchives ?? 0) > 0) {
+        parts.push(`${totals.prunedArchives} pruned`);
+      }
+      details.textContent = parts.join(', ');
+      item.append(name, details);
+      list.appendChild(item);
+    });
+  section.appendChild(list);
+  return section;
+}
+
+function updatePipelineWidget(payload) {
+  if (!pipelineMetricsContainer) {
+    return;
+  }
+  if (pipelineMetricsEmpty) {
+    pipelineMetricsEmpty.remove();
+  }
+
+  if (!payload) {
+    renderMetricsMessage('Metrics unavailable.');
+    return;
+  }
+
+  pipelineMetricsContainer.innerHTML = '';
+
+  const updatedAt = document.createElement('p');
+  updatedAt.className = 'meta';
+  updatedAt.textContent = `Updated ${formatRelativeTime(payload.fetchedAt)}`;
+  pipelineMetricsContainer.appendChild(updatedAt);
+
+  const pipelineEntries = [
+    ['Video streams', payload.pipelines?.ffmpeg],
+    ['Audio streams', payload.pipelines?.audio]
+  ];
+  pipelineEntries.forEach(([label, snapshot]) => {
+    const section = renderPipelineSection(label, snapshot);
+    if (section) {
+      pipelineMetricsContainer.appendChild(section);
+    }
+  });
+
+  const retentionSection = renderRetentionSection(payload.retention);
+  if (retentionSection) {
+    pipelineMetricsContainer.appendChild(retentionSection);
+  }
+
+  if (pipelineMetricsContainer.children.length === 1) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No pipeline metrics available yet.';
+    pipelineMetricsContainer.appendChild(empty);
+  }
+}
+
+async function refreshPipelineMetrics() {
+  if (!pipelineMetricsContainer || state.metrics.pending) {
+    return;
+  }
+  state.metrics.pending = true;
+  pipelineMetricsContainer.setAttribute('aria-busy', 'true');
+  try {
+    const response = await fetch('/api/metrics/pipelines');
+    if (!response.ok) {
+      throw new Error(`Failed to load metrics (${response.status})`);
+    }
+    const payload = await response.json();
+    state.metrics.data = payload;
+    state.metrics.lastFetched = Date.now();
+    updatePipelineWidget(payload);
+  } catch (error) {
+    console.error('Failed to load pipeline metrics', error);
+    state.metrics.data = null;
+    renderMetricsMessage('Failed to load metrics.');
+  } finally {
+    state.metrics.pending = false;
+    pipelineMetricsContainer.setAttribute('aria-busy', 'false');
+  }
+}
+
 function pruneSelectedChannels() {
   const selected = getSelectedChannels();
   let changed = false;
@@ -617,6 +868,11 @@ resetButton.addEventListener('click', () => {
 });
 
 updateStreamWidget();
+const METRICS_REFRESH_INTERVAL = 30_000;
+refreshPipelineMetrics();
+setInterval(() => {
+  void refreshPipelineMetrics();
+}, METRICS_REFRESH_INTERVAL);
 
 loadInitial().then(() => {
   renderEvents();

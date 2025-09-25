@@ -10,7 +10,7 @@ Environment=GUARDIAN_DATA_DIR=/var/lib/guardian
 Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
 ExecStart=/usr/bin/env pnpm start
-ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts health
+ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts status --json
 ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop
 KillSignal=SIGTERM
 Restart=on-failure

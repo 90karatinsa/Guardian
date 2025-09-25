@@ -217,6 +217,7 @@ export class MotionDetector {
       }
 
       if (this.backoffFrames > 0) {
+        metrics.incrementDetectorCounter('motion', 'backoffSuppressedFrames', 1);
         this.backoffFrames -= 1;
         this.activationFrames = 0;
         return;
@@ -235,6 +236,7 @@ export class MotionDetector {
 
       this.lastEventTs = ts;
       this.backoffFrames = effectiveBackoffFrames;
+      metrics.incrementDetectorCounter('motion', 'backoffActivations', 1);
 
       const payload: EventPayload = {
         ts,

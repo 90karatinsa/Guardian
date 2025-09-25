@@ -5,6 +5,7 @@ import { TextDecoder } from 'node:util';
 import { EventEmitter } from 'node:events';
 import { clearEvents, listEvents, storeEvent } from '../src/db.js';
 import { startHttpServer, type HttpServerRuntime, type HttpServerOptions } from '../src/server/http.js';
+import metrics from '../src/metrics/index.js';
 
 type StubFace = {
   id: number;
@@ -67,6 +68,7 @@ describe('RestApiEvents', () => {
     }
     clearEvents();
     fs.rmSync(snapshotDir, { recursive: true, force: true });
+    metrics.reset();
   });
 
   async function ensureServer(overrides: Partial<HttpServerOptions> = {}) {
@@ -160,6 +162,31 @@ describe('RestApiEvents', () => {
     const snapshotPayload = await snapshotResponse.json();
     expect(snapshotPayload.items).toHaveLength(1);
     expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
+  });
+
+  it('HttpMetricsStream returns pipeline metrics snapshot', async () => {
+    metrics.reset();
+    metrics.recordPipelineRestart('ffmpeg', 'spawn-error', { channel: 'video:lobby' });
+    metrics.recordPipelineRestart('audio', 'watchdog-timeout', { channel: 'audio:mic' });
+    metrics.recordRetentionRun({
+      removedEvents: 2,
+      archivedSnapshots: 3,
+      prunedArchives: 1,
+      perCamera: {
+        lobby: { archivedSnapshots: 2, prunedArchives: 1 },
+        global: { archivedSnapshots: 1, prunedArchives: 0 }
+      }
+    });
+
+    const { port } = await ensureServer();
+    const response = await fetch(`http://localhost:${port}/api/metrics/pipelines`);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(payload.pipelines.ffmpeg.restarts).toBe(1);
+    expect(payload.pipelines.ffmpeg.byChannel['video:lobby'].restarts).toBe(1);
+    expect(payload.pipelines.audio.restarts).toBe(1);
+    expect(payload.retention.totals.archivedSnapshots).toBe(3);
+    expect(payload.retention.totalsByCamera.lobby.archivedSnapshots).toBe(2);
   });
 
   it('HttpApiSnapshotDelivery handles snapshot errors and streams face registry results', async () => {
@@ -290,6 +317,55 @@ describe('RestApiEvents', () => {
     globalThis.HTMLElement = window.HTMLElement;
     globalThis.MessageEvent = window.MessageEvent;
 
+    const metricsSnapshot = {
+      fetchedAt: new Date(1700000000000).toISOString(),
+      pipelines: {
+        ffmpeg: {
+          restarts: 2,
+          lastRestartAt: new Date(1700000000400).toISOString(),
+          byReason: { 'watchdog-timeout': 2 },
+          lastRestart: { reason: 'watchdog-timeout' },
+          attempts: {},
+          byChannel: {
+            'video:lobby': {
+              restarts: 2,
+              lastRestartAt: new Date(1700000000400).toISOString(),
+              byReason: { 'watchdog-timeout': 2 },
+              lastRestart: { reason: 'watchdog-timeout' }
+            }
+          },
+          deviceDiscovery: {},
+          deviceDiscoveryByChannel: {},
+          delayHistogram: {},
+          attemptHistogram: {}
+        },
+        audio: {
+          restarts: 1,
+          lastRestartAt: null,
+          byReason: { 'spawn-error': 1 },
+          lastRestart: { reason: 'spawn-error' },
+          attempts: {},
+          byChannel: {},
+          deviceDiscovery: {},
+          deviceDiscoveryByChannel: {},
+          delayHistogram: {},
+          attemptHistogram: {}
+        }
+      },
+      retention: {
+        runs: 1,
+        lastRunAt: new Date(1700000000200).toISOString(),
+        warnings: 0,
+        warningsByCamera: {},
+        lastWarning: null,
+        totals: { removedEvents: 0, archivedSnapshots: 2, prunedArchives: 0 },
+        totalsByCamera: {
+          lobby: { archivedSnapshots: 1, prunedArchives: 0 },
+          stream: { archivedSnapshots: 1, prunedArchives: 0 }
+        }
+      }
+    };
+
     const fetchMock = vi.fn(async (input: unknown) => {
       const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
       if (url.includes('/api/events')) {
@@ -313,6 +389,13 @@ describe('RestApiEvents', () => {
             status: 200
           }
         );
+      }
+
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(JSON.stringify(metricsSnapshot), {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200
+        });
       }
 
       return new Response(JSON.stringify({ items: [], total: 0 }), {
@@ -436,6 +519,17 @@ describe('RestApiEvents', () => {
     const eventCards = window.document.querySelectorAll('#events .event');
     expect(eventCards.length).toBe(1);
     expect(eventCards[0].textContent).toContain('stream event');
+
+    await vi.waitFor(() => {
+      const metricsWidget = window.document.getElementById('pipeline-metrics');
+      if (!metricsWidget) {
+        throw new Error('metrics widget not ready');
+      }
+      const content = metricsWidget.textContent ?? '';
+      expect(content.includes('Video streams')).toBe(true);
+      expect(content.includes('lobby')).toBe(true);
+      expect(content.includes('Retention')).toBe(true);
+    });
 
     const previewImg = window.document.getElementById('preview-image') as HTMLImageElement;
     expect(previewImg.src).toContain('/api/events/42/snapshot');

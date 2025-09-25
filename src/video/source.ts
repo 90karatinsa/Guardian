@@ -4,6 +4,8 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import metrics from '../metrics/index.js';
 
+type Errno = NodeJS.ErrnoException & { errno?: number };
+
 const ffmpegPath = ffmpegStatic as string | null;
 if (ffmpegPath) {
   ffmpeg.setFfmpegPath(ffmpegPath);
@@ -53,6 +55,16 @@ export type RecoverEvent = {
   attempt: number;
   delayMs: number;
   meta: RecoverEventMeta;
+  channel: string | null;
+  errorCode: string | number | null;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+};
+
+type RecoveryContext = {
+  errorCode?: string | number | null;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
 };
 
 type RestartDelayResult = {
@@ -109,7 +121,6 @@ export class VideoSource extends EventEmitter {
     const onData = (chunk: Buffer) => {
       if (!this.hasReceivedFrame) {
         this.hasReceivedFrame = true;
-        this.restartCount = 0;
         this.clearStartTimer();
       }
 
@@ -130,7 +141,7 @@ export class VideoSource extends EventEmitter {
 
     const onError = (err: Error) => {
       this.emit('error', err);
-      this.scheduleRecovery('stream-error');
+      this.scheduleRecovery('stream-error', this.normalizeErrno(err));
     };
 
     const onClose = () => {
@@ -185,8 +196,11 @@ export class VideoSource extends EventEmitter {
       if (this.shouldStop || this.recovering) {
         return;
       }
+
+      const details = this.normalizeErrno(err);
       this.emit('error', err);
-      this.scheduleRecovery('ffmpeg-error');
+      const reason = details.errorCode === 'ENOENT' ? 'ffmpeg-missing' : 'ffmpeg-error';
+      this.scheduleRecovery(reason, details);
     };
 
     const onEnd = () => {
@@ -198,8 +212,20 @@ export class VideoSource extends EventEmitter {
       this.scheduleRecovery('ffmpeg-ended');
     };
 
-    const onClose = () => {
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
       this.finalizeCommandLifecycle();
+      if (this.shouldStop || this.recovering) {
+        return;
+      }
+
+      const exitCode = typeof code === 'number' ? code : null;
+      const context: RecoveryContext = {
+        exitCode,
+        signal: signal ?? null
+      };
+
+      const reason = exitCode === 0 ? 'ffmpeg-ended' : 'ffmpeg-exit';
+      this.scheduleRecovery(reason, context);
     };
 
     command.once('error', onError);
@@ -222,8 +248,10 @@ export class VideoSource extends EventEmitter {
       this.consume(stream);
     } catch (error) {
       this.finalizeCommandLifecycle();
-      this.emit('error', error as Error);
-      this.scheduleRecovery('start-error');
+      const err = error as Errno;
+      this.emit('error', err);
+      const reason = err?.code === 'ENOENT' ? 'ffmpeg-missing' : 'start-error';
+      this.scheduleRecovery(reason, this.normalizeErrno(err));
     }
   }
 
@@ -311,7 +339,7 @@ export class VideoSource extends EventEmitter {
     this.buffer = Buffer.alloc(0);
   }
 
-  private scheduleRecovery(reason: string) {
+  private scheduleRecovery(reason: string, context: RecoveryContext = {}) {
     if (this.shouldStop) {
       return;
     }
@@ -325,6 +353,16 @@ export class VideoSource extends EventEmitter {
     const attempt = this.restartCount;
     const timing = this.computeRestartDelay(attempt);
 
+    const channel = this.options.channel ?? null;
+    const errorCode =
+      typeof context.errorCode === 'string' || typeof context.errorCode === 'number'
+        ? context.errorCode
+        : typeof context.exitCode === 'number'
+          ? context.exitCode
+          : null;
+    const exitCode = typeof context.exitCode === 'number' ? context.exitCode : null;
+    const signal = context.signal ?? null;
+
     metrics.recordPipelineRestart('ffmpeg', reason, {
       attempt,
       delayMs: timing.delayMs,
@@ -332,11 +370,23 @@ export class VideoSource extends EventEmitter {
       minDelayMs: timing.meta.minDelayMs,
       maxDelayMs: timing.meta.maxDelayMs,
       jitterMs: timing.meta.appliedJitterMs,
-      channel: this.options.channel
+      channel: channel ?? undefined,
+      errorCode: errorCode ?? undefined,
+      exitCode: exitCode ?? undefined,
+      signal: signal ?? undefined
     });
     this.emit(
       'recover',
-      { reason, attempt, delayMs: timing.delayMs, meta: timing.meta } satisfies RecoverEvent
+      {
+        reason,
+        attempt,
+        delayMs: timing.delayMs,
+        meta: timing.meta,
+        channel,
+        errorCode: errorCode ?? null,
+        exitCode,
+        signal
+      } satisfies RecoverEvent
     );
 
     this.clearStartTimer();
@@ -549,6 +599,23 @@ export class VideoSource extends EventEmitter {
         baseDelayMs,
         appliedJitterMs
       }
+    };
+  }
+
+  private normalizeErrno(error: unknown): RecoveryContext {
+    if (!error || typeof error !== 'object') {
+      return { errorCode: null, exitCode: null, signal: null };
+    }
+
+    const err = error as Errno;
+    const code = err.code;
+    const errno = err.errno;
+    const errorCode = typeof code === 'string' ? code : typeof errno === 'number' ? errno : null;
+    const exitCode = typeof code === 'number' ? code : null;
+    return {
+      errorCode: errorCode ?? null,
+      exitCode,
+      signal: null
     };
   }
 }

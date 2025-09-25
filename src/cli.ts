@@ -20,6 +20,12 @@ type GuardRuntime = {
   stop: () => void | Promise<void>;
 };
 
+type ShutdownHookSummary = {
+  name: string;
+  status: 'ok' | 'error';
+  error?: string;
+};
+
 type HealthPayload = {
   status: HealthStatus;
   state: ServiceStatus;
@@ -43,6 +49,13 @@ type HealthPayload = {
   application: {
     name: string;
     version: string;
+    shutdown: {
+      lastAt: string | null;
+      lastReason: string | null;
+      lastSignal: NodeJS.Signals | null;
+      lastError: string | null;
+      hooks: ShutdownHookSummary[];
+    };
   };
 };
 
@@ -63,6 +76,10 @@ const state: {
   shuttingDown: boolean;
   shutdownPromise: Promise<void> | null;
   lastShutdownError: Error | null;
+  lastShutdownHooks: ShutdownHookSummary[];
+  lastShutdownAt: number | null;
+  lastShutdownReason: string | null;
+  lastShutdownSignal: NodeJS.Signals | null;
 } = {
   status: 'idle',
   startedAt: null,
@@ -70,7 +87,11 @@ const state: {
   stopResolver: null,
   shuttingDown: false,
   shutdownPromise: null,
-  lastShutdownError: null
+  lastShutdownError: null,
+  lastShutdownHooks: [],
+  lastShutdownAt: null,
+  lastShutdownReason: null,
+  lastShutdownSignal: null
 };
 
 export function getServiceState() {
@@ -106,6 +127,14 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
     }
   });
 
+  const shutdownSummary = {
+    lastAt: state.lastShutdownAt ? new Date(state.lastShutdownAt).toISOString() : null,
+    lastReason: state.lastShutdownReason,
+    lastSignal: state.lastShutdownSignal,
+    lastError: state.lastShutdownError ? state.lastShutdownError.message : null,
+    hooks: state.lastShutdownHooks.map(hook => ({ ...hook }))
+  } satisfies HealthPayload['application']['shutdown'];
+
   return {
     status,
     state: state.status,
@@ -114,7 +143,8 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
     timestamp: new Date().toISOString(),
     application: {
       name: packageJson.name ?? 'guardian',
-      version: packageJson.version ?? '0.0.0'
+      version: packageJson.version ?? '0.0.0',
+      shutdown: shutdownSummary
     },
     runtime: {
       pipelines: {
@@ -161,7 +191,8 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
       return stopDaemon(io);
     }
     case 'status': {
-      return printStatus(io);
+      const json = argv.includes('--json') || argv.includes('-j');
+      return printStatus(io, { json });
     }
     case 'health': {
       return outputHealth(io);
@@ -254,12 +285,25 @@ async function stopDaemon(io: CliIo): Promise<number> {
   }
 
   const payload = await buildHealthPayload();
+  if (state.lastShutdownHooks.length > 0) {
+    const failures = state.lastShutdownHooks.filter(hook => hook.status === 'error');
+    const successes = state.lastShutdownHooks.length - failures.length;
+    io.stdout.write(`Shutdown hooks executed: ${successes} ok, ${failures.length} failed\n`);
+    for (const hook of failures) {
+      const message = hook.error ?? 'unknown error';
+      io.stderr.write(`Hook ${hook.name} failed: ${message}\n`);
+    }
+  }
   io.stdout.write(`Guardian daemon stopped (status: ${payload.status})\n`);
   return resolveHealthExitCode(payload.status);
 }
 
-async function printStatus(io: CliIo): Promise<number> {
+async function printStatus(io: CliIo, options: { json?: boolean } = {}): Promise<number> {
   const payload = await buildHealthPayload();
+  if (options.json) {
+    io.stdout.write(`${JSON.stringify(payload)}\n`);
+    return resolveHealthExitCode(payload.status);
+  }
   const summary = [`Guardian status: ${payload.state}`, `Health: ${payload.status}`];
 
   const lastError = payload.metrics.logs.lastErrorMessage;
@@ -305,6 +349,10 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
   state.shuttingDown = true;
   state.status = 'stopping';
   state.lastShutdownError = null;
+  state.lastShutdownHooks = [];
+  state.lastShutdownReason = reason;
+  state.lastShutdownSignal = signal ?? null;
+  state.lastShutdownAt = Date.now();
   logger.info({ reason, signal }, 'Guardian daemon shutting down');
 
   const shutdownTask = (async () => {
@@ -325,6 +373,7 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
     } finally {
       try {
         const results = await runShutdownHooks({ reason, signal });
+        const hookSummaries: ShutdownHookSummary[] = [];
         for (const result of results) {
           if (result.status === 'error' && result.error) {
             logger.error({ err: result.error, hook: result.name }, 'Shutdown hook failed');
@@ -334,13 +383,29 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
           } else {
             logger.debug({ hook: result.name }, 'Shutdown hook executed');
           }
+          hookSummaries.push({
+            name: result.name,
+            status: result.status === 'error' ? 'error' : 'ok',
+            error:
+              result.status === 'error' && result.error
+                ? result.error.message ?? String(result.error)
+                : undefined
+          });
         }
+        state.lastShutdownHooks = hookSummaries;
       } catch (hookError) {
         const err = hookError as Error;
         logger.error({ err }, 'Shutdown hooks threw unexpectedly');
         if (!state.lastShutdownError) {
           state.lastShutdownError = err;
         }
+        state.lastShutdownHooks = [
+          {
+            name: 'shutdown-hooks',
+            status: 'error',
+            error: err.message ?? String(err)
+          }
+        ];
       }
 
       state.runtime = null;

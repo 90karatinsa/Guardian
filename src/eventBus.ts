@@ -41,6 +41,7 @@ interface SuppressionHit {
   history: number[];
   windowExpiresAt?: number;
   rateLimit?: RateLimitConfig;
+  cooldownMs?: number;
 }
 
 class EventBus extends EventEmitter {
@@ -106,7 +107,8 @@ class EventBus extends EventEmitter {
         windowExpiresAt: hit.windowExpiresAt,
         history: [...hit.history],
         historyCount: hit.history.length,
-        rateLimitWindowMs: hit.rateLimit?.perMs
+        rateLimitWindowMs: hit.rateLimit?.perMs,
+        cooldownMs: hit.cooldownMs
       }));
       const meta = {
         ...normalized.meta,
@@ -116,6 +118,7 @@ class EventBus extends EventEmitter {
         suppressionRuleId: primary?.rule.id,
         suppressionWindowExpiresAt: primary?.windowExpiresAt,
         rateLimitWindowMs: primary?.rateLimit?.perMs,
+        rateLimitCooldownMs: primary?.cooldownMs,
         suppressionHistory: combinedHistory,
         suppressionHistoryCount: combinedHistory.length,
         suppressedBy
@@ -136,6 +139,7 @@ class EventBus extends EventEmitter {
           history: [...hit.history],
           windowExpiresAt: hit.windowExpiresAt,
           rateLimit: hit.rateLimit,
+          cooldownMs: hit.cooldownMs,
           combinedHistoryCount: combinedHistory.length
         };
         this.metrics.recordSuppressedEvent(detail);
@@ -173,56 +177,57 @@ class EventBus extends EventEmitter {
 
       pruneHistory(rule, event.ts);
 
-      const windowActive = Boolean(rule.suppressForMs && event.ts < rule.suppressedUntil);
+      const windowActive = event.ts < rule.suppressedUntil;
+      const rateLimitConfig = rule.rateLimit;
       const rateLimitExceeded = Boolean(
-        rule.rateLimit && rule.history.length >= rule.rateLimit.count
+        rateLimitConfig && rule.history.length >= rateLimitConfig.count
       );
 
       const historySnapshot = [...rule.history];
 
       if (windowActive) {
         recordHistory(rule, event.ts);
+        const windowCooldown = rule.rateLimit ? normalizeCooldownMs(rule.rateLimit.cooldownMs) : 0;
         hits.push({
           rule,
           type: 'window',
           reason: rule.reason,
           history: [...rule.history],
           windowExpiresAt: rule.suppressedUntil,
-          rateLimit: rule.rateLimit
+          rateLimit: rule.rateLimit,
+          cooldownMs: windowCooldown > 0 ? windowCooldown : undefined
         });
         continue;
       }
 
       recordHistory(rule, event.ts);
 
-      if (rateLimitExceeded && rule.rateLimit) {
-        const historyLimit = rule.rateLimit.count;
+      if (rateLimitExceeded && rateLimitConfig) {
+        const historyLimit = rateLimitConfig.count;
         const relevantSnapshot =
           historyLimit && historyLimit > 0
             ? historySnapshot.slice(-historyLimit)
             : [...historySnapshot];
         const rateLimitHistory = [...relevantSnapshot, event.ts];
-        if (rule.suppressForMs) {
-          const windowUntil = Math.max(rule.suppressedUntil, event.ts + rule.suppressForMs);
-          rule.suppressedUntil = windowUntil;
-          hits.push({
-            rule,
-            type: 'rate-limit',
-            reason: rule.reason,
-            history: rateLimitHistory,
-            windowExpiresAt: windowUntil,
-            rateLimit: rule.rateLimit
-          });
-        } else {
-          hits.push({
-            rule,
-            type: 'rate-limit',
-            reason: rule.reason,
-            history: rateLimitHistory,
-            windowExpiresAt: undefined,
-            rateLimit: rule.rateLimit
-          });
+        const cooldownMs = normalizeCooldownMs(rateLimitConfig.cooldownMs);
+        let windowUntil: number | undefined;
+        if (rule.suppressForMs || cooldownMs > 0) {
+          const suppressUntil = rule.suppressForMs ? event.ts + rule.suppressForMs : 0;
+          const cooldownUntil = cooldownMs > 0 ? event.ts + cooldownMs : 0;
+          windowUntil = Math.max(rule.suppressedUntil, suppressUntil, cooldownUntil);
+          if (windowUntil > 0) {
+            rule.suppressedUntil = windowUntil;
+          }
         }
+        hits.push({
+          rule,
+          type: 'rate-limit',
+          reason: rule.reason,
+          history: rateLimitHistory,
+          windowExpiresAt: windowUntil,
+          rateLimit: rateLimitConfig,
+          cooldownMs: cooldownMs > 0 ? cooldownMs : undefined
+        });
         continue;
       }
 
@@ -264,6 +269,7 @@ export { EventBus };
 export type { EventRecord };
 
 function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressionRule {
+  const rateLimit = normalizeRateLimit(rule.rateLimit);
   return {
     id: rule.id,
     detectors: asArray(rule.detector),
@@ -271,11 +277,11 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     severities: asArray(rule.severity),
     channels: asArray(rule.channel),
     suppressForMs: rule.suppressForMs,
-    rateLimit: rule.rateLimit,
+    rateLimit,
     reason: rule.reason,
     suppressedUntil: 0,
     history: [],
-    historyLimit: Math.max(rule.rateLimit?.count ?? 0, 10)
+    historyLimit: Math.max(rateLimit?.count ?? 0, 10)
   };
 }
 
@@ -340,6 +346,27 @@ function recordHistory(rule: InternalSuppressionRule, ts: number) {
   if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
     rule.history.splice(0, rule.history.length - rule.historyLimit);
   }
+}
+
+function normalizeRateLimit(rateLimit?: RateLimitConfig): RateLimitConfig | undefined {
+  if (!rateLimit) {
+    return undefined;
+  }
+  const count = Math.max(1, Math.floor(rateLimit.count));
+  const perMs = Math.max(1, Math.floor(rateLimit.perMs));
+  const cooldown = normalizeCooldownMs(rateLimit.cooldownMs);
+  const normalized: RateLimitConfig = { count, perMs };
+  if (cooldown > 0) {
+    normalized.cooldownMs = cooldown;
+  }
+  return normalized;
+}
+
+function normalizeCooldownMs(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(value));
 }
 
 function extractEventChannels(meta: Record<string, unknown> | undefined): string[] {

@@ -13,11 +13,13 @@ import {
 import FaceRegistry, { IdentifyResult } from '../../video/faceRegistry.js';
 import logger from '../../logger.js';
 import { EventRecord } from '../../types.js';
+import metricsModule, { MetricsRegistry } from '../../metrics/index.js';
 
 interface EventsRouterOptions {
   bus: EventEmitter;
   faceRegistry?: FaceRegistry | null;
   createFaceRegistry?: () => Promise<FaceRegistry>;
+  metrics?: MetricsRegistry;
 }
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
@@ -40,18 +42,21 @@ export class EventsRouter {
   private faceRegistry: FaceRegistry | null;
   private faceRegistryFactory?: () => Promise<FaceRegistry>;
   private faceRegistryPromise: Promise<FaceRegistry | null> | null = null;
+  private readonly metrics: MetricsRegistry;
 
   constructor(options: EventsRouterOptions) {
     this.bus = options.bus;
     this.heartbeatMs = 15000;
     this.handlers = [
       (req, res, url) => this.handleList(req, res, url),
+      (req, res, url) => this.handleMetrics(req, res, url),
       (req, res, url) => this.handleStream(req, res, url),
       (req, res, url) => this.handleSnapshot(req, res, url),
       (req, res, url) => this.handleFaces(req, res, url)
     ];
     this.faceRegistry = options.faceRegistry ?? null;
     this.faceRegistryFactory = options.createFaceRegistry;
+    this.metrics = options.metrics ?? metricsModule;
 
     this.bus.on('event', this.handleBusEvent);
   }
@@ -116,6 +121,21 @@ export class EventsRouter {
       total: result.total,
       limit: options.limit ?? undefined,
       offset: options.offset ?? undefined
+    });
+
+    return true;
+  }
+
+  private handleMetrics(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+    if (req.method !== 'GET' || url.pathname !== '/api/metrics/pipelines') {
+      return false;
+    }
+
+    const snapshot = this.metrics.snapshot();
+    sendJson(res, 200, {
+      fetchedAt: snapshot.createdAt,
+      pipelines: snapshot.pipelines,
+      retention: snapshot.retention
     });
 
     return true;

@@ -23,6 +23,10 @@ type PipelineRestartMeta = {
   minDelayMs: number | null;
   maxDelayMs: number | null;
   jitterMs: number | null;
+  exitCode: number | null;
+  errorCode: string | number | null;
+  signal: NodeJS.Signals | null;
+  channel: string | null;
 };
 
 type PipelineChannelSnapshot = {
@@ -35,6 +39,10 @@ type PipelineChannelSnapshot = {
 type PipelineSnapshot = PipelineChannelSnapshot & {
   attempts: CounterMap;
   byChannel: Record<string, PipelineChannelSnapshot>;
+  deviceDiscovery: CounterMap;
+  deviceDiscoveryByChannel: Record<string, CounterMap>;
+  delayHistogram: HistogramSnapshot;
+  attemptHistogram: HistogramSnapshot;
 };
 
 type SuppressionSnapshot = {
@@ -53,6 +61,7 @@ type SuppressionSnapshot = {
     historyCount?: number | null;
     combinedHistoryCount?: number | null;
     rateLimit?: RateLimitConfig | null;
+    cooldownMs?: number | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
 };
@@ -67,6 +76,7 @@ type SuppressionRuleSnapshot = {
     lastCombinedCount: number | null;
     lastType: 'window' | 'rate-limit' | null;
     lastRateLimit: RateLimitConfig | null;
+    lastCooldownMs: number | null;
   };
 };
 
@@ -78,6 +88,7 @@ type SuppressedEventMetric = {
   history?: number[];
   windowExpiresAt?: number;
   rateLimit?: RateLimitConfig;
+  cooldownMs?: number;
   combinedHistoryCount?: number;
 };
 
@@ -100,6 +111,16 @@ type RetentionSnapshot = {
   warningsByCamera: CounterMap;
   lastWarning: RetentionWarningSnapshot | null;
   totals: RetentionTotals;
+  totalsByCamera: Record<string, RetentionCameraTotals>;
+};
+
+type RetentionCameraTotals = {
+  archivedSnapshots: number;
+  prunedArchives: number;
+};
+
+type RetentionRunContext = RetentionTotals & {
+  perCamera?: Record<string, RetentionCameraTotals>;
 };
 
 type DetectorSnapshot = {
@@ -199,6 +220,8 @@ class MetricsRegistry {
   private readonly audioRestartsByChannel = new Map<string, PipelineChannelState>();
   private readonly ffmpegRestartAttempts = new Map<string, number>();
   private readonly audioRestartAttempts = new Map<string, number>();
+  private readonly audioDeviceDiscovery = new Map<string, number>();
+  private readonly audioDeviceDiscoveryByChannel = new Map<string, Map<string, number>>();
   private lastFfmpegRestartMeta: PipelineRestartMeta | null = null;
   private lastAudioRestartMeta: PipelineRestartMeta | null = null;
   private readonly suppressionByRule = new Map<string, number>();
@@ -212,6 +235,7 @@ class MetricsRegistry {
     historyCount?: number | null;
     combinedHistoryCount?: number | null;
     rateLimit?: RateLimitConfig | null;
+    cooldownMs?: number | null;
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -235,6 +259,7 @@ class MetricsRegistry {
     archivedSnapshots: 0,
     prunedArchives: 0
   };
+  private readonly retentionTotalsByCamera = new Map<string, RetentionCameraTotals>();
 
   reset() {
     this.logLevelCounters.clear();
@@ -250,6 +275,8 @@ class MetricsRegistry {
     this.audioRestartsByChannel.clear();
     this.ffmpegRestartAttempts.clear();
     this.audioRestartAttempts.clear();
+    this.audioDeviceDiscovery.clear();
+    this.audioDeviceDiscoveryByChannel.clear();
     this.lastFfmpegRestartMeta = null;
     this.lastAudioRestartMeta = null;
     this.suppressionByRule.clear();
@@ -275,6 +302,7 @@ class MetricsRegistry {
     this.retentionWarningsByCamera.clear();
     this.lastRetentionWarning = null;
     this.retentionTotals = { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 };
+    this.retentionTotalsByCamera.clear();
   }
 
   incrementLogLevel(level: string, context?: { message?: string; detector?: string }) {
@@ -340,6 +368,10 @@ class MetricsRegistry {
     ) {
       this.suppressionCombinedHistoryCount += normalizedDetail.combinedHistoryCount;
     }
+    const cooldownValue =
+      typeof normalizedDetail.cooldownMs === 'number' && Number.isFinite(normalizedDetail.cooldownMs)
+        ? normalizedDetail.cooldownMs
+        : null;
     this.lastSuppressedEvent = {
       ruleId,
       reason,
@@ -350,7 +382,8 @@ class MetricsRegistry {
         typeof normalizedDetail.combinedHistoryCount === 'number'
           ? normalizedDetail.combinedHistoryCount
           : null,
-      rateLimit: normalizedDetail.rateLimit ?? null
+      rateLimit: normalizedDetail.rateLimit ?? null,
+      cooldownMs: cooldownValue
     };
     if (ruleId) {
       this.suppressionByRule.set(ruleId, (this.suppressionByRule.get(ruleId) ?? 0) + 1);
@@ -362,7 +395,8 @@ class MetricsRegistry {
         lastHistoryCount: null,
         lastCombinedHistoryCount: null,
         lastType: null,
-        lastRateLimit: null
+        lastRateLimit: null,
+        lastCooldownMs: null
       };
       ruleState.total += 1;
       if (reason) {
@@ -385,11 +419,14 @@ class MetricsRegistry {
       if (normalizedDetail.rateLimit) {
         ruleState.lastRateLimit = normalizedDetail.rateLimit;
       }
+      if (cooldownValue !== null) {
+        ruleState.lastCooldownMs = cooldownValue;
+      }
       this.suppressionRules.set(ruleId, ruleState);
     }
   }
 
-  recordRetentionRun(context: RetentionTotals) {
+  recordRetentionRun(context: RetentionRunContext) {
     this.retentionRuns += 1;
     this.lastRetentionRunAt = Date.now();
     this.retentionTotals = {
@@ -397,6 +434,28 @@ class MetricsRegistry {
       archivedSnapshots: this.retentionTotals.archivedSnapshots + (context.archivedSnapshots ?? 0),
       prunedArchives: this.retentionTotals.prunedArchives + (context.prunedArchives ?? 0)
     };
+    if (context.perCamera) {
+      for (const [camera, stats] of Object.entries(context.perCamera)) {
+        if (!camera) {
+          continue;
+        }
+        const existing = this.retentionTotalsByCamera.get(camera) ?? {
+          archivedSnapshots: 0,
+          prunedArchives: 0
+        };
+        const archived =
+          typeof stats?.archivedSnapshots === 'number' && Number.isFinite(stats.archivedSnapshots)
+            ? stats.archivedSnapshots
+            : 0;
+        const pruned =
+          typeof stats?.prunedArchives === 'number' && Number.isFinite(stats.prunedArchives)
+            ? stats.prunedArchives
+            : 0;
+        existing.archivedSnapshots += archived;
+        existing.prunedArchives += pruned;
+        this.retentionTotalsByCamera.set(camera, existing);
+      }
+    }
   }
 
   recordRetentionWarning(warning: { camera?: string | null; path: string; reason: string }) {
@@ -443,6 +502,9 @@ class MetricsRegistry {
       maxDelayMs?: number;
       jitterMs?: number;
       channel?: string;
+      exitCode?: number | null;
+      errorCode?: string | number | null;
+      signal?: NodeJS.Signals | null;
     }
   ) {
     const normalized = reason || 'unknown';
@@ -458,7 +520,14 @@ class MetricsRegistry {
         baseDelayMs: typeof meta?.baseDelayMs === 'number' ? meta?.baseDelayMs : null,
         minDelayMs: typeof meta?.minDelayMs === 'number' ? meta?.minDelayMs : null,
         maxDelayMs: typeof meta?.maxDelayMs === 'number' ? meta?.maxDelayMs : null,
-        jitterMs: typeof meta?.jitterMs === 'number' ? meta?.jitterMs : null
+        jitterMs: typeof meta?.jitterMs === 'number' ? meta?.jitterMs : null,
+        exitCode: typeof meta?.exitCode === 'number' ? meta?.exitCode : null,
+        errorCode:
+          typeof meta?.errorCode === 'string' || typeof meta?.errorCode === 'number'
+            ? meta?.errorCode
+            : null,
+        signal: meta?.signal ?? null,
+        channel: meta?.channel ?? null
       };
       this.lastFfmpegRestartMeta = metaPayload;
       if (channel) {
@@ -484,7 +553,14 @@ class MetricsRegistry {
         baseDelayMs: typeof meta?.baseDelayMs === 'number' ? meta?.baseDelayMs : null,
         minDelayMs: typeof meta?.minDelayMs === 'number' ? meta?.minDelayMs : null,
         maxDelayMs: typeof meta?.maxDelayMs === 'number' ? meta?.maxDelayMs : null,
-        jitterMs: typeof meta?.jitterMs === 'number' ? meta?.jitterMs : null
+        jitterMs: typeof meta?.jitterMs === 'number' ? meta?.jitterMs : null,
+        exitCode: typeof meta?.exitCode === 'number' ? meta?.exitCode : null,
+        errorCode:
+          typeof meta?.errorCode === 'string' || typeof meta?.errorCode === 'number'
+            ? meta?.errorCode
+            : null,
+        signal: meta?.signal ?? null,
+        channel: meta?.channel ?? null
       };
       this.lastAudioRestartMeta = metaPayload;
       if (channel) {
@@ -506,6 +582,20 @@ class MetricsRegistry {
       const metric = `pipeline.${type}.restart.delay`;
       this.observeLatency(metric, delay);
       this.observeHistogram(metric, delay);
+    }
+  }
+
+  recordAudioDeviceDiscovery(reason: string, meta: { channel?: string } = {}) {
+    const normalized = reason || 'unknown';
+    this.audioDeviceDiscovery.set(
+      normalized,
+      (this.audioDeviceDiscovery.get(normalized) ?? 0) + 1
+    );
+
+    if (meta.channel) {
+      const byReason = this.audioDeviceDiscoveryByChannel.get(meta.channel) ?? new Map<string, number>();
+      byReason.set(normalized, (byReason.get(normalized) ?? 0) + 1);
+      this.audioDeviceDiscoveryByChannel.set(meta.channel, byReason);
     }
   }
 
@@ -585,6 +675,11 @@ class MetricsRegistry {
   }
 
   snapshot(): MetricsSnapshot {
+    const ffmpegDelayHistogram = this.histograms.get('pipeline.ffmpeg.restart.delay');
+    const ffmpegAttemptHistogram = this.histograms.get('pipeline.ffmpeg.restart.attempt');
+    const audioDelayHistogram = this.histograms.get('pipeline.audio.restart.delay');
+    const audioAttemptHistogram = this.histograms.get('pipeline.audio.restart.attempt');
+
     return {
       createdAt: new Date().toISOString(),
       events: {
@@ -609,7 +704,11 @@ class MetricsRegistry {
           byReason: mapFrom(this.ffmpegRestartReasons),
           lastRestart: this.lastFfmpegRestartMeta,
           attempts: mapFrom(this.ffmpegRestartAttempts),
-          byChannel: mapFromPipelineChannels(this.ffmpegRestartsByChannel)
+          byChannel: mapFromPipelineChannels(this.ffmpegRestartsByChannel),
+          deviceDiscovery: {},
+          deviceDiscoveryByChannel: {},
+          delayHistogram: mapFrom(ffmpegDelayHistogram ?? new Map()),
+          attemptHistogram: mapFrom(ffmpegAttemptHistogram ?? new Map())
         },
         audio: {
           restarts: this.audioRestarts,
@@ -617,7 +716,11 @@ class MetricsRegistry {
           byReason: mapFrom(this.audioRestartReasons),
           lastRestart: this.lastAudioRestartMeta,
           attempts: mapFrom(this.audioRestartAttempts),
-          byChannel: mapFromPipelineChannels(this.audioRestartsByChannel)
+          byChannel: mapFromPipelineChannels(this.audioRestartsByChannel),
+          deviceDiscovery: mapFrom(this.audioDeviceDiscovery),
+          deviceDiscoveryByChannel: mapFromNested(this.audioDeviceDiscoveryByChannel),
+          delayHistogram: mapFrom(audioDelayHistogram ?? new Map()),
+          attemptHistogram: mapFrom(audioAttemptHistogram ?? new Map())
         }
       },
       suppression: {
@@ -638,7 +741,8 @@ class MetricsRegistry {
         warnings: this.retentionWarnings,
         warningsByCamera: mapFrom(this.retentionWarningsByCamera),
         lastWarning: this.lastRetentionWarning ? { ...this.lastRetentionWarning } : null,
-        totals: { ...this.retentionTotals }
+        totals: { ...this.retentionTotals },
+        totalsByCamera: mapFromRetentionCameras(this.retentionTotalsByCamera)
       },
       detectors: mapFromDetectors(this.detectorMetrics)
     };
@@ -661,6 +765,7 @@ type SuppressionRuleState = {
   lastCombinedHistoryCount: number | null;
   lastType: 'window' | 'rate-limit' | null;
   lastRateLimit: RateLimitConfig | null;
+  lastCooldownMs: number | null;
 };
 
 type DetectorMetricState = {
@@ -736,8 +841,23 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
         lastCount: state.lastHistoryCount,
         lastCombinedCount: state.lastCombinedHistoryCount,
         lastType: state.lastType,
-        lastRateLimit: state.lastRateLimit
+        lastRateLimit: state.lastRateLimit,
+        lastCooldownMs: state.lastCooldownMs
       }
+    };
+  }
+  return result;
+}
+
+function mapFromRetentionCameras(
+  source: Map<string, RetentionCameraTotals>
+): Record<string, RetentionCameraTotals> {
+  const result: Record<string, RetentionCameraTotals> = {};
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [camera, totals] of ordered) {
+    result[camera] = {
+      archivedSnapshots: totals.archivedSnapshots,
+      prunedArchives: totals.prunedArchives
     };
   }
   return result;
