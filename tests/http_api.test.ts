@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { JSDOM } from 'jsdom';
 import { clearEvents, listEvents, storeEvent } from '../src/db.js';
 import { startHttpServer, HttpServerRuntime } from '../src/server/http.js';
 
@@ -107,6 +108,16 @@ describe('RestApiEvents', () => {
     const rangePayload = await rangeResponse.json();
     expect(rangePayload.items).toHaveLength(1);
     expect(rangePayload.items[0].source).toBe('video:test-camera');
+
+    const searchResponse = await fetch(`http://localhost:${port}/api/events?search=person`);
+    const searchPayload = await searchResponse.json();
+    expect(searchPayload.items).toHaveLength(1);
+    expect(searchPayload.items[0].message).toContain('Person');
+
+    const snapshotResponse = await fetch(`http://localhost:${port}/api/events?snapshot=with`);
+    const snapshotPayload = await snapshotResponse.json();
+    expect(snapshotPayload.items).toHaveLength(1);
+    expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
   });
 
   it('serves snapshot files for events', async () => {
@@ -135,62 +146,152 @@ describe('RestApiEvents', () => {
     expect(buffer.length).toBeGreaterThan(0);
   });
 
-  it('DashboardStream streams events with heartbeat and stream-status metadata', async () => {
-    const { port } = await ensureServer();
-    const controller = new AbortController();
+  it('HttpDashboardStream updates widget counts on SSE events', async () => {
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
 
-    const response = await fetch(`http://localhost:${port}/api/events/stream?camera=cam-stream&retry=2500`, {
-      signal: controller.signal
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
     });
-    expect(response.status).toBe(200);
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
 
-    const reader = response.body?.getReader();
-    expect(reader).toBeDefined();
-    const decoder = new TextDecoder();
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        headers: { 'Content-Type': 'application/json' },
+        status: 200
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
-    const firstChunk = await reader!.read();
-    expect(firstChunk.done).toBe(false);
-    const initialText = decoder.decode(firstChunk.value);
-    expect(initialText).toContain(': connected');
-    expect(initialText).toContain('retry: 2500');
-    expect(initialText).toContain('stream-status');
-    expect(initialText).toContain('cam-stream');
+    type Listener = (event: MessageEvent) => void;
+    class MockEventSource {
+      static instances: MockEventSource[] = [];
+      public url: string;
+      public readyState = 0;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      public onerror: ((event: Event) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
 
-    const event = {
-      id: 123,
-      ts: Date.now(),
+      constructor(url: string) {
+        this.url = url;
+        MockEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const payload = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(payload));
+      }
+
+      emitMessage(data: string) {
+        this.onmessage?.(new window.MessageEvent('message', { data }));
+      }
+
+      open() {
+        this.onopen?.(new window.Event('open'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+
+    await import('../public/dashboard.js');
+    await Promise.resolve();
+
+    const instance = MockEventSource.instances[0];
+    expect(instance).toBeDefined();
+    instance!.open();
+
+    instance!.dispatch('stream-status', JSON.stringify({ status: 'connected', retryMs: 1500 }));
+    instance!.dispatch('heartbeat', JSON.stringify({ ts: 1700000000000 }));
+    const eventPayload = {
+      id: 42,
+      ts: 1700000000500,
       source: 'cam-stream',
       detector: 'motion',
       severity: 'warning',
       message: 'stream event',
       meta: { channel: 'video:stream', camera: 'cam-stream' }
     };
+    instance!.emitMessage(JSON.stringify(eventPayload));
 
-    bus.emit('event', event);
+    const stateText = window.document.getElementById('stream-state')?.textContent;
+    expect(stateText).toBe('Connected');
+    expect(window.document.getElementById('stream-heartbeats')?.textContent).toBe('1');
+    expect(window.document.getElementById('stream-events')?.textContent).toBe('1');
+    const updatedText = window.document.getElementById('stream-updated')?.textContent ?? '';
+    expect(updatedText).not.toBe('—');
 
-    const payloadChunk = await readUntil(reader!, chunk => chunk.includes('data:'));
-    expect(payloadChunk).toContain('stream event');
+    const eventCards = window.document.querySelectorAll('#events .event');
+    expect(eventCards.length).toBe(1);
+    expect(eventCards[0].textContent).toContain('stream event');
 
-    controller.abort();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    instance?.close();
+    MockEventSource.instances.length = 0;
+    dom.window.close();
+    vi.unstubAllGlobals();
+
+    if (originalWindow) {
+      globalThis.window = originalWindow;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.window;
+    }
+    if (originalDocument) {
+      globalThis.document = originalDocument;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.document;
+    }
+    if (originalEventSource) {
+      globalThis.EventSource = originalEventSource;
+    }
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    }
+    if (originalHTMLElement) {
+      globalThis.HTMLElement = originalHTMLElement;
+    }
+    if (originalMessageEvent) {
+      globalThis.MessageEvent = originalMessageEvent;
+    }
+    if (originalNavigator) {
+      globalThis.navigator = originalNavigator;
+    } else {
+      // @ts-expect-error cleanup for navigator in node environment
+      delete globalThis.navigator;
+    }
   });
 });
 
-async function readUntil(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  predicate: (chunk: string) => boolean,
-  timeoutMs = 2000
-): Promise<string> {
-  const decoder = new TextDecoder();
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    const text = decoder.decode(value);
-    if (predicate(text)) {
-      return text;
-    }
-  }
-  throw new Error('Timed out waiting for stream chunk');
-}

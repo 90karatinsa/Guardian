@@ -5,15 +5,25 @@ const previewEmpty = document.getElementById('preview-empty');
 const previewFigure = document.getElementById('preview-figure');
 const previewImage = document.getElementById('preview-image');
 const previewCaption = document.getElementById('preview-caption');
+const streamState = document.getElementById('stream-state');
+const streamHeartbeats = document.getElementById('stream-heartbeats');
+const streamEvents = document.getElementById('stream-events');
+const streamUpdated = document.getElementById('stream-updated');
 
 const MAX_EVENTS = 50;
 
 const state = {
   events: [],
-  filters: { source: '', camera: '', channel: '', severity: '', from: '', to: '' },
+  filters: { source: '', camera: '', channel: '', severity: '', from: '', to: '', search: '', snapshot: '' },
   activeId: null,
   eventSource: null,
-  reconnectDelayMs: 5000
+  reconnectDelayMs: 5000,
+  stream: {
+    heartbeats: 0,
+    events: 0,
+    lastUpdate: null,
+    status: 'connecting'
+  }
 };
 
 function getEventKey(event) {
@@ -36,6 +46,7 @@ function matchesFilters(event) {
   const meta = event.meta ?? {};
   const channel = typeof meta.channel === 'string' ? meta.channel : '';
   const cameraMeta = typeof meta.camera === 'string' ? meta.camera : '';
+  const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : '';
   const ts = typeof event.ts === 'number' ? event.ts : Date.now();
 
   if (state.filters.source && event.source !== state.filters.source) {
@@ -55,6 +66,30 @@ function matchesFilters(event) {
   }
   if (state.filters.severity && event.severity !== state.filters.severity) {
     return false;
+  }
+  if (state.filters.snapshot === 'with' && !snapshotPath) {
+    return false;
+  }
+  if (state.filters.snapshot === 'without' && snapshotPath) {
+    return false;
+  }
+
+  if (state.filters.search) {
+    const search = state.filters.search.toLowerCase();
+    const haystack = [
+      event.message,
+      event.detector,
+      event.source,
+      channel,
+      cameraMeta,
+      snapshotPath
+    ]
+      .filter(value => typeof value === 'string')
+      .map(value => value.toLowerCase());
+
+    if (!haystack.some(value => value.includes(search))) {
+      return false;
+    }
   }
 
   const fromTs = parseDateFilter(state.filters.from);
@@ -189,6 +224,49 @@ function clearPreview() {
   previewEmpty.textContent = 'Select an event to view the latest snapshot.';
 }
 
+function updateStreamWidget() {
+  if (streamState) {
+    const status = state.stream.status;
+    const label = status ? status.charAt(0).toUpperCase() + status.slice(1) : '—';
+    streamState.textContent = label;
+  }
+  if (streamHeartbeats) {
+    streamHeartbeats.textContent = String(state.stream.heartbeats);
+  }
+  if (streamEvents) {
+    streamEvents.textContent = String(state.stream.events);
+  }
+  if (streamUpdated) {
+    streamUpdated.textContent = state.stream.lastUpdate
+      ? new Date(state.stream.lastUpdate).toLocaleTimeString()
+      : '—';
+  }
+}
+
+function setConnectionState(status) {
+  state.stream.status = status;
+  updateStreamWidget();
+}
+
+function resetStreamStats() {
+  state.stream.heartbeats = 0;
+  state.stream.events = 0;
+  state.stream.lastUpdate = null;
+  updateStreamWidget();
+}
+
+function recordHeartbeat(timestamp) {
+  state.stream.heartbeats += 1;
+  state.stream.lastUpdate = typeof timestamp === 'number' ? timestamp : Date.now();
+  updateStreamWidget();
+}
+
+function recordStreamEvent(timestamp) {
+  state.stream.events += 1;
+  state.stream.lastUpdate = typeof timestamp === 'number' ? timestamp : Date.now();
+  updateStreamWidget();
+}
+
 async function loadInitial() {
   const params = buildQueryParams();
   params.set('limit', String(MAX_EVENTS));
@@ -229,10 +307,17 @@ function subscribe() {
     state.eventSource.close();
   }
 
+  resetStreamStats();
+  setConnectionState('connecting');
+
   const params = buildQueryParams();
   params.set('retry', String(state.reconnectDelayMs));
   const source = new EventSource(`/api/events/stream?${params.toString()}`);
   state.eventSource = source;
+
+  source.onopen = () => {
+    setConnectionState('connected');
+  };
 
   source.addEventListener('stream-status', event => {
     try {
@@ -240,8 +325,21 @@ function subscribe() {
       if (payload?.retryMs) {
         state.reconnectDelayMs = payload.retryMs;
       }
+      if (payload?.status) {
+        setConnectionState(String(payload.status));
+      }
     } catch (error) {
       console.debug('Failed to parse stream-status payload', error);
+    }
+  });
+
+  source.addEventListener('heartbeat', event => {
+    try {
+      const payload = JSON.parse(event.data);
+      recordHeartbeat(typeof payload?.ts === 'number' ? payload.ts : Date.now());
+    } catch (error) {
+      recordHeartbeat(Date.now());
+      console.debug('Failed to parse heartbeat payload', error);
     }
   });
 
@@ -249,6 +347,7 @@ function subscribe() {
     try {
       const payload = JSON.parse(event.data);
       const keyed = insertEvent(payload);
+      recordStreamEvent(typeof payload?.ts === 'number' ? payload.ts : Date.now());
       if (!state.activeId && matchesFilters(keyed)) {
         setActiveEvent(keyed.__key);
       }
@@ -258,9 +357,13 @@ function subscribe() {
   };
 
   source.onerror = () => {
+    setConnectionState('disconnected');
     source.close();
     state.eventSource = null;
-    setTimeout(subscribe, state.reconnectDelayMs);
+    setTimeout(() => {
+      setConnectionState('reconnecting');
+      subscribe();
+    }, state.reconnectDelayMs);
   };
 }
 
@@ -270,12 +373,24 @@ function syncFiltersFromForm() {
   state.filters.camera = (formData.get('camera') ?? '').toString().trim();
   state.filters.channel = (formData.get('channel') ?? '').toString().trim();
   state.filters.severity = (formData.get('severity') ?? '').toString().trim();
+  state.filters.search = (formData.get('search') ?? '').toString().trim();
+  const snapshot = (formData.get('snapshot') ?? '').toString().trim();
+  state.filters.snapshot = snapshot === 'with' || snapshot === 'without' ? snapshot : '';
   state.filters.from = (formData.get('from') ?? '').toString();
   state.filters.to = (formData.get('to') ?? '').toString();
 }
 
 function resetFilters() {
-  state.filters = { source: '', camera: '', channel: '', severity: '', from: '', to: '' };
+  state.filters = {
+    source: '',
+    camera: '',
+    channel: '',
+    severity: '',
+    from: '',
+    to: '',
+    search: '',
+    snapshot: ''
+  };
   filtersForm.reset();
   clearPreview();
   loadInitial();
@@ -294,6 +409,8 @@ resetButton.addEventListener('click', () => {
   subscribe();
 });
 
+updateStreamWidget();
+
 loadInitial().then(() => {
   renderEvents();
 });
@@ -305,6 +422,8 @@ function buildQueryParams() {
   if (state.filters.camera) params.set('camera', state.filters.camera);
   if (state.filters.channel) params.set('channel', state.filters.channel);
   if (state.filters.severity) params.set('severity', state.filters.severity);
+  if (state.filters.search) params.set('search', state.filters.search);
+  if (state.filters.snapshot) params.set('snapshot', state.filters.snapshot);
   if (state.filters.from) params.set('from', state.filters.from);
   if (state.filters.to) params.set('to', state.filters.to);
   return params;

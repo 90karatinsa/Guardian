@@ -70,6 +70,10 @@
         gap: 0.35rem;
       }
 
+      .filters label.wide {
+        flex: 1 1 16rem;
+      }
+
       .filters input,
       .filters select {
         border: 1px solid #cbd2d9;
@@ -94,6 +98,41 @@
         color: #243b53;
       }
 
+      .stream-widget {
+        background: #fff;
+        border-radius: 0.75rem;
+        padding: 1rem 1.25rem;
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        border: 1px solid #d9e2ec;
+      }
+
+      .stream-widget h2 {
+        margin: 0 0 0.75rem 0;
+        font-size: 1.05rem;
+        color: #243b53;
+      }
+
+      .stream-widget dl {
+        margin: 0;
+        display: grid;
+        gap: 0.5rem 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      }
+
+      .stream-widget dt {
+        font-weight: 600;
+        font-size: 0.8rem;
+        color: #52606d;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .stream-widget dd {
+        margin: 0;
+        font-size: 0.95rem;
+        color: #1f2933;
+      }
+
       main.dashboard {
         max-width: 1200px;
         margin: 0 auto;
@@ -101,6 +140,12 @@
         gap: 1.5rem;
         grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
         align-items: start;
+      }
+
+      #event-column {
+        display: grid;
+        gap: 1.5rem;
+        align-content: start;
       }
 
       #events {
@@ -219,6 +264,10 @@
           Channel
           <input type="text" name="channel" placeholder="video:default" />
         </label>
+        <label class="wide">
+          Search
+          <input type="text" name="search" placeholder="message or detector" />
+        </label>
         <label>
           Severity
           <select name="severity">
@@ -226,6 +275,14 @@
             <option value="info">Info</option>
             <option value="warning">Warning</option>
             <option value="critical">Critical</option>
+          </select>
+        </label>
+        <label>
+          Snapshot
+          <select name="snapshot">
+            <option value="">Any snapshot</option>
+            <option value="with">With snapshot</option>
+            <option value="without">Without snapshot</option>
           </select>
         </label>
         <label>
@@ -241,7 +298,22 @@
       </form>
     </header>
     <main class="dashboard">
-      <section aria-live="polite" aria-label="Live events" id="events"></section>
+      <div id="event-column">
+        <section class="stream-widget" aria-live="polite" aria-label="Stream activity">
+          <h2>Live stream</h2>
+          <dl>
+            <dt>Status</dt>
+            <dd id="stream-state">Connecting…</dd>
+            <dt>Heartbeats</dt>
+            <dd id="stream-heartbeats">0</dd>
+            <dt>Events</dt>
+            <dd id="stream-events">0</dd>
+            <dt>Last update</dt>
+            <dd id="stream-updated">—</dd>
+          </dl>
+        </section>
+        <section aria-live="polite" aria-label="Live events" id="events"></section>
+      </div>
       <aside id="preview" aria-label="Snapshot preview">
         <div class="preview-empty" id="preview-empty">Select an event to view the latest snapshot.</div>
         <figure id="preview-figure" hidden>

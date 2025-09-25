@@ -29,6 +29,7 @@ interface InternalSuppressionRule {
   reason: string;
   suppressedUntil: number;
   history: number[];
+  historyLimit: number;
 }
 
 type SuppressionHitType = 'window' | 'rate-limit';
@@ -37,6 +38,9 @@ interface SuppressionHit {
   rule: InternalSuppressionRule;
   type: SuppressionHitType;
   reason: string;
+  history: number[];
+  windowExpiresAt?: number;
+  rateLimit?: RateLimitConfig;
 }
 
 class EventBus extends EventEmitter {
@@ -92,19 +96,29 @@ class EventBus extends EventEmitter {
 
     if (evaluation.suppressed) {
       const primary = evaluation.hits[0];
+      const historyWithSuppressedEvent = buildSuppressionHistory(primary, normalized.ts);
+      const suppressedBy = evaluation.hits.map(hit => ({
+        ruleId: hit.rule.id,
+        reason: hit.reason,
+        type: hit.type,
+        suppressForMs: hit.rule.suppressForMs,
+        rateLimit: hit.rule.rateLimit,
+        windowExpiresAt: hit.windowExpiresAt,
+        history: [...hit.history],
+        historyCount: hit.history.length,
+        rateLimitWindowMs: hit.rateLimit?.perMs
+      }));
       const meta = {
         ...normalized.meta,
         suppressed: true,
         suppressionReason: primary?.reason,
         suppressionType: primary?.type,
         suppressionRuleId: primary?.rule.id,
-        suppressedBy: evaluation.hits.map(hit => ({
-          ruleId: hit.rule.id,
-          reason: hit.reason,
-          type: hit.type,
-          suppressForMs: hit.rule.suppressForMs,
-          rateLimit: hit.rule.rateLimit
-        }))
+        suppressionWindowExpiresAt: primary?.windowExpiresAt,
+        rateLimitWindowMs: primary?.rateLimit?.perMs,
+        suppressionHistory: historyWithSuppressedEvent,
+        suppressionHistoryCount: historyWithSuppressedEvent.length,
+        suppressedBy
       };
       for (const hit of evaluation.hits) {
         this.metrics.recordSuppressedEvent(hit.rule.id, hit.reason);
@@ -125,10 +139,6 @@ class EventBus extends EventEmitter {
       if (rule.suppressForMs && !rule.rateLimit) {
         rule.suppressedUntil = normalized.ts + rule.suppressForMs;
       }
-
-      if (rule.rateLimit) {
-        rule.history.push(normalized.ts);
-      }
     }
 
     this.emit(EVENT_CHANNEL, normalized);
@@ -144,23 +154,64 @@ class EventBus extends EventEmitter {
         continue;
       }
 
-      matchedRules.push(rule);
+      pruneHistory(rule, event.ts);
 
-      if (rule.suppressForMs && event.ts < rule.suppressedUntil) {
-        hits.push({ rule, type: 'window', reason: rule.reason });
+      const windowActive = Boolean(rule.suppressForMs && event.ts < rule.suppressedUntil);
+      const rateLimitExceeded = Boolean(
+        rule.rateLimit && rule.history.length >= rule.rateLimit.count
+      );
+
+      const historySnapshot = [...rule.history];
+
+      if (windowActive) {
+        recordHistory(rule, event.ts);
+        hits.push({
+          rule,
+          type: 'window',
+          reason: rule.reason,
+          history: [...rule.history],
+          windowExpiresAt: rule.suppressedUntil,
+          rateLimit: rule.rateLimit
+        });
         continue;
       }
 
-      if (rule.rateLimit) {
-        pruneHistory(rule, event.ts);
-        if (rule.history.length >= rule.rateLimit.count) {
-          hits.push({ rule, type: 'rate-limit', reason: rule.reason });
-          if (rule.suppressForMs) {
-            rule.suppressedUntil = Math.max(rule.suppressedUntil, event.ts + rule.suppressForMs);
-          }
-          rule.history.push(event.ts);
+      recordHistory(rule, event.ts);
+
+      if (rateLimitExceeded && rule.rateLimit) {
+        const historyLimit = rule.rateLimit.count;
+        const relevantSnapshot =
+          historyLimit && historyLimit > 0
+            ? historySnapshot.slice(-historyLimit)
+            : [...historySnapshot];
+        const rateLimitHistory = rule.suppressForMs
+          ? [...relevantSnapshot]
+          : [...relevantSnapshot, event.ts];
+        if (rule.suppressForMs) {
+          const windowUntil = Math.max(rule.suppressedUntil, event.ts + rule.suppressForMs);
+          rule.suppressedUntil = windowUntil;
+          hits.push({
+            rule,
+            type: 'rate-limit',
+            reason: rule.reason,
+            history: rateLimitHistory,
+            windowExpiresAt: windowUntil,
+            rateLimit: rule.rateLimit
+          });
+        } else {
+          hits.push({
+            rule,
+            type: 'rate-limit',
+            reason: rule.reason,
+            history: rateLimitHistory,
+            windowExpiresAt: undefined,
+            rateLimit: rule.rateLimit
+          });
         }
+        continue;
       }
+
+      matchedRules.push(rule);
     }
 
     if (hits.length > 0) {
@@ -208,7 +259,8 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     rateLimit: rule.rateLimit,
     reason: rule.reason,
     suppressedUntil: 0,
-    history: []
+    history: [],
+    historyLimit: Math.max(rule.rateLimit?.count ?? 0, 10)
   };
 }
 
@@ -249,7 +301,9 @@ function ruleMatchesEvent(rule: InternalSuppressionRule, event: EventRecord): bo
 function pruneHistory(rule: InternalSuppressionRule, ts: number) {
   const windowMs = rule.rateLimit?.perMs;
   if (!windowMs) {
-    rule.history = [];
+    if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
+      rule.history.splice(0, rule.history.length - rule.historyLimit);
+    }
     return;
   }
 
@@ -263,6 +317,13 @@ function pruneHistory(rule: InternalSuppressionRule, ts: number) {
   }
   if (removeCount > 0) {
     rule.history.splice(0, removeCount);
+  }
+}
+
+function recordHistory(rule: InternalSuppressionRule, ts: number) {
+  rule.history.push(ts);
+  if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
+    rule.history.splice(0, rule.history.length - rule.historyLimit);
   }
 }
 
@@ -282,4 +343,18 @@ function extractEventChannels(meta: Record<string, unknown> | undefined): string
   }
 
   return [];
+}
+
+function buildSuppressionHistory(hit: SuppressionHit | undefined, eventTs: number): number[] {
+  if (!hit) {
+    return [];
+  }
+
+  const baseHistory = [...hit.history];
+
+  if (hit.type === 'rate-limit' && hit.rule.suppressForMs) {
+    return [...baseHistory, eventTs];
+  }
+
+  return baseHistory;
 }

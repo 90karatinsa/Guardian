@@ -17,9 +17,20 @@
     "retention": {
       "retentionDays": 30,
       "intervalMinutes": 60,
-      "vacuum": "auto",
       "archiveDir": "archive",
-      "enabled": true
+      "enabled": true,
+      "maxArchivesPerCamera": 5,
+      "snapshot": {
+        "mode": "archive",
+        "retentionDays": 21
+      },
+      "vacuum": {
+        "mode": "auto",
+        "analyze": true,
+        "reindex": true,
+        "optimize": true,
+        "target": "main"
+      }
     },
     "suppression": {
       "rules": [
@@ -47,6 +58,13 @@
       "restartMaxDelayMs": 5000,
       "restartJitterFactor": 0.2
     },
+    "channels": {
+      "video:test-camera": {
+        "ffmpeg": {
+          "inputArgs": ["-use_wallclock_as_timestamps", "1"]
+        }
+      }
+    },
     "cameras": [
       {
         "id": "test-camera",
@@ -65,9 +83,6 @@
           "areaSmoothing": 0.2,
           "areaInflation": 1.2,
           "areaDeltaThreshold": 0.015
-        },
-        "ffmpeg": {
-          "inputArgs": ["-use_wallclock_as_timestamps", "1"]
         }
       }
     ]
@@ -78,7 +93,8 @@
     "checkEveryNFrames": 3,
     "maxDetections": 5,
     "snapshotDir": "snapshots",
-    "minIntervalMs": 2000
+    "minIntervalMs": 2000,
+    "classIndices": [0, 15, 16]
   },
   "motion": {
     "diffThreshold": 25,
@@ -103,6 +119,24 @@
     "normalHours": [
       { "start": 7, "end": 22 }
     ]
+  },
+  "pose": {
+    "modelPath": "models/pose.onnx",
+    "forecastHorizonMs": 900,
+    "smoothingWindow": 3,
+    "minMovement": 0.05,
+    "historySize": 12
+  },
+  "face": {
+    "modelPath": "models/face.onnx",
+    "embeddingSize": 128
+  },
+  "objects": {
+    "modelPath": "models/object.onnx",
+    "labels": ["pet", "delivery", "threat"],
+    "threatLabels": ["threat"],
+    "threatThreshold": 0.6,
+    "classIndices": [15, 16]
   },
   "audio": {
     "idleTimeoutMs": 4000,

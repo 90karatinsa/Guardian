@@ -31,7 +31,7 @@ describe('EventSuppression', () => {
     });
   });
 
-  it('EventSuppressionChannelRateLimit filters by channel before applying rate limits', () => {
+  it('EventSuppressionRateLimit filters by channel before applying rate limits', () => {
     bus.configureSuppression([
       {
         id: 'channel-limit',
@@ -57,12 +57,16 @@ describe('EventSuppression', () => {
       suppressionType: 'rate-limit',
       suppressionRuleId: 'channel-limit'
     });
+    expect(suppressionCall?.[0]?.meta?.suppressionHistoryCount).toBe(3);
+    expect(Array.isArray(suppressionCall?.[0]?.meta?.suppressionHistory)).toBe(true);
+    expect((suppressionCall?.[0]?.meta?.suppressionHistory as unknown[])?.length).toBe(3);
     const suppressedBy = suppressionCall?.[0]?.meta?.suppressedBy as Array<Record<string, unknown>>;
     expect(Array.isArray(suppressedBy)).toBe(true);
-    expect(suppressedBy?.[0]).toMatchObject({ ruleId: 'channel-limit', type: 'rate-limit' });
+    expect(suppressedBy?.[0]).toMatchObject({ ruleId: 'channel-limit', type: 'rate-limit', historyCount: 3 });
+    expect((suppressedBy?.[0]?.history as unknown[])?.length).toBe(3);
   });
 
-  it('EventSuppressionWindowCombo combines rate limit triggers with cooldown windows', () => {
+  it('EventSuppressionRateLimit combines rate limit triggers with cooldown windows', () => {
     bus.configureSuppression([
       {
         id: 'combo',
@@ -90,11 +94,13 @@ describe('EventSuppression', () => {
       suppressionType: 'rate-limit',
       suppressionRuleId: 'combo'
     });
-    expect(rateLimitedCall[0]?.suppressedBy?.[0]).toMatchObject({ type: 'rate-limit' });
+    expect(rateLimitedCall[0]?.suppressedBy?.[0]).toMatchObject({ type: 'rate-limit', historyCount: 2 });
+    expect((rateLimitedCall[0]?.suppressedBy?.[0]?.history as unknown[])?.length).toBe(2);
     expect(rateLimitedCall[1]).toMatchObject({
       suppressionType: 'window',
       suppressionRuleId: 'combo'
     });
     expect(rateLimitedCall[1]?.suppressedBy?.[0]).toMatchObject({ type: 'window' });
+    expect(rateLimitedCall[1]?.suppressionWindowExpiresAt).toBeGreaterThan(rateLimitedCall[1]?.suppressionHistory?.[0] ?? 0);
   });
 });

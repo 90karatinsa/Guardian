@@ -1,13 +1,14 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { Writable } from 'node:stream';
 import metrics from '../src/metrics/index.js';
+import { registerShutdownHook, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
 
 const startGuardMock = vi.fn();
 vi.mock('../src/run-guard.js', () => ({
   startGuard: startGuardMock
 }));
 
-import { runCli } from '../src/cli.js';
+import { runCli, buildHealthPayload } from '../src/cli.js';
 
 type TestIo = {
   io: { stdout: NodeJS.WritableStream; stderr: NodeJS.WritableStream };
@@ -44,6 +45,7 @@ function createTestIo(): TestIo {
 beforeEach(async () => {
   startGuardMock.mockReset();
   metrics.reset();
+  resetAppLifecycle();
   const cleanupIo = createTestIo();
   await runCli(['stop'], cleanupIo.io);
 });
@@ -99,12 +101,46 @@ describe('GuardianCliShutdown', () => {
       expect(startGuardMock).toHaveBeenCalledTimes(1);
     });
 
-  const stopIo = createTestIo();
+    const stopIo = createTestIo();
     const stopCode = await runCli(['stop'], stopIo.io);
 
     expect(stopCode).toBe(0);
     expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(stopIo.stdout()).toContain('Guardian daemon stopped (status: ok)');
+    await expect(startPromise).resolves.toBe(0);
+  });
+
+  it('CliGracefulShutdown runs registered hooks and updates health payload', async () => {
+    const stopSpy = vi.fn();
+    const hook = vi.fn();
+    registerShutdownHook('test-hook', hook);
+    registerHealthIndicator('runtime', async () => ({
+      status: 'ok',
+      details: { ready: true }
+    }));
+    startGuardMock.mockResolvedValue({ stop: stopSpy });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const stopIo = createTestIo();
+    const stopCode = await runCli(['stop'], stopIo.io);
+
+    expect(stopCode).toBe(0);
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith({ reason: 'cli-stop', signal: undefined });
+
+    const health = await buildHealthPayload();
+    expect(health.state).toBe('stopped');
+    const runtimeCheck = health.checks.find(check => check.name === 'runtime');
+    expect(runtimeCheck?.status).toBe('ok');
+    expect(runtimeCheck?.details).toEqual({ ready: true });
+    expect(stopIo.stdout()).toContain('Guardian daemon stopped (status: ok)');
+
     await expect(startPromise).resolves.toBe(0);
   });
 });

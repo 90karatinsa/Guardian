@@ -3,6 +3,12 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import PersonDetector from '../src/video/personDetector.js';
+import {
+  DEFAULT_NMS_IOU_THRESHOLD,
+  YOLO_CLASS_START_INDEX,
+  computeIoU,
+  parseYoloDetections
+} from '../src/video/yoloParser.js';
 
 const runMock = vi.fn();
 
@@ -308,6 +314,84 @@ describe('PersonDetector', () => {
 
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
+  });
+});
+
+describe('YoloParser', () => {
+  it('YoloParserMultiClass orders detections per class with IoU suppression', () => {
+    const classCount = 3;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    setChannelFirstDetection(data, detections, 0, {
+      cx: 300,
+      cy: 260,
+      width: 180,
+      height: 220,
+      objectnessLogit: 2.4,
+      classLogit: 2.1
+    });
+    // additional classes for detection 0
+    data[(YOLO_CLASS_START_INDEX + 1) * detections + 0] = 1.6;
+    data[(YOLO_CLASS_START_INDEX + 2) * detections + 0] = -4;
+
+    setChannelFirstDetection(data, detections, 1, {
+      cx: 310,
+      cy: 270,
+      width: 175,
+      height: 210,
+      objectnessLogit: 1.7,
+      classLogit: 1.5
+    });
+    data[(YOLO_CLASS_START_INDEX + 1) * detections + 1] = 1.4;
+    data[(YOLO_CLASS_START_INDEX + 2) * detections + 1] = -2.5;
+
+    const meta = {
+      scale: 1,
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480
+    };
+
+    const tensor = { data, dims: [1, attributes, detections] } as any;
+    const result = parseYoloDetections(tensor, meta, {
+      classIndices: [0, 1, 2],
+      scoreThreshold: 0.2,
+      nmsThreshold: DEFAULT_NMS_IOU_THRESHOLD,
+      maxDetections: 5
+    });
+
+    // Expect detections for class 0 and 1 but class 2 scores fall below threshold
+    const classIds = result.map(candidate => candidate.classId);
+    expect(classIds.every(id => id === 0 || id === 1)).toBe(true);
+    expect(classIds.filter(id => id === 0)).toHaveLength(1);
+    expect(classIds.filter(id => id === 1)).toHaveLength(1);
+
+    const [personDetection] = result.filter(candidate => candidate.classId === 0);
+    const [catDetection] = result.filter(candidate => candidate.classId === 1);
+    expect(personDetection).toBeDefined();
+    expect(catDetection).toBeDefined();
+    const person = personDetection!;
+    const cat = catDetection!;
+    expect(person.score).toBeGreaterThan(cat.score);
+    expect(person.score).toBeGreaterThan(0.5);
+    expect(cat.score).toBeGreaterThan(0.4);
+
+    const iou = computeIoU(person.bbox, {
+      left: 310 - 175 / 2,
+      top: 270 - 210 / 2,
+      width: 175,
+      height: 210
+    });
+    expect(iou).toBeGreaterThan(0.4);
+    expect(iou).toBeCloseTo(0.82, 2);
+    expect(result.length).toBe(2);
+    expect(person.areaRatio).toBeGreaterThan(0);
+    expect(cat.areaRatio).toBeGreaterThan(0);
+    expect(person.bbox.width).toBeCloseTo(180, 5);
+    expect(cat.bbox.height).toBeCloseTo(220, 5);
   });
 });
 

@@ -13,13 +13,19 @@ import configManager, {
   EventsConfig,
   CameraFfmpegConfig,
   CameraMotionConfig,
-  RetentionConfig
+  VideoChannelConfig,
+  RetentionConfig,
+  PoseConfig,
+  FaceConfig,
+  ObjectsConfig
 } from './config/index.js';
+import PoseEstimator from './video/poseEstimator.js';
+import ObjectClassifier from './video/objectClassifier.js';
 import { ensureSampleVideo } from './video/sampleVideo.js';
 import { VideoSource } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector from './video/personDetector.js';
-import { RetentionTask, startRetentionTask } from './tasks/retention.js';
+import { RetentionTask, RetentionTaskOptions, startRetentionTask } from './tasks/retention.js';
 
 type CameraPipelineState = {
   channel: string;
@@ -30,7 +36,24 @@ type CameraPipelineState = {
     score: number;
     snapshotDir?: string;
     minIntervalMs?: number;
+    classIndices?: number[];
   };
+  pose?: PoseConfig;
+  objects?: ObjectsConfig;
+};
+
+type CameraRestartEvent = {
+  reason: string;
+  attempt: number;
+  delayMs: number;
+  at: number;
+};
+
+type CameraRestartStats = {
+  total: number;
+  byReason: Map<string, number>;
+  last: CameraRestartEvent | null;
+  history: CameraRestartEvent[];
 };
 
 type CameraRuntime = {
@@ -39,11 +62,15 @@ type CameraRuntime = {
   source: VideoSource;
   motionDetector: MotionDetector;
   personDetector: PersonDetector;
+  poseEstimator?: PoseEstimator | null;
+  objectClassifier?: ObjectClassifier | null;
   framesSinceMotion: number | null;
   detectionAttempts: number;
   checkEvery: number;
   maxDetections: number;
   pipelineState: CameraPipelineState;
+  restartStats: CameraRestartStats;
+  cleanup: Array<() => void>;
 };
 
 type GuardConfig = {
@@ -51,6 +78,9 @@ type GuardConfig = {
   person: PersonConfig;
   motion?: MotionConfig;
   events?: EventsConfig;
+  pose?: PoseConfig;
+  face?: FaceConfig;
+  objects?: ObjectsConfig;
 };
 
 type GuardLogger = Pick<typeof loggerModule, 'info' | 'warn' | 'error'>;
@@ -103,6 +133,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   let stopWatching: (() => void) | null = null;
   let retentionTask: RetentionTask | null = null;
   let syncPromise: Promise<void> = Promise.resolve();
+  let handleConfigError: ((error: unknown) => void) | null = null;
 
   const configureRetention = (config: GuardConfig) => {
     const retentionOptions = buildRetentionOptions({
@@ -161,14 +192,42 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       areaDeltaThreshold: context.motion.areaDeltaThreshold
     });
 
-    const personDetector = await PersonDetector.create({
-      source: context.pipelineState.channel,
-      modelPath: config.person.modelPath,
-      scoreThreshold: context.pipelineState.person.score,
-      snapshotDir: context.pipelineState.person.snapshotDir,
-      minIntervalMs:
-        context.pipelineState.person.minIntervalMs ?? config.person.minIntervalMs ?? 2000
-    });
+    const objectClassifier = context.pipelineState.objects
+      ? await ObjectClassifier.create({
+          modelPath: context.pipelineState.objects.modelPath,
+          labels: context.pipelineState.objects.labels,
+          threatLabels: context.pipelineState.objects.threatLabels,
+          threatThreshold: context.pipelineState.objects.threatThreshold
+        })
+      : null;
+
+    const personDetector = await PersonDetector.create(
+      {
+        source: context.pipelineState.channel,
+        modelPath: config.person.modelPath,
+        scoreThreshold: context.pipelineState.person.score,
+        snapshotDir: context.pipelineState.person.snapshotDir,
+        minIntervalMs:
+          context.pipelineState.person.minIntervalMs ?? config.person.minIntervalMs ?? 2000,
+        classIndices: context.pipelineState.person.classIndices,
+        objectClassifier: objectClassifier ?? undefined
+      },
+      bus
+    );
+
+    const poseEstimator = context.pipelineState.pose
+      ? await PoseEstimator.create({
+          source: context.pipelineState.channel,
+          modelPath: context.pipelineState.pose.modelPath,
+          forecastHorizonMs: context.pipelineState.pose.forecastHorizonMs,
+          smoothingWindow: context.pipelineState.pose.smoothingWindow,
+          minMovement: context.pipelineState.pose.minMovement,
+          historySize: context.pipelineState.pose.historySize,
+          bus
+        })
+      : null;
+
+    const cleanup: Array<() => void> = [];
 
     const runtime: CameraRuntime = {
       id: camera.id,
@@ -176,12 +235,39 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       source,
       motionDetector,
       personDetector,
+      poseEstimator,
+      objectClassifier,
       framesSinceMotion: null,
       detectionAttempts: 0,
       checkEvery: context.checkEvery,
       maxDetections: context.maxDetections,
-      pipelineState: context.pipelineState
+      pipelineState: context.pipelineState,
+      restartStats: {
+        total: 0,
+        byReason: new Map(),
+        last: null,
+        history: []
+      },
+      cleanup
     };
+
+    if (poseEstimator) {
+      const motionListener = async (payload: { detector?: string; source?: string; meta?: Record<string, unknown>; ts?: number }) => {
+        if (payload.detector !== 'motion' || payload.source !== runtime.channel) {
+          return;
+        }
+
+        try {
+          await poseEstimator.forecast(payload.meta, typeof payload.ts === 'number' ? payload.ts : Date.now());
+          payload.meta = poseEstimator.mergeIntoMotionMeta(payload.meta);
+        } catch (error) {
+          logger.warn({ err: error, camera: runtime.id }, 'Pose forecast failed');
+        }
+      };
+
+      bus.on('event', motionListener);
+      cleanup.push(() => bus.off('event', motionListener));
+    }
 
     pipelines.set(context.pipelineState.channel, runtime);
     pipelinesById.set(camera.id, runtime);
@@ -205,6 +291,14 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       if (!desiredIds.has(runtime.id)) {
         pipelines.delete(runtime.channel);
         pipelinesById.delete(runtime.id);
+        runtime.cleanup.forEach(fn => {
+          try {
+            fn();
+          } catch (error) {
+            logger.warn({ err: error, camera: runtime.id }, 'Pipeline cleanup failed');
+          }
+        });
+        runtime.cleanup.length = 0;
         runtime.source.stop();
         logger.info({ camera: runtime.id }, 'Stopping guard pipeline');
       }
@@ -222,6 +316,14 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       if (needsPipelineRestart(existing.pipelineState, context.pipelineState)) {
         pipelines.delete(existing.channel);
         pipelinesById.delete(existing.id);
+        existing.cleanup.forEach(fn => {
+          try {
+            fn();
+          } catch (error) {
+            logger.warn({ err: error, camera: existing.id }, 'Pipeline cleanup failed');
+          }
+        });
+        existing.cleanup.length = 0;
         existing.source.stop();
         logger.info({ camera: existing.id }, 'Restarting guard pipeline');
         await createPipeline(camera, config);
@@ -274,6 +376,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   if (!injectedConfig) {
     stopWatching = manager.watch();
     manager.on('reload', handleReload);
+    handleConfigError = error => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.warn({ err }, 'configuration reload failed');
+    };
+    manager.on('error', handleConfigError);
   }
 
   const eventHandler = (payload: { detector?: string; source?: string }) => {
@@ -298,9 +405,20 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     bus.off('event', eventHandler);
     if (!injectedConfig) {
       manager.off('reload', handleReload);
+      if (handleConfigError) {
+        manager.off('error', handleConfigError);
+      }
       stopWatching?.();
     }
     for (const runtime of pipelinesById.values()) {
+      runtime.cleanup.forEach(fn => {
+        try {
+          fn();
+        } catch (error) {
+          logger.warn({ err: error, camera: runtime.id }, 'Pipeline cleanup failed');
+        }
+      });
+      runtime.cleanup.length = 0;
       runtime.source.stop();
     }
     pipelines.clear();
@@ -341,6 +459,10 @@ function resolveCameraInput(camera: CameraConfig, videoConfig: VideoConfig) {
   }
 
   return ensureSampleVideo(input);
+}
+
+function resolveVideoChannel(videoConfig: VideoConfig, channel: string): VideoChannelConfig | undefined {
+  return videoConfig.channels?.[channel];
 }
 
 function resolveCameraFfmpeg(
@@ -384,10 +506,17 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   }
 
   const channel = camera.channel ?? `video:${camera.id}`;
+  const channelConfig = resolveVideoChannel(config.video, channel);
   const input = resolveCameraInput(camera, config.video);
-  const framesPerSecond = camera.framesPerSecond ?? config.video.framesPerSecond;
-  const ffmpeg = resolveCameraFfmpeg(camera.ffmpeg, config.video.ffmpeg);
-  const minIntervalMs = camera.person?.minIntervalMs ?? config.person.minIntervalMs ?? 2000;
+  const framesPerSecond =
+    camera.framesPerSecond ?? channelConfig?.framesPerSecond ?? config.video.framesPerSecond;
+  const channelFfmpeg = resolveCameraFfmpeg(channelConfig?.ffmpeg, config.video.ffmpeg);
+  const ffmpeg = resolveCameraFfmpeg(camera.ffmpeg, channelFfmpeg);
+  const minIntervalMs =
+    camera.person?.minIntervalMs ??
+    channelConfig?.person?.minIntervalMs ??
+    config.person.minIntervalMs ??
+    2000;
 
   const pipelineState: CameraPipelineState = {
     channel,
@@ -395,22 +524,40 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
     framesPerSecond,
     ffmpeg,
     person: {
-      score: camera.person?.score ?? config.person.score,
-      snapshotDir: camera.person?.snapshotDir ?? config.person.snapshotDir,
-      minIntervalMs
-    }
+      score: camera.person?.score ?? channelConfig?.person?.score ?? config.person.score,
+      snapshotDir:
+        camera.person?.snapshotDir ??
+        channelConfig?.person?.snapshotDir ??
+        config.person.snapshotDir,
+      minIntervalMs,
+      classIndices:
+        camera.person?.classIndices ??
+        channelConfig?.person?.classIndices ??
+        config.person.classIndices
+    },
+    pose: config.pose,
+    objects: config.objects
   };
 
-  const motion = resolveCameraMotion(camera.motion, config.motion);
+  const motionDefaults = channelConfig?.motion
+    ? resolveCameraMotion(channelConfig.motion, config.motion)
+    : config.motion;
+  const motion = resolveCameraMotion(camera.motion, motionDefaults);
 
   const checkEvery = Math.max(
     1,
-    camera.person?.checkEveryNFrames ?? config.person.checkEveryNFrames ?? DEFAULT_CHECK_EVERY
+    camera.person?.checkEveryNFrames ??
+      channelConfig?.person?.checkEveryNFrames ??
+      config.person.checkEveryNFrames ??
+      DEFAULT_CHECK_EVERY
   );
 
   const maxDetections = Math.max(
     1,
-    camera.person?.maxDetections ?? config.person.maxDetections ?? DEFAULT_MAX_DETECTIONS
+    camera.person?.maxDetections ??
+      channelConfig?.person?.maxDetections ??
+      config.person.maxDetections ??
+      DEFAULT_MAX_DETECTIONS
   );
 
   return { pipelineState, motion, checkEvery, maxDetections } as const;
@@ -445,6 +592,18 @@ function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelin
     return true;
   }
 
+  if (!arrayEqual(previous.person.classIndices, next.person.classIndices)) {
+    return true;
+  }
+
+  if (!poseConfigsEqual(previous.pose, next.pose)) {
+    return true;
+  }
+
+  if (!objectConfigsEqual(previous.objects, next.objects)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -459,6 +618,39 @@ function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
     a.restartDelayMs === b.restartDelayMs &&
     a.restartMaxDelayMs === b.restartMaxDelayMs &&
     a.restartJitterFactor === b.restartJitterFactor
+  );
+}
+
+function poseConfigsEqual(a?: PoseConfig, b?: PoseConfig) {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+  return (
+    a.modelPath === b.modelPath &&
+    a.forecastHorizonMs === b.forecastHorizonMs &&
+    a.smoothingWindow === b.smoothingWindow &&
+    a.minMovement === b.minMovement &&
+    a.historySize === b.historySize
+  );
+}
+
+function objectConfigsEqual(a?: ObjectsConfig, b?: ObjectsConfig) {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+
+  return (
+    a.modelPath === b.modelPath &&
+    a.threatThreshold === b.threatThreshold &&
+    arrayEqual(a.labels, b.labels) &&
+    arrayEqual(a.threatLabels, b.threatLabels) &&
+    arrayEqual(a.classIndices, b.classIndices)
   );
 }
 
@@ -483,7 +675,10 @@ function pickGuardConfig(config: GuardianConfig): GuardConfig {
     video: config.video,
     person: config.person,
     motion: config.motion,
-    events: config.events
+    events: config.events,
+    pose: config.pose,
+    face: config.face,
+    objects: config.objects
   };
 }
 
@@ -492,7 +687,10 @@ function mergeGuardConfig(injected: GuardConfig, fallback: GuardianConfig): Guar
     video: injected.video,
     person: injected.person,
     motion: injected.motion ?? fallback.motion,
-    events: injected.events ?? fallback.events
+    events: injected.events ?? fallback.events,
+    pose: injected.pose ?? fallback.pose,
+    face: injected.face ?? fallback.face,
+    objects: injected.objects ?? fallback.objects
   };
 }
 
@@ -514,6 +712,12 @@ function buildRetentionOptions(options: {
   const snapshotDirs = collectSnapshotDirectories(options.video, options.person);
   const archiveDir = retention.archiveDir ?? path.join(process.cwd(), 'archive');
   const intervalMinutes = retention.intervalMinutes ?? 60;
+  const vacuum = retention.vacuum ?? 'auto';
+  const snapshot = retention.snapshot;
+  const maxArchives =
+    typeof retention.maxArchivesPerCamera === 'number'
+      ? retention.maxArchivesPerCamera
+      : snapshot?.maxArchivesPerCamera;
 
   return {
     enabled: retention.enabled !== false,
@@ -521,9 +725,25 @@ function buildRetentionOptions(options: {
     intervalMs: intervalMinutes * 60 * 1000,
     archiveDir,
     snapshotDirs,
-    vacuumMode: retention.vacuum ?? 'auto',
+    maxArchivesPerCamera: typeof maxArchives === 'number' ? maxArchives : undefined,
+    vacuum: typeof vacuum === 'string'
+      ? vacuum
+      : {
+          mode: vacuum.mode,
+          target: vacuum.target,
+          analyze: vacuum.analyze,
+          reindex: vacuum.reindex,
+          optimize: vacuum.optimize,
+          pragmas: vacuum.pragmas
+        },
+    snapshot: snapshot
+      ? {
+          mode: snapshot.mode,
+          retentionDays: snapshot.retentionDays
+        }
+      : undefined,
     logger: options.logger
-  } as const;
+  } satisfies RetentionTaskOptions;
 }
 
 function collectSnapshotDirectories(video: VideoConfig, person: PersonConfig): string[] {
@@ -579,6 +799,13 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
   });
 
   source.on('recover', event => {
+    const now = Date.now();
+    const stats = runtime.restartStats;
+    stats.total += 1;
+    stats.byReason.set(event.reason, (stats.byReason.get(event.reason) ?? 0) + 1);
+    const record = { reason: event.reason, attempt: event.attempt, delayMs: event.delayMs, at: now };
+    stats.last = record;
+    stats.history.push(record);
     logger.warn(
       { camera: runtime.id, attempt: event.attempt, reason: event.reason, delayMs: event.delayMs },
       `Video source reconnecting (reason=${event.reason})`

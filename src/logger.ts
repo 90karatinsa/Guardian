@@ -21,6 +21,18 @@ function extractContext(args: unknown[]): LogContext {
       const candidate = value as Record<string, unknown>;
       if (typeof candidate.detector === 'string' && candidate.detector.length > 0 && !detector) {
         detector = candidate.detector;
+      } else if (!detector) {
+        const meta = candidate.meta as Record<string, unknown> | undefined;
+        if (meta && typeof meta.detector === 'string' && meta.detector.length > 0) {
+          detector = meta.detector;
+        }
+        const context = candidate.context as Record<string, unknown> | undefined;
+        if (context && typeof context.detector === 'string' && context.detector.length > 0) {
+          detector = context.detector;
+        }
+      }
+      if (typeof candidate.message === 'string' && candidate.message.length > 0 && !message) {
+        message = candidate.message;
       }
     }
   }

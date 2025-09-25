@@ -21,12 +21,31 @@ export type EventsConfig = {
 
 export type RetentionVacuumMode = 'auto' | 'full';
 
+export type RetentionVacuumConfig = {
+  mode?: RetentionVacuumMode;
+  target?: string;
+  analyze?: boolean;
+  reindex?: boolean;
+  optimize?: boolean;
+  pragmas?: string[];
+};
+
+export type RetentionSnapshotMode = 'archive' | 'delete' | 'ignore';
+
+export type RetentionSnapshotConfig = {
+  mode?: RetentionSnapshotMode;
+  retentionDays?: number;
+  maxArchivesPerCamera?: number;
+};
+
 export type RetentionConfig = {
   enabled?: boolean;
   retentionDays: number;
   intervalMinutes?: number;
-  vacuum?: RetentionVacuumMode;
   archiveDir: string;
+  maxArchivesPerCamera?: number;
+  vacuum?: RetentionVacuumMode | RetentionVacuumConfig;
+  snapshot?: RetentionSnapshotConfig;
 };
 
 export type AppConfig = {
@@ -65,6 +84,13 @@ export type CameraMotionConfig = MotionTuningConfig & {
   minIntervalMs?: number;
 };
 
+export type VideoChannelConfig = {
+  framesPerSecond?: number;
+  ffmpeg?: CameraFfmpegConfig;
+  motion?: CameraMotionConfig;
+  person?: CameraPersonConfig;
+};
+
 export type CameraFfmpegConfig = {
   inputArgs?: string[];
   rtspTransport?: string;
@@ -92,6 +118,7 @@ export type VideoConfig = {
   cameras?: CameraConfig[];
   testFile?: string;
   ffmpeg?: CameraFfmpegConfig;
+  channels?: Record<string, VideoChannelConfig>;
 };
 
 export type PersonConfig = {
@@ -101,12 +128,34 @@ export type PersonConfig = {
   maxDetections?: number;
   snapshotDir?: string;
   minIntervalMs?: number;
+  classIndices?: number[];
 };
 
 export type MotionConfig = MotionTuningConfig & {
   diffThreshold: number;
   areaThreshold: number;
   minIntervalMs?: number;
+};
+
+export type PoseConfig = {
+  modelPath: string;
+  forecastHorizonMs?: number;
+  smoothingWindow?: number;
+  minMovement?: number;
+  historySize?: number;
+};
+
+export type FaceConfig = {
+  modelPath: string;
+  embeddingSize?: number;
+};
+
+export type ObjectsConfig = {
+  modelPath: string;
+  labels: string[];
+  threatLabels?: string[];
+  threatThreshold?: number;
+  classIndices?: number[];
 };
 
 export type LightTuningConfig = {
@@ -176,6 +225,9 @@ export type GuardianConfig = {
   motion: MotionConfig;
   light?: LightConfig;
   audio?: AudioConfig;
+  pose?: PoseConfig;
+  face?: FaceConfig;
+  objects?: ObjectsConfig;
 };
 
 type JsonType = 'object' | 'number' | 'string' | 'boolean' | 'array';
@@ -251,8 +303,33 @@ const guardianConfigSchema: JsonSchema = {
             enabled: { type: 'boolean' },
             retentionDays: { type: 'number', minimum: 0 },
             intervalMinutes: { type: 'number', minimum: 1 },
-            vacuum: { type: 'string', enum: ['auto', 'full'] },
-            archiveDir: { type: 'string' }
+            vacuum: {
+              type: ['string', 'object'],
+              enum: ['auto', 'full'],
+              additionalProperties: false,
+              properties: {
+                mode: { type: 'string', enum: ['auto', 'full'] },
+                target: { type: 'string' },
+                analyze: { type: 'boolean' },
+                reindex: { type: 'boolean' },
+                optimize: { type: 'boolean' },
+                pragmas: {
+                  type: 'array',
+                  items: { type: 'string' }
+                }
+              }
+            },
+            archiveDir: { type: 'string' },
+            maxArchivesPerCamera: { type: 'number', minimum: 0 },
+            snapshot: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                mode: { type: 'string', enum: ['archive', 'delete', 'ignore'] },
+                retentionDays: { type: 'number', minimum: 0 },
+                maxArchivesPerCamera: { type: 'number', minimum: 0 }
+              }
+            }
           }
         },
         suppression: {
@@ -331,6 +408,65 @@ const guardianConfigSchema: JsonSchema = {
             restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
           }
         },
+        channels: {
+          type: 'object',
+          additionalProperties: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              framesPerSecond: { type: 'number', minimum: 1 },
+              ffmpeg: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  inputArgs: {
+                    type: 'array',
+                    items: { type: 'string' }
+                  },
+                  rtspTransport: { type: 'string' },
+                  idleTimeoutMs: { type: 'number', minimum: 0 },
+                  startTimeoutMs: { type: 'number', minimum: 0 },
+                  watchdogTimeoutMs: { type: 'number', minimum: 0 },
+                  forceKillTimeoutMs: { type: 'number', minimum: 0 },
+                  restartDelayMs: { type: 'number', minimum: 0 },
+                  restartMaxDelayMs: { type: 'number', minimum: 0 },
+                  restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
+                }
+              },
+              motion: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  diffThreshold: { type: 'number' },
+                  areaThreshold: { type: 'number' },
+                  minIntervalMs: { type: 'number', minimum: 0 },
+                  debounceFrames: { type: 'number', minimum: 0 },
+                  backoffFrames: { type: 'number', minimum: 0 },
+                  noiseMultiplier: { type: 'number', minimum: 0 },
+                  noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+                  areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+                  areaInflation: { type: 'number', minimum: 0 },
+                  areaDeltaThreshold: { type: 'number', minimum: 0 }
+                }
+              },
+              person: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  score: { type: 'number' },
+                  checkEveryNFrames: { type: 'number', minimum: 1 },
+                  maxDetections: { type: 'number', minimum: 1 },
+                  snapshotDir: { type: 'string' },
+                  minIntervalMs: { type: 'number', minimum: 0 },
+                  classIndices: {
+                    type: 'array',
+                    items: { type: 'number', minimum: 0 }
+                  }
+                }
+              }
+            }
+          }
+        },
         cameras: {
           type: 'array',
           items: {
@@ -350,7 +486,11 @@ const guardianConfigSchema: JsonSchema = {
                   checkEveryNFrames: { type: 'number', minimum: 1 },
                   maxDetections: { type: 'number', minimum: 1 },
                   snapshotDir: { type: 'string' },
-                  minIntervalMs: { type: 'number', minimum: 0 }
+                  minIntervalMs: { type: 'number', minimum: 0 },
+                  classIndices: {
+                    type: 'array',
+                    items: { type: 'number', minimum: 0 }
+                  }
                 }
               },
               motion: {
@@ -402,7 +542,11 @@ const guardianConfigSchema: JsonSchema = {
         checkEveryNFrames: { type: 'number', minimum: 1 },
         maxDetections: { type: 'number', minimum: 1 },
         snapshotDir: { type: 'string' },
-        minIntervalMs: { type: 'number', minimum: 0 }
+        minIntervalMs: { type: 'number', minimum: 0 },
+        classIndices: {
+          type: 'array',
+          items: { type: 'number', minimum: 0 }
+        }
       }
     },
     motion: {
@@ -420,6 +564,48 @@ const guardianConfigSchema: JsonSchema = {
         areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
         areaInflation: { type: 'number', minimum: 0 },
         areaDeltaThreshold: { type: 'number', minimum: 0 }
+      }
+    },
+    pose: {
+      type: 'object',
+      required: ['modelPath'],
+      additionalProperties: false,
+      properties: {
+        modelPath: { type: 'string' },
+        forecastHorizonMs: { type: 'number', minimum: 0 },
+        smoothingWindow: { type: 'number', minimum: 1 },
+        minMovement: { type: 'number', minimum: 0 },
+        historySize: { type: 'number', minimum: 1 }
+      }
+    },
+    face: {
+      type: 'object',
+      required: ['modelPath'],
+      additionalProperties: false,
+      properties: {
+        modelPath: { type: 'string' },
+        embeddingSize: { type: 'number', minimum: 1 }
+      }
+    },
+    objects: {
+      type: 'object',
+      required: ['modelPath', 'labels'],
+      additionalProperties: false,
+      properties: {
+        modelPath: { type: 'string' },
+        labels: {
+          type: 'array',
+          items: { type: 'string' }
+        },
+        threatLabels: {
+          type: 'array',
+          items: { type: 'string' }
+        },
+        threatThreshold: { type: 'number', minimum: 0 },
+        classIndices: {
+          type: 'array',
+          items: { type: 'number', minimum: 0 }
+        }
       }
     },
     light: {

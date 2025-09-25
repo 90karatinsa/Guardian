@@ -42,6 +42,13 @@ type SuppressionSnapshot = {
   rules: Record<string, { total: number; byReason: CounterMap }>;
 };
 
+type DetectorSnapshot = {
+  counters: CounterMap;
+  lastRunAt: string | null;
+  lastErrorAt: string | null;
+  lastErrorMessage: string | null;
+};
+
 type MetricsSnapshot = {
   createdAt: string;
   events: {
@@ -63,6 +70,7 @@ type MetricsSnapshot = {
     audio: PipelineSnapshot;
   };
   suppression: SuppressionSnapshot;
+  detectors: Record<string, DetectorSnapshot>;
 };
 
 type HistogramConfig = {
@@ -96,6 +104,7 @@ class MetricsRegistry {
   private readonly suppressionByRule = new Map<string, number>();
   private readonly suppressionByReason = new Map<string, number>();
   private readonly suppressionRules = new Map<string, SuppressionRuleState>();
+  private readonly detectorMetrics = new Map<string, DetectorMetricState>();
   private totalEvents = 0;
   private lastEventTimestamp: number | null = null;
   private ffmpegRestarts = 0;
@@ -122,6 +131,7 @@ class MetricsRegistry {
     this.suppressionByRule.clear();
     this.suppressionByReason.clear();
     this.suppressionRules.clear();
+    this.detectorMetrics.clear();
     this.totalEvents = 0;
     this.lastEventTimestamp = null;
     this.ffmpegRestarts = 0;
@@ -181,6 +191,25 @@ class MetricsRegistry {
       }
       this.suppressionRules.set(ruleId, ruleState);
     }
+  }
+
+  incrementDetectorCounter(detector: string, counter: string, amount = 1) {
+    if (!Number.isFinite(amount)) {
+      return;
+    }
+    const state = getDetectorMetricState(this.detectorMetrics, detector);
+    const current = state.counters.get(counter) ?? 0;
+    state.counters.set(counter, current + amount);
+    state.lastRunAt = Date.now();
+  }
+
+  recordDetectorError(detector: string, message: string) {
+    const state = getDetectorMetricState(this.detectorMetrics, detector);
+    state.lastRunAt = Date.now();
+    state.lastErrorAt = Date.now();
+    state.lastErrorMessage = message;
+    const current = state.counters.get('errors') ?? 0;
+    state.counters.set('errors', current + 1);
   }
 
   recordPipelineRestart(
@@ -340,7 +369,8 @@ class MetricsRegistry {
         byRule: mapFrom(this.suppressionByRule),
         byReason: mapFrom(this.suppressionByReason),
         rules: mapFromSuppressionRules(this.suppressionRules)
-      }
+      },
+      detectors: mapFromDetectors(this.detectorMetrics)
     };
   }
 }
@@ -355,6 +385,13 @@ type PipelineChannelState = {
 type SuppressionRuleState = {
   total: number;
   byReason: Map<string, number>;
+};
+
+type DetectorMetricState = {
+  counters: Map<string, number>;
+  lastRunAt: number | null;
+  lastErrorAt: number | null;
+  lastErrorMessage: string | null;
 };
 
 function mapFrom(source: Map<string, number>): CounterMap {
@@ -420,6 +457,20 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
   return result;
 }
 
+function mapFromDetectors(source: Map<string, DetectorMetricState>): Record<string, DetectorSnapshot> {
+  const result: Record<string, DetectorSnapshot> = {};
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [detector, state] of ordered) {
+    result[detector] = {
+      counters: mapFrom(state.counters),
+      lastRunAt: state.lastRunAt ? new Date(state.lastRunAt).toISOString() : null,
+      lastErrorAt: state.lastErrorAt ? new Date(state.lastErrorAt).toISOString() : null,
+      lastErrorMessage: state.lastErrorMessage
+    };
+  }
+  return result;
+}
+
 function getPipelineChannelState(map: Map<string, PipelineChannelState>, channel: string): PipelineChannelState {
   const existing = map.get(channel);
   if (existing) {
@@ -444,6 +495,21 @@ function updatePipelineChannelState(
   state.lastRestartAt = Date.now();
   state.byReason.set(reason, (state.byReason.get(reason) ?? 0) + 1);
   state.lastRestart = meta;
+}
+
+function getDetectorMetricState(map: Map<string, DetectorMetricState>, detector: string): DetectorMetricState {
+  const existing = map.get(detector);
+  if (existing) {
+    return existing;
+  }
+  const created: DetectorMetricState = {
+    counters: new Map<string, number>(),
+    lastRunAt: null,
+    lastErrorAt: null,
+    lastErrorMessage: null
+  };
+  map.set(detector, created);
+  return created;
 }
 
 function compareHistogramKeys(a: string, b: string) {
@@ -485,7 +551,8 @@ export type {
   MetricsSnapshot,
   PipelineChannelSnapshot,
   PipelineSnapshot,
-  SuppressionSnapshot
+  SuppressionSnapshot,
+  DetectorSnapshot
 };
 export { MetricsRegistry };
 export default defaultRegistry;

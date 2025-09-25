@@ -44,6 +44,7 @@ export class MotionDetector {
   private areaBaseline = 0;
   private activationFrames = 0;
   private backoffFrames = 0;
+  private suppressedFrames = 0;
 
   constructor(
     private options: MotionDetectorOptions,
@@ -64,6 +65,11 @@ export class MotionDetector {
       if (!this.previousFrame) {
         this.previousFrame = smoothed;
         this.baselineFrame = smoothed;
+        this.areaBaseline = 0;
+        this.noiseLevel = 0;
+        this.activationFrames = 0;
+        this.backoffFrames = 0;
+        this.suppressedFrames = 0;
         return;
       }
 
@@ -82,18 +88,36 @@ export class MotionDetector {
       const stats = frameDiffStats(referenceFrame, smoothed);
       this.previousFrame = smoothed;
 
-      const currentNoiseLevel = this.noiseLevel === 0 ? stats.meanDelta : this.noiseLevel;
-      const noiseRatio = currentNoiseLevel === 0 ? 1 : stats.meanDelta / (currentNoiseLevel || 1);
+      const priorNoiseFloor = this.noiseLevel === 0 ? stats.meanDelta : this.noiseLevel;
+      const noiseRatio = priorNoiseFloor === 0 ? 1 : stats.meanDelta / Math.max(priorNoiseFloor, 1);
+      const noiseDelta = stats.meanDelta - priorNoiseFloor;
+
       const effectiveNoiseSmoothing = clamp(
-        noiseRatio > 1.1 ? baseNoiseSmoothing * 1.3 : baseNoiseSmoothing * 0.8,
+        baseNoiseSmoothing * (noiseDelta > 0
+          ? 1 + Math.min(Math.max(noiseRatio - 1, 0), 1) * 0.6
+          : 0.6),
         0.05,
         0.5
       );
-      const cappedNoiseLevel =
-        currentNoiseLevel === 0
-          ? 0
-          : Math.min(currentNoiseLevel, diffThreshold * noiseMultiplier);
-      const adaptiveDiffThreshold = Math.max(diffThreshold, cappedNoiseLevel * noiseMultiplier);
+
+      const updatedNoiseFloor =
+        priorNoiseFloor === 0
+          ? stats.meanDelta
+          : priorNoiseFloor * (1 - effectiveNoiseSmoothing) + stats.meanDelta * effectiveNoiseSmoothing;
+      this.noiseLevel = updatedNoiseFloor;
+
+      const noiseSuppressionFactor = clamp(
+        noiseRatio > 1 ? 1 + (noiseRatio - 1) * 0.8 : 1 - Math.min(0.3, (1 - noiseRatio) * 0.5),
+        0.6,
+        3
+      );
+
+      const dynamicDiffThreshold = Math.max(diffThreshold, updatedNoiseFloor * noiseMultiplier);
+      const adaptiveDiffThreshold = clamp(
+        dynamicDiffThreshold * noiseSuppressionFactor,
+        diffThreshold,
+        diffThreshold * noiseMultiplier * 2.5
+      );
 
       let changedPixels = 0;
       for (let i = 0; i < stats.totalPixels; i += 1) {
@@ -103,57 +127,78 @@ export class MotionDetector {
       }
 
       const areaPct = changedPixels / stats.totalPixels;
-
-      const baselineForThreshold = this.areaBaseline;
-      const adaptiveAreaThreshold = Math.max(
-        areaThreshold,
-        baselineForThreshold * areaInflation
+      const previousBaseline = this.areaBaseline;
+      const areaTrend = previousBaseline === 0 ? areaPct : areaPct - previousBaseline;
+      const normalizedAreaTrend = clamp(
+        previousBaseline === 0
+          ? areaPct / Math.max(areaThreshold, 0.01)
+          : areaTrend / Math.max(areaThreshold, 0.01),
+        -2,
+        2
       );
+
       const effectiveAreaSmoothing = clamp(
-        areaPct >= baselineForThreshold ? baseAreaSmoothing * 1.2 : baseAreaSmoothing * 0.7,
+        baseAreaSmoothing * (areaTrend > 0 ? 1 + Math.min(normalizedAreaTrend, 1) * 0.3 : 0.7),
         0.05,
         0.5
       );
-      const effectiveDebounceFrames = noiseRatio > 1.1 ? Math.max(baseDebounce, Math.round(baseDebounce * 1.5)) : baseDebounce;
-      const effectiveBackoffFrames =
-        areaPct >= adaptiveAreaThreshold
-          ? baseBackoff
-          : Math.max(baseBackoff, Math.round(baseBackoff * 1.5));
 
       const nextBaseline =
-        baselineForThreshold === 0
+        previousBaseline === 0
           ? areaPct * effectiveAreaSmoothing
-          : baselineForThreshold * (1 - effectiveAreaSmoothing) + areaPct * effectiveAreaSmoothing;
+          : previousBaseline * (1 - effectiveAreaSmoothing) + areaPct * effectiveAreaSmoothing;
 
-      const areaDelta = baselineForThreshold === 0 ? areaPct : areaPct - baselineForThreshold;
+      const baselineForThreshold = previousBaseline === 0 ? nextBaseline : previousBaseline;
+      const adaptiveAreaThreshold = Math.max(areaThreshold, baselineForThreshold * areaInflation);
+
+      const adjustedAreaDeltaThreshold =
+        areaDeltaThreshold *
+        (noiseSuppressionFactor > 1.5 ? Math.min(noiseSuppressionFactor, 2.5) : 1);
+
       const hasSignificantArea =
-        areaPct >= adaptiveAreaThreshold || areaDelta >= areaDeltaThreshold;
+        areaPct >= adaptiveAreaThreshold || areaTrend >= adjustedAreaDeltaThreshold;
 
-      if (!hasSignificantArea) {
-        if (this.noiseLevel === 0) {
-          this.noiseLevel = stats.meanDelta;
-        } else {
-          this.noiseLevel =
-            this.noiseLevel * (1 - effectiveNoiseSmoothing) + stats.meanDelta * effectiveNoiseSmoothing;
-        }
+      const debounceMultiplier = clamp(
+        noiseSuppressionFactor > 1 ? 1 + (noiseSuppressionFactor - 1) * 0.7 : 1,
+        1,
+        3
+      );
+      const relaxationMultiplier = normalizedAreaTrend < 0 ? 1.15 : 1;
+      const effectiveDebounceFrames = Math.max(
+        baseDebounce,
+        Math.round(baseDebounce * debounceMultiplier * relaxationMultiplier)
+      );
 
-        this.areaBaseline = nextBaseline;
-        this.baselineFrame = smoothed;
-        this.activationFrames = 0;
-        if (this.backoffFrames > 0) {
-          this.backoffFrames -= 1;
-        }
-        return;
-      }
-
-      this.noiseLevel =
-        this.noiseLevel * (1 - effectiveNoiseSmoothing) + stats.meanDelta * effectiveNoiseSmoothing;
+      const backoffMultiplier = clamp(
+        noiseSuppressionFactor > 1
+          ? 1 + (noiseSuppressionFactor - 1)
+          : 1 + Math.max(0, -normalizedAreaTrend) * 0.5,
+        1,
+        4
+      );
+      const effectiveBackoffFrames = Math.max(
+        baseBackoff,
+        Math.round(baseBackoff * backoffMultiplier)
+      );
 
       this.areaBaseline = nextBaseline;
       this.baselineFrame = smoothed;
 
+      if (!hasSignificantArea) {
+        this.activationFrames = 0;
+        if (this.backoffFrames > 0) {
+          this.backoffFrames -= 1;
+        }
+        this.suppressedFrames += 1;
+        return;
+      }
+
+      const suppressedFramesSnapshot = this.suppressedFrames;
+      this.suppressedFrames = 0;
+
       if (this.backoffFrames > 0) {
         this.backoffFrames -= 1;
+        this.activationFrames = 0;
         return;
       }
 
@@ -185,14 +230,21 @@ export class MotionDetector {
           adaptiveAreaThreshold,
           areaBaseline: this.areaBaseline,
           noiseLevel: this.noiseLevel,
-          areaDelta,
-          areaDeltaThreshold,
+          noiseFloor: updatedNoiseFloor,
+          noiseRatio,
+          noiseSuppressionFactor,
+          areaTrend,
+          areaDeltaThreshold: adjustedAreaDeltaThreshold,
+          normalizedAreaTrend,
           effectiveDebounceFrames,
           effectiveBackoffFrames,
           noiseSmoothing: effectiveNoiseSmoothing,
           areaSmoothing: effectiveAreaSmoothing,
           noiseMultiplier,
-          areaInflation
+          areaInflation,
+          debounceMultiplier,
+          backoffMultiplier,
+          suppressedFramesBeforeTrigger: suppressedFramesSnapshot
         }
       };
 

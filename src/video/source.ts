@@ -70,6 +70,7 @@ export class VideoSource extends EventEmitter {
   private watchdogTimer: NodeJS.Timeout | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
   private killTimer: NodeJS.Timeout | null = null;
+  private commandExitPromise: Promise<void> | null = null;
   private shouldStop = false;
   private recovering = false;
   private restartCount = 0;
@@ -320,11 +321,19 @@ export class VideoSource extends EventEmitter {
     this.clearStartTimer();
     this.clearWatchdogTimer();
     this.cleanupStream();
-    this.terminateCommand(true);
+    const termination = this.terminateCommand(true);
+    const waitForTermination = termination ?? this.commandExitPromise ?? Promise.resolve();
 
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      this.startCommand();
+      waitForTermination
+        .catch(() => {})
+        .then(() => {
+          if (this.shouldStop) {
+            return;
+          }
+          this.startCommand();
+        });
     }, Math.max(0, timing.delayMs));
   }
 
@@ -335,9 +344,12 @@ export class VideoSource extends EventEmitter {
     this.clearKillTimer();
   }
 
-  private terminateCommand(force = false, options: { skipForceDelay?: boolean } = {}) {
+  private terminateCommand(
+    force = false,
+    options: { skipForceDelay?: boolean } = {}
+  ): Promise<void> | null {
     if (!this.command) {
-      return;
+      return this.commandExitPromise;
     }
 
     const command = this.command;
@@ -347,44 +359,70 @@ export class VideoSource extends EventEmitter {
     this.commandCleanup = null;
 
     if (!force) {
-      return;
+      return this.commandExitPromise;
     }
 
-    try {
-      command.kill('SIGTERM');
-    } catch (error) {
-      // Swallow errors from already terminated processes
-    }
+    const resolveExit = (promise: Promise<void>) =>
+      promise.finally(() => {
+        if (this.commandExitPromise === promise) {
+          this.commandExitPromise = null;
+        }
+      });
 
-    this.clearKillTimer();
     const delay = this.options.forceKillTimeoutMs ?? DEFAULT_FORCE_KILL_TIMEOUT_MS;
     if (options.skipForceDelay || delay <= 0) {
       try {
-        command.kill('SIGKILL');
+        command.kill('SIGTERM');
       } catch (error) {
-        // Ignore
+        // Swallow errors from already terminated processes
       }
-      return;
-    }
-
-    const cleanup = () => {
-      this.clearKillTimer();
-      command.off('end', cleanup);
-      command.off('error', cleanup);
-    };
-
-    command.once('end', cleanup);
-    command.once('error', cleanup);
-
-    this.killTimer = setTimeout(() => {
-      this.killTimer = null;
-      cleanup();
       try {
         command.kill('SIGKILL');
       } catch (error) {
         // Ignore
       }
-    }, delay);
+      const resolved = Promise.resolve();
+      this.commandExitPromise = resolveExit(resolved);
+      return this.commandExitPromise;
+    }
+
+    const exitPromise = new Promise<void>(resolve => {
+      const finalize = () => {
+        if (this.killTimer) {
+          clearTimeout(this.killTimer);
+          this.killTimer = null;
+        }
+        command.off('end', finalize);
+        command.off('error', finalize);
+        resolve();
+      };
+
+      command.once('end', finalize);
+      command.once('error', finalize);
+
+      try {
+        command.kill('SIGTERM');
+      } catch (error) {
+        // Swallow errors from already terminated processes
+      }
+
+      this.clearKillTimer();
+      this.killTimer = setTimeout(() => {
+        this.killTimer = null;
+        command.off('end', finalize);
+        command.off('error', finalize);
+        try {
+          command.kill('SIGKILL');
+        } catch (error) {
+          // Ignore
+        }
+        resolve();
+      }, delay);
+    });
+
+    const tracked = resolveExit(exitPromise);
+    this.commandExitPromise = tracked;
+    return tracked;
   }
 
   private clearStartTimer() {

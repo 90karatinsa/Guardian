@@ -1,0 +1,20 @@
+[Unit]
+Description=Guardian detector service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/guardian
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/default/guardian
+ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts start
+ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop
+ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts status
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,9 @@ import {
   RetentionOutcome,
   RetentionPolicyOptions,
   vacuumDatabase,
-  VacuumMode
+  VacuumMode,
+  VacuumOptions,
+  SnapshotRotationOptions
 } from '../db.js';
 
 type RetentionLogger = Pick<typeof loggerModule, 'info' | 'warn' | 'error'>;
@@ -18,6 +20,8 @@ export interface RetentionTaskOptions {
   snapshotDirs: string[];
   maxArchivesPerCamera?: number;
   vacuumMode?: VacuumMode;
+  vacuum?: VacuumMode | VacuumOptions;
+  snapshot?: SnapshotRotationOptions;
   logger?: RetentionLogger;
 }
 
@@ -28,7 +32,8 @@ type NormalizedOptions = {
   archiveDir: string;
   snapshotDirs: string[];
   maxArchivesPerCamera?: number;
-  vacuumMode: VacuumMode;
+  vacuum: VacuumOptions;
+  snapshot?: SnapshotRotationOptions;
 };
 
 export class RetentionTask {
@@ -105,7 +110,8 @@ export class RetentionTask {
         retentionDays: this.options.retentionDays,
         archiveDir,
         snapshotDirs,
-        maxArchivesPerCamera: this.options.maxArchivesPerCamera
+        maxArchivesPerCamera: this.options.maxArchivesPerCamera,
+        snapshot: this.options.snapshot
       });
 
       for (const warning of outcome.warnings) {
@@ -113,7 +119,7 @@ export class RetentionTask {
       }
 
       if (outcome.removedEvents > 0) {
-        vacuumDatabase(this.options.vacuumMode);
+        vacuumDatabase(this.options.vacuum);
       }
 
       this.logger.info(
@@ -122,7 +128,16 @@ export class RetentionTask {
           archivedSnapshots: outcome.archivedSnapshots,
           prunedArchives: outcome.prunedArchives,
           retentionDays: this.options.retentionDays,
-          vacuumMode: outcome.removedEvents > 0 ? this.options.vacuumMode : 'skipped'
+          vacuumMode: outcome.removedEvents > 0 ? this.options.vacuum.mode ?? 'auto' : 'skipped',
+          vacuumTasks:
+            outcome.removedEvents > 0
+              ? {
+                  analyze: this.options.vacuum.analyze === true,
+                  reindex: this.options.vacuum.reindex === true,
+                  optimize: this.options.vacuum.optimize === true,
+                  target: this.options.vacuum.target
+                }
+              : undefined
         },
         'Retention task completed'
       );
@@ -148,6 +163,8 @@ function normalizeOptions(options: RetentionTaskOptions): NormalizedOptions {
   const intervalMs = Math.max(1000, Math.floor(options.intervalMs));
   const archiveDir = path.resolve(options.archiveDir);
   const snapshotDirs = dedupeDirectories(options.snapshotDirs);
+  const snapshot = normalizeSnapshotConfig(options.snapshot);
+  const vacuum = normalizeVacuumConfig(options);
 
   return {
     enabled: options.enabled !== false,
@@ -159,7 +176,8 @@ function normalizeOptions(options: RetentionTaskOptions): NormalizedOptions {
       typeof options.maxArchivesPerCamera === 'number' && options.maxArchivesPerCamera >= 0
         ? Math.floor(options.maxArchivesPerCamera)
         : undefined,
-    vacuumMode: options.vacuumMode ?? 'auto'
+    vacuum,
+    snapshot
   };
 }
 
@@ -179,13 +197,57 @@ function runPolicy(options: {
   archiveDir: string;
   snapshotDirs: string[];
   maxArchivesPerCamera?: number;
+  snapshot?: SnapshotRotationOptions;
 }): RetentionOutcome {
   const policy: RetentionPolicyOptions = {
     retentionDays: options.retentionDays,
     archiveDir: options.archiveDir,
     snapshotDirs: options.snapshotDirs,
-    maxArchivesPerCamera: options.maxArchivesPerCamera
+    maxArchivesPerCamera: options.maxArchivesPerCamera,
+    snapshot: options.snapshot
   };
 
   return applyRetentionPolicy(policy);
+}
+
+function normalizeSnapshotConfig(snapshot?: SnapshotRotationOptions): SnapshotRotationOptions | undefined {
+  if (!snapshot) {
+    return undefined;
+  }
+
+  const normalized: SnapshotRotationOptions = { mode: snapshot.mode ?? 'archive' };
+  if (typeof snapshot.retentionDays === 'number' && Number.isFinite(snapshot.retentionDays)) {
+    normalized.retentionDays = Math.max(0, Math.floor(snapshot.retentionDays));
+  }
+  return normalized;
+}
+
+function normalizeVacuumConfig(options: RetentionTaskOptions): VacuumOptions {
+  const base = options.vacuum;
+  const legacyMode = options.vacuumMode;
+
+  if (typeof base === 'string') {
+    return { mode: base };
+  }
+
+  if (base && typeof base === 'object') {
+    const pragmas = Array.isArray(base.pragmas)
+      ? base.pragmas.filter((entry): entry is string => typeof entry === 'string')
+      : undefined;
+
+    return {
+      mode: base.mode ?? legacyMode ?? 'auto',
+      target: base.target?.trim() || undefined,
+      analyze: base.analyze === true,
+      reindex: base.reindex === true,
+      optimize: base.optimize === true,
+      pragmas
+    } satisfies VacuumOptions;
+  }
+
+  if (legacyMode) {
+    return { mode: legacyMode };
+  }
+
+  return { mode: 'auto' };
 }

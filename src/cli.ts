@@ -4,6 +4,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import logger from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
+import { collectHealthChecks, runShutdownHooks } from './app.js';
 import packageJson from '../package.json' assert { type: 'json' };
 
 type ServiceStatus = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
@@ -68,7 +69,7 @@ export function getServiceState() {
   return { status: state.status, startedAt: state.startedAt };
 }
 
-export function buildHealthPayload(): HealthPayload {
+export async function buildHealthPayload(): Promise<HealthPayload> {
   const snapshot = metrics.snapshot();
   const errorCount = snapshot.logs.byLevel.error ?? 0;
   const fatalCount = snapshot.logs.byLevel.fatal ?? 0;
@@ -84,6 +85,13 @@ export function buildHealthPayload(): HealthPayload {
   }
 
   const uptimeSeconds = state.startedAt ? (Date.now() - state.startedAt) / 1000 : process.uptime();
+
+  const additionalChecks = await collectHealthChecks({
+    service: {
+      status: state.status,
+      startedAt: state.startedAt
+    }
+  });
 
   return {
     status,
@@ -110,7 +118,8 @@ export function buildHealthPayload(): HealthPayload {
         details: {
           levels: snapshot.logs.byLevel
         }
-      }
+      },
+      ...additionalChecks
     ],
     metrics: snapshot
   };
@@ -223,13 +232,13 @@ async function stopDaemon(io: CliIo): Promise<number> {
     return 1;
   }
 
-  const payload = buildHealthPayload();
+  const payload = await buildHealthPayload();
   io.stdout.write(`Guardian daemon stopped (status: ${payload.status})\n`);
   return resolveHealthExitCode(payload.status);
 }
 
 async function printStatus(io: CliIo): Promise<number> {
-  const payload = buildHealthPayload();
+  const payload = await buildHealthPayload();
   const summary = [`Guardian status: ${payload.state}`, `Health: ${payload.status}`];
 
   const lastError = payload.metrics.logs.lastErrorMessage;
@@ -293,6 +302,26 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
       state.lastShutdownError = err;
       logger.error({ err }, 'Error during shutdown');
     } finally {
+      try {
+        const results = await runShutdownHooks({ reason, signal });
+        for (const result of results) {
+          if (result.status === 'error' && result.error) {
+            logger.error({ err: result.error, hook: result.name }, 'Shutdown hook failed');
+            if (!state.lastShutdownError) {
+              state.lastShutdownError = result.error;
+            }
+          } else {
+            logger.debug({ hook: result.name }, 'Shutdown hook executed');
+          }
+        }
+      } catch (hookError) {
+        const err = hookError as Error;
+        logger.error({ err }, 'Shutdown hooks threw unexpectedly');
+        if (!state.lastShutdownError) {
+          state.lastShutdownError = err;
+        }
+      }
+
       state.runtime = null;
       state.status = 'stopped';
       state.startedAt = null;
@@ -327,7 +356,7 @@ if (resolvedPath === modulePath) {
 }
 
 async function outputHealth(io: CliIo): Promise<number> {
-  const payload = buildHealthPayload();
+  const payload = await buildHealthPayload();
   io.stdout.write(`${JSON.stringify(payload)}\n`);
   return resolveHealthExitCode(payload.status);
 }

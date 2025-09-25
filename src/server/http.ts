@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events';
 import defaultBus from '../eventBus.js';
 import logger from '../logger.js';
 import { createEventsRouter } from './routes/events.js';
+import FaceRegistry from '../video/faceRegistry.js';
 
 export interface HttpServerOptions {
   port?: number;
@@ -26,7 +27,11 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   const staticDir = options.staticDir ?? path.resolve(process.cwd(), 'public');
   const bus = options.bus ?? defaultBus;
 
-  const eventsRouter = createEventsRouter({ bus });
+  const eventsRouter = createEventsRouter({
+    bus,
+    createFaceRegistry: async () =>
+      FaceRegistry.create({ modelPath: path.resolve(process.cwd(), 'models/face.onnx') })
+  });
 
   const server = http.createServer((req, res) => {
     try {
