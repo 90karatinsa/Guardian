@@ -32,13 +32,13 @@ describe('EventSuppressionRateLimit', () => {
     });
   });
 
-  it('combines rate limit history into suppression metadata and metrics', () => {
+  it('SuppressionRateLimitCooldown merges history and cooldown metadata', () => {
     bus.configureSuppression([
       {
         id: 'channel-limit',
         detector: 'test-detector',
         channel: 'alerts',
-        rateLimit: { count: 2, perMs: 1000 },
+        rateLimit: { count: 2, perMs: 1000, cooldownMs: 800 },
         suppressForMs: 800,
         reason: 'alerts throttled'
       }
@@ -63,10 +63,13 @@ describe('EventSuppressionRateLimit', () => {
     expect(rateLimited.suppressionHistoryCount).toBe(3);
     expect(Array.isArray(rateLimited.suppressionHistory)).toBe(true);
     expect((rateLimited.suppressedBy?.[0]?.historyCount as number) ?? 0).toBe(3);
+    expect(rateLimited.rateLimitCooldownMs).toBe(800);
+    expect(rateLimited.suppressedBy?.[0]?.cooldownMs).toBe(800);
 
     const windowSuppression = suppressionCalls[1] ?? {};
     expect(windowSuppression.suppressionType).toBe('window');
     expect((windowSuppression.suppressedBy?.[0]?.historyCount as number) ?? 0).toBeGreaterThanOrEqual(3);
+    expect(windowSuppression.rateLimitCooldownMs).toBe(800);
 
     const metricArgs = metricsMock.recordSuppressedEvent.mock.calls.map(call => call[0]);
     expect(metricArgs[0]).toMatchObject({
@@ -74,7 +77,8 @@ describe('EventSuppressionRateLimit', () => {
       reason: 'alerts throttled',
       type: 'rate-limit',
       historyCount: 3,
-      combinedHistoryCount: 3
+      combinedHistoryCount: 3,
+      cooldownMs: 800
     });
     expect(metricArgs[1]).toMatchObject({ type: 'window', ruleId: 'channel-limit' });
   });

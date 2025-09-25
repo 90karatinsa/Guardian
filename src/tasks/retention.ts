@@ -120,7 +120,8 @@ export class RetentionTask {
 
       const shouldVacuum =
         this.options.vacuum.run === 'always' ||
-        (this.options.vacuum.run !== 'always' && outcome.removedEvents > 0);
+        (this.options.vacuum.run !== 'always' &&
+          (outcome.removedEvents > 0 || outcome.archivedSnapshots > 0 || outcome.prunedArchives > 0));
 
       for (const warning of outcome.warnings) {
         this.logger.warn(
@@ -141,7 +142,8 @@ export class RetentionTask {
       this.metrics.recordRetentionRun({
         removedEvents: outcome.removedEvents,
         archivedSnapshots: outcome.archivedSnapshots,
-        prunedArchives: outcome.prunedArchives
+        prunedArchives: outcome.prunedArchives,
+        perCamera: outcome.perCamera
       });
 
       this.logger.info(
@@ -160,7 +162,8 @@ export class RetentionTask {
                   optimize: this.options.vacuum.optimize === true,
                   target: this.options.vacuum.target
                 }
-              : undefined
+              : undefined,
+          perCamera: outcome.perCamera
         },
         'Retention task completed'
       );

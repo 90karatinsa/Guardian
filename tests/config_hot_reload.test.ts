@@ -4,8 +4,18 @@ import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { ConfigManager, loadConfigFromFile } from '../src/config/index.js';
-import type { CameraConfig, GuardianConfig } from '../src/config/index.js';
+import type { CameraConfig, GuardianConfig, MotionTuningConfig } from '../src/config/index.js';
 import { EventBus } from '../src/eventBus.js';
+import AudioAnomalyDetector from '../src/audio/anomaly.js';
+
+vi.mock('meyda', () => ({
+  default: {
+    extract: vi.fn(() => ({
+      rms: 0,
+      spectralCentroid: 0
+    }))
+  }
+}));
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
@@ -32,6 +42,17 @@ class MockMotionDetector {
     MockMotionDetector.instances.push(this);
   }
   handleFrame() {}
+}
+
+class MockAudioSource extends EventEmitter {
+  static instances: MockAudioSource[] = [];
+  public updateOptions = vi.fn();
+  public start = vi.fn();
+  public stop = vi.fn();
+  constructor(public readonly options: Record<string, unknown>) {
+    super();
+    MockAudioSource.instances.push(this);
+  }
 }
 
 class InMemoryConfigManager extends EventEmitter {
@@ -71,6 +92,10 @@ vi.mock('../src/video/sampleVideo.js', () => ({
   ensureSampleVideo: (input: string) => input
 }));
 
+vi.mock('../src/audio/source.js', () => ({
+  AudioSource: MockAudioSource
+}));
+
 const retentionMock = {
   configure: vi.fn(),
   stop: vi.fn()
@@ -89,6 +114,7 @@ describe('ConfigHotReload', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-config-'));
     configPath = path.join(tempDir, 'config.json');
     MockMotionDetector.instances = [];
+    MockAudioSource.instances = [];
   });
 
   afterEach(() => {
@@ -127,7 +153,90 @@ describe('ConfigHotReload', () => {
     }
   });
 
-  it('applies motion threshold updates to active detectors', async () => {
+  it('ConfigDuplicateChannelGuard handles duplicate camera channels and ids on reload', async () => {
+    const base = createConfig({
+      diffThreshold: 30,
+      cameras: [
+        { id: 'cam-1', channel: 'video:cam-1', input: 'rtsp://cam-1' },
+        { id: 'cam-2', channel: 'video:cam-2', input: 'rtsp://cam-2' }
+      ]
+    });
+    base.video.channels = {
+      'video:cam-1': {},
+      'video:cam-2': {}
+    };
+
+    const baseRaw = JSON.stringify(base, null, 2);
+    fs.writeFileSync(configPath, baseRaw);
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2);
+
+      expect(runtime.pipelines.has('video:cam-1')).toBe(true);
+      expect(runtime.pipelines.has('video:cam-2')).toBe(true);
+      const initialSources = MockVideoSource.instances.length;
+      const warnCallsBefore = logger.warn.mock.calls.length;
+
+      const invalid = JSON.parse(JSON.stringify(base)) as GuardianConfig;
+      if (invalid.video.cameras) {
+        invalid.video.cameras[1].channel = 'video:cam-1';
+        invalid.video.cameras[1].id = 'cam-1';
+      }
+      fs.writeFileSync(configPath, JSON.stringify(invalid, null, 2));
+
+      await waitFor(() => logger.warn.mock.calls.length > warnCallsBefore);
+
+      await waitFor(() => fs.readFileSync(configPath, 'utf-8') === baseRaw);
+      await new Promise(resolve => setTimeout(resolve, 250));
+
+      expect(runtime.pipelines.has('video:cam-1')).toBe(true);
+      expect(runtime.pipelines.has('video:cam-2')).toBe(true);
+
+      const repaired = JSON.parse(JSON.stringify(base)) as GuardianConfig;
+      repaired.video.channels = {
+        'video:cam-1': {},
+        'video:cam-3': {}
+      };
+      if (repaired.video.cameras) {
+        repaired.video.cameras[1].channel = 'video:cam-3';
+        repaired.video.cameras[1].id = 'cam-3';
+        repaired.video.cameras[1].input = 'rtsp://cam-3';
+      }
+      fs.writeFileSync(configPath, JSON.stringify(repaired, null, 2));
+      await waitFor(
+        () => manager.getConfig().video.cameras?.some(camera => camera.id === 'cam-3') ?? false,
+        4000
+      );
+
+      await waitFor(() => MockVideoSource.instances.length > initialSources, 4000);
+      await waitFor(() => runtime.pipelines.has('video:cam-3'), 4000);
+
+      expect(runtime.pipelines.has('video:cam-2')).toBe(false);
+      expect(runtime.pipelines.size).toBe(2);
+      expect(MockVideoSource.instances.length).toBeGreaterThan(initialSources);
+      expect(
+        MockVideoSource.instances.some(instance => instance.options.channel === 'video:cam-3')
+      ).toBe(true);
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('MotionHotReloadTuning applies motion tuning updates to active detectors', async () => {
     const config = createConfig({ diffThreshold: 25 });
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 
@@ -152,13 +261,72 @@ describe('ConfigHotReload', () => {
       const detector = MockMotionDetector.instances[0];
       expect(detector.options.diffThreshold).toBe(25);
 
-      const updatedConfig = createConfig({ diffThreshold: 40 });
+      const configWithMotion = createConfig({
+        diffThreshold: 25,
+        motionOverrides: {
+          areaThreshold: 0.02,
+          minIntervalMs: 1750,
+          debounceFrames: 2,
+          backoffFrames: 4,
+          noiseMultiplier: 2.5,
+          noiseSmoothing: 0.2,
+          areaSmoothing: 0.3,
+          areaInflation: 1.6,
+          areaDeltaThreshold: 0.05
+        }
+      });
+      fs.writeFileSync(configPath, JSON.stringify(configWithMotion, null, 2));
+
+      await waitFor(() => detector.updateOptions.mock.calls.length > 0);
+
+      expect(detector.updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({
+          diffThreshold: 25,
+          areaThreshold: 0.02,
+          minIntervalMs: 1750,
+          debounceFrames: 2,
+          backoffFrames: 4,
+          noiseMultiplier: 2.5,
+          noiseSmoothing: 0.2,
+          areaSmoothing: 0.3,
+          areaInflation: 1.6,
+          areaDeltaThreshold: 0.05
+        })
+      );
+
+      detector.updateOptions.mockClear();
+
+      const updatedConfig = createConfig({
+        diffThreshold: 40,
+        motionOverrides: {
+          areaThreshold: 0.03,
+          minIntervalMs: 1900,
+          debounceFrames: 5,
+          backoffFrames: 8,
+          noiseMultiplier: 3.1,
+          noiseSmoothing: 0.25,
+          areaSmoothing: 0.35,
+          areaInflation: 2.1,
+          areaDeltaThreshold: 0.08
+        }
+      });
       fs.writeFileSync(configPath, JSON.stringify(updatedConfig, null, 2));
 
       await waitFor(() => detector.updateOptions.mock.calls.length > 0);
 
       expect(detector.updateOptions).toHaveBeenCalledWith(
-        expect.objectContaining({ diffThreshold: 40 })
+        expect.objectContaining({
+          diffThreshold: 40,
+          areaThreshold: 0.03,
+          minIntervalMs: 1900,
+          debounceFrames: 5,
+          backoffFrames: 8,
+          noiseMultiplier: 3.1,
+          noiseSmoothing: 0.25,
+          areaSmoothing: 0.35,
+          areaInflation: 2.1,
+          areaDeltaThreshold: 0.08
+        })
       );
       expect(logger.info).toHaveBeenCalledWith(
         expect.objectContaining({ diffThreshold: 40 }),
@@ -376,12 +544,117 @@ describe('ConfigHotReload', () => {
       runtime.stop();
     }
   });
+
+  it('AudioHotReloadThresholds refreshes audio fallbacks and anomaly windows', async () => {
+    const initialConfig = createConfig({ diffThreshold: 20 });
+    initialConfig.audio = {
+      channel: 'audio:test',
+      idleTimeoutMs: 800,
+      micFallbacks: {
+        linux: [{ device: 'hw:0,0' }]
+      },
+      anomaly: {
+        sampleRate: 16000,
+        rmsThreshold: 0.3,
+        centroidJumpThreshold: 180,
+        minIntervalMs: 400,
+        minTriggerDurationMs: 180,
+        rmsWindowMs: 240,
+        centroidWindowMs: 260,
+        thresholds: {
+          day: { rms: 0.3, centroidJump: 200 }
+        }
+      }
+    };
+
+    const manager = new InMemoryConfigManager(initialConfig);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const anomalySpy = vi.spyOn(AudioAnomalyDetector.prototype, 'updateOptions');
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(MockAudioSource.instances).toHaveLength(1);
+      const audioSource = MockAudioSource.instances[0];
+      expect(audioSource.start).toHaveBeenCalledTimes(1);
+      expect(audioSource.options.channel).toBe('audio:test');
+
+      (audioSource.updateOptions as vi.Mock).mockClear();
+      anomalySpy.mockClear();
+
+      const updatedConfig = JSON.parse(JSON.stringify(initialConfig)) as GuardianConfig;
+      updatedConfig.audio = {
+        channel: 'audio:test',
+        idleTimeoutMs: 1500,
+        micFallbacks: {
+          linux: [
+            { device: 'hw:1,0' },
+            { device: 'hw:2,0' }
+          ]
+        },
+        anomaly: {
+          sampleRate: 22050,
+          rmsThreshold: 0.18,
+          centroidJumpThreshold: 140,
+          minIntervalMs: 420,
+          minTriggerDurationMs: 320,
+          rmsWindowMs: 480,
+          centroidWindowMs: 520,
+          thresholds: {
+            day: { rms: 0.18, centroidJump: 150 },
+            night: { rms: 0.12, centroidJump: 120, rmsWindowMs: 520 }
+          }
+        }
+      };
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded'));
+
+      const updateCalls = (audioSource.updateOptions as vi.Mock).mock.calls;
+      expect(updateCalls.length).toBeGreaterThan(0);
+      const latestUpdate = updateCalls[updateCalls.length - 1]?.[0] as Record<string, any>;
+      expect(latestUpdate?.micFallbacks?.linux).toHaveLength(2);
+      expect(latestUpdate?.idleTimeoutMs).toBe(1500);
+
+      expect(anomalySpy).toHaveBeenCalled();
+      const anomalyArgs = anomalySpy.mock.calls[anomalySpy.mock.calls.length - 1]?.[0] as Record<string, any>;
+      expect(anomalyArgs?.rmsWindowMs).toBe(480);
+      expect(anomalyArgs?.centroidWindowMs).toBe(520);
+      expect(anomalyArgs?.thresholds).toMatchObject({
+        day: { rms: 0.18, centroidJump: 150 },
+        night: { rms: 0.12, centroidJump: 120, rmsWindowMs: 520 }
+      });
+    } finally {
+      anomalySpy.mockRestore();
+      runtime.stop();
+    }
+  });
 });
+
+type MotionOverrides =
+  | undefined
+  | ({
+      areaThreshold?: number;
+      minIntervalMs?: number;
+    } & MotionTuningConfig);
 
 function createConfig(overrides: {
   diffThreshold: number;
   suppressionRules?: Record<string, unknown>[];
   cameras?: CameraConfig[];
+  motionOverrides?: MotionOverrides;
 }): GuardianConfig {
   const base = {
     app: { name: 'Guardian Test' },
@@ -439,8 +712,15 @@ function createConfig(overrides: {
     },
     motion: {
       diffThreshold: overrides.diffThreshold,
-      areaThreshold: 0.02,
-      minIntervalMs: 1500
+      areaThreshold: overrides.motionOverrides?.areaThreshold ?? 0.02,
+      minIntervalMs: overrides.motionOverrides?.minIntervalMs ?? 1500,
+      debounceFrames: overrides.motionOverrides?.debounceFrames,
+      backoffFrames: overrides.motionOverrides?.backoffFrames,
+      noiseMultiplier: overrides.motionOverrides?.noiseMultiplier,
+      noiseSmoothing: overrides.motionOverrides?.noiseSmoothing,
+      areaSmoothing: overrides.motionOverrides?.areaSmoothing,
+      areaInflation: overrides.motionOverrides?.areaInflation,
+      areaDeltaThreshold: overrides.motionOverrides?.areaDeltaThreshold
     }
   };
 

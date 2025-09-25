@@ -91,6 +91,45 @@ describe('GuardianCliHealthcheck', () => {
     expect(code).toBe(0);
     expect(capture.stdout()).toContain('Restarts - video: 1, audio: 1');
   });
+
+  it('CliJsonStatus exposes shutdown summaries and hook statuses', async () => {
+    const capture = createTestIo();
+    const initialCode = await runCli(['status', '--json'], capture.io);
+    const initialPayload = JSON.parse(capture.stdout().trim());
+
+    expect(initialCode).toBe(0);
+    expect(initialPayload.application.shutdown.hooks).toEqual([]);
+    expect(initialPayload.application.shutdown.lastReason).toBeNull();
+
+    const stopSpy = vi.fn();
+    const hook = vi.fn();
+    registerShutdownHook('status-json-hook', hook);
+    startGuardMock.mockResolvedValue({ stop: stopSpy });
+
+    const startIo = createTestIo();
+    const startPromise = runCli(['start'], startIo.io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const stopIo = createTestIo();
+    await runCli(['stop'], stopIo.io);
+
+    const statusCapture = createTestIo();
+    const statusCode = await runCli(['status', '--json'], statusCapture.io);
+    const statusPayload = JSON.parse(statusCapture.stdout().trim());
+
+    expect(statusCode).toBe(0);
+    expect(statusPayload.application.shutdown.lastReason).toBe('cli-stop');
+    const hookSummary = statusPayload.application.shutdown.hooks.find(
+      (entry: { name: string }) => entry.name === 'status-json-hook'
+    );
+    expect(hookSummary).toBeDefined();
+    expect(hookSummary?.status).toBe('ok');
+
+    await expect(startPromise).resolves.toBe(0);
+  });
 });
 
 describe('GuardianCliShutdown', () => {
@@ -143,6 +182,7 @@ describe('GuardianCliShutdown', () => {
     const runtimeCheck = health.checks.find(check => check.name === 'runtime');
     expect(runtimeCheck?.status).toBe('ok');
     expect(runtimeCheck?.details).toEqual({ ready: true });
+    expect(stopIo.stdout()).toContain('Shutdown hooks executed: 1 ok, 0 failed');
     expect(stopIo.stdout()).toContain('Guardian daemon stopped (status: ok)');
 
     await expect(startPromise).resolves.toBe(0);

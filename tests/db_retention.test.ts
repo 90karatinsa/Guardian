@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import db, { clearEvents, storeEvent } from '../src/db.js';
 import { startRetentionTask } from '../src/tasks/retention.js';
+import { __test__ as guardTestUtils } from '../src/run-guard.ts';
 import { EventRecord } from '../src/types.js';
 
 describe('RetentionMaintenance', () => {
@@ -66,10 +67,14 @@ describe('RetentionMaintenance', () => {
     try {
       await vi.runOnlyPendingTimersAsync();
       expect(execSpy).toHaveBeenCalledWith('VACUUM');
-      expect(metrics.recordRetentionRun).toHaveBeenCalledWith({
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall).toMatchObject({
         removedEvents: 0,
         archivedSnapshots: 0,
         prunedArchives: 0
+      });
+      expect(runCall?.perCamera).toMatchObject({
+        [path.basename(cameraOneDir)]: { archivedSnapshots: 0, prunedArchives: 0 }
       });
       expect(metrics.recordRetentionWarning).not.toHaveBeenCalled();
 
@@ -170,10 +175,15 @@ describe('RetentionMaintenance', () => {
       const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
       expect(infoCall?.[0]).toMatchObject({ prunedArchives: 1, archivedSnapshots: 4 });
 
-      expect(metrics.recordRetentionRun).toHaveBeenCalledWith({
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall).toMatchObject({
         removedEvents: 1,
         archivedSnapshots: 4,
         prunedArchives: 1
+      });
+      expect(runCall?.perCamera).toMatchObject({
+        [path.basename(cameraOneDir)]: { archivedSnapshots: 2, prunedArchives: expect.any(Number) },
+        [path.basename(cameraTwoDir)]: { archivedSnapshots: 2, prunedArchives: expect.any(Number) }
       });
 
       const camOneFiles = collectArchiveFiles(path.join(archiveDir, path.basename(cameraOneDir)));
@@ -183,6 +193,96 @@ describe('RetentionMaintenance', () => {
     } finally {
       task.stop();
       renameSpy.mockRestore();
+    }
+  });
+
+  it('RetentionChannelSnapshotRotation rotates channel snapshots and records per-camera totals', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 5, 10);
+    vi.setSystemTime(now);
+
+    const globalDir = path.join(tempDir, 'global-snapshots');
+    const channelDir = path.join(tempDir, 'channel-lobby');
+    fs.mkdirSync(globalDir, { recursive: true });
+    fs.mkdirSync(channelDir, { recursive: true });
+
+    const directories = guardTestUtils.collectSnapshotDirectories(
+      {
+        framesPerSecond: 10,
+        channels: {
+          'video:lobby': { person: { snapshotDir: channelDir } }
+        },
+        cameras: [
+          {
+            id: 'cam-a',
+            channel: 'video:lobby',
+            person: { snapshotDir: cameraOneDir }
+          }
+        ]
+      } as any,
+      { modelPath: 'person.onnx', score: 0.5, snapshotDir: globalDir } as any
+    );
+
+    expect(new Set(directories)).toEqual(
+      new Set([
+        path.resolve(globalDir),
+        path.resolve(channelDir),
+        path.resolve(cameraOneDir)
+      ])
+    );
+
+    const oldFiles = [
+      path.join(globalDir, 'global-old.jpg'),
+      path.join(channelDir, 'channel-one.jpg'),
+      path.join(channelDir, 'channel-two.jpg')
+    ];
+    for (const file of oldFiles) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, (now - 40 * dayMs) / 1000, (now - 40 * dayMs) / 1000);
+    }
+
+    const execSpy = vi.spyOn(db, 'exec');
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const task = startRetentionTask({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 1000,
+      archiveDir,
+      snapshotDirs: directories,
+      snapshot: { mode: 'archive', retentionDays: 7 },
+      logger,
+      metrics: metrics as any
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(execSpy).toHaveBeenCalledWith('VACUUM');
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall).toMatchObject({
+        removedEvents: 0,
+        archivedSnapshots: 3
+      });
+      expect(runCall?.perCamera).toMatchObject({
+        [path.basename(globalDir)]: { archivedSnapshots: 1, prunedArchives: 0 },
+        [path.basename(channelDir)]: {
+          archivedSnapshots: 2,
+          prunedArchives: expect.any(Number)
+        },
+        [path.basename(cameraOneDir)]: { archivedSnapshots: 0, prunedArchives: 0 }
+      });
+    } finally {
+      task.stop();
+      execSpy.mockRestore();
     }
   });
 });

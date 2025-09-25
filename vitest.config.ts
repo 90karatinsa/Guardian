@@ -5,7 +5,8 @@ export default defineConfig({
   resolve: {
     alias: {
       'onnxruntime-node': path.resolve(__dirname, 'tests/stubs/onnxruntime-node.ts'),
-      pngjs: path.resolve(__dirname, 'tests/stubs/pngjs.ts')
+      pngjs: path.resolve(__dirname, 'tests/stubs/pngjs.ts'),
+      meyda: path.resolve(__dirname, 'tests/stubs/meyda.ts')
     }
   },
   test: {

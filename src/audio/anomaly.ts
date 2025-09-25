@@ -60,11 +60,11 @@ type ResolvedThresholds = {
 export class AudioAnomalyDetector {
   private lastEventTs = 0;
   private buffer: number[] = [];
-  private readonly frameSize: number;
-  private readonly hopSize: number;
-  private readonly window: Float32Array;
-  private readonly frameDurationMs: number;
-  private readonly hopDurationMs: number;
+  private frameSize: number;
+  private hopSize: number;
+  private window: Float32Array;
+  private frameDurationMs: number;
+  private hopDurationMs: number;
   private rmsDurationMs = 0;
   private centroidDurationMs = 0;
   private rmsRecoveryMs = 0;
@@ -74,42 +74,28 @@ export class AudioAnomalyDetector {
   private readonly rmsValues: number[] = [];
   private readonly centroidValues: number[] = [];
   private processedFrames = 0;
-  private readonly defaultRmsWindowMs: number;
-  private readonly defaultCentroidWindowMs: number;
-  private readonly defaultMinTriggerDurationMs: number;
+  private defaultRmsWindowMs: number;
+  private defaultCentroidWindowMs: number;
+  private defaultMinTriggerDurationMs: number;
   private currentThresholds: ResolvedThresholds | null = null;
 
   constructor(
-    private readonly options: AudioAnomalyOptions,
+    private options: AudioAnomalyOptions,
     private readonly bus: EventEmitter = eventBus
   ) {
-    const sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
-    if (options.frameSize && options.frameSize > 0) {
-      this.frameSize = Math.max(1, Math.floor(options.frameSize));
-    } else if (options.frameDurationMs && options.frameDurationMs > 0) {
-      this.frameSize = Math.max(1, Math.round((sampleRate * options.frameDurationMs) / 1000));
-    } else {
-      this.frameSize = DEFAULT_FRAME_SIZE;
-    }
+    this.options = {
+      ...options,
+      thresholds: cloneThresholdSchedule(options.thresholds),
+      nightHours: options.nightHours ? { ...options.nightHours } : undefined
+    };
 
-    const configuredHopDuration = options.hopDurationMs ?? null;
-    let configuredHop = options.hopSize;
-    if (!configuredHop && configuredHopDuration && configuredHopDuration > 0) {
-      configuredHop = Math.round((sampleRate * configuredHopDuration) / 1000);
-    }
-
-    if (!configuredHop || configuredHop <= 0) {
-      configuredHop = Math.floor(this.frameSize / 2);
-    }
-
-    this.hopSize = Math.min(this.frameSize, Math.max(1, configuredHop));
-    this.window = createHanningWindow(this.frameSize);
-    this.frameDurationMs = (this.frameSize / sampleRate) * 1000;
-    this.hopDurationMs = (this.hopSize / sampleRate) * 1000;
-    this.defaultRmsWindowMs = options.rmsWindowMs ?? DEFAULT_RMS_WINDOW_MS;
-    this.defaultCentroidWindowMs = options.centroidWindowMs ?? DEFAULT_CENTROID_WINDOW_MS;
+    this.defaultRmsWindowMs = this.options.rmsWindowMs ?? DEFAULT_RMS_WINDOW_MS;
+    this.defaultCentroidWindowMs =
+      this.options.centroidWindowMs ?? DEFAULT_CENTROID_WINDOW_MS;
     this.defaultMinTriggerDurationMs =
-      options.minTriggerDurationMs ?? DEFAULT_MIN_TRIGGER_DURATION_MS;
+      this.options.minTriggerDurationMs ?? DEFAULT_MIN_TRIGGER_DURATION_MS;
+
+    this.updateWindowGeometry(this.options);
     this.rmsWindowFrames = Math.max(
       1,
       Math.round(this.defaultRmsWindowMs / this.hopDurationMs)
@@ -120,12 +106,80 @@ export class AudioAnomalyDetector {
     );
     this.currentThresholds = {
       profile: 'default',
-      rms: options.rmsThreshold ?? DEFAULT_RMS_THRESHOLD,
-      centroidJump: options.centroidJumpThreshold ?? DEFAULT_CENTROID_JUMP,
+      rms: this.options.rmsThreshold ?? DEFAULT_RMS_THRESHOLD,
+      centroidJump: this.options.centroidJumpThreshold ?? DEFAULT_CENTROID_JUMP,
       rmsWindowMs: this.defaultRmsWindowMs,
       centroidWindowMs: this.defaultCentroidWindowMs,
       minTriggerDurationMs: this.defaultMinTriggerDurationMs
     };
+  }
+
+  updateOptions(options: Partial<Omit<AudioAnomalyOptions, 'source'>>) {
+    const hasChanges =
+      options.sampleRate !== undefined ||
+      options.frameSize !== undefined ||
+      options.hopSize !== undefined ||
+      options.frameDurationMs !== undefined ||
+      options.hopDurationMs !== undefined ||
+      options.rmsThreshold !== undefined ||
+      options.centroidJumpThreshold !== undefined ||
+      options.minIntervalMs !== undefined ||
+      options.thresholds !== undefined ||
+      options.nightHours !== undefined ||
+      options.minTriggerDurationMs !== undefined ||
+      options.rmsWindowMs !== undefined ||
+      options.centroidWindowMs !== undefined;
+
+    if (!hasChanges) {
+      return;
+    }
+
+    const thresholds = options.thresholds ? cloneThresholdSchedule(options.thresholds) : undefined;
+    const nightHours = options.nightHours ? { ...options.nightHours } : undefined;
+    const next: AudioAnomalyOptions = {
+      ...this.options,
+      ...options,
+      thresholds: thresholds ?? this.options.thresholds,
+      nightHours: nightHours ?? this.options.nightHours
+    };
+
+    if (options.rmsWindowMs !== undefined) {
+      this.defaultRmsWindowMs = options.rmsWindowMs ?? this.defaultRmsWindowMs;
+    }
+
+    if (options.centroidWindowMs !== undefined) {
+      this.defaultCentroidWindowMs = options.centroidWindowMs ?? this.defaultCentroidWindowMs;
+    }
+
+    if (options.minTriggerDurationMs !== undefined) {
+      this.defaultMinTriggerDurationMs =
+        options.minTriggerDurationMs ?? this.defaultMinTriggerDurationMs;
+    }
+
+    this.options = next;
+
+    const geometryChanged =
+      options.sampleRate !== undefined ||
+      options.frameSize !== undefined ||
+      options.hopSize !== undefined ||
+      options.frameDurationMs !== undefined ||
+      options.hopDurationMs !== undefined;
+
+    if (geometryChanged) {
+      this.updateWindowGeometry(next);
+    } else {
+      this.rmsWindowFrames = Math.max(
+        1,
+        Math.round(this.defaultRmsWindowMs / this.hopDurationMs)
+      );
+      this.centroidWindowFrames = Math.max(
+        1,
+        Math.round(this.defaultCentroidWindowMs / this.hopDurationMs)
+      );
+    }
+
+    this.resetWindows();
+    this.currentThresholds = null;
   }
 
   handleChunk(samples: Int16Array, ts = Date.now()) {
@@ -274,6 +328,53 @@ export class AudioAnomalyDetector {
     }
   }
 
+  private updateWindowGeometry(options: AudioAnomalyOptions) {
+    const sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
+    if (options.frameSize && options.frameSize > 0) {
+      this.frameSize = Math.max(1, Math.floor(options.frameSize));
+    } else if (options.frameDurationMs && options.frameDurationMs > 0) {
+      this.frameSize = Math.max(1, Math.round((sampleRate * options.frameDurationMs) / 1000));
+    } else {
+      this.frameSize = DEFAULT_FRAME_SIZE;
+    }
+
+    const configuredHopDuration = options.hopDurationMs ?? null;
+    let configuredHop = options.hopSize;
+    if ((!configuredHop || configuredHop <= 0) && configuredHopDuration && configuredHopDuration > 0) {
+      configuredHop = Math.round((sampleRate * configuredHopDuration) / 1000);
+    }
+
+    if (!configuredHop || configuredHop <= 0) {
+      configuredHop = Math.floor(this.frameSize / 2);
+    }
+
+    this.hopSize = Math.min(this.frameSize, Math.max(1, configuredHop));
+    this.window = createHanningWindow(this.frameSize);
+    this.frameDurationMs = (this.frameSize / sampleRate) * 1000;
+    this.hopDurationMs = (this.hopSize / sampleRate) * 1000;
+    this.rmsWindowFrames = Math.max(
+      1,
+      Math.round(this.defaultRmsWindowMs / this.hopDurationMs)
+    );
+    this.centroidWindowFrames = Math.max(
+      1,
+      Math.round(this.defaultCentroidWindowMs / this.hopDurationMs)
+    );
+    this.processedFrames = 0;
+  }
+
+  private resetWindows() {
+    this.buffer.length = 0;
+    this.rmsValues.length = 0;
+    this.centroidValues.length = 0;
+    this.rmsDurationMs = 0;
+    this.centroidDurationMs = 0;
+    this.rmsRecoveryMs = 0;
+    this.centroidRecoveryMs = 0;
+    this.lastEventTs = 0;
+    this.processedFrames = 0;
+  }
+
   private resolveThresholds(ts: number): ResolvedThresholds {
     const baseRms = this.options.rmsThreshold ?? DEFAULT_RMS_THRESHOLD;
     const baseCentroid = this.options.centroidJumpThreshold ?? DEFAULT_CENTROID_JUMP;
@@ -341,17 +442,16 @@ export class AudioAnomalyDetector {
     const windowChanged =
       rmsWindowFrames !== this.rmsWindowFrames || centroidWindowFrames !== this.centroidWindowFrames;
 
-    if (profileChanged || windowChanged) {
-      this.rmsValues.length = Math.min(this.rmsValues.length, rmsWindowFrames);
-      this.centroidValues.length = Math.min(this.centroidValues.length, centroidWindowFrames);
-      if (profileChanged) {
-        this.rmsDurationMs = 0;
-        this.centroidDurationMs = 0;
-        this.rmsRecoveryMs = 0;
-        this.centroidRecoveryMs = 0;
-      }
+    if (windowChanged) {
       this.rmsWindowFrames = rmsWindowFrames;
       this.centroidWindowFrames = centroidWindowFrames;
+      this.resetWindows();
+    } else {
+      this.rmsWindowFrames = rmsWindowFrames;
+      this.centroidWindowFrames = centroidWindowFrames;
+      if (profileChanged) {
+        this.resetWindows();
+      }
     }
     const applied = { ...resolved } as ResolvedThresholds;
     this.currentThresholds = applied;
@@ -396,6 +496,36 @@ function normalizeSamples(samples: Int16Array): Float32Array {
     normalized[i] = samples[i] * scale;
   }
   return normalized;
+}
+
+function cloneThresholdSchedule(
+  schedule?: AudioAnomalyThresholdSchedule
+): AudioAnomalyThresholdSchedule | undefined {
+  if (!schedule) {
+    return undefined;
+  }
+
+  const cloneEntry = (entry?: AudioAnomalyThresholds) =>
+    entry
+      ? {
+          ...entry
+        }
+      : undefined;
+
+  const cloned: AudioAnomalyThresholdSchedule = {};
+  const defaultEntry = cloneEntry(schedule.default);
+  if (defaultEntry) {
+    cloned.default = defaultEntry;
+  }
+  const dayEntry = cloneEntry(schedule.day);
+  if (dayEntry) {
+    cloned.day = dayEntry;
+  }
+  const nightEntry = cloneEntry(schedule.night);
+  if (nightEntry) {
+    cloned.night = nightEntry;
+  }
+  return cloned;
 }
 
 function createHanningWindow(size: number): Float32Array {

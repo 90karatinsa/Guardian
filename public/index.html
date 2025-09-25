@@ -98,7 +98,8 @@
         color: #243b53;
       }
 
-      .stream-widget {
+      .stream-widget,
+      .metrics-widget {
         background: #fff;
         border-radius: 0.75rem;
         padding: 1rem 1.25rem;
@@ -106,7 +107,8 @@
         border: 1px solid #d9e2ec;
       }
 
-      .stream-widget h2 {
+      .stream-widget h2,
+      .metrics-widget h2 {
         margin: 0 0 0.75rem 0;
         font-size: 1.05rem;
         color: #243b53;
@@ -161,6 +163,59 @@
         display: grid;
         gap: 0.5rem 1rem;
         grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      }
+
+      .metrics-grid {
+        display: grid;
+        gap: 1rem;
+      }
+
+      .metrics-section {
+        border-top: 1px solid #d9e2ec;
+        padding-top: 0.75rem;
+      }
+
+      .metrics-section:first-child {
+        border-top: none;
+        padding-top: 0;
+      }
+
+      .metrics-summary {
+        display: grid;
+        gap: 0.25rem;
+        font-size: 0.85rem;
+        color: #52606d;
+      }
+
+      .metrics-summary strong {
+        font-size: 1.05rem;
+        color: #243b53;
+      }
+
+      .metrics-channels {
+        display: grid;
+        gap: 0.4rem;
+        margin-top: 0.6rem;
+      }
+
+      .metrics-channel {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        padding: 0.4rem 0.55rem;
+        border-radius: 0.5rem;
+        background: #f0f4f8;
+        font-size: 0.85rem;
+        color: #364152;
+      }
+
+      .metrics-channel span {
+        font-weight: 600;
+        color: #243b53;
+      }
+
+      .metrics-channel small {
+        color: #52606d;
       }
 
       .stream-widget dt {
@@ -351,6 +406,16 @@
             <dt>Last update</dt>
             <dd id="stream-updated">—</dd>
           </dl>
+        </section>
+        <section
+          class="metrics-widget"
+          aria-live="polite"
+          aria-label="Pipeline and channel metrics"
+        >
+          <h2>Pipeline health</h2>
+          <div id="pipeline-metrics" class="metrics-grid" aria-live="polite">
+            <p class="meta" id="pipeline-metrics-empty">Loading metrics…</p>
+          </div>
         </section>
         <section
           id="channel-filter"
