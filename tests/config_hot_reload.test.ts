@@ -441,6 +441,42 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigChannelCollisionValidation rejects channel conflicts on reload', async () => {
+    const baseConfig = createConfig({ diffThreshold: 25 });
+    baseConfig.audio = { channel: 'audio:primary' } as GuardianConfig['audio'];
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({ logger, configManager: manager });
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const invalidConfig = createConfig({ diffThreshold: 30 });
+      invalidConfig.audio = { channel: 'video:cam-1' } as GuardianConfig['audio'];
+      fs.writeFileSync(configPath, JSON.stringify(invalidConfig, null, 2));
+
+      await waitFor(() =>
+        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+      );
+
+      expect(
+        logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
+      ).toBe(false);
+      expect(MockVideoSource.instances).toHaveLength(1);
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigReloadRestartsPipelines stops removed cameras', async () => {
     const initialConfig = createConfig({
       diffThreshold: 20,

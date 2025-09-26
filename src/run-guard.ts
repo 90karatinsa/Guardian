@@ -26,13 +26,13 @@ import PoseEstimator from './video/poseEstimator.js';
 import ObjectClassifier from './video/objectClassifier.js';
 import { ensureSampleVideo } from './video/sampleVideo.js';
 import { VideoSource } from './video/source.js';
-import type { RecoverEventMeta } from './video/source.js';
+import type { FatalEvent, RecoverEventMeta } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector, { normalizeClassScoreThresholds } from './video/personDetector.js';
 import LightDetector from './video/lightDetector.js';
 import { RetentionTask, RetentionTaskOptions, startRetentionTask } from './tasks/retention.js';
 import metrics from './metrics/index.js';
-import { AudioSource } from './audio/source.js';
+import { AudioSource, type AudioFatalEvent } from './audio/source.js';
 import AudioAnomalyDetector from './audio/anomaly.js';
 
 type CameraPipelineState = {
@@ -70,6 +70,10 @@ type CameraRestartStats = {
   last: CameraRestartEvent | null;
   history: CameraRestartEvent[];
   watchdogBackoffMs: number;
+  totalDelayMs: number;
+  historyLimit: number;
+  droppedHistory: number;
+  lastFatal: (FatalEvent & { at: number }) | null;
 };
 
 type CameraRuntime = {
@@ -128,6 +132,7 @@ export type GuardRuntime = {
 
 const DEFAULT_CHECK_EVERY = 3;
 const DEFAULT_MAX_DETECTIONS = 5;
+const CAMERA_RESTART_HISTORY_LIMIT = 50;
 
 export async function startGuard(options: GuardStartOptions = {}): Promise<GuardRuntime> {
   const bus = options.bus ?? defaultBus;
@@ -242,6 +247,15 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     };
     source.on('recover', handleRecover);
     runtime.cleanup.push(() => source.off('recover', handleRecover));
+
+    const handleFatal = (event: AudioFatalEvent) => {
+      logger.error(
+        { channel, attempts: event.attempts, reason: event.reason, lastFailure: event.lastFailure },
+        'Audio source fatal error'
+      );
+    };
+    source.on('fatal', handleFatal);
+    runtime.cleanup.push(() => source.off('fatal', handleFatal));
 
     runtime.cleanup.push(() => {
       if (runtime.dataListener) {
@@ -374,7 +388,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       forceKillTimeoutMs: context.pipelineState.ffmpeg.forceKillTimeoutMs,
       restartDelayMs: context.pipelineState.ffmpeg.restartDelayMs,
       restartMaxDelayMs: context.pipelineState.ffmpeg.restartMaxDelayMs,
-      restartJitterFactor: context.pipelineState.ffmpeg.restartJitterFactor
+      restartJitterFactor: context.pipelineState.ffmpeg.restartJitterFactor,
+      circuitBreakerThreshold: context.pipelineState.ffmpeg.circuitBreakerThreshold
     });
 
     const motionDetector = new MotionDetector({
@@ -462,7 +477,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         byReason: new Map(),
         last: null,
         history: [],
-        watchdogBackoffMs: 0
+        watchdogBackoffMs: 0,
+        totalDelayMs: 0,
+        historyLimit: CAMERA_RESTART_HISTORY_LIMIT,
+        droppedHistory: 0,
+        lastFatal: null
       },
       cleanup
     };
@@ -747,7 +766,9 @@ function resolveCameraFfmpeg(
     forceKillTimeoutMs: camera?.forceKillTimeoutMs ?? defaults?.forceKillTimeoutMs,
     restartDelayMs: camera?.restartDelayMs ?? defaults?.restartDelayMs,
     restartMaxDelayMs: camera?.restartMaxDelayMs ?? defaults?.restartMaxDelayMs,
-    restartJitterFactor: camera?.restartJitterFactor ?? defaults?.restartJitterFactor
+    restartJitterFactor: camera?.restartJitterFactor ?? defaults?.restartJitterFactor,
+    circuitBreakerThreshold:
+      camera?.circuitBreakerThreshold ?? defaults?.circuitBreakerThreshold
   };
 }
 
@@ -1223,8 +1244,11 @@ function collectSnapshotDirectories(video: VideoConfig, person: PersonConfig): s
 }
 
 export const __test__ = {
-  collectSnapshotDirectories
+  collectSnapshotDirectories,
+  buildRetentionOptions
 };
+
+export { buildRetentionOptions };
 
 function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
   const { source } = runtime;
@@ -1290,8 +1314,16 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
     };
     stats.last = record;
     stats.history.push(record);
-    if (event.reason === 'watchdog-timeout' && typeof event.delayMs === 'number') {
-      stats.watchdogBackoffMs += event.delayMs;
+    if (stats.history.length > stats.historyLimit) {
+      const overflow = stats.history.length - stats.historyLimit;
+      stats.history.splice(0, overflow);
+      stats.droppedHistory += overflow;
+    }
+    if (typeof event.delayMs === 'number') {
+      stats.totalDelayMs += event.delayMs;
+      if (event.reason === 'watchdog-timeout') {
+        stats.watchdogBackoffMs += event.delayMs;
+      }
     }
     const restartChannel = record.channel ?? runtime.channel;
     metrics.recordPipelineRestart('ffmpeg', event.reason, {
@@ -1304,7 +1336,8 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
       channel: restartChannel,
       errorCode: record.errorCode ?? undefined,
       exitCode: record.exitCode ?? undefined,
-      signal: record.signal ?? undefined
+      signal: record.signal ?? undefined,
+      at: now
     });
     logger.warn(
       {
@@ -1319,6 +1352,22 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
         meta: event.meta
       },
       `Video source reconnecting (reason=${event.reason})`
+    );
+  });
+
+  source.on('fatal', (event: FatalEvent) => {
+    const now = Date.now();
+    runtime.restartStats.lastFatal = { ...event, at: now };
+    const channel = event.channel ?? runtime.channel;
+    logger.error(
+      {
+        camera: runtime.id,
+        attempts: event.attempts,
+        reason: event.reason,
+        channel,
+        lastFailure: event.lastFailure
+      },
+      'Video source fatal error'
     );
   });
 

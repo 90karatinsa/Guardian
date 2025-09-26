@@ -84,6 +84,9 @@ describe('MetricsCounters', () => {
       attempt: null,
       delayMs: null
     });
+    expect(snapshot.pipelines.ffmpeg.restartHistory).toHaveLength(2);
+    expect(snapshot.pipelines.ffmpeg.totalRestartDelayMs).toBe(1500);
+    expect(snapshot.pipelines.ffmpeg.totalWatchdogBackoffMs).toBe(1500);
     expect(snapshot.pipelines.ffmpeg.delayHistogram['1000-2000']).toBe(1);
     expect(snapshot.pipelines.ffmpeg.attemptHistogram['2']).toBe(1);
     expect(snapshot.pipelines.audio.restarts).toBe(1);
@@ -92,6 +95,9 @@ describe('MetricsCounters', () => {
       attempt: 1,
       delayMs: 800
     });
+    expect(snapshot.pipelines.audio.restartHistory).toHaveLength(1);
+    expect(snapshot.pipelines.audio.totalRestartDelayMs).toBe(800);
+    expect(snapshot.pipelines.audio.totalWatchdogBackoffMs).toBe(0);
     expect(snapshot.pipelines.audio.delayHistogram['500-1000']).toBe(1);
     expect(snapshot.pipelines.audio.attemptHistogram['1']).toBe(1);
     expect(snapshot.suppression.total).toBe(1);
@@ -126,8 +132,13 @@ describe('MetricsCounters', () => {
 
     expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].restarts).toBe(2);
     expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].byReason['watchdog-timeout']).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].restartHistory.length).toBeLessThanOrEqual(
+      snapshot.pipelines.ffmpeg.byChannel['video:lobby'].historyLimit
+    );
     expect(snapshot.pipelines.ffmpeg.byChannel['video:parking'].restarts).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:parking'].restartHistory.length).toBe(1);
     expect(snapshot.pipelines.audio.byChannel['audio:mic'].restarts).toBe(1);
+    expect(snapshot.pipelines.audio.byChannel['audio:mic'].totalRestartDelayMs).toBeGreaterThanOrEqual(0);
     expect(snapshot.pipelines.ffmpeg.attemptHistogram['2']).toBe(1);
     expect(snapshot.pipelines.ffmpeg.attemptHistogram['3']).toBe(1);
     expect(snapshot.pipelines.ffmpeg.delayHistogram).toEqual({});
@@ -275,6 +286,38 @@ describe('MetricsSnapshotEnrichment', () => {
 
     const deviceCheck = checks.find(check => check.name === 'audio-device-discovery');
     expect(deviceCheck?.status).toBe('ok');
+  });
+
+  it('MetricsPipelineBackoffSnapshot exposes watchdog jitter and per-channel histograms', () => {
+    metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      delayMs: 1800,
+      attempt: 2,
+      jitterMs: 120,
+      channel: 'video:lobby'
+    });
+    metrics.recordPipelineRestart('ffmpeg', 'spawn-error', {
+      delayMs: 60,
+      attempt: 1,
+      channel: 'video:lobby'
+    });
+    metrics.recordPipelineRestart('audio', 'watchdog-timeout', {
+      delayMs: 900,
+      attempt: 3,
+      jitterMs: 45,
+      channel: 'audio:mic'
+    });
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.lastWatchdogJitterMs).toBe(120);
+    expect(snapshot.pipelines.ffmpeg.watchdogBackoffByChannel['video:lobby']).toBe(1800);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].watchdogBackoffMs).toBe(1800);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].delayHistogram['1000-2000']).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:lobby'].attemptHistogram['2']).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.restartHistogram.delay['1000-2000']).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.restartHistogram.attempt['2']).toBe(1);
+    expect(snapshot.pipelines.audio.lastWatchdogJitterMs).toBe(45);
+    expect(snapshot.pipelines.audio.watchdogBackoffByChannel['audio:mic']).toBe(900);
+    expect(snapshot.pipelines.audio.byChannel['audio:mic'].watchdogBackoffMs).toBe(900);
   });
 
   it('MetricsPipelineRestartHistogram tracks restart attempts and detector latency histograms', () => {

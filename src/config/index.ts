@@ -109,6 +109,7 @@ export type CameraFfmpegConfig = {
   restartDelayMs?: number;
   restartMaxDelayMs?: number;
   restartJitterFactor?: number;
+  circuitBreakerThreshold?: number;
 };
 
 export type CameraConfig = {
@@ -466,7 +467,8 @@ const guardianConfigSchema: JsonSchema = {
             forceKillTimeoutMs: { type: 'number', minimum: 0 },
             restartDelayMs: { type: 'number', minimum: 0 },
             restartMaxDelayMs: { type: 'number', minimum: 0 },
-            restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
+            restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
+            circuitBreakerThreshold: { type: 'number', minimum: 1 }
           }
         },
         channels: {
@@ -491,7 +493,8 @@ const guardianConfigSchema: JsonSchema = {
                   forceKillTimeoutMs: { type: 'number', minimum: 0 },
                   restartDelayMs: { type: 'number', minimum: 0 },
                   restartMaxDelayMs: { type: 'number', minimum: 0 },
-                  restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
+                  restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
+                  circuitBreakerThreshold: { type: 'number', minimum: 1 }
                 }
               },
               motion: {
@@ -589,7 +592,8 @@ const guardianConfigSchema: JsonSchema = {
                   forceKillTimeoutMs: { type: 'number', minimum: 0 },
                   restartDelayMs: { type: 'number', minimum: 0 },
                   restartMaxDelayMs: { type: 'number', minimum: 0 },
-                  restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 }
+                  restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
+                  circuitBreakerThreshold: { type: 'number', minimum: 1 }
                 }
               }
             }
@@ -908,8 +912,28 @@ function validateLogicalConfig(config: GuardianConfig) {
   const messages: string[] = [];
 
   const channelDefinitions = config.video.channels ? new Set(Object.keys(config.video.channels)) : null;
+  const normalizedChannelDefinitions = new Map<string, string>();
+  if (config.video.channels) {
+    for (const channelId of Object.keys(config.video.channels)) {
+      const trimmed = channelId.trim();
+      if (!trimmed) {
+        messages.push('config.video.channels must not include empty channel identifiers');
+        continue;
+      }
+      const normalized = trimmed.toLowerCase();
+      const existing = normalizedChannelDefinitions.get(normalized);
+      if (existing && existing !== channelId) {
+        messages.push(
+          `config.video.channels.${channelId} duplicates channel id "${existing}" ignoring case`
+        );
+      } else if (!existing) {
+        normalizedChannelDefinitions.set(normalized, channelId);
+      }
+    }
+  }
   const cameraIdMap = new Map<string, { index: number; label: string }>();
   const channelMap = new Map<string, { id: string; label: string }>();
+  const cameraChannelNormalized = new Map<string, { id: string; label: string }>();
   if (Array.isArray(config.video.cameras)) {
     config.video.cameras.forEach((camera, index) => {
       const label = camera.id ?? `#${index}`;
@@ -938,8 +962,40 @@ function validateLogicalConfig(config: GuardianConfig) {
         } else {
           channelMap.set(camera.channel, { id: camera.id ?? label, label });
         }
+
+        const normalized = camera.channel.trim().toLowerCase();
+        if (normalized) {
+          const existingNormalized = cameraChannelNormalized.get(normalized);
+          if (existingNormalized) {
+            messages.push(
+              `config.video.cameras[${label}] reuses channel "${camera.channel}" already assigned to camera "${existingNormalized.id}" (case-insensitive match)`
+            );
+          } else {
+            cameraChannelNormalized.set(normalized, { id: camera.id ?? label, label });
+          }
+        }
       }
     });
+  }
+
+  const audioChannelCandidate =
+    typeof config.audio?.channel === 'string' && config.audio.channel.trim().length > 0
+      ? config.audio.channel.trim()
+      : 'audio:microphone';
+  if (audioChannelCandidate) {
+    const normalized = audioChannelCandidate.toLowerCase();
+    const normalizedVideo = normalizedChannelDefinitions.get(normalized);
+    if (normalizedVideo) {
+      messages.push(
+        `config.audio.channel "${audioChannelCandidate}" conflicts with video channel definition "${normalizedVideo}"`
+      );
+    }
+    const cameraConflict = cameraChannelNormalized.get(normalized);
+    if (cameraConflict) {
+      messages.push(
+        `config.audio.channel "${audioChannelCandidate}" conflicts with camera "${cameraConflict.id}" channel`
+      );
+    }
   }
 
   const micFallbacks = config.audio?.micFallbacks;

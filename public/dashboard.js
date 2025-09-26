@@ -894,6 +894,10 @@ function buildQueryParams() {
   if (state.filters.snapshot) params.set('snapshot', state.filters.snapshot);
   if (state.filters.from) params.set('from', state.filters.from);
   if (state.filters.to) params.set('to', state.filters.to);
+  const selectedChannels = Array.from(getSelectedChannels());
+  selectedChannels.forEach(channel => {
+    params.append('channel', channel);
+  });
   return params;
 }
 

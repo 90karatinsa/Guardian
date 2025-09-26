@@ -98,20 +98,54 @@ class EventBus extends EventEmitter {
 
     if (evaluation.suppressed) {
       const primary = evaluation.hits[0];
+      const eventChannels = extractEventChannels(normalized.meta);
+      const primaryChannel = eventChannels[0];
+      const primaryWindowRemainingMs =
+        primary && typeof primary.windowExpiresAt === 'number'
+          ? Math.max(0, primary.windowExpiresAt - normalized.ts)
+          : undefined;
+      const primaryCooldownRemainingMs =
+        primary && typeof primary.cooldownMs === 'number'
+          ? Math.max(
+              0,
+              typeof primaryWindowRemainingMs === 'number'
+                ? Math.min(primary.cooldownMs, primaryWindowRemainingMs)
+                : primary.cooldownMs
+            )
+          : undefined;
       const combinedHistory = mergeSuppressionHistory(evaluation.hits, normalized.ts);
-      const suppressedBy = evaluation.hits.map(hit => ({
-        ruleId: hit.rule.id,
-        reason: hit.reason,
-        type: hit.type,
-        suppressForMs: hit.rule.suppressForMs,
-        rateLimit: hit.rule.rateLimit,
-        maxEvents: hit.rule.maxEvents,
-        windowExpiresAt: hit.windowExpiresAt,
-        history: [...hit.history],
-        historyCount: hit.history.length,
-        rateLimitWindowMs: hit.rateLimit?.perMs,
-        cooldownMs: hit.cooldownMs
-      }));
+      const suppressedBy = evaluation.hits.map(hit => {
+        const windowRemainingMs =
+          typeof hit.windowExpiresAt === 'number'
+            ? Math.max(0, hit.windowExpiresAt - normalized.ts)
+            : undefined;
+        const cooldownRemainingMs =
+          typeof hit.cooldownMs === 'number'
+            ? Math.max(
+                0,
+                typeof hit.windowExpiresAt === 'number'
+                  ? Math.min(hit.cooldownMs, Math.max(0, hit.windowExpiresAt - normalized.ts))
+                  : hit.cooldownMs
+              )
+            : undefined;
+        return {
+          ruleId: hit.rule.id,
+          reason: hit.reason,
+          type: hit.type,
+          suppressForMs: hit.rule.suppressForMs,
+          rateLimit: hit.rule.rateLimit,
+          maxEvents: hit.rule.maxEvents,
+          windowExpiresAt: hit.windowExpiresAt,
+          history: [...hit.history],
+          historyCount: hit.history.length,
+          rateLimitWindowMs: hit.rateLimit?.perMs,
+          cooldownMs: hit.cooldownMs,
+          channel: primaryChannel ?? undefined,
+          channels: [...eventChannels],
+          windowRemainingMs,
+          cooldownRemainingMs
+        };
+      });
       const meta = {
         ...normalized.meta,
         suppressed: true,
@@ -121,9 +155,13 @@ class EventBus extends EventEmitter {
         suppressionWindowExpiresAt: primary?.windowExpiresAt,
         rateLimitWindowMs: primary?.rateLimit?.perMs,
         rateLimitCooldownMs: primary?.cooldownMs,
+        rateLimitCooldownRemainingMs: primaryCooldownRemainingMs,
         suppressionHistory: combinedHistory,
         suppressionHistoryCount: combinedHistory.length,
-        suppressedBy
+        suppressedBy,
+        suppressionChannel: primaryChannel ?? null,
+        suppressionChannels: [...eventChannels],
+        suppressionWindowRemainingMs: primaryWindowRemainingMs
       };
       normalized.meta = meta;
       if (payload.meta && typeof payload.meta === 'object') {
@@ -132,7 +170,8 @@ class EventBus extends EventEmitter {
         payload.meta = meta;
       }
 
-      for (const hit of evaluation.hits) {
+      evaluation.hits.forEach((hit, index) => {
+        const suppressedMeta = suppressedBy[index];
         const detail: SuppressedEventMetric = {
           ruleId: hit.rule.id,
           reason: hit.reason,
@@ -143,10 +182,14 @@ class EventBus extends EventEmitter {
           rateLimit: hit.rateLimit,
           cooldownMs: hit.cooldownMs,
           maxEvents: hit.rule.maxEvents,
-          combinedHistoryCount: combinedHistory.length
+          combinedHistoryCount: combinedHistory.length,
+          channel: primaryChannel ?? undefined,
+          channels: [...eventChannels],
+          windowRemainingMs: suppressedMeta.windowRemainingMs,
+          cooldownRemainingMs: suppressedMeta.cooldownRemainingMs
         };
         this.metrics.recordSuppressedEvent(detail);
-      }
+      });
       this.log.info(
         {
           detector: normalized.detector,

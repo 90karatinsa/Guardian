@@ -65,8 +65,8 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
       "restartMaxDelayMs": 5000,
       "restartJitterFactor": 0.2
     },
-    "cameras": {
-      "lobby": {
+    "cameras": [
+      {
         "id": "lobby",
         "channel": "video:lobby",
         "input": "rtsp://192.168.1.10/stream1",
@@ -90,7 +90,7 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
           "restartMaxDelayMs": 6000
         }
       }
-    }
+    ]
   },
   "audio": {
     "idleTimeoutMs": 4000,
@@ -141,7 +141,7 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
 Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kamerasını içerir. Üretimde kendi kameralarınızı tanımlamak için aşağıdaki bölümlere göz atın.
 
 ### RTSP ve çoklu kamera
-- `video.cameras` nesnesine her kamera için benzersiz bir anahtar ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
+- `video.cameras` dizisine her kamera için benzersiz bir nesne ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
 - `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Dashboard filtreleri ve metriklerdeki `pipelines.ffmpeg.byChannel` haritası bu alanı kullanır.
 - `ffmpeg` altındaki `idleTimeoutMs`, `watchdogTimeoutMs`, `startTimeoutMs`, `forceKillTimeoutMs`, `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` seçenekleri boru hattının yeniden deneme davranışını ve watchdog zamanlamalarını kontrol eder.
 - Kamera bazlı `motion` ve `person` blokları debounce/backoff gibi gürültü bastırma katsayılarını içerir; aynı dosyada birden fazla kamera tanımlayarak her kanal için farklı eşikler uygulayabilirsiniz.
@@ -161,17 +161,17 @@ Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir re
 - `events.retention.archiveDir`, `events.retention.maxArchivesPerCamera` ve `events.retention.snapshot.maxArchivesPerCamera`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`snapshots/2024-03-18/` gibi). Limit aşıldığında en eski klasörler taşınır ve silinir. `snapshot.maxArchivesPerCamera` anahtarı `snapshot.perCameraMax` ile eşdeğer olup kamera kimliği → kota eşlemesini kabul eder; tanımlanmadığında üst düzey `maxArchivesPerCamera` değeri kullanılır.
 - Görev her çalıştırmada loglara `Retention task completed` satırını bırakır; `archivedSnapshots` değeri 0’dan büyükse arşiv döngüsünün devrede olduğu anlaşılır. `vacuum.run` değeriniz `on-change` ise, önceki çalıştırmada hiçbir satır/snapshot temizlenmediyse VACUUM adımı atlanır.
 
-Bakım sırasında retention politikasını manuel olarak tetiklemek için:
+Bakım sırasında retention politikasını manuel olarak tetiklemek için artık doğrudan CLI komutunu kullanabilirsiniz:
 
 ```bash
-# Veritabanı retention ve VACUUM adımlarını çalıştırır
-pnpm exec tsx scripts/db-maintenance.ts
+# Etkin yapılandırmayı kullanarak retention görevini tek seferlik çalıştırır
+guardian retention run
 
-# Sadece VACUUM/ANALYZE işlemi yapar
-pnpm exec tsx scripts/vacuum.ts
+# Alternatif bir konfigürasyon dosyasıyla çalıştırmak için
+guardian retention run --config config/production.json
 ```
 
-Bu komutların özetini `guardian status --json` çıktısındaki `retention` alanından takip edebilirsiniz; CLI son kapanış nedeni ve hook sonuçlarını da raporlar.
+Komut stdout’a `Retention task completed` özetini yazar ve exit kodu 0 döner; `pipelines.ffmpeg.watchdogBackoffByChannel` ve `retention.totals` alanları üzerinden metrik güncellemelerini takip edebilirsiniz. CLI son kapanış nedeni ve hook sonuçlarını da raporlar.
 
 Retention ayarlarını değiştirip dosyayı kaydettiğinizde hot reload mekanizması yeni değerleri uygular.
 
@@ -193,6 +193,9 @@ guardian stop
 
 # Servis durumunu exit kodlarıyla raporlar
 guardian status
+
+# Tek seferlik retention bakımı
+guardian retention run
 ```
 
 - `guardian status --json` çıktısı `metrics` anlık görüntüsüne ek olarak `runtime.pipelines.videoChannels`, `runtime.pipelines.audioChannels` ve her boru hattının yeniden başlatma sayaçlarını (`videoRestarts`, `audioRestarts`) içerir. Ayrıca `application.shutdown` alanında son kapanış nedeni, sinyali ve hook özetleri raporlanır. Sağlık kodları; `0=ok`, `1=degraded`, `2=starting`, `3=stopping` olarak döner.
@@ -293,6 +296,8 @@ Guardian tüm metrikleri JSON olarak üretir:
 ## Video ve ses boru hatları
 - `pnpm tsx src/run-video-detectors.ts` komutu test videosunu çalıştırır ve motion/light/person dedektörlerini tetikleyerek snapshot üretir. Kare akışı 5 saniye durursa loglarda `Video source reconnecting (reason=watchdog-timeout)` mesajı görülür; artan gecikmeli yeniden denemeler `delayMs` alanında raporlanır.
 - `pnpm tsx src/run-audio-detector.ts` komutu platforma özel ffmpeg argümanlarıyla mikrofonu okur. Cihaz bulunamadığında veya akış sessiz kaldığında `Audio source recovering (reason=ffmpeg-missing|stream-idle)` logları üretilir, watchdog zamanlayıcıları tetiklenir ve metriklerde ilgili kanalın yeniden deneme sayaçları artar.
+- FFmpeg kaynağı ardışık start/watchdog hatalarında `circuit-breaker` korumasına geçer. CLI’nin `guardian status --json` çıktısında `pipelines.ffmpeg.lastRestart.reason` alanı `circuit-breaker` olduğunda yeni süreç başlatılmaz; `pipelines.ffmpeg.lastWatchdogJitterMs` ve `pipelines.ffmpeg.watchdogBackoffByChannel[channel]` değerleri artan bekleme sürelerini gösterir.
+- Ses boru hattı için aynı devre kesici mantığı `pipelines.audio.lastRestart.reason`, `pipelines.audio.watchdogBackoffByChannel` ve `pipelines.audio.byChannel[channel].watchdogBackoffMs` alanlarında izlenebilir; loglarda `Audio source fatal (reason=circuit-breaker)` satırı görünür.
 
 ## Docker ile çalışma
 Proje kökünde çok aşamalı bir Dockerfile bulunur:

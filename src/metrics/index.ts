@@ -27,6 +27,7 @@ type PipelineRestartMeta = {
   errorCode: string | number | null;
   signal: NodeJS.Signals | null;
   channel: string | null;
+  at: string | null;
 };
 
 type PipelineChannelSnapshot = {
@@ -34,6 +35,29 @@ type PipelineChannelSnapshot = {
   lastRestartAt: string | null;
   byReason: CounterMap;
   lastRestart: PipelineRestartMeta | null;
+  restartHistory: PipelineRestartHistorySnapshot[];
+  historyLimit: number;
+  droppedHistory: number;
+  totalRestartDelayMs: number;
+  totalWatchdogBackoffMs: number;
+  watchdogBackoffMs: number;
+  lastWatchdogJitterMs: number | null;
+  delayHistogram: HistogramSnapshot;
+  attemptHistogram: HistogramSnapshot;
+};
+
+type PipelineRestartHistorySnapshot = {
+  reason: string;
+  attempt: number | null;
+  delayMs: number | null;
+  baseDelayMs: number | null;
+  minDelayMs: number | null;
+  maxDelayMs: number | null;
+  jitterMs: number | null;
+  exitCode: number | null;
+  errorCode: string | number | null;
+  signal: NodeJS.Signals | null;
+  at: string;
 };
 
 type PipelineSnapshot = PipelineChannelSnapshot & {
@@ -43,6 +67,12 @@ type PipelineSnapshot = PipelineChannelSnapshot & {
   deviceDiscoveryByChannel: Record<string, CounterMap>;
   delayHistogram: HistogramSnapshot;
   attemptHistogram: HistogramSnapshot;
+  watchdogBackoffByChannel: Record<string, number>;
+  lastWatchdogJitterMs: number | null;
+  restartHistogram: {
+    delay: HistogramSnapshot;
+    attempt: HistogramSnapshot;
+  };
 };
 
 type SuppressionSnapshot = {
@@ -63,6 +93,11 @@ type SuppressionSnapshot = {
     rateLimit?: RateLimitConfig | null;
     cooldownMs?: number | null;
     maxEvents?: number | null;
+    channel?: string | null;
+    channels?: string[] | null;
+    windowExpiresAt?: string | null;
+    windowRemainingMs?: number | null;
+    cooldownRemainingMs?: number | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
 };
@@ -79,6 +114,11 @@ type SuppressionRuleSnapshot = {
     lastRateLimit: RateLimitConfig | null;
     lastCooldownMs: number | null;
     lastMaxEvents: number | null;
+    lastChannel: string | null;
+    lastChannels: string[] | null;
+    lastWindowExpiresAt: string | null;
+    lastWindowRemainingMs: number | null;
+    lastCooldownRemainingMs: number | null;
   };
 };
 
@@ -93,6 +133,10 @@ type SuppressedEventMetric = {
   cooldownMs?: number;
   maxEvents?: number;
   combinedHistoryCount?: number;
+   channel?: string;
+   channels?: string[];
+   windowRemainingMs?: number;
+   cooldownRemainingMs?: number;
 };
 
 type RetentionTotals = {
@@ -202,6 +246,8 @@ const RESTART_ATTEMPT_HISTOGRAM: HistogramConfig = {
   }
 };
 
+const DEFAULT_RESTART_HISTORY_LIMIT = 50;
+
 type DetectorLatencyState = {
   count: number;
   totalMs: number;
@@ -221,6 +267,8 @@ class MetricsRegistry {
   private readonly audioRestartReasons = new Map<string, number>();
   private readonly ffmpegRestartsByChannel = new Map<string, PipelineChannelState>();
   private readonly audioRestartsByChannel = new Map<string, PipelineChannelState>();
+  private readonly ffmpegRestartState = createPipelineChannelState();
+  private readonly audioRestartState = createPipelineChannelState();
   private readonly ffmpegRestartAttempts = new Map<string, number>();
   private readonly audioRestartAttempts = new Map<string, number>();
   private readonly audioDeviceDiscovery = new Map<string, number>();
@@ -240,6 +288,11 @@ class MetricsRegistry {
     rateLimit?: RateLimitConfig | null;
     cooldownMs?: number | null;
     maxEvents?: number | null;
+    channel?: string | null;
+    channels?: string[] | null;
+    windowExpiresAt?: number | null;
+    windowRemainingMs?: number | null;
+    cooldownRemainingMs?: number | null;
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -283,6 +336,8 @@ class MetricsRegistry {
     this.audioDeviceDiscoveryByChannel.clear();
     this.lastFfmpegRestartMeta = null;
     this.lastAudioRestartMeta = null;
+    resetPipelineChannelState(this.ffmpegRestartState);
+    resetPipelineChannelState(this.audioRestartState);
     this.suppressionByRule.clear();
     this.suppressionByReason.clear();
     this.suppressionByType.clear();
@@ -376,6 +431,39 @@ class MetricsRegistry {
       typeof normalizedDetail.cooldownMs === 'number' && Number.isFinite(normalizedDetail.cooldownMs)
         ? normalizedDetail.cooldownMs
         : null;
+    const detailChannels = Array.isArray(normalizedDetail.channels)
+      ? normalizedDetail.channels
+          .map(channel => (typeof channel === 'string' ? channel.trim() : ''))
+          .filter(channel => channel.length > 0)
+      : [];
+    const explicitChannel =
+      typeof normalizedDetail.channel === 'string' && normalizedDetail.channel.trim().length > 0
+        ? normalizedDetail.channel.trim()
+        : null;
+    const channelSet = new Set<string>();
+    for (const channel of detailChannels) {
+      channelSet.add(channel);
+    }
+    if (explicitChannel) {
+      channelSet.add(explicitChannel);
+    }
+    const channelList = Array.from(channelSet);
+    const primaryChannel = explicitChannel ?? channelList[0] ?? null;
+    const windowExpiresAtValue =
+      typeof normalizedDetail.windowExpiresAt === 'number' &&
+      Number.isFinite(normalizedDetail.windowExpiresAt)
+        ? normalizedDetail.windowExpiresAt
+        : null;
+    const windowRemainingValue =
+      typeof normalizedDetail.windowRemainingMs === 'number' &&
+      Number.isFinite(normalizedDetail.windowRemainingMs)
+        ? Math.max(0, normalizedDetail.windowRemainingMs)
+        : null;
+    const cooldownRemainingValue =
+      typeof normalizedDetail.cooldownRemainingMs === 'number' &&
+      Number.isFinite(normalizedDetail.cooldownRemainingMs)
+        ? Math.max(0, normalizedDetail.cooldownRemainingMs)
+        : null;
     this.lastSuppressedEvent = {
       ruleId,
       reason,
@@ -391,7 +479,12 @@ class MetricsRegistry {
       maxEvents:
         typeof normalizedDetail.maxEvents === 'number' && Number.isFinite(normalizedDetail.maxEvents)
           ? normalizedDetail.maxEvents
-          : null
+          : null,
+      channel: primaryChannel,
+      channels: channelList.length > 0 ? [...channelList] : null,
+      windowExpiresAt: windowExpiresAtValue,
+      windowRemainingMs: windowRemainingValue,
+      cooldownRemainingMs: cooldownRemainingValue
     };
     if (ruleId) {
       this.suppressionByRule.set(ruleId, (this.suppressionByRule.get(ruleId) ?? 0) + 1);
@@ -405,7 +498,12 @@ class MetricsRegistry {
         lastType: null,
         lastRateLimit: null,
         lastCooldownMs: null,
-        lastMaxEvents: null
+        lastMaxEvents: null,
+        lastChannel: null,
+        lastChannels: null,
+        lastWindowExpiresAt: null,
+        lastWindowRemainingMs: null,
+        lastCooldownRemainingMs: null
       };
       ruleState.total += 1;
       if (reason) {
@@ -434,6 +532,11 @@ class MetricsRegistry {
       if (typeof normalizedDetail.maxEvents === 'number' && Number.isFinite(normalizedDetail.maxEvents)) {
         ruleState.lastMaxEvents = normalizedDetail.maxEvents;
       }
+      ruleState.lastChannel = primaryChannel;
+      ruleState.lastChannels = channelList.length > 0 ? [...channelList] : null;
+      ruleState.lastWindowExpiresAt = windowExpiresAtValue;
+      ruleState.lastWindowRemainingMs = windowRemainingValue;
+      ruleState.lastCooldownRemainingMs = cooldownRemainingValue;
       this.suppressionRules.set(ruleId, ruleState);
     }
   }
@@ -494,6 +597,19 @@ class MetricsRegistry {
     state.lastRunAt = Date.now();
   }
 
+  resetDetectorCounters(detector: string, counters: string | string[]) {
+    const list = Array.isArray(counters) ? counters : [counters];
+    if (list.length === 0) {
+      return;
+    }
+    const state = getDetectorMetricState(this.detectorMetrics, detector);
+    const now = Date.now();
+    for (const counter of list) {
+      state.counters.set(counter, 0);
+    }
+    state.lastRunAt = now;
+  }
+
   recordDetectorError(detector: string, message: string) {
     const state = getDetectorMetricState(this.detectorMetrics, detector);
     state.lastRunAt = Date.now();
@@ -517,13 +633,15 @@ class MetricsRegistry {
       exitCode?: number | null;
       errorCode?: string | number | null;
       signal?: NodeJS.Signals | null;
+      at?: number;
     }
   ) {
     const normalized = reason || 'unknown';
     const channel = meta?.channel;
+    const occurredAt = typeof meta?.at === 'number' ? meta.at : Date.now();
     if (type === 'ffmpeg') {
       this.ffmpegRestarts += 1;
-      this.lastFfmpegRestartAt = Date.now();
+      this.lastFfmpegRestartAt = occurredAt;
       this.ffmpegRestartReasons.set(normalized, (this.ffmpegRestartReasons.get(normalized) ?? 0) + 1);
       const metaPayload: PipelineRestartMeta = {
         reason: normalized,
@@ -539,12 +657,14 @@ class MetricsRegistry {
             ? meta?.errorCode
             : null,
         signal: meta?.signal ?? null,
-        channel: meta?.channel ?? null
+        channel: meta?.channel ?? null,
+        at: new Date(occurredAt).toISOString()
       };
       this.lastFfmpegRestartMeta = metaPayload;
+      updatePipelineChannelState(this.ffmpegRestartState, metaPayload, normalized, occurredAt);
       if (channel) {
         const state = getPipelineChannelState(this.ffmpegRestartsByChannel, channel);
-        updatePipelineChannelState(state, metaPayload, normalized);
+        updatePipelineChannelState(state, metaPayload, normalized, occurredAt);
       }
       if (typeof meta?.attempt === 'number' && meta.attempt >= 0) {
         const attemptKey = String(meta.attempt);
@@ -556,7 +676,7 @@ class MetricsRegistry {
       }
     } else {
       this.audioRestarts += 1;
-      this.lastAudioRestartAt = Date.now();
+      this.lastAudioRestartAt = occurredAt;
       this.audioRestartReasons.set(normalized, (this.audioRestartReasons.get(normalized) ?? 0) + 1);
       const metaPayload: PipelineRestartMeta = {
         reason: normalized,
@@ -572,12 +692,14 @@ class MetricsRegistry {
             ? meta?.errorCode
             : null,
         signal: meta?.signal ?? null,
-        channel: meta?.channel ?? null
+        channel: meta?.channel ?? null,
+        at: new Date(occurredAt).toISOString()
       };
       this.lastAudioRestartMeta = metaPayload;
+      updatePipelineChannelState(this.audioRestartState, metaPayload, normalized, occurredAt);
       if (channel) {
         const state = getPipelineChannelState(this.audioRestartsByChannel, channel);
-        updatePipelineChannelState(state, metaPayload, normalized);
+        updatePipelineChannelState(state, metaPayload, normalized, occurredAt);
       }
       if (typeof meta?.attempt === 'number' && meta.attempt >= 0) {
         const attemptKey = String(meta.attempt);
@@ -691,6 +813,54 @@ class MetricsRegistry {
     const ffmpegAttemptHistogram = this.histograms.get('pipeline.ffmpeg.restart.attempt');
     const audioDelayHistogram = this.histograms.get('pipeline.audio.restart.delay');
     const audioAttemptHistogram = this.histograms.get('pipeline.audio.restart.attempt');
+    const ffmpegByChannel = mapFromPipelineChannels(this.ffmpegRestartsByChannel);
+    const audioByChannel = mapFromPipelineChannels(this.audioRestartsByChannel);
+    const ffmpegDelaySnapshot = mapHistogram(ffmpegDelayHistogram ?? new Map());
+    const ffmpegAttemptSnapshot = mapHistogram(ffmpegAttemptHistogram ?? new Map());
+    const audioDelaySnapshot = mapHistogram(audioDelayHistogram ?? new Map());
+    const audioAttemptSnapshot = mapHistogram(audioAttemptHistogram ?? new Map());
+    const lastSuppressedEventSnapshot = this.lastSuppressedEvent
+      ? {
+          ruleId: this.lastSuppressedEvent.ruleId,
+          reason: this.lastSuppressedEvent.reason,
+          type: this.lastSuppressedEvent.type ?? null,
+          historyCount:
+            typeof this.lastSuppressedEvent.historyCount === 'number'
+              ? this.lastSuppressedEvent.historyCount
+              : null,
+          combinedHistoryCount:
+            typeof this.lastSuppressedEvent.combinedHistoryCount === 'number'
+              ? this.lastSuppressedEvent.combinedHistoryCount
+              : null,
+          rateLimit: this.lastSuppressedEvent.rateLimit ? { ...this.lastSuppressedEvent.rateLimit } : null,
+          cooldownMs:
+            typeof this.lastSuppressedEvent.cooldownMs === 'number'
+              ? this.lastSuppressedEvent.cooldownMs
+              : null,
+          maxEvents:
+            typeof this.lastSuppressedEvent.maxEvents === 'number'
+              ? this.lastSuppressedEvent.maxEvents
+              : null,
+          channel: this.lastSuppressedEvent.channel ?? null,
+          channels: this.lastSuppressedEvent.channels
+            ? [...this.lastSuppressedEvent.channels]
+            : this.lastSuppressedEvent.channel
+            ? [this.lastSuppressedEvent.channel]
+            : null,
+          windowExpiresAt:
+            typeof this.lastSuppressedEvent.windowExpiresAt === 'number'
+              ? new Date(this.lastSuppressedEvent.windowExpiresAt).toISOString()
+              : null,
+          windowRemainingMs:
+            typeof this.lastSuppressedEvent.windowRemainingMs === 'number'
+              ? this.lastSuppressedEvent.windowRemainingMs
+              : null,
+          cooldownRemainingMs:
+            typeof this.lastSuppressedEvent.cooldownRemainingMs === 'number'
+              ? this.lastSuppressedEvent.cooldownRemainingMs
+              : null
+        }
+      : null;
 
     return {
       createdAt: new Date().toISOString(),
@@ -715,24 +885,48 @@ class MetricsRegistry {
           lastRestartAt: this.lastFfmpegRestartAt ? new Date(this.lastFfmpegRestartAt).toISOString() : null,
           byReason: mapFrom(this.ffmpegRestartReasons),
           lastRestart: this.lastFfmpegRestartMeta,
+          restartHistory: mapHistory(this.ffmpegRestartState.restartHistory),
+          historyLimit: this.ffmpegRestartState.historyLimit,
+          droppedHistory: this.ffmpegRestartState.droppedHistory,
+          totalRestartDelayMs: this.ffmpegRestartState.totalDelayMs,
+          totalWatchdogBackoffMs: this.ffmpegRestartState.totalWatchdogBackoffMs,
+          watchdogBackoffMs: this.ffmpegRestartState.totalWatchdogBackoffMs,
+          lastWatchdogJitterMs: this.ffmpegRestartState.lastWatchdogJitterMs,
           attempts: mapFrom(this.ffmpegRestartAttempts),
-          byChannel: mapFromPipelineChannels(this.ffmpegRestartsByChannel),
+          byChannel: ffmpegByChannel,
+          watchdogBackoffByChannel: mapWatchdogBackoffByChannel(this.ffmpegRestartsByChannel),
           deviceDiscovery: {},
           deviceDiscoveryByChannel: {},
-          delayHistogram: mapFrom(ffmpegDelayHistogram ?? new Map()),
-          attemptHistogram: mapFrom(ffmpegAttemptHistogram ?? new Map())
+          delayHistogram: ffmpegDelaySnapshot,
+          attemptHistogram: ffmpegAttemptSnapshot,
+          restartHistogram: {
+            delay: ffmpegDelaySnapshot,
+            attempt: ffmpegAttemptSnapshot
+          }
         },
         audio: {
           restarts: this.audioRestarts,
           lastRestartAt: this.lastAudioRestartAt ? new Date(this.lastAudioRestartAt).toISOString() : null,
           byReason: mapFrom(this.audioRestartReasons),
           lastRestart: this.lastAudioRestartMeta,
+          restartHistory: mapHistory(this.audioRestartState.restartHistory),
+          historyLimit: this.audioRestartState.historyLimit,
+          droppedHistory: this.audioRestartState.droppedHistory,
+          totalRestartDelayMs: this.audioRestartState.totalDelayMs,
+          totalWatchdogBackoffMs: this.audioRestartState.totalWatchdogBackoffMs,
+          watchdogBackoffMs: this.audioRestartState.totalWatchdogBackoffMs,
+          lastWatchdogJitterMs: this.audioRestartState.lastWatchdogJitterMs,
           attempts: mapFrom(this.audioRestartAttempts),
-          byChannel: mapFromPipelineChannels(this.audioRestartsByChannel),
+          byChannel: audioByChannel,
+          watchdogBackoffByChannel: mapWatchdogBackoffByChannel(this.audioRestartsByChannel),
           deviceDiscovery: mapFrom(this.audioDeviceDiscovery),
           deviceDiscoveryByChannel: mapFromNested(this.audioDeviceDiscoveryByChannel),
-          delayHistogram: mapFrom(audioDelayHistogram ?? new Map()),
-          attemptHistogram: mapFrom(audioAttemptHistogram ?? new Map())
+          delayHistogram: audioDelaySnapshot,
+          attemptHistogram: audioAttemptSnapshot,
+          restartHistogram: {
+            delay: audioDelaySnapshot,
+            attempt: audioAttemptSnapshot
+          }
         }
       },
       suppression: {
@@ -744,7 +938,7 @@ class MetricsRegistry {
           historyCount: this.suppressionHistoryCount,
           combinedHistoryCount: this.suppressionCombinedHistoryCount
         },
-        lastEvent: this.lastSuppressedEvent ? { ...this.lastSuppressedEvent } : null,
+        lastEvent: lastSuppressedEventSnapshot,
         rules: mapFromSuppressionRules(this.suppressionRules)
       },
       retention: {
@@ -766,7 +960,45 @@ type PipelineChannelState = {
   lastRestartAt: number | null;
   byReason: Map<string, number>;
   lastRestart: PipelineRestartMeta | null;
+  restartHistory: PipelineRestartHistoryRecord[];
+  historyLimit: number;
+  droppedHistory: number;
+  totalDelayMs: number;
+  totalWatchdogBackoffMs: number;
+  lastWatchdogJitterMs: number | null;
+  delayHistogram: Map<string, number>;
+  attemptHistogram: Map<string, number>;
 };
+
+type PipelineRestartHistoryRecord = {
+  reason: string;
+  attempt: number | null;
+  delayMs: number | null;
+  baseDelayMs: number | null;
+  minDelayMs: number | null;
+  maxDelayMs: number | null;
+  jitterMs: number | null;
+  exitCode: number | null;
+  errorCode: string | number | null;
+  signal: NodeJS.Signals | null;
+  at: number;
+};
+
+function mapHistory(entries: PipelineRestartHistoryRecord[]): PipelineRestartHistorySnapshot[] {
+  return entries.map(entry => ({
+    reason: entry.reason,
+    attempt: entry.attempt,
+    delayMs: entry.delayMs,
+    baseDelayMs: entry.baseDelayMs,
+    minDelayMs: entry.minDelayMs,
+    maxDelayMs: entry.maxDelayMs,
+    jitterMs: entry.jitterMs,
+    exitCode: entry.exitCode,
+    errorCode: entry.errorCode,
+    signal: entry.signal,
+    at: new Date(entry.at).toISOString()
+  }));
+}
 
 type SuppressionRuleState = {
   total: number;
@@ -779,6 +1011,11 @@ type SuppressionRuleState = {
   lastRateLimit: RateLimitConfig | null;
   lastCooldownMs: number | null;
   lastMaxEvents: number | null;
+  lastChannel: string | null;
+  lastChannels: string[] | null;
+  lastWindowExpiresAt: number | null;
+  lastWindowRemainingMs: number | null;
+  lastCooldownRemainingMs: number | null;
 };
 
 type DetectorMetricState = {
@@ -821,8 +1058,7 @@ function mapFromLatencies(
 function mapFromHistograms(source: Map<string, Map<string, number>>): Record<string, HistogramSnapshot> {
   const result: Record<string, HistogramSnapshot> = {};
   for (const [metric, histogram] of source.entries()) {
-    const ordered = Array.from(histogram.entries()).sort(([a], [b]) => compareHistogramKeys(a, b));
-    result[metric] = Object.fromEntries(ordered);
+    result[metric] = mapHistogram(histogram);
   }
   return result;
 }
@@ -835,8 +1071,33 @@ function mapFromPipelineChannels(source: Map<string, PipelineChannelState>): Rec
       restarts: state.restarts,
       lastRestartAt: state.lastRestartAt ? new Date(state.lastRestartAt).toISOString() : null,
       byReason: mapFrom(state.byReason),
-      lastRestart: state.lastRestart
+      lastRestart: state.lastRestart,
+      restartHistory: mapHistory(state.restartHistory),
+      historyLimit: state.historyLimit,
+      droppedHistory: state.droppedHistory,
+      totalRestartDelayMs: state.totalDelayMs,
+      totalWatchdogBackoffMs: state.totalWatchdogBackoffMs,
+      watchdogBackoffMs: state.totalWatchdogBackoffMs,
+      lastWatchdogJitterMs: state.lastWatchdogJitterMs,
+      delayHistogram: mapHistogram(state.delayHistogram),
+      attemptHistogram: mapHistogram(state.attemptHistogram)
     };
+  }
+  return result;
+}
+
+function mapHistogram(source: Map<string, number>): HistogramSnapshot {
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => compareHistogramKeys(a, b));
+  return Object.fromEntries(ordered);
+}
+
+function mapWatchdogBackoffByChannel(
+  source: Map<string, PipelineChannelState>
+): Record<string, number> {
+  const result: Record<string, number> = {};
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [channel, state] of ordered) {
+    result[channel] = state.totalWatchdogBackoffMs;
   }
   return result;
 }
@@ -856,7 +1117,17 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
         lastType: state.lastType,
         lastRateLimit: state.lastRateLimit,
         lastCooldownMs: state.lastCooldownMs,
-        lastMaxEvents: state.lastMaxEvents
+        lastMaxEvents: state.lastMaxEvents,
+        lastChannel: state.lastChannel ?? null,
+        lastChannels: state.lastChannels ? [...state.lastChannels] : null,
+        lastWindowExpiresAt:
+          typeof state.lastWindowExpiresAt === 'number'
+            ? new Date(state.lastWindowExpiresAt).toISOString()
+            : null,
+        lastWindowRemainingMs:
+          typeof state.lastWindowRemainingMs === 'number' ? state.lastWindowRemainingMs : null,
+        lastCooldownRemainingMs:
+          typeof state.lastCooldownRemainingMs === 'number' ? state.lastCooldownRemainingMs : null
       }
     };
   }
@@ -906,17 +1177,43 @@ function mapFromDetectors(source: Map<string, DetectorMetricState>): Record<stri
   return result;
 }
 
+function createPipelineChannelState(): PipelineChannelState {
+  return {
+    restarts: 0,
+    lastRestartAt: null,
+    byReason: new Map<string, number>(),
+    lastRestart: null,
+    restartHistory: [],
+    historyLimit: DEFAULT_RESTART_HISTORY_LIMIT,
+    droppedHistory: 0,
+    totalDelayMs: 0,
+    totalWatchdogBackoffMs: 0,
+    lastWatchdogJitterMs: null,
+    delayHistogram: new Map<string, number>(),
+    attemptHistogram: new Map<string, number>()
+  };
+}
+
+function resetPipelineChannelState(state: PipelineChannelState) {
+  state.restarts = 0;
+  state.lastRestartAt = null;
+  state.byReason.clear();
+  state.lastRestart = null;
+  state.restartHistory.length = 0;
+  state.droppedHistory = 0;
+  state.totalDelayMs = 0;
+  state.totalWatchdogBackoffMs = 0;
+  state.lastWatchdogJitterMs = null;
+  state.delayHistogram.clear();
+  state.attemptHistogram.clear();
+}
+
 function getPipelineChannelState(map: Map<string, PipelineChannelState>, channel: string): PipelineChannelState {
   const existing = map.get(channel);
   if (existing) {
     return existing;
   }
-  const created: PipelineChannelState = {
-    restarts: 0,
-    lastRestartAt: null,
-    byReason: new Map<string, number>(),
-    lastRestart: null
-  };
+  const created = createPipelineChannelState();
   map.set(channel, created);
   return created;
 }
@@ -924,12 +1221,52 @@ function getPipelineChannelState(map: Map<string, PipelineChannelState>, channel
 function updatePipelineChannelState(
   state: PipelineChannelState,
   meta: PipelineRestartMeta,
-  reason: string
+  reason: string,
+  occurredAt: number
 ) {
   state.restarts += 1;
-  state.lastRestartAt = Date.now();
+  state.lastRestartAt = occurredAt;
   state.byReason.set(reason, (state.byReason.get(reason) ?? 0) + 1);
   state.lastRestart = meta;
+  if (typeof meta.delayMs === 'number' && meta.delayMs >= 0) {
+    state.totalDelayMs += meta.delayMs;
+    const delayBucket = resolveHistogramBucket(meta.delayMs, DEFAULT_HISTOGRAM);
+    state.delayHistogram.set(delayBucket, (state.delayHistogram.get(delayBucket) ?? 0) + 1);
+    if (reason === 'watchdog-timeout') {
+      state.totalWatchdogBackoffMs += meta.delayMs;
+      if (typeof meta.jitterMs === 'number') {
+        state.lastWatchdogJitterMs = meta.jitterMs;
+      }
+    }
+  } else if (reason === 'watchdog-timeout' && typeof meta.jitterMs === 'number') {
+    state.lastWatchdogJitterMs = meta.jitterMs;
+  }
+  if (typeof meta.attempt === 'number' && meta.attempt >= 0) {
+    const attemptBucket = resolveHistogramBucket(meta.attempt, RESTART_ATTEMPT_HISTOGRAM);
+    state.attemptHistogram.set(
+      attemptBucket,
+      (state.attemptHistogram.get(attemptBucket) ?? 0) + 1
+    );
+  }
+  const record: PipelineRestartHistoryRecord = {
+    reason,
+    attempt: meta.attempt,
+    delayMs: meta.delayMs,
+    baseDelayMs: meta.baseDelayMs,
+    minDelayMs: meta.minDelayMs,
+    maxDelayMs: meta.maxDelayMs,
+    jitterMs: meta.jitterMs,
+    exitCode: meta.exitCode,
+    errorCode: meta.errorCode,
+    signal: meta.signal,
+    at: occurredAt
+  };
+  state.restartHistory.push(record);
+  if (state.restartHistory.length > state.historyLimit) {
+    const overflow = state.restartHistory.length - state.historyLimit;
+    state.restartHistory.splice(0, overflow);
+    state.droppedHistory += overflow;
+  }
 }
 
 function getDetectorMetricState(map: Map<string, DetectorMetricState>, detector: string): DetectorMetricState {

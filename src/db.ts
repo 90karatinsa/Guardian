@@ -33,6 +33,7 @@ db.exec(`
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
   CREATE INDEX IF NOT EXISTS idx_events_source_detector ON events (source, detector);
+  CREATE INDEX IF NOT EXISTS idx_events_channel ON events (json_extract(meta, '$.channel'));
   CREATE INDEX IF NOT EXISTS idx_faces_label ON faces (label);
 `);
 
@@ -86,6 +87,7 @@ export interface ListEventsOptions {
   detector?: string;
   source?: string;
   channel?: string;
+  channels?: string[];
   camera?: string;
   severity?: EventSeverity;
   since?: number;
@@ -176,6 +178,18 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
   const filters: string[] = [];
   const params: Record<string, unknown> = {};
 
+  const channelFilters = collectChannelFilters(options);
+  if (channelFilters.length === 1) {
+    filters.push("json_extract(meta, '$.channel') = @channel0");
+    params.channel0 = channelFilters[0];
+  } else if (channelFilters.length > 1) {
+    const placeholders = channelFilters.map((_, index) => `@channel${index}`);
+    filters.push(`json_extract(meta, '$.channel') IN (${placeholders.join(', ')})`);
+    channelFilters.forEach((value, index) => {
+      params[`channel${index}`] = value;
+    });
+  }
+
   if (options.detector) {
     filters.push('detector = @detector');
     params.detector = options.detector;
@@ -184,11 +198,6 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
   if (options.source) {
     filters.push('source = @source');
     params.source = options.source;
-  }
-
-  if (options.channel) {
-    filters.push("json_extract(meta, '$.channel') = @channel");
-    params.channel = options.channel;
   }
 
   if (options.camera) {
@@ -767,6 +776,28 @@ function normalizeVacuumOptions(options: VacuumOptions | VacuumMode): Required<V
 
 function escapeLike(value: string) {
   return value.replace(/([_%\\])/g, '\\$1');
+}
+
+function collectChannelFilters(options: { channel?: string; channels?: string[] }): string[] {
+  const set = new Set<string>();
+  if (typeof options.channel === 'string') {
+    const trimmed = options.channel.trim();
+    if (trimmed) {
+      set.add(trimmed);
+    }
+  }
+  if (Array.isArray(options.channels)) {
+    for (const candidate of options.channels) {
+      if (typeof candidate !== 'string') {
+        continue;
+      }
+      const trimmed = candidate.trim();
+      if (trimmed) {
+        set.add(trimmed);
+      }
+    }
+  }
+  return Array.from(set);
 }
 
 export default db;

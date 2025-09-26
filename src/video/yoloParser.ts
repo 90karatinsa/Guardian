@@ -64,6 +64,10 @@ export function parseYoloDetections(
 
   for (let detectionIndex = 0; detectionIndex < accessor.detections; detectionIndex += 1) {
     const objectnessLogit = accessor.get(detectionIndex, OBJECTNESS_INDEX);
+    if (!isFiniteNumber(objectnessLogit)) {
+      continue;
+    }
+
     const objectness = sigmoid(objectnessLogit);
 
     if (!Number.isFinite(objectness) || objectness <= 0) {
@@ -75,13 +79,32 @@ export function parseYoloDetections(
     const width = accessor.get(detectionIndex, 2);
     const height = accessor.get(detectionIndex, 3);
 
+    if (!isFiniteNumber(cx) || !isFiniteNumber(cy) || !isFiniteNumber(width) || !isFiniteNumber(height)) {
+      continue;
+    }
+
+    if (width <= 0 || height <= 0) {
+      continue;
+    }
+
     const bbox = projectBoundingBox(cx, cy, width, height, meta);
 
-    if (bbox.width <= 0 || bbox.height <= 0) {
+    if (
+      !isFiniteNumber(bbox.left) ||
+      !isFiniteNumber(bbox.top) ||
+      !isFiniteNumber(bbox.width) ||
+      !isFiniteNumber(bbox.height) ||
+      bbox.width <= 0 ||
+      bbox.height <= 0
+    ) {
       continue;
     }
 
     const areaRatio = computeAreaRatio(bbox, meta);
+
+    if (!Number.isFinite(areaRatio) || areaRatio <= 0) {
+      continue;
+    }
 
     for (const classId of classIndices) {
       const attributeIndex = CLASS_START_INDEX + classId;
@@ -90,6 +113,10 @@ export function parseYoloDetections(
       }
 
       const classLogit = accessor.get(detectionIndex, attributeIndex);
+      if (!isFiniteNumber(classLogit)) {
+        continue;
+      }
+
       const classProbability = sigmoid(classLogit);
 
       if (!Number.isFinite(classProbability) || classProbability <= 0) {
@@ -376,11 +403,18 @@ export function computeIoU(a: BoundingBox, b: BoundingBox) {
 }
 
 function clamp(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
   return Math.max(min, Math.min(max, value));
 }
 
 function sigmoid(value: number) {
   return 1 / (1 + Math.exp(-value));
+}
+
+function isFiniteNumber(value: number) {
+  return typeof value === 'number' && Number.isFinite(value);
 }
 
 export { DEFAULT_NMS_IOU_THRESHOLD };

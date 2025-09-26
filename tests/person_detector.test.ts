@@ -349,6 +349,99 @@ describe('YoloParser utilities', () => {
     expect(first?.areaRatio ?? 0).toBeCloseTo((440 * 620) / (1280 * 720), 5);
     expect(second?.areaRatio ?? 0).toBeCloseTo((440 * 260) / (1280 * 720), 5);
   });
+
+  it('YoloParserNaNResilience filters invalid numeric detections safely', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      values.classProbabilities.forEach((prob, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit(prob);
+      });
+    };
+
+    assign(0, {
+      cx: 300,
+      cy: 200,
+      width: 140,
+      height: 160,
+      objectness: 0.92,
+      classProbabilities: [0.85, 0.2]
+    });
+
+    assign(1, {
+      cx: Number.NaN,
+      cy: 120,
+      width: Number.POSITIVE_INFINITY,
+      height: 180,
+      objectness: 0.9,
+      classProbabilities: [0.95, 0.4]
+    });
+
+    assign(2, {
+      cx: 350,
+      cy: 260,
+      width: 8000,
+      height: 6000,
+      objectness: 0.88,
+      classProbabilities: [0.6, Number.NaN]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [attributes, detections]);
+
+    const meta = {
+      scale: 0.5,
+      padX: 10,
+      padY: 20,
+      originalWidth: 1280,
+      originalHeight: 720,
+      resizedWidth: 640,
+      resizedHeight: 360,
+      scaleX: 0.5,
+      scaleY: 0.5
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0, 1],
+      scoreThreshold: 0.5
+    });
+
+    expect(results).toHaveLength(2);
+    results.forEach(result => {
+      expect(Number.isFinite(result.score)).toBe(true);
+      expect(result.score).toBeGreaterThan(0);
+      expect(Number.isFinite(result.bbox.left)).toBe(true);
+      expect(Number.isFinite(result.bbox.top)).toBe(true);
+      expect(Number.isFinite(result.bbox.width)).toBe(true);
+      expect(Number.isFinite(result.bbox.height)).toBe(true);
+      expect(result.bbox.width).toBeGreaterThan(0);
+      expect(result.bbox.height).toBeGreaterThan(0);
+      expect(Number.isFinite(result.areaRatio)).toBe(true);
+      expect(result.areaRatio).toBeGreaterThan(0);
+      expect(result.areaRatio).toBeLessThanOrEqual(1);
+    });
+
+    const classIds = results.map(result => result.classId).sort();
+    expect(classIds).toEqual([0, 0]);
+  });
 });
 
 describe('PersonDetector', () => {

@@ -239,6 +239,84 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioSilenceCircuitBreaker stops retries and records fatal restart', async () => {
+    vi.useFakeTimers();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    spawnMock.mockImplementation((_cmd: string, _args: string[]) => {
+      return createFakeProcess();
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      sampleRate: 8000,
+      channels: 1,
+      frameDurationMs: 40,
+      silenceDurationMs: 40,
+      silenceThreshold: 0.0001,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      watchdogTimeoutMs: 60,
+      silenceCircuitBreakerThreshold: 3,
+      micFallbacks: {
+        linux: [
+          { format: 'alsa', device: 'hw:1' },
+          { format: 'alsa', device: 'hw:2' }
+        ]
+      }
+    });
+
+    const fatalSpy = vi.fn();
+    source.on('fatal', fatalSpy);
+    source.on('error', () => {});
+
+    try {
+      expect((source as any).options.silenceCircuitBreakerThreshold).toBe(3);
+      source.start();
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+      const firstArgs = spawnMock.mock.calls[0][1];
+      const firstDevice = firstArgs[firstArgs.indexOf('-i') + 1];
+      expect(firstDevice).toBe('default');
+
+      (source as any).scheduleRetry('stream-silence');
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+      expect(spawnMock).toHaveBeenCalledTimes(2);
+      const secondArgs = spawnMock.mock.calls[1][1];
+      const secondDevice = secondArgs[secondArgs.indexOf('-i') + 1];
+      expect(secondDevice).toBe('hw:1');
+
+      (source as any).scheduleRetry('watchdog-timeout');
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+      expect(spawnMock).toHaveBeenCalledTimes(3);
+      const thirdArgs = spawnMock.mock.calls[2][1];
+      const thirdDevice = thirdArgs[thirdArgs.indexOf('-i') + 1];
+      expect(thirdDevice).toBe('hw:2');
+
+      (source as any).scheduleRetry('stream-silence');
+      await Promise.resolve();
+
+      expect(fatalSpy).toHaveBeenCalledTimes(1);
+      expect(fatalSpy.mock.calls[0][0]).toMatchObject({ reason: 'circuit-breaker', attempts: 5 });
+      expect((source as any).circuitBreakerFailures).toBe(3);
+      expect((source as any).circuitBroken).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(spawnMock).toHaveBeenCalledTimes(3);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.audio.lastRestart?.reason).toBe('circuit-breaker');
+      expect(snapshot.pipelines.audio.lastRestart?.attempt).toBe(5);
+    } finally {
+      source.stop();
+      platformSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('AudioDeviceFallbackRotation rotates microphone inputs across platforms', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
     const { AudioSource } = await import('../src/audio/source.js');
