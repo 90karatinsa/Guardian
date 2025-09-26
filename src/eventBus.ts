@@ -28,10 +28,15 @@ interface InternalSuppressionRule {
   rateLimit?: RateLimitConfig;
   maxEvents?: number;
   reason: string;
-  suppressedUntil: number;
-  history: number[];
+  timeline: SuppressionTimeline;
+  timelines: Map<string, SuppressionTimeline>;
   historyLimit: number;
 }
+
+type SuppressionTimeline = {
+  suppressedUntil: number;
+  history: number[];
+};
 
 type SuppressionHitType = 'window' | 'rate-limit';
 
@@ -43,6 +48,7 @@ interface SuppressionHit {
   windowExpiresAt?: number;
   rateLimit?: RateLimitConfig;
   cooldownMs?: number;
+  channel: string | null;
 }
 
 class EventBus extends EventEmitter {
@@ -79,8 +85,8 @@ class EventBus extends EventEmitter {
 
   resetSuppressionState() {
     for (const rule of this.suppressionRules) {
-      rule.suppressedUntil = 0;
-      rule.history = [];
+      resetTimeline(rule.timeline);
+      rule.timelines.clear();
     }
   }
 
@@ -97,9 +103,9 @@ class EventBus extends EventEmitter {
     const evaluation = this.evaluateSuppression(normalized);
 
     if (evaluation.suppressed) {
-      const primary = evaluation.hits[0];
       const eventChannels = extractEventChannels(normalized.meta);
-      const primaryChannel = eventChannels[0];
+      const primary = evaluation.hits[0];
+      const primaryChannel = primary?.channel ?? eventChannels[0] ?? null;
       const primaryWindowRemainingMs =
         primary && typeof primary.windowExpiresAt === 'number'
           ? Math.max(0, primary.windowExpiresAt - normalized.ts)
@@ -141,7 +147,7 @@ class EventBus extends EventEmitter {
           historyCount: history.length,
           rateLimitWindowMs: hit.rateLimit?.perMs,
           cooldownMs: hit.cooldownMs,
-          channel: primaryChannel ?? undefined,
+          channel: hit.channel ?? undefined,
           channels: [...eventChannels],
           windowRemainingMs,
           cooldownRemainingMs
@@ -160,7 +166,7 @@ class EventBus extends EventEmitter {
         suppressionHistory: combinedHistory,
         suppressionHistoryCount: combinedHistory.length,
         suppressedBy,
-        suppressionChannel: primaryChannel ?? null,
+        suppressionChannel: primaryChannel,
         suppressionChannels: [...eventChannels],
         suppressionWindowRemainingMs: primaryWindowRemainingMs
       };
@@ -185,7 +191,7 @@ class EventBus extends EventEmitter {
           cooldownMs: hit.cooldownMs,
           maxEvents: hit.rule.maxEvents,
           combinedHistoryCount: combinedHistory.length,
-          channel: primaryChannel ?? undefined,
+          channel: hit.channel ?? undefined,
           channels: [...eventChannels],
           windowRemainingMs: suppressedMeta.windowRemainingMs,
           cooldownRemainingMs: suppressedMeta.cooldownRemainingMs
@@ -204,9 +210,12 @@ class EventBus extends EventEmitter {
       return false;
     }
 
-    for (const rule of evaluation.matchedRules) {
-      if (rule.suppressForMs && !rule.rateLimit) {
-        rule.suppressedUntil = normalized.ts + rule.suppressForMs;
+    for (const match of evaluation.matchedRules) {
+      if (match.rule.suppressForMs && !match.rule.rateLimit) {
+        const suppressUntil = normalized.ts + match.rule.suppressForMs;
+        if (suppressUntil > match.timeline.suppressedUntil) {
+          match.timeline.suppressedUntil = suppressUntil;
+        }
       }
     }
 
@@ -216,42 +225,50 @@ class EventBus extends EventEmitter {
 
   private evaluateSuppression(event: EventRecord) {
     const hits: SuppressionHit[] = [];
-    const matchedRules: InternalSuppressionRule[] = [];
+    const matchedRules: Array<{
+      rule: InternalSuppressionRule;
+      channel: string | null;
+      timeline: SuppressionTimeline;
+    }> = [];
+    const eventChannels = extractEventChannels(event.meta);
 
     for (const rule of this.suppressionRules) {
-      if (!ruleMatchesEvent(rule, event)) {
+      if (!ruleMatchesEvent(rule, event, eventChannels)) {
         continue;
       }
 
-      pruneHistory(rule, event.ts);
+      const channel = resolveRuleChannel(rule, eventChannels);
+      const timeline = getTimelineForRule(rule, channel);
+      pruneTimeline(rule, timeline, event.ts);
 
-      const windowActive = event.ts < rule.suppressedUntil;
+      const windowActive = event.ts < timeline.suppressedUntil;
       const rateLimitConfig = rule.rateLimit;
       const normalizedMaxEvents =
         typeof rule.maxEvents === 'number' && rule.maxEvents > 0
           ? Math.floor(rule.maxEvents)
           : undefined;
       const rateLimitExceeded = Boolean(
-        rateLimitConfig && rule.history.length >= rateLimitConfig.count
+        rateLimitConfig && timeline.history.length >= rateLimitConfig.count
       );
 
-      const historySnapshot = [...rule.history];
+      const historySnapshot = [...timeline.history];
 
       if (windowActive) {
-        recordHistory(rule, event.ts);
-        if (normalizedMaxEvents && rule.history.length > normalizedMaxEvents) {
-          rule.history.splice(0, rule.history.length - normalizedMaxEvents);
+        recordTimelineHistory(timeline, event.ts, rule.historyLimit);
+        if (normalizedMaxEvents && timeline.history.length > normalizedMaxEvents) {
+          timeline.history.splice(0, timeline.history.length - normalizedMaxEvents);
         }
         const windowCooldown = rule.rateLimit ? normalizeCooldownMs(rule.rateLimit.cooldownMs) : 0;
-        const history = dedupeAndSortHistory(rule.history);
+        const history = dedupeAndSortHistory(timeline.history);
         hits.push({
           rule,
           type: 'window',
           reason: rule.reason,
           history,
-          windowExpiresAt: rule.suppressedUntil,
+          windowExpiresAt: timeline.suppressedUntil,
           rateLimit: rule.rateLimit,
-          cooldownMs: windowCooldown > 0 ? windowCooldown : undefined
+          cooldownMs: windowCooldown > 0 ? windowCooldown : undefined,
+          channel
         });
         continue;
       }
@@ -259,9 +276,9 @@ class EventBus extends EventEmitter {
       if (normalizedMaxEvents && historySnapshot.length >= normalizedMaxEvents) {
         const windowMs = normalizeWindowMs(rule.suppressForMs);
         const windowExpiresAt =
-          windowMs > 0 ? Math.max(rule.suppressedUntil, event.ts + windowMs) : rule.suppressedUntil;
-        if (windowExpiresAt > 0 && windowExpiresAt > rule.suppressedUntil) {
-          rule.suppressedUntil = windowExpiresAt;
+          windowMs > 0 ? Math.max(timeline.suppressedUntil, event.ts + windowMs) : timeline.suppressedUntil;
+        if (windowExpiresAt > 0 && windowExpiresAt > timeline.suppressedUntil) {
+          timeline.suppressedUntil = windowExpiresAt;
         }
         const historyForMeta = dedupeAndSortHistory(historySnapshot.slice(-normalizedMaxEvents));
         hits.push({
@@ -271,15 +288,16 @@ class EventBus extends EventEmitter {
           history: historyForMeta,
           windowExpiresAt: windowExpiresAt > 0 ? windowExpiresAt : undefined,
           rateLimit: rule.rateLimit,
-          cooldownMs: undefined
+          cooldownMs: undefined,
+          channel
         });
         continue;
       }
 
-      recordHistory(rule, event.ts);
+      recordTimelineHistory(timeline, event.ts, rule.historyLimit);
 
-      if (normalizedMaxEvents && rule.history.length > normalizedMaxEvents) {
-        rule.history.splice(0, rule.history.length - normalizedMaxEvents);
+      if (normalizedMaxEvents && timeline.history.length > normalizedMaxEvents) {
+        timeline.history.splice(0, timeline.history.length - normalizedMaxEvents);
       }
 
       if (rateLimitExceeded && rateLimitConfig) {
@@ -294,9 +312,9 @@ class EventBus extends EventEmitter {
         if (rule.suppressForMs || cooldownMs > 0) {
           const suppressUntil = rule.suppressForMs ? event.ts + rule.suppressForMs : 0;
           const cooldownUntil = cooldownMs > 0 ? event.ts + cooldownMs : 0;
-          windowUntil = Math.max(rule.suppressedUntil, suppressUntil, cooldownUntil);
+          windowUntil = Math.max(timeline.suppressedUntil, suppressUntil, cooldownUntil);
           if (windowUntil > 0) {
-            rule.suppressedUntil = windowUntil;
+            timeline.suppressedUntil = windowUntil;
           }
         }
         hits.push({
@@ -306,7 +324,8 @@ class EventBus extends EventEmitter {
           history: rateLimitHistory,
           windowExpiresAt: windowUntil,
           rateLimit: rateLimitConfig,
-          cooldownMs: cooldownMs > 0 ? cooldownMs : undefined
+          cooldownMs: cooldownMs > 0 ? cooldownMs : undefined,
+          channel
         });
         continue;
       }
@@ -315,7 +334,7 @@ class EventBus extends EventEmitter {
         continue;
       }
 
-      matchedRules.push(rule);
+      matchedRules.push({ rule, channel, timeline });
     }
 
     if (hits.length > 0) {
@@ -366,10 +385,22 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     rateLimit,
     maxEvents,
     reason: rule.reason,
-    suppressedUntil: 0,
-    history: [],
+    timeline: createTimeline(),
+    timelines: new Map<string, SuppressionTimeline>(),
     historyLimit: Math.max(rateLimit?.count ?? 0, maxEvents ?? 0, 10)
   };
+}
+
+function createTimeline(): SuppressionTimeline {
+  return {
+    suppressedUntil: 0,
+    history: []
+  };
+}
+
+function resetTimeline(timeline: SuppressionTimeline) {
+  timeline.suppressedUntil = 0;
+  timeline.history.length = 0;
 }
 
 function asArray<T>(value: T | T[] | undefined): T[] | undefined {
@@ -379,7 +410,11 @@ function asArray<T>(value: T | T[] | undefined): T[] | undefined {
   return Array.isArray(value) ? value : [value];
 }
 
-function ruleMatchesEvent(rule: InternalSuppressionRule, event: EventRecord): boolean {
+function ruleMatchesEvent(
+  rule: InternalSuppressionRule,
+  event: EventRecord,
+  eventChannelsArg?: string[]
+): boolean {
   if (rule.detectors && !rule.detectors.includes(event.detector)) {
     return false;
   }
@@ -393,7 +428,7 @@ function ruleMatchesEvent(rule: InternalSuppressionRule, event: EventRecord): bo
   }
 
   if (rule.channels) {
-    const eventChannels = extractEventChannels(event.meta);
+    const eventChannels = eventChannelsArg ?? extractEventChannels(event.meta);
     if (eventChannels.length === 0) {
       return false;
     }
@@ -406,56 +441,89 @@ function ruleMatchesEvent(rule: InternalSuppressionRule, event: EventRecord): bo
   return true;
 }
 
-function pruneHistory(rule: InternalSuppressionRule, ts: number) {
+function pruneTimeline(rule: InternalSuppressionRule, timeline: SuppressionTimeline, ts: number) {
   const windowMs =
     rule.rateLimit?.perMs ?? (rule.maxEvents && rule.suppressForMs ? rule.suppressForMs : 0);
   if (windowMs && windowMs > 0) {
     const cutoff = ts - windowMs;
     let removeCount = 0;
-    for (const time of rule.history) {
+    for (const time of timeline.history) {
       if (time > cutoff) {
         break;
       }
       removeCount += 1;
     }
     if (removeCount > 0) {
-      rule.history.splice(0, removeCount);
+      timeline.history.splice(0, removeCount);
     }
   }
 
-  if (rule.history.length > 1) {
-    sortHistory(rule.history);
-    dedupeSortedInPlace(rule.history);
+  if (timeline.history.length > 1) {
+    sortHistory(timeline.history);
+    dedupeSortedInPlace(timeline.history);
   }
 
-  if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
-    rule.history.splice(0, rule.history.length - rule.historyLimit);
+  if (rule.historyLimit > 0 && timeline.history.length > rule.historyLimit) {
+    timeline.history.splice(0, timeline.history.length - rule.historyLimit);
   }
 }
 
-function recordHistory(rule: InternalSuppressionRule, ts: number) {
+function recordTimelineHistory(
+  timeline: SuppressionTimeline,
+  ts: number,
+  historyLimit: number
+) {
   if (!Number.isFinite(ts)) {
     return;
   }
-  if (rule.history.length === 0) {
-    rule.history.push(ts);
+  if (timeline.history.length === 0) {
+    timeline.history.push(ts);
   } else {
-    const last = rule.history[rule.history.length - 1];
+    const last = timeline.history[timeline.history.length - 1];
     if (ts >= last) {
       if (ts !== last) {
-        rule.history.push(ts);
+        timeline.history.push(ts);
       }
     } else {
-      rule.history.push(ts);
-      sortHistory(rule.history);
+      timeline.history.push(ts);
+      sortHistory(timeline.history);
     }
-    if (rule.history.length > 1) {
-      dedupeSortedInPlace(rule.history);
+    if (timeline.history.length > 1) {
+      dedupeSortedInPlace(timeline.history);
     }
   }
-  if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
-    rule.history.splice(0, rule.history.length - rule.historyLimit);
+  if (historyLimit > 0 && timeline.history.length > historyLimit) {
+    timeline.history.splice(0, timeline.history.length - historyLimit);
   }
+}
+
+function resolveRuleChannel(rule: InternalSuppressionRule, eventChannels: string[]): string | null {
+  if (rule.channels && rule.channels.length > 0) {
+    for (const channel of eventChannels) {
+      if (rule.channels.includes(channel)) {
+        return channel;
+      }
+    }
+    return rule.channels[0] ?? null;
+  }
+  return eventChannels[0] ?? null;
+}
+
+function getTimelineForRule(
+  rule: InternalSuppressionRule,
+  channel: string | null
+): SuppressionTimeline {
+  const normalized = typeof channel === 'string' ? channel.trim() : '';
+  if (!normalized) {
+    return rule.timeline;
+  }
+  const existing = rule.timelines.get(normalized);
+  if (existing) {
+    return existing;
+  }
+  const created = createTimeline();
+  rule.timelines.set(normalized, created);
+  return created;
 }
 
 function normalizeRateLimit(rateLimit?: RateLimitConfig): RateLimitConfig | undefined {

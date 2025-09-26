@@ -2,9 +2,9 @@
 import process from 'node:process';
 import path from 'node:path';
 import logger from '../src/logger.js';
-import metrics from '../src/metrics/index.js';
-import configManager from '../src/config/index.js';
-import { runRetentionOnce } from '../src/tasks/retention.js';
+import metrics, { type MetricsRegistry } from '../src/metrics/index.js';
+import configManager, { type GuardianConfig } from '../src/config/index.js';
+import { runRetentionOnce, type RetentionTaskOptions } from '../src/tasks/retention.js';
 
 type MaintenanceSummary = {
   removedEvents: number;
@@ -13,10 +13,25 @@ type MaintenanceSummary = {
   warnings: number;
 };
 
-async function main() {
-  logger.info('Guardian maintenance starting');
+export interface MaintenanceRunResult {
+  skipped: boolean;
+  options: RetentionTaskOptions | null;
+  result: Awaited<ReturnType<typeof runRetentionOnce>> | null;
+}
 
-  const config = configManager.getConfig();
+export interface MaintenanceOptions {
+  config?: GuardianConfig;
+  logger?: typeof logger;
+  metrics?: MetricsRegistry;
+}
+
+export async function runMaintenance(overrides: MaintenanceOptions = {}): Promise<MaintenanceRunResult> {
+  const activeLogger = overrides.logger ?? logger;
+  const activeMetrics = overrides.metrics ?? metrics;
+
+  activeLogger.info('Guardian maintenance starting');
+
+  const config = overrides.config ?? configManager.getConfig();
   const module = await import('../src/run-guard.js');
   const buildRetentionOptions = module.buildRetentionOptions as typeof import('../src/run-guard.js')['buildRetentionOptions'];
 
@@ -24,19 +39,19 @@ async function main() {
     retention: config.events?.retention,
     video: config.video,
     person: config.person,
-    logger
+    logger: activeLogger
   });
 
   if (!retentionOptions) {
-    logger.info('Retention maintenance skipped (retention disabled)');
-    return;
+    activeLogger.info('Retention maintenance skipped (retention disabled)');
+    return { skipped: true, options: null, result: null };
   }
 
-  const result = await runRetentionOnce({ ...retentionOptions, metrics });
+  const result = await runRetentionOnce({ ...retentionOptions, metrics: activeMetrics });
 
   if (result.skipped) {
-    logger.info('Retention maintenance skipped (retention disabled)');
-    return;
+    activeLogger.info('Retention maintenance skipped (retention disabled)');
+    return { skipped: true, options: retentionOptions, result };
   }
 
   const totals = normalizeOutcome(result) ?? {
@@ -46,7 +61,7 @@ async function main() {
     warnings: result.warnings.length
   };
 
-  logger.info(
+  activeLogger.info(
     {
       removedEvents: totals.removedEvents,
       archivedSnapshots: totals.archivedSnapshots,
@@ -61,15 +76,21 @@ async function main() {
 
   if (result.warnings.length > 0) {
     for (const warning of result.warnings) {
-      logger.warn({ warning }, 'Retention maintenance warning');
+      activeLogger.warn({ warning }, 'Retention maintenance warning');
     }
   }
 
   if (result.vacuum.ran) {
-    logger.info({ vacuum: result.vacuum }, 'VACUUM completed');
+    activeLogger.info({ vacuum: result.vacuum }, 'VACUUM completed');
   } else {
-    logger.info({ vacuum: result.vacuum }, 'VACUUM skipped');
+    activeLogger.info({ vacuum: result.vacuum }, 'VACUUM skipped');
   }
+
+  return { skipped: false, options: retentionOptions, result };
+}
+
+async function main() {
+  await runMaintenance();
 }
 
 function normalizeOutcome(result: Awaited<ReturnType<typeof runRetentionOnce>>): MaintenanceSummary | null {

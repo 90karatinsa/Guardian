@@ -100,6 +100,13 @@ type SuppressionSnapshot = {
     cooldownRemainingMs?: number | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
+  histogram: {
+    historyCount: HistogramSnapshot;
+    combinedHistoryCount: HistogramSnapshot;
+    cooldownMs: HistogramSnapshot;
+    cooldownRemainingMs: HistogramSnapshot;
+    windowRemainingMs: HistogramSnapshot;
+  };
 };
 
 type SuppressionRuleSnapshot = {
@@ -339,6 +346,11 @@ class MetricsRegistry {
     this.registerReservedHistogram('pipeline.audio.restart.delay', DEFAULT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.audio.restart.attempt', RESTART_ATTEMPT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.audio.restarts', COUNTER_HISTOGRAM);
+    this.registerReservedHistogram('suppression.historyCount', COUNTER_HISTOGRAM);
+    this.registerReservedHistogram('suppression.combinedHistoryCount', COUNTER_HISTOGRAM);
+    this.registerReservedHistogram('suppression.cooldownMs', DEFAULT_HISTOGRAM);
+    this.registerReservedHistogram('suppression.cooldownRemainingMs', DEFAULT_HISTOGRAM);
+    this.registerReservedHistogram('suppression.windowRemainingMs', DEFAULT_HISTOGRAM);
   }
 
   reset() {
@@ -470,12 +482,18 @@ class MetricsRegistry {
     }
     if (typeof normalizedDetail.historyCount === 'number' && Number.isFinite(normalizedDetail.historyCount)) {
       this.suppressionHistoryCount += normalizedDetail.historyCount;
+      this.observeHistogram('suppression.historyCount', normalizedDetail.historyCount, COUNTER_HISTOGRAM);
     }
     if (
       typeof normalizedDetail.combinedHistoryCount === 'number' &&
       Number.isFinite(normalizedDetail.combinedHistoryCount)
     ) {
       this.suppressionCombinedHistoryCount += normalizedDetail.combinedHistoryCount;
+      this.observeHistogram(
+        'suppression.combinedHistoryCount',
+        normalizedDetail.combinedHistoryCount,
+        COUNTER_HISTOGRAM
+      );
     }
     const cooldownValue =
       typeof normalizedDetail.cooldownMs === 'number' && Number.isFinite(normalizedDetail.cooldownMs)
@@ -514,6 +532,15 @@ class MetricsRegistry {
       Number.isFinite(normalizedDetail.cooldownRemainingMs)
         ? Math.max(0, normalizedDetail.cooldownRemainingMs)
         : null;
+    if (typeof cooldownValue === 'number') {
+      this.observeHistogram('suppression.cooldownMs', cooldownValue);
+    }
+    if (typeof windowRemainingValue === 'number') {
+      this.observeHistogram('suppression.windowRemainingMs', windowRemainingValue);
+    }
+    if (typeof cooldownRemainingValue === 'number') {
+      this.observeHistogram('suppression.cooldownRemainingMs', cooldownRemainingValue);
+    }
     this.lastSuppressedEvent = {
       ruleId,
       reason,
@@ -930,6 +957,21 @@ class MetricsRegistry {
               : null
         }
       : null;
+    const logLevelSnapshot = mapLogLevelCounters(this.logLevelCounters);
+    const logHistogramSnapshot = mapLogLevelCounters(this.logLevelHistogram);
+    const suppressionHistogramSnapshot = {
+      historyCount: mapHistogram(this.histograms.get('suppression.historyCount') ?? new Map()),
+      combinedHistoryCount: mapHistogram(
+        this.histograms.get('suppression.combinedHistoryCount') ?? new Map()
+      ),
+      cooldownMs: mapHistogram(this.histograms.get('suppression.cooldownMs') ?? new Map()),
+      cooldownRemainingMs: mapHistogram(
+        this.histograms.get('suppression.cooldownRemainingMs') ?? new Map()
+      ),
+      windowRemainingMs: mapHistogram(
+        this.histograms.get('suppression.windowRemainingMs') ?? new Map()
+      )
+    };
 
     return {
       createdAt: new Date().toISOString(),
@@ -940,11 +982,11 @@ class MetricsRegistry {
         bySeverity: mapFrom(this.severityCounters)
       },
       logs: {
-        byLevel: mapFrom(this.logLevelCounters),
+        byLevel: logLevelSnapshot,
         byDetector: mapFromNested(this.logLevelByDetector),
         lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
         lastErrorMessage: this.lastErrorMessage,
-        histogram: mapFrom(this.logLevelHistogram)
+        histogram: logHistogramSnapshot
       },
       latencies: mapFromLatencies(this.latencyStats),
       histograms: mapFromHistograms(this.histograms),
@@ -1008,7 +1050,8 @@ class MetricsRegistry {
           combinedHistoryCount: this.suppressionCombinedHistoryCount
         },
         lastEvent: lastSuppressedEventSnapshot,
-        rules: mapFromSuppressionRules(this.suppressionRules)
+        rules: mapFromSuppressionRules(this.suppressionRules),
+        histogram: suppressionHistogramSnapshot
       },
       retention: {
         runs: this.retentionRuns,
@@ -1096,6 +1139,23 @@ type DetectorMetricState = {
   latency: DetectorLatencyState | null;
   latencyHistogram: Map<string, number> | null;
 };
+
+function mapLogLevelCounters(source: Map<string, number>): CounterMap {
+  const normalized = new Map<string, number>();
+  for (const [key, value] of source.entries()) {
+    normalized.set(key.toLowerCase(), value);
+  }
+  const result: CounterMap = {};
+  for (const level of PINO_LEVEL_ORDER) {
+    result[level] = normalized.get(level) ?? 0;
+  }
+  for (const [key, value] of normalized.entries()) {
+    if (!(key in result)) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
 
 function mapFrom(source: Map<string, number>): CounterMap {
   return Object.fromEntries(Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b)));

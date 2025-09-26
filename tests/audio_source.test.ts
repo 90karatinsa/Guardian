@@ -131,6 +131,72 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioDeviceFallbackDiscovery preserves discovered device ordering', async () => {
+    vi.useFakeTimers();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const output = `
+[alsa @ 0x7f] ALSA audio devices
+[0] hw:1,0
+[1] plughw:2,0
+`;
+
+    execFileMock.mockImplementation((_command: string, _args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      callback(null, output, '');
+      return child;
+    });
+
+    const encountered: Array<{ format?: string; device?: string }> = [];
+    const seen = new Set<string>();
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      const formatIndex = args.indexOf('-f');
+      const deviceIndex = args.indexOf('-i');
+      const format = formatIndex >= 0 ? args[formatIndex + 1] : undefined;
+      const device = deviceIndex >= 0 ? args[deviceIndex + 1] : undefined;
+      const key = `${format ?? 'none'}|${device ?? ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        encountered.push({ format, device });
+      }
+      const error = new Error('missing') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      throw error;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 50,
+      device: 'default',
+      restartDelayMs: 25,
+      restartMaxDelayMs: 25,
+      restartJitterFactor: 0,
+      random: () => 0.5
+    });
+
+    const recoverSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', () => {});
+    source.start();
+
+    await waitForCondition(() => recoverSpy.mock.calls.length > 0, 1000);
+
+    expect(encountered).toEqual([
+      { format: 'alsa', device: 'default' },
+      { format: 'alsa', device: 'hw:1,0' },
+      { format: 'alsa', device: 'plughw:2,0' },
+      { format: 'alsa', device: 'hw:0' },
+      { format: 'alsa', device: 'plughw:0' }
+    ]);
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+    platformSpy.mockRestore();
+  });
+
   it('AudioPipeMisalignTriggersRecovery restarts pipe streams on misaligned chunks', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -509,7 +575,10 @@ describe('AudioSource resilience', () => {
     const devices = await AudioSource.listDevices('auto');
 
     expect(execFileMock).toHaveBeenCalled();
-    expect(devices).toEqual(['Microphone (USB)', 'Line In (High Definition)']);
+    expect(devices).toEqual([
+      { format: 'dshow', device: 'Microphone (USB)' },
+      { format: 'dshow', device: 'Line In (High Definition)' }
+    ]);
 
     execFileMock.mockClear();
     const cachedDevices = await AudioSource.listDevices('auto');
@@ -544,7 +613,10 @@ describe('AudioSource resilience', () => {
     await Promise.resolve();
     await vi.advanceTimersByTimeAsync(10);
 
-    await expect(promise).resolves.toEqual(['Microphone (USB)', 'Line In (High Definition)']);
+    await expect(promise).resolves.toEqual([
+      { format: 'dshow', device: 'Microphone (USB)' },
+      { format: 'dshow', device: 'Line In (High Definition)' }
+    ]);
     expect(execFileMock).toHaveBeenCalledTimes(2);
     expect(hangingChild.kill).toHaveBeenCalled();
 

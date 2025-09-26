@@ -515,6 +515,11 @@ async function startDaemon(io: CliIo): Promise<number> {
 
 async function stopDaemon(io: CliIo): Promise<number> {
   if ((state.status === 'idle' || state.status === 'stopped') && !state.runtime) {
+    state.lastShutdownAt = null;
+    state.lastShutdownError = null;
+    state.lastShutdownHooks = [];
+    state.lastShutdownReason = null;
+    state.lastShutdownSignal = null;
     io.stdout.write('Guardian daemon is not running\n');
     return 0;
   }

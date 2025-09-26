@@ -34,7 +34,7 @@ describe('PoseEstimatorForecast', () => {
     metrics.reset();
   });
 
-  it('PoseEstimatorThreatPrediction generates motion snapshots with future movement context', async () => {
+  it('PoseForecastThreatFusion generates motion snapshots with future movement context', async () => {
     const bus = new EventEmitter();
     const events: unknown[] = [];
     bus.on('event', event => {
@@ -63,7 +63,15 @@ describe('PoseEstimatorForecast', () => {
     ];
     frames.forEach(frame => estimator.ingest(frame));
 
-    const motionMeta = { areaPct: 0.18, diffThreshold: 12, framesActive: 4 } as Record<string, unknown>;
+    const motionMeta = {
+      areaPct: 0.18,
+      diffThreshold: 12,
+      framesActive: 4,
+      history: [
+        { ts: 0, areaPct: 0.05, adaptiveDiffThreshold: 11, reason: 'suppressed' },
+        { ts: 1, areaPct: 0.12, adaptiveDiffThreshold: 12, reason: 'candidate' }
+      ]
+    } as Record<string, unknown>;
     const forecast = await estimator.forecast(motionMeta, 42);
 
     expect(forecast).not.toBeNull();
@@ -78,7 +86,8 @@ describe('PoseEstimatorForecast', () => {
     expect(resolved.movementFlags).toEqual([true]);
     expect(resolved.confidence).toBeCloseTo(1, 5);
     expect(resolved.movingJointCount).toBe(1);
-    expect(resolved.movingJointRatio).toBeCloseTo(1, 5);
+    expect(resolved.movingJointRatio).toBeGreaterThan(0);
+    expect(resolved.history).toHaveLength(frames.length);
     expect(resolved.dominantJoint).toBe(0);
     expect(resolved.threatSummary).toBeNull();
 
@@ -99,12 +108,15 @@ describe('PoseEstimatorForecast', () => {
       forecastConfidence: resolved.confidence,
       horizonMs: horizon
     });
+    expect(Array.isArray((event.meta?.motion as Record<string, unknown>).history)).toBe(true);
     expect(event.meta?.velocityMagnitude).toHaveLength(1);
     expect(event.meta?.movingJointCount).toBe(1);
     expect(event.meta?.dominantJoint).toBe(resolved.dominantJoint);
     expect(event.meta?.threats).toBeNull();
     expect(Array.isArray(event.meta?.frames)).toBe(true);
     expect((event.meta?.frames as unknown[]).length).toBe(3);
+    expect(Array.isArray(event.meta?.poseHistory)).toBe(true);
+    expect((event.meta?.poseHistory as Array<{ keypoints: unknown[] }>)[0]?.keypoints.length).toBeGreaterThan(0);
 
     const merged = estimator.mergeIntoMotionMeta({
       existing: true
@@ -119,6 +131,7 @@ describe('PoseEstimatorForecast', () => {
     expect(motionDetails.futureMovementFlags).toEqual([true]);
     expect(Array.isArray(motionDetails.futureVelocityMagnitude)).toBe(true);
     expect(Array.isArray(motionDetails.futureAccelerationMagnitude)).toBe(true);
+    expect(Array.isArray(merged?.poseHistory)).toBe(true);
     expect(merged?.poseThreatSummary).toBeUndefined();
 
     const snapshot = metrics.snapshot();

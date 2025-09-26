@@ -87,13 +87,16 @@ describe('AudioAnomalyWindowing', () => {
     expect(eventMeta.triggeredBy).toBe('rms');
     const thresholds = eventMeta.thresholds as Record<string, unknown>;
     expect(thresholds?.profile).toBe('day');
-    expect(Number(thresholds?.rmsWindowMs)).toBeCloseTo(180, 1);
-    expect(Number(thresholds?.minTriggerDurationMs)).toBeCloseTo(120, 1);
+    expect(Number(thresholds?.rmsWindowMs)).toBeCloseTo(192, 5);
+    expect(Number(thresholds?.minTriggerDurationMs)).toBeCloseTo(128, 5);
     const state = eventMeta.state as Record<string, any>;
-    expect(Number(state?.rms?.durationMs ?? 0)).toBeGreaterThanOrEqual(120);
+    expect(Number(state?.rms?.durationMs ?? 0)).toBeGreaterThanOrEqual(
+      Number(thresholds?.minTriggerDurationMs ?? 0)
+    );
     const windowMs = Number(state?.rms?.windowMs ?? 0);
-    expect(windowMs).toBeGreaterThanOrEqual(180);
-    expect(windowMs).toBeLessThanOrEqual(200);
+    const alignedWindow = Number(thresholds?.rmsWindowMs ?? 0);
+    expect(windowMs).toBeCloseTo(alignedWindow, 5);
+    expect(alignedWindow % hopDurationMs).toBeCloseTo(0, 5);
     expect(Number(state?.centroid?.recoveryMs ?? 0)).toBeGreaterThanOrEqual(0);
     const recovery = eventMeta.recoveryMs as Record<string, number>;
     expect(Number(recovery?.rmsMs ?? 0)).toBe(0);
@@ -157,14 +160,16 @@ describe('AudioAnomalyWindowing', () => {
     expect(Number(weights?.day ?? 0)).toBeGreaterThan(0);
     expect(Number(thresholds?.rms)).toBeGreaterThan(0.12);
     expect(Number(thresholds?.rms)).toBeLessThan(0.6);
-    expect(Number(thresholds?.rmsWindowMs)).toBeGreaterThan(200);
-    expect(Number(thresholds?.rmsWindowMs)).toBeLessThan(320);
+    const blendedWindow = Number(thresholds?.rmsWindowMs ?? 0);
+    expect(blendedWindow).toBeGreaterThan(200);
+    expect(blendedWindow).toBeLessThan(320);
+    expect(blendedWindow % hopDurationMs).toBeCloseTo(0, 5);
     const recovery = meta.recoveryMs as Record<string, number>;
     expect(Number(recovery?.rmsMs ?? 0)).toBeGreaterThanOrEqual(0);
     expect(Number(recovery?.centroidMs ?? 0)).toBeGreaterThan(0);
     const state = meta.state as Record<string, any>;
     expect(Number(state?.rms?.recoveryMs ?? 0)).toBeGreaterThanOrEqual(0);
-    expect(Number(state?.rms?.windowMs ?? 0)).toBeGreaterThan(200);
+    expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(blendedWindow, 5);
   });
 
   it('AudioAnomalyHotReload resets buffers and applies new window lengths', () => {
@@ -224,10 +229,10 @@ describe('AudioAnomalyWindowing', () => {
     expect(events.length).toBe(1);
     const meta = events[0].meta as Record<string, any>;
     expect(meta.thresholds?.profile).toBe('night');
-    expect(Number(meta.thresholds?.rmsWindowMs)).toBeCloseTo(520, 1);
+    expect(Number(meta.thresholds?.rmsWindowMs)).toBeCloseTo(512, 5);
     expect(Number(meta.durationAboveThresholdMs)).toBeGreaterThanOrEqual(320);
     const state = meta.state as Record<string, any>;
-    expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(520, 1);
+    expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(512, 5);
     const accumulation = meta.accumulationMs as Record<string, number>;
     expect(Number(accumulation?.rmsMs ?? 0)).toBeGreaterThanOrEqual(320);
   });

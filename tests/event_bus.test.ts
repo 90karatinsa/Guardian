@@ -130,6 +130,53 @@ describe('EventSuppressionRateLimit', () => {
     expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(400);
   });
 
+  it('EventSuppressionRateLimitWindow isolates cooldown per channel', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'per-channel',
+        detector: 'test-detector',
+        rateLimit: { count: 2, perMs: 1000, cooldownMs: 800 },
+        suppressForMs: 600,
+        reason: 'per-channel limit'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 100, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(false);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 250, meta: { channel: 'cam:b' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 700, meta: { channel: 'cam:a' } })).toBe(false);
+
+    const suppressionCalls = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressionCalls).toHaveLength(2);
+    const firstSuppression = suppressionCalls[0];
+    const secondSuppression = suppressionCalls[1];
+    expect(firstSuppression.suppressionChannel).toBe('cam:a');
+    expect(firstSuppression.suppressedBy?.[0]?.channel).toBe('cam:a');
+    expect(Number(firstSuppression.cooldownRemainingMs ?? 0)).toBeLessThanOrEqual(800);
+    expect(secondSuppression.suppressionChannel).toBe('cam:a');
+    expect(secondSuppression.suppressedBy?.[0]?.channel).toBe('cam:a');
+    expect(Number(secondSuppression.cooldownRemainingMs ?? 0)).toBeLessThanOrEqual(800);
+    expect(Number(secondSuppression.cooldownRemainingMs ?? 0)).toBeLessThan(
+      Number(firstSuppression.cooldownRemainingMs ?? Infinity)
+    );
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.lastEvent?.channel).toBe('cam:a');
+    expect(Number(snapshot.suppression.lastEvent?.cooldownRemainingMs ?? 0)).toBeLessThanOrEqual(800);
+    expect(Number(snapshot.suppression.lastEvent?.cooldownRemainingMs ?? 0)).toBeGreaterThanOrEqual(0);
+  });
+
   it('EventSuppressionMaxEvents enforces burst limits with history metadata', () => {
     bus.configureSuppression([
       {

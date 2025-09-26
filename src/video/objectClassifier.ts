@@ -105,6 +105,7 @@ export class ObjectClassifier {
     const objects: ClassifiedObject[] = [];
 
     for (let index = 0; index < detections.length; index += 1) {
+      const detection = detections[index];
       const start = index * labelCount;
       const end = start + labelCount;
       const logits = scores.slice(start, end);
@@ -124,7 +125,13 @@ export class ObjectClassifier {
       }
 
       const label = labels[bestIndex] ?? `class-${bestIndex}`;
-      const threatScore = this.computeThreatScore(label, probabilityMap);
+      const detectionConfidence = clamp(
+        Math.max(0, Math.min(1, detection.score), Math.min(1, detection.objectness ?? 0), Math.min(1, detection.classProbability)),
+        0,
+        1
+      );
+      const threatProbability = this.resolveThreatProbability(label, probabilityMap);
+      const threatScore = clamp(threatProbability * detectionConfidence, 0, 1);
       const isThreat = threatScore >= this.threatThreshold;
 
       objects.push({
@@ -146,19 +153,20 @@ export class ObjectClassifier {
     return objects;
   }
 
-  private computeThreatScore(label: string, probabilities: Record<string, number>) {
+  private resolveThreatProbability(label: string, probabilities: Record<string, number>) {
+    let maxThreat = 0;
     if (this.threatLabels.has(label)) {
-      return probabilities[label] ?? 0;
+      maxThreat = Math.max(maxThreat, probabilities[label] ?? 0);
     }
 
-    let maxThreat = 0;
     for (const threat of this.threatLabels) {
       const score = probabilities[threat];
       if (typeof score === 'number' && score > maxThreat) {
         maxThreat = score;
       }
     }
-    return maxThreat;
+
+    return clamp(maxThreat, 0, 1);
   }
 
   private async ensureSession() {
@@ -208,6 +216,13 @@ function softmax(values: number[]): number[] {
     return values.map(() => 0);
   }
   return expValues.map(value => value / sum);
+}
+
+function clamp(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, value));
 }
 
 function createMockSession(labelCount: number): InferenceSessionLike {

@@ -35,6 +35,7 @@ export type YoloDetection = {
   classProbability: number;
   areaRatio: number;
   combinedLogit: number;
+  appliedThreshold: number;
   projectionIndex?: number;
   normalizedProjection?: boolean;
 };
@@ -153,6 +154,7 @@ export function parseYoloDetections(
         classProbability,
         areaRatio,
         combinedLogit,
+        appliedThreshold: threshold,
         projectionIndex: projected.projectionIndex,
         normalizedProjection: projected.normalized
       });

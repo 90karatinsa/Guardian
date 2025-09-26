@@ -16,6 +16,8 @@ type StubFace = {
 };
 
 class StubFaceRegistry {
+  private identifyHandler: ((buffer: Buffer, threshold: number) => Promise<any> | any) | null = null;
+
   constructor(private readonly faces: StubFace[]) {}
 
   list() {
@@ -35,8 +37,15 @@ class StubFaceRegistry {
     return { ...record };
   }
 
-  async identify() {
-    return { embedding: [], match: null };
+  setIdentifyHandler(handler: (buffer: Buffer, threshold: number) => Promise<any> | any) {
+    this.identifyHandler = handler;
+  }
+
+  async identify(buffer: Buffer, threshold: number) {
+    if (this.identifyHandler) {
+      return await this.identifyHandler(buffer, threshold);
+    }
+    return { embedding: [], match: null, threshold: Math.max(0, threshold), distance: null, unknown: true };
   }
 
   remove(id: number) {
@@ -330,6 +339,7 @@ describe('RestApiEvents', () => {
     const metricsDigest = metricsEvents[0] as { pipelines?: { ffmpeg?: { channels?: unknown[] } } };
     expect(Array.isArray(metricsDigest.pipelines?.ffmpeg?.channels)).toBe(true);
     expect(facesPayload?.faces?.length).toBe(2);
+    expect(facesPayload?.threshold).toBeCloseTo(0.5, 5);
     expect(
       Array.isArray(facesPayload?.faces) &&
         facesPayload.faces.every((face: { metadata?: { channel?: string } }) =>
@@ -463,6 +473,67 @@ describe('RestApiEvents', () => {
     expect(facesPayload.count).toBe(1);
     expect(facesPayload.query).toBe('Lobby');
     expect(facesPayload.faces[0]?.label).toBe('Lobby Guard');
+    expect((facesPayload as any).threshold).toBeCloseTo(0.5, 5);
+  });
+
+  it('FaceRegistryRestIntegration returns thresholds and unknown flags', async () => {
+    const faces: StubFace[] = [
+      { id: 1, label: 'Guard', createdAt: Date.now(), metadata: { camera: 'video:lobby' }, embedding: [] }
+    ];
+
+    const stubRegistry = new StubFaceRegistry(faces);
+    const identifyMock = vi.fn((_: Buffer, threshold: number) => {
+      const normalized = Math.max(0, threshold);
+      if (normalized <= 0.2) {
+        return {
+          embedding: [0.1, 0.2],
+          match: { face: faces[0], distance: 0.12 },
+          threshold: normalized,
+          distance: 0.12,
+          unknown: false
+        };
+      }
+      return {
+        embedding: [0.3, 0.4],
+        match: null,
+        threshold: normalized,
+        distance: null,
+        unknown: true
+      };
+    });
+    stubRegistry.setIdentifyHandler(identifyMock);
+
+    const { port } = await ensureServer({ faceRegistry: stubRegistry as any });
+
+    const facesResponse = await fetch(`http://localhost:${port}/api/faces`);
+    expect(facesResponse.status).toBe(200);
+    const facesPayload = await facesResponse.json();
+    expect(facesPayload.threshold).toBeCloseTo(0.5, 5);
+    expect(facesPayload.faces).toHaveLength(1);
+
+    const image = Buffer.from([1, 2, 3, 4]).toString('base64');
+    const identifyResponse = await fetch(`http://localhost:${port}/api/faces/identify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image, threshold: 0.1 })
+    });
+    expect(identifyResponse.status).toBe(200);
+    const identifyPayload = await identifyResponse.json();
+    expect(identifyPayload.threshold).toBeCloseTo(0.1, 5);
+    expect(identifyPayload.unknown).toBe(false);
+    expect(identifyPayload.distance).toBeCloseTo(0.12, 5);
+    expect(identifyPayload.match.face.label).toBe('Guard');
+
+    const unknownResponse = await fetch(`http://localhost:${port}/api/faces/identify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image, threshold: 0.4 })
+    });
+    expect(unknownResponse.status).toBe(200);
+    const unknownPayload = await unknownResponse.json();
+    expect(unknownPayload.unknown).toBe(true);
+    expect(unknownPayload.match).toBeNull();
+    expect(identifyMock).toHaveBeenCalledTimes(2);
   });
 
   it('DashboardChannelFilter updates widget counts on SSE events', async () => {

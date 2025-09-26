@@ -786,6 +786,23 @@ const RTSP_TIMEOUT_PATTERNS = [
   /Read\s+timeout\s+after\s+[0-9]+\s+ms/i
 ];
 
+const RTSP_AUTH_PATTERNS = [
+  /method\s+DESCRIBE\s+failed:.*401/i,
+  /RTSP\/1\.0\s+401\s+unauthorized/i,
+  /401\s+unauthorized/i,
+  /authorization\s+failed/i,
+  /authentication\s+failed/i,
+  /unauthorized\s+access/i
+];
+
+const RTSP_CONNECTION_PATTERNS = [
+  /connection\s+refused/i,
+  /connection\s+reset/i,
+  /no\s+route\s+to\s+host/i,
+  /network\s+is\s+unreachable/i,
+  /unable\s+to\s+connect/i
+];
+
 function classifyFfmpegStderr(message: string): FfmpegClassification | null {
   if (!message) {
     return null;
@@ -796,6 +813,26 @@ function classifyFfmpegStderr(message: string): FfmpegClassification | null {
       return {
         reason: 'rtsp-timeout',
         errorCode: 'rtsp-timeout',
+        breakAfter: true
+      };
+    }
+  }
+
+  for (const pattern of RTSP_AUTH_PATTERNS) {
+    if (pattern.test(message)) {
+      return {
+        reason: 'rtsp-auth-failure',
+        errorCode: 'rtsp-auth-failure',
+        breakAfter: true
+      };
+    }
+  }
+
+  for (const pattern of RTSP_CONNECTION_PATTERNS) {
+    if (pattern.test(message)) {
+      return {
+        reason: 'rtsp-connection-failure',
+        errorCode: 'rtsp-connection-failure',
         breakAfter: true
       };
     }

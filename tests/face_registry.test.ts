@@ -65,12 +65,18 @@ describe('FaceRegistryEnrollment', () => {
     const match = await registry.identify(faceImageA, 0.25);
     expect(match.match?.face.label).toBe('Alice');
     expect(match.match?.distance).toBeLessThan(0.25);
+    expect(match.threshold).toBeCloseTo(0.25, 5);
+    expect(match.unknown).toBe(false);
+    expect(match.distance).toBeLessThan(0.25);
 
     runMock.mockResolvedValueOnce({
       embedding: new ort.Tensor('float32', new Float32Array([0.1, 0.8, 0.1, 0.5]), [1, 4])
     });
     const miss = await registry.identify(faceImageA, 0.15);
     expect(miss.match).toBeNull();
+    expect(miss.threshold).toBeCloseTo(0.15, 5);
+    expect(miss.unknown).toBe(true);
+    expect(miss.distance).toBeNull();
 
     const removed = registry.remove(alice.id);
     expect(removed).toBe(true);

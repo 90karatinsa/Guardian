@@ -119,6 +119,7 @@ describe('MotionDetector', () => {
 
     const snapshot = metrics.snapshot();
     expect(snapshot.detectors.motion?.counters?.suppressedFrames).toBeGreaterThan(0);
+    expect(snapshot.detectors.motion?.counters?.backoffActivations ?? 0).toBeGreaterThan(0);
     expect(
       snapshot.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0
     ).toBeGreaterThanOrEqual(meta.suppressedFramesBeforeTrigger ?? 0);

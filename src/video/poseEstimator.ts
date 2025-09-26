@@ -33,6 +33,7 @@ export type PoseForecast = {
   movingJointRatio?: number;
   dominantJoint?: number | null;
   threatSummary?: ThreatSummary | null;
+  history: PoseFrame[];
 };
 
 export interface PoseEstimatorOptions {
@@ -125,7 +126,8 @@ export class PoseEstimator {
         horizonMs: this.options.forecastHorizonMs ?? DEFAULT_HORIZON_MS,
         minMovement: this.options.minMovement ?? DEFAULT_MIN_MOVEMENT,
         previous: this.lastForecast,
-        smoothingFactor
+        smoothingFactor,
+        historyFrames: history
       });
       const threatSummary = summarizeThreatMetadata(motionMeta);
       const enrichedForecast = enrichForecast(forecast, threatSummary);
@@ -167,7 +169,16 @@ export class PoseEstimator {
           dominantJoint: enrichedForecast.dominantJoint,
           motion: combinedMotion,
           threats: threatSummary,
-          frames: history.map(frame => ({ ts: frame.ts, keypoints: frame.keypoints.length }))
+          frames: history.map(frame => ({ ts: frame.ts, keypoints: frame.keypoints.length })),
+          poseHistory: enrichedForecast.history.map(frame => ({
+            ts: frame.ts,
+            keypoints: frame.keypoints.map(point => ({
+              x: roundFloat(point.x),
+              y: roundFloat(point.y),
+              z: typeof point.z === 'number' ? roundFloat(point.z) : undefined,
+              confidence: typeof point.confidence === 'number' ? roundFloat(point.confidence) : undefined
+            }))
+          }))
         }
       };
 
@@ -194,6 +205,12 @@ export class PoseEstimator {
       base.motion = { ...motionMeta, ...this.lastMotionSnapshot };
     }
     base.poseForecast = { ...this.lastForecast };
+    if (this.lastForecast?.history) {
+      base.poseHistory = this.lastForecast.history.map(frame => ({
+        ts: frame.ts,
+        keypoints: frame.keypoints.map(point => ({ ...point }))
+      }));
+    }
     if (this.lastThreatSummary) {
       base.poseThreatSummary = this.lastThreatSummary;
     }
@@ -241,9 +258,20 @@ function buildPoseTensor(history: PoseFrame[]) {
 
 function interpretForecast(
   output: ort.OnnxValue,
-  options: { horizonMs: number; minMovement: number; previous?: PoseForecast | null; smoothingFactor?: number }
+  options: {
+    horizonMs: number;
+    minMovement: number;
+    previous?: PoseForecast | null;
+    smoothingFactor?: number;
+    historyFrames?: PoseFrame[];
+  }
 ): PoseForecast {
   const data = output.data as Float32Array | number[] | undefined;
+  const historyFrames = Array.isArray(options.historyFrames) ? options.historyFrames : [];
+  const history = historyFrames.map(frame => ({
+    ts: frame.ts,
+    keypoints: frame.keypoints.map(point => ({ ...point }))
+  }));
   if (!data || data.length === 0) {
     return {
       horizonMs: options.horizonMs,
@@ -254,7 +282,8 @@ function interpretForecast(
       smoothedVelocity: [],
       smoothedAcceleration: [],
       movementFlags: [],
-      confidence: 0
+      confidence: 0,
+      history
     };
   }
 
@@ -300,7 +329,8 @@ function interpretForecast(
     confidence,
     movingJointCount,
     movingJointRatio,
-    dominantJoint
+    dominantJoint,
+    history
   };
 }
 

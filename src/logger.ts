@@ -37,6 +37,10 @@ function extractContext(args: unknown[]): LogContext {
         if (context && typeof context.detector === 'string' && context.detector.length > 0) {
           detector = context.detector;
         }
+        const event = candidate.event as Record<string, unknown> | undefined;
+        if (event && typeof event.detector === 'string' && event.detector.length > 0) {
+          detector = event.detector;
+        }
       }
       if (typeof candidate.message === 'string' && candidate.message.length > 0 && !message) {
         message = candidate.message;

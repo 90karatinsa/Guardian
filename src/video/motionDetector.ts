@@ -26,6 +26,22 @@ export interface MotionDetectorOptions {
   idleRebaselineMs?: number;
 }
 
+type MotionHistoryEntry = {
+  ts: number;
+  areaPct: number;
+  areaBaseline: number;
+  adaptiveAreaThreshold: number;
+  adaptiveDiffThreshold: number;
+  noiseLevel: number;
+  noiseRatio: number;
+  suppressed: boolean;
+  backoff: boolean;
+  triggered: boolean;
+  pendingBeforeTrigger: number;
+  denoiseStrategy: string;
+  reason: string;
+};
+
 const DEFAULT_DIFF_THRESHOLD = 25;
 const DEFAULT_AREA_THRESHOLD = 0.02;
 const DEFAULT_MIN_INTERVAL_MS = 2000;
@@ -37,6 +53,7 @@ const DEFAULT_AREA_SMOOTHING = 0.2;
 const DEFAULT_AREA_INFLATION = 1.5;
 const DEFAULT_AREA_DELTA_THRESHOLD = 0.02;
 const DEFAULT_IDLE_REBASELINE_MS = 30_000;
+const MAX_HISTORY_SIZE = 120;
 
 export class MotionDetector {
   private previousFrame: GrayscaleFrame | null = null;
@@ -51,6 +68,7 @@ export class MotionDetector {
   private pendingSuppressedFramesBeforeTrigger = 0;
   private lastFrameTs: number | null = null;
   private lastDenoiseStrategy = 'gaussian-median';
+  private readonly motionHistory: MotionHistoryEntry[] = [];
 
   constructor(
     private options: MotionDetectorOptions,
@@ -279,6 +297,22 @@ export class MotionDetector {
       this.areaBaseline = nextBaseline;
       this.baselineFrame = smoothed;
 
+      const historyEntry: MotionHistoryEntry = {
+        ts,
+        areaPct,
+        areaBaseline: this.areaBaseline,
+        adaptiveAreaThreshold,
+        adaptiveDiffThreshold,
+        noiseLevel: this.noiseLevel,
+        noiseRatio,
+        suppressed: !hasSignificantArea,
+        backoff: false,
+        triggered: false,
+        pendingBeforeTrigger: this.pendingSuppressedFramesBeforeTrigger,
+        denoiseStrategy,
+        reason: hasSignificantArea ? 'candidate' : 'suppressed'
+      };
+
       if (!hasSignificantArea) {
         this.activationFrames = 0;
         if (this.backoffFrames > 0) {
@@ -286,6 +320,10 @@ export class MotionDetector {
         }
         this.suppressedFrames += 1;
         metrics.incrementDetectorCounter('motion', 'suppressedFrames', 1);
+        historyEntry.suppressed = true;
+        historyEntry.reason = 'insufficient-area';
+        historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+        this.recordHistory(historyEntry);
         return;
       }
 
@@ -298,24 +336,39 @@ export class MotionDetector {
           'suppressedFramesBeforeTrigger',
           suppressedFramesSnapshot
         );
+        historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
       }
 
       if (this.backoffFrames > 0) {
         metrics.incrementDetectorCounter('motion', 'backoffSuppressedFrames', 1);
         this.backoffFrames -= 1;
         this.activationFrames = 0;
+        historyEntry.backoff = true;
+        historyEntry.suppressed = true;
+        historyEntry.reason = 'backoff';
+        historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+        this.recordHistory(historyEntry);
         return;
       }
 
       this.activationFrames += 1;
       if (this.activationFrames < effectiveDebounceFrames) {
+        historyEntry.suppressed = true;
+        historyEntry.reason = 'debouncing';
+        historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+        this.recordHistory(historyEntry);
         return;
       }
 
       this.activationFrames = 0;
 
       if (ts - this.lastEventTs < (this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS)) {
+        const cooldownPending = this.pendingSuppressedFramesBeforeTrigger;
         this.pendingSuppressedFramesBeforeTrigger = 0;
+        historyEntry.suppressed = true;
+        historyEntry.reason = 'cooldown';
+        historyEntry.pendingBeforeTrigger = cooldownPending;
+        this.recordHistory(historyEntry);
         return;
       }
 
@@ -325,6 +378,20 @@ export class MotionDetector {
 
       const suppressedFramesBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
       this.pendingSuppressedFramesBeforeTrigger = 0;
+
+      historyEntry.triggered = true;
+      historyEntry.suppressed = false;
+      historyEntry.reason = 'trigger';
+      historyEntry.pendingBeforeTrigger = suppressedFramesBeforeTrigger;
+      this.recordHistory(historyEntry);
+
+      const historySnapshot = this.getHistorySnapshot(
+        Math.max(10, effectiveDebounceFrames + effectiveBackoffFrames)
+      );
+      const historyWindowMs =
+        historySnapshot.length > 1
+          ? historySnapshot[historySnapshot.length - 1]!.ts - historySnapshot[0]!.ts
+          : 0;
 
       const payload: EventPayload = {
         ts,
@@ -356,7 +423,9 @@ export class MotionDetector {
           debounceMultiplier,
           backoffMultiplier,
           suppressedFramesBeforeTrigger,
-          denoiseStrategy
+          denoiseStrategy,
+          history: historySnapshot,
+          historyWindowMs
         }
       };
 
@@ -374,6 +443,7 @@ export class MotionDetector {
       this.previousFrame = null;
       this.baselineFrame = null;
       this.lastFrameTs = null;
+      this.motionHistory.length = 0;
     }
 
     this.areaBaseline = 0;
@@ -386,6 +456,19 @@ export class MotionDetector {
       this.pendingSuppressedFramesBeforeTrigger = 0;
     }
     this.lastDenoiseStrategy = 'gaussian-median';
+  }
+
+  private recordHistory(entry: MotionHistoryEntry) {
+    this.motionHistory.push(entry);
+    if (this.motionHistory.length > MAX_HISTORY_SIZE) {
+      this.motionHistory.splice(0, this.motionHistory.length - MAX_HISTORY_SIZE);
+    }
+  }
+
+  private getHistorySnapshot(limit: number) {
+    const count = Math.max(1, Math.min(limit, MAX_HISTORY_SIZE));
+    const entries = this.motionHistory.slice(-count);
+    return entries.map(entry => ({ ...entry }));
   }
 }
 
