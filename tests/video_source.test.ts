@@ -307,6 +307,61 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoFfmpegAuthRetry classifies auth failures and records restart metrics', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const commands: FakeCommand[] = [];
+    const recoverReasons: string[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:test',
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      random: () => 0.5,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverReasons.push(event.reason);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    try {
+      await waitFor(() => commands.length === 1, 200);
+      const first = commands[0];
+      first.emit('start');
+      first.emit('stderr', 'method DESCRIBE failed: 401 Unauthorized');
+      await Promise.resolve();
+
+      expect(recoverReasons).toContain('rtsp-auth-failure');
+      expect(first.killedSignals).toContain('SIGTERM');
+
+      first.emitClose(1);
+      await vi.runOnlyPendingTimersAsync();
+      await waitFor(() => commands.length >= 2, 500);
+    } finally {
+      source.stop();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(
+      recoverReasons.filter(reason => reason === 'rtsp-auth-failure').length
+    ).toBeGreaterThanOrEqual(1);
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:test'].byReason['rtsp-auth-failure']).toBe(1);
+  });
+
   it('VideoFfmpegIdleTimeout restarts idle streams with metrics reason tracking', async () => {
     vi.useFakeTimers();
 

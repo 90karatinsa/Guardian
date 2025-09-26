@@ -477,7 +477,7 @@ describe('ConfigHotReload', () => {
     }
   });
 
-  it('ConfigHotReloadCameraValidation enforces channel and threshold constraints with rollback', async () => {
+  it('ConfigHotReloadValidation enforces channel and threshold constraints with rollback', async () => {
     const baseConfig = createConfig({ diffThreshold: 28 });
     baseConfig.video.channels = { 'video:cam-1': {} };
     fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));

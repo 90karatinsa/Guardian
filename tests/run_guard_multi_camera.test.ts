@@ -153,7 +153,7 @@ describe('run-guard multi camera orchestration', () => {
     retentionMock.stop.mockReset();
   });
 
-  it('RunGuardMultiCameraThresholds applies camera overrides and logs startup state', async () => {
+  it('RunGuardRtspPerChannelConfig applies layered ffmpeg watchdog settings per camera', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 
     const bus = new EventEmitter();
@@ -170,7 +170,29 @@ describe('run-guard multi camera orchestration', () => {
         video: {
           framesPerSecond: 2,
           ffmpeg: {
-            inputArgs: ['-re']
+            inputArgs: ['-re'],
+            startTimeoutMs: 4100,
+            idleTimeoutMs: 6500,
+            watchdogTimeoutMs: 9000,
+            restartDelayMs: 225,
+            restartMaxDelayMs: 3200,
+            restartJitterFactor: 0.2,
+            forceKillTimeoutMs: 3600
+          },
+          channels: {
+            'video:cam-1': {
+              ffmpeg: {
+                idleTimeoutMs: 7800,
+                watchdogTimeoutMs: 12500,
+                restartDelayMs: 330
+              }
+            },
+            'video:cam-2': {
+              ffmpeg: {
+                startTimeoutMs: 4800,
+                restartMaxDelayMs: 4500
+              }
+            }
           },
           cameras: [
             {
@@ -180,7 +202,9 @@ describe('run-guard multi camera orchestration', () => {
               framesPerSecond: 5,
               ffmpeg: {
                 rtspTransport: 'tcp',
-                inputArgs: ['-stimeout', '5000000']
+                inputArgs: ['-stimeout', '5000000'],
+                watchdogTimeoutMs: 15000,
+                restartMaxDelayMs: 6400
               },
               person: {
                 score: 0.6,
@@ -196,6 +220,12 @@ describe('run-guard multi camera orchestration', () => {
               id: 'cam-2',
               channel: 'video:cam-2',
               input: 'http://camera-2/playlist.m3u8',
+              ffmpeg: {
+                inputArgs: ['-re'],
+                idleTimeoutMs: 7200,
+                watchdogTimeoutMs: 11200,
+                restartDelayMs: 400
+              },
               person: {
                 score: 0.7,
                 checkEveryNFrames: 1,
@@ -263,16 +293,37 @@ describe('run-guard multi camera orchestration', () => {
     expect(MockVideoSource.instances).toHaveLength(2);
     const [rtspSource, httpSource] = MockVideoSource.instances;
     expect(rtspSource.options).toMatchObject({
+      channel: 'video:cam-1',
       file: 'rtsp://camera-1/stream',
       framesPerSecond: 5,
       rtspTransport: 'tcp',
-      inputArgs: ['-stimeout', '5000000']
+      inputArgs: ['-stimeout', '5000000'],
+      startTimeoutMs: 4100,
+      idleTimeoutMs: 7800,
+      watchdogTimeoutMs: 15000,
+      restartDelayMs: 330,
+      restartMaxDelayMs: 6400,
+      restartJitterFactor: 0.2,
+      forceKillTimeoutMs: 3600
     });
     expect(httpSource.options).toMatchObject({
+      channel: 'video:cam-2',
       file: 'http://camera-2/playlist.m3u8',
       framesPerSecond: 2,
-      inputArgs: ['-re']
+      inputArgs: ['-re'],
+      startTimeoutMs: 4800,
+      idleTimeoutMs: 7200,
+      watchdogTimeoutMs: 11200,
+      restartDelayMs: 400,
+      restartMaxDelayMs: 4500,
+      restartJitterFactor: 0.2,
+      forceKillTimeoutMs: 3600
     });
+
+    expect(MockVideoSource.instances.map(instance => instance.options.channel)).toEqual([
+      'video:cam-1',
+      'video:cam-2'
+    ]);
 
     expect(MockMotionDetector.instances).toHaveLength(2);
     expect(MockMotionDetector.instances[0].options).toMatchObject({

@@ -250,7 +250,9 @@ describe('MetricsSnapshotEnrichment', () => {
       historyCount: 2,
       combinedHistoryCount: 5,
       rateLimit: { count: 4, perMs: 1000 },
-      cooldownMs: 900
+      cooldownMs: 900,
+      cooldownRemainingMs: 450,
+      windowRemainingMs: 600
     });
     metrics.recordSuppressedEvent({
       ruleId: 'window-1',
@@ -261,8 +263,11 @@ describe('MetricsSnapshotEnrichment', () => {
     });
 
     const snapshot = metrics.snapshot();
+    expect(snapshot.logs.byLevel.info).toBe(1);
+    expect(snapshot.logs.byLevel.error).toBe(1);
     expect(snapshot.logs.histogram.info).toBe(1);
     expect(snapshot.logs.histogram.error).toBe(1);
+    expect(snapshot.logs.histogram.warn).toBe(0);
     expect(snapshot.suppression.byType.window).toBe(2);
     expect(snapshot.suppression.byType['rate-limit']).toBe(1);
     expect(snapshot.suppression.historyTotals.historyCount).toBe(9);
@@ -272,6 +277,12 @@ describe('MetricsSnapshotEnrichment', () => {
     expect(snapshot.suppression.rules['rate-1'].history.lastCooldownMs).toBe(900);
     expect(snapshot.suppression.lastEvent?.ruleId).toBe('window-1');
     expect(snapshot.suppression.lastEvent?.cooldownMs).toBeNull();
+    expect(snapshot.suppression.histogram.historyCount['2-5']).toBe(3);
+    expect(snapshot.suppression.histogram.combinedHistoryCount['2-5']).toBe(1);
+    expect(snapshot.suppression.histogram.combinedHistoryCount['5-10']).toBe(1);
+    expect(snapshot.suppression.histogram.cooldownMs['500-1000']).toBe(1);
+    expect(snapshot.suppression.histogram.cooldownRemainingMs['250-500']).toBe(1);
+    expect(snapshot.suppression.histogram.windowRemainingMs['500-1000']).toBe(1);
 
     const unregister = registerHealthIndicator('metrics-snapshot', context => {
       expect(context.metrics?.suppression.total).toBe(3);

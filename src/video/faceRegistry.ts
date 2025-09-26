@@ -27,6 +27,9 @@ const DEFAULT_EMBEDDING_SIZE = 128;
 export interface IdentifyResult {
   embedding: number[];
   match: FaceMatchResult | null;
+  threshold: number;
+  distance: number | null;
+  unknown: boolean;
 }
 
 export class FaceRegistry {
@@ -62,13 +65,20 @@ export class FaceRegistry {
       metrics.recordDetectorError('face', 'empty-embedding');
     }
     const normalized = normalizeVector(embedding, this.embeddingSize);
-    const match = findNearestFace(normalized, threshold);
+    const normalizedThreshold = normalizeThreshold(threshold);
+    const match = findNearestFace(normalized, normalizedThreshold);
     if (match) {
       metrics.incrementDetectorCounter('face', 'matches');
     } else {
       metrics.incrementDetectorCounter('face', 'misses');
     }
-    return { embedding: normalized, match };
+    return {
+      embedding: normalized,
+      match,
+      threshold: normalizedThreshold,
+      distance: match?.distance ?? null,
+      unknown: !match
+    };
   }
 
   list(): FaceRecord[] {
@@ -177,6 +187,13 @@ function normalizeVector(values: number[], size: number) {
   }
 
   return values.map(value => value / length);
+}
+
+function normalizeThreshold(value: number) {
+  if (!Number.isFinite(value)) {
+    return 0.5;
+  }
+  return Math.max(0, value);
 }
 
 function createMockSession(embeddingSize: number): InferenceSessionLike {

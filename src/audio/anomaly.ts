@@ -576,13 +576,20 @@ export class AudioAnomalyDetector {
   private applyThresholdProfile(resolved: ResolvedThresholds): ResolvedThresholds {
     const previous = this.currentThresholds;
     if (!previous) {
-      const applied = { ...resolved } as ResolvedThresholds;
-      this.currentThresholds = applied;
-      this.rmsWindowFrames = Math.max(1, Math.round(applied.rmsWindowMs / this.hopDurationMs));
-      this.centroidWindowFrames = Math.max(
+      const rmsFrames = Math.max(1, Math.round(resolved.rmsWindowMs / this.hopDurationMs));
+      const centroidFrames = Math.max(
         1,
-        Math.round(applied.centroidWindowMs / this.hopDurationMs)
+        Math.round(resolved.centroidWindowMs / this.hopDurationMs)
       );
+      const applied = {
+        ...resolved,
+        rmsWindowMs: rmsFrames * this.hopDurationMs,
+        centroidWindowMs: centroidFrames * this.hopDurationMs,
+        minTriggerDurationMs: alignDuration(resolved.minTriggerDurationMs, this.hopDurationMs)
+      } as ResolvedThresholds;
+      this.currentThresholds = applied;
+      this.rmsWindowFrames = rmsFrames;
+      this.centroidWindowFrames = centroidFrames;
       return applied;
     }
 
@@ -606,7 +613,12 @@ export class AudioAnomalyDetector {
         this.resetWindows();
       }
     }
-    const applied = { ...resolved } as ResolvedThresholds;
+    const applied = {
+      ...resolved,
+      rmsWindowMs: rmsWindowFrames * this.hopDurationMs,
+      centroidWindowMs: centroidWindowFrames * this.hopDurationMs,
+      minTriggerDurationMs: alignDuration(resolved.minTriggerDurationMs, this.hopDurationMs)
+    } as ResolvedThresholds;
     this.currentThresholds = applied;
     return applied;
   }
@@ -690,6 +702,17 @@ function createHanningWindow(size: number): Float32Array {
     window[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (size - 1 || 1)));
   }
   return window;
+}
+
+function alignDuration(value: number, step: number) {
+  if (!Number.isFinite(step) || step <= 0) {
+    return value;
+  }
+  if (!Number.isFinite(value) || value <= 0) {
+    return step;
+  }
+  const frames = Math.max(1, Math.round(value / step));
+  return frames * step;
 }
 
 function applyWindow(frame: number[], window: Float32Array): Float32Array {

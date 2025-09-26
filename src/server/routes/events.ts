@@ -34,6 +34,8 @@ type ClientState = {
   facesQuery: string | null;
 };
 
+const DEFAULT_FACE_THRESHOLD = 0.5;
+
 export class EventsRouter {
   private readonly bus: EventEmitter;
   private readonly clients = new Map<ServerResponse, ClientState>();
@@ -289,7 +291,7 @@ export class EventsRouter {
     }
 
     const faces = filterFaces(registry.list(), search);
-    sendJson(res, 200, { faces });
+    sendJson(res, 200, { faces, threshold: DEFAULT_FACE_THRESHOLD });
   }
 
   private async handleFaceEnroll(req: IncomingMessage, res: ServerResponse) {
@@ -394,8 +396,11 @@ export class EventsRouter {
 
     const response: Record<string, unknown> = {
       embedding: result.embedding,
+      threshold: result.threshold,
+      distance: result.distance,
+      unknown: result.unknown,
       match: result.match
-        ? { face: result.match.face, distance: result.match.distance }
+        ? { face: result.match.face, distance: result.match.distance, unknown: false }
         : null
     };
 
@@ -481,7 +486,8 @@ export class EventsRouter {
           status: 'ok',
           query,
           count: payload.length,
-          faces: payload
+          faces: payload,
+          threshold: DEFAULT_FACE_THRESHOLD
         })}\n\n`
       );
     } catch (error) {
@@ -800,6 +806,18 @@ function createMetricsDigest(snapshot: ReturnType<MetricsRegistry['snapshot']>) 
     })
   );
 
+  const retention = snapshot.retention
+    ? {
+        runs: snapshot.retention.runs,
+        lastRunAt: snapshot.retention.lastRunAt,
+        warnings: snapshot.retention.warnings,
+        warningsByCamera: snapshot.retention.warningsByCamera,
+        lastWarning: snapshot.retention.lastWarning,
+        totals: snapshot.retention.totals,
+        totalsByCamera: snapshot.retention.totalsByCamera
+      }
+    : undefined;
+
   return {
     fetchedAt: snapshot.createdAt,
     events: snapshot.events,
@@ -814,7 +832,8 @@ function createMetricsDigest(snapshot: ReturnType<MetricsRegistry['snapshot']>) 
         lastRestartAt: snapshot.pipelines.audio.lastRestartAt,
         watchdogBackoffMs: snapshot.pipelines.audio.watchdogBackoffMs
       }
-    }
+    },
+    retention
   };
 }
 

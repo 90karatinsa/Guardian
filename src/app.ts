@@ -12,6 +12,7 @@ export type HealthIndicatorContext = {
     startedAt: number | null;
   };
   metrics?: MetricsSnapshot;
+  metricsCreatedAt?: string;
 };
 
 export type HealthIndicatorResult = {
@@ -63,9 +64,11 @@ export function registerHealthIndicator(name: string, indicator: HealthIndicator
 export async function collectHealthChecks(context: HealthIndicatorContext) {
   const results: Array<{ name: string; status: HealthStatus; details?: Record<string, unknown> }> = [];
   const metricsSnapshot = context.metrics ?? metrics.snapshot();
+  const metricsCapturedAt = metricsSnapshot.createdAt;
   const enrichedContext: HealthIndicatorContext = {
     ...context,
-    metrics: metricsSnapshot
+    metrics: metricsSnapshot,
+    metricsCreatedAt: metricsCapturedAt
   };
   for (const entry of healthIndicators) {
     try {

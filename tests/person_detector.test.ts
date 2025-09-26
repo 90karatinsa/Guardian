@@ -268,7 +268,7 @@ describe('YoloParser utilities', () => {
     expect(packageCandidate.projectionIndex).toBeGreaterThanOrEqual(0);
   });
 
-  it('YoloParserNmsChannelLast suppresses overlapping boxes in channel-last tensors', () => {
+  it('YoloParserPersonNms suppresses overlapping boxes in channel-last tensors', () => {
     const classCount = 2;
     const attributes = YOLO_CLASS_START_INDEX + classCount;
     const detections = 3;
@@ -340,7 +340,8 @@ describe('YoloParser utilities', () => {
       classIndices: [0, 1],
       scoreThreshold: 0.3,
       classScoreThresholds: { 0: 0.6, 1: 0.75 },
-      nmsThreshold: 0.4
+      nmsThreshold: 0.4,
+      maxDetections: 2
     });
 
     expect(results).toHaveLength(2);
@@ -348,9 +349,11 @@ describe('YoloParser utilities', () => {
     const packageDetection = results.find(result => result.classId === 1);
 
     expect(person).toBeDefined();
-    expect(person?.score ?? 0).toBeCloseTo(0.95 * 0.9, 5);
+    expect(person?.score ?? 0).toBeCloseTo(sigmoid(logit(0.95) + logit(0.9)), 5);
+    expect(person?.appliedThreshold ?? 0).toBeCloseTo(0.6, 5);
     expect(packageDetection).toBeDefined();
     expect(packageDetection?.score ?? 0).toBeGreaterThan(0.7);
+    expect(packageDetection?.appliedThreshold ?? 0).toBeCloseTo(0.75, 5);
 
     const duplicate = results.filter(result => result.classId === 0);
     expect(duplicate).toHaveLength(1);

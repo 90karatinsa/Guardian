@@ -96,7 +96,7 @@ const DEFAULT_SILENCE_CIRCUIT_BREAKER_THRESHOLD = 4;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
-const DEVICE_DISCOVERY_CACHE = new Map<string, Promise<string[]>>();
+const DEVICE_DISCOVERY_CACHE = new Map<string, Promise<MicCandidate[]>>();
 
 export class AudioSource extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
@@ -280,12 +280,12 @@ export class AudioSource extends EventEmitter {
   static async listDevices(
     format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto',
     options: { timeoutMs?: number; channel?: string } = {}
-  ) {
+  ): Promise<MicCandidate[]> {
     const cacheKey = `${process.platform}:${format}`;
     const cached = DEVICE_DISCOVERY_CACHE.get(cacheKey);
     if (cached) {
       const devices = await cached;
-      return [...devices];
+      return devices.map(device => ({ ...device }));
     }
 
     const discovery = (async () => {
@@ -311,7 +311,7 @@ export class AudioSource extends EventEmitter {
             const { stdout, stderr } = await execFileAsync(command, args, { timeoutMs });
             const parsed = parseDeviceList(`${stdout}\n${stderr}`);
             if (parsed.length > 0) {
-              return [...parsed];
+              return parsed.map(device => ({ format: fmt, device }));
             }
           } catch (error) {
             lastError = error as Error;
@@ -332,8 +332,11 @@ export class AudioSource extends EventEmitter {
 
     try {
       const devices = await discovery;
-      DEVICE_DISCOVERY_CACHE.set(cacheKey, Promise.resolve([...devices]));
-      return [...devices];
+      DEVICE_DISCOVERY_CACHE.set(
+        cacheKey,
+        Promise.resolve(devices.map(device => ({ ...device })))
+      );
+      return devices.map(device => ({ ...device }));
     } catch (error) {
       DEVICE_DISCOVERY_CACHE.delete(cacheKey);
       throw error;
@@ -370,10 +373,30 @@ export class AudioSource extends EventEmitter {
     const format = this.options.inputFormat ?? 'auto';
 
     try {
-      await AudioSource.listDevices(format, {
+      const discovered = await AudioSource.listDevices(format, {
         timeoutMs,
         channel: this.options.channel
       });
+
+      if (this.shouldStop || this.circuitBroken) {
+        return false;
+      }
+
+      if (this.options.type === 'mic') {
+        this.micInputArgs = buildMicInputArgs(
+          process.platform,
+          this.options,
+          this.options.micFallbacks,
+          discovered
+        );
+        if (this.micInputArgs.length > 0) {
+          if (this.lastSuccessfulMicIndex !== null) {
+            this.micCandidateIndex = this.lastSuccessfulMicIndex % this.micInputArgs.length;
+          } else if (this.micCandidateIndex >= this.micInputArgs.length) {
+            this.micCandidateIndex = 0;
+          }
+        }
+      }
     } catch (error) {
       if (isTimeoutError(error)) {
         const err = error instanceof Error ? error : new Error('Audio device discovery timed out');
@@ -1056,6 +1079,16 @@ function defaultMicFormat(platform: NodeJS.Platform): AudioSourceOptions['inputF
   }
 }
 
+function resolveMicFormatValue(
+  platform: NodeJS.Platform,
+  format: AudioSourceOptions['inputFormat'] | undefined
+) {
+  if (!format || format === 'auto') {
+    return defaultMicFormat(platform) ?? undefined;
+  }
+  return format;
+}
+
 function defaultMicDevice(platform: NodeJS.Platform): string {
   switch (platform) {
     case 'darwin':
@@ -1070,18 +1103,19 @@ function defaultMicDevice(platform: NodeJS.Platform): string {
 function buildMicInputArgs(
   platform: NodeJS.Platform,
   options: Extract<AudioSourceOptions, { type: 'mic' }>,
-  overrides?: Record<string, MicCandidate[]>
+  overrides?: Record<string, MicCandidate[]>,
+  discovered: MicCandidate[] = []
 ) {
   const candidates: string[][] = [];
   const seen = new Set<string>();
 
-  const addCandidate = (entry: MicCandidate | null) => {
+  const pushCandidate = (entry: MicCandidate | null) => {
     if (!entry) {
       return;
     }
 
-    const format = entry.format ?? undefined;
-    const device = entry.device;
+    const format = resolveMicFormatValue(platform, entry.format ?? options.inputFormat);
+    const device = typeof entry.device === 'string' ? entry.device.trim() : '';
 
     if (!device) {
       return;
@@ -1101,13 +1135,17 @@ function buildMicInputArgs(
     seen.add(key);
   };
 
-  addCandidate({
-    format: options.inputFormat ?? defaultMicFormat(platform) ?? undefined,
-    device: options.device ?? defaultMicDevice(platform)
+  pushCandidate({
+    format: options.inputFormat,
+    device: (options.device ?? defaultMicDevice(platform))?.trim()
   });
 
+  for (const candidate of discovered) {
+    pushCandidate(candidate);
+  }
+
   for (const fallback of resolveMicFallbacks(platform, overrides)) {
-    addCandidate(fallback);
+    pushCandidate(fallback);
   }
 
   return candidates;

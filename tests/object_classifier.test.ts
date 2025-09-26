@@ -81,7 +81,7 @@ const setRunMock = (ort as unknown as { __setRunMock: (modelPath: string, run: R
 const Tensor = ort.Tensor as typeof import('onnxruntime-node').Tensor;
 const { PNG } = await import('pngjs');
 
-describe('ObjectThreatClassification', () => {
+describe('ObjectThreatProbabilityFusion', () => {
   const snapshotsDir = path.resolve('snapshots');
   beforeEach(() => {
     runMocks.clear();
@@ -96,7 +96,7 @@ describe('ObjectThreatClassification', () => {
     }
   });
 
-  it('ObjectThreatClassification annotates person events with classified threat metadata', async () => {
+  it('ObjectThreatProbabilityFusion annotates person events with fused threat scores', async () => {
     const detectionRun = vi.fn(async () => {
       const classCount = 3;
       const attributes = YOLO_CLASS_START_INDEX + classCount;
@@ -171,14 +171,22 @@ describe('ObjectThreatClassification', () => {
     const meta = events[0].meta as Record<string, unknown>;
     const objects = meta.objects as Array<Record<string, unknown>>;
     expect(Array.isArray(objects)).toBe(true);
-    expect(objects).toHaveLength(1);
-    expect(objects[0].label).toBe('threat');
-    expect(objects[0].threat).toBe(true);
-    expect(objects[0].threatScore).toBeGreaterThan(0.6);
-    expect(objects[0].confidence).toBeGreaterThan(0);
-    expect(objects[0].confidence).toBeLessThanOrEqual(1);
+    expect(objects.length).toBeGreaterThanOrEqual(1);
+    const threatObject = objects.find(object => object.label === 'threat');
+    expect(threatObject).toBeDefined();
+    expect(threatObject?.threat).toBe(true);
+    expect(threatObject?.threatScore ?? 0).toBeGreaterThan(0.6);
+    expect(threatObject?.confidence ?? 0).toBeGreaterThan(0);
+    expect(threatObject?.confidence ?? 0).toBeLessThanOrEqual(1);
+    const detectionScore = (threatObject?.detection as Record<string, number>).score;
+    const threatProbability = (threatObject?.probabilities as Record<string, number>).threat ?? 0;
+    const expectedFusedScore = detectionScore * threatProbability;
+    expect(threatObject?.threatScore ?? 0).toBeCloseTo(expectedFusedScore, 5);
+    const thresholds = meta.thresholds as { classScoreThresholds?: Record<string, number>; classIndices?: number[] };
+    expect(thresholds.classIndices).toContain(0);
+    expect(meta.detections[0].appliedThreshold).toBeDefined();
     expect((meta.threat as Record<string, unknown>).label).toBe('threat');
-    expect((meta.threat as Record<string, unknown>).confidence).toBe(objects[0].confidence);
+    expect((meta.threat as Record<string, unknown>).confidence).toBe(threatObject?.confidence);
   });
 });
 

@@ -22,7 +22,8 @@
       "maxArchivesPerCamera": 5,
       "snapshot": {
         "mode": "archive",
-        "retentionDays": 21
+        "retentionDays": 21,
+        "maxArchivesPerCamera": 3
       },
       "vacuum": {
         "mode": "auto",

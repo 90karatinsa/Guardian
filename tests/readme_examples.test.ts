@@ -41,19 +41,21 @@ describe('ReadmeExamples', () => {
   it('ReadmeUsageExamples ensures README snippets and CLI output stay in sync', async () => {
     const readme = readReadme();
 
-    expect(readme).toContain('"idleTimeoutMs"');
-    expect(readme).toContain('"restartJitterFactor"');
+    expect(readme).toContain('"idleTimeoutMs": 5000');
+    expect(readme).toContain('"restartJitterFactor": 0.2');
     expect(readme).toContain('Audio source recovering (reason=ffmpeg-missing|stream-idle)');
     expect(readme).toContain('pipelines.ffmpeg.byChannel');
     expect(readme).toContain('watchdogBackoffByChannel');
-    expect(readme).toContain('circuit-breaker');
     expect(readme).toContain('guardian status --json');
     expect(readme).toContain('guardian health');
     expect(readme).toContain('guardian retention run');
     expect(readme).toContain('pnpm exec tsx src/cli.ts status --json');
     expect(readme).toContain('guardian log-level set debug');
-    expect(readme).toContain('Platform farklılıkları (ALSA/CoreAudio/Video4Linux)');
     expect(readme).toContain('metrics.histograms.pipeline.ffmpeg.restarts');
+    expect(readme).toContain('metrics.suppression.histogram.historyCount');
+    expect(readme).toContain('metrics.logs.byLevel.error');
+    expect(readme).toContain('"maxArchivesPerCamera": 3');
+    expect(readme).toContain('Sorun giderme');
     expect(readme).toContain('pnpm tsx src/cli.ts --health');
 
     metrics.reset();

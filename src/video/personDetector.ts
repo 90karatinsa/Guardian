@@ -138,6 +138,9 @@ export class PersonDetector {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
             nms: DEFAULT_NMS_IOU_THRESHOLD,
             classScoreThresholds: this.classScoreThresholds
+              ? { ...this.classScoreThresholds }
+              : undefined,
+            classIndices: [...this.classIndices]
           },
           detections: personDetections.map(serializeDetection),
           preprocess: {
@@ -211,6 +214,7 @@ function serializeDetection(detection: YoloDetection) {
     classProbability: detection.classProbability,
     areaRatio: detection.areaRatio,
     combinedLogit: detection.combinedLogit,
+    appliedThreshold: detection.appliedThreshold,
     projectionIndex: detection.projectionIndex,
     normalizedProjection: detection.normalizedProjection
   };
