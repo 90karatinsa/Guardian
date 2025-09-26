@@ -39,6 +39,7 @@ export class LightDetector {
   private backoffFrames = 0;
   private suppressedFrames = 0;
   private deltaTrend = 0;
+  private pendingSuppressedFramesBeforeTrigger = 0;
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
@@ -190,6 +191,7 @@ export class LightDetector {
       const suppressedFramesSnapshot = this.suppressedFrames;
       this.suppressedFrames = 0;
       if (suppressedFramesSnapshot > 0) {
+        this.pendingSuppressedFramesBeforeTrigger += suppressedFramesSnapshot;
         metrics.incrementDetectorCounter(
           'light',
           'suppressedFramesBeforeTrigger',
@@ -219,6 +221,7 @@ export class LightDetector {
       if (ts - this.lastEventTs < minInterval) {
         this.pendingFrames = 0;
         this.backoffFrames = Math.max(this.backoffFrames, Math.ceil(effectiveBackoff / 2));
+        this.pendingSuppressedFramesBeforeTrigger = 0;
         return;
       }
 
@@ -230,6 +233,9 @@ export class LightDetector {
       const previousBaseline = this.baseline;
       this.baseline = this.baseline * (1 - effectiveSmoothing) + luminance * effectiveSmoothing;
       const updatedBaseline = this.baseline;
+
+      const suppressedFramesBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+      this.pendingSuppressedFramesBeforeTrigger = 0;
 
       const payload: EventPayload = {
         ts,
@@ -258,7 +264,7 @@ export class LightDetector {
           noiseMultiplier,
           debounceMultiplier,
           backoffMultiplier,
-          suppressedFramesBeforeTrigger: suppressedFramesSnapshot
+          suppressedFramesBeforeTrigger
         }
       };
 
@@ -285,6 +291,7 @@ export class LightDetector {
     this.backoffFrames = 0;
     this.suppressedFrames = 0;
     this.deltaTrend = 0;
+    this.pendingSuppressedFramesBeforeTrigger = 0;
   }
 
   private isWithinNormalHours(ts: number) {

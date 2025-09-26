@@ -46,6 +46,7 @@ export class MotionDetector {
   private activationFrames = 0;
   private backoffFrames = 0;
   private suppressedFrames = 0;
+  private pendingSuppressedFramesBeforeTrigger = 0;
 
   constructor(
     private options: MotionDetectorOptions,
@@ -53,7 +54,35 @@ export class MotionDetector {
   ) {}
 
   updateOptions(options: Partial<Omit<MotionDetectorOptions, 'source'>>) {
-    this.options = { ...this.options, ...options };
+    const previous = this.options;
+    const next: MotionDetectorOptions = { ...previous, ...options };
+
+    const hasOptionChanged = <K extends keyof Omit<MotionDetectorOptions, 'source'>>(key: K) => {
+      if (!Object.prototype.hasOwnProperty.call(options, key)) {
+        return false;
+      }
+      return next[key] !== previous[key];
+    };
+
+    const referenceResetNeeded =
+      hasOptionChanged('diffThreshold') ||
+      hasOptionChanged('areaThreshold') ||
+      hasOptionChanged('noiseMultiplier') ||
+      hasOptionChanged('noiseSmoothing') ||
+      hasOptionChanged('areaSmoothing') ||
+      hasOptionChanged('areaInflation') ||
+      hasOptionChanged('areaDeltaThreshold');
+
+    const countersResetNeeded =
+      referenceResetNeeded || hasOptionChanged('debounceFrames') || hasOptionChanged('backoffFrames');
+
+    this.options = next;
+
+    if (referenceResetNeeded) {
+      this.resetAdaptiveState();
+    } else if (countersResetNeeded) {
+      this.resetAdaptiveState({ preserveReference: true });
+    }
   }
 
   handleFrame(frame: Buffer, ts = Date.now()) {
@@ -66,12 +95,7 @@ export class MotionDetector {
       if (!this.previousFrame) {
         this.previousFrame = smoothed;
         this.baselineFrame = smoothed;
-        this.areaBaseline = 0;
-        this.noiseLevel = 0;
-        this.areaTrendMomentum = 0;
-        this.activationFrames = 0;
-        this.backoffFrames = 0;
-        this.suppressedFrames = 0;
+        this.resetAdaptiveState({ preserveReference: true });
         return;
       }
 
@@ -209,6 +233,7 @@ export class MotionDetector {
       const suppressedFramesSnapshot = this.suppressedFrames;
       this.suppressedFrames = 0;
       if (suppressedFramesSnapshot > 0) {
+        this.pendingSuppressedFramesBeforeTrigger += suppressedFramesSnapshot;
         metrics.incrementDetectorCounter(
           'motion',
           'suppressedFramesBeforeTrigger',
@@ -231,12 +256,16 @@ export class MotionDetector {
       this.activationFrames = 0;
 
       if (ts - this.lastEventTs < (this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS)) {
+        this.pendingSuppressedFramesBeforeTrigger = 0;
         return;
       }
 
       this.lastEventTs = ts;
       this.backoffFrames = effectiveBackoffFrames;
       metrics.incrementDetectorCounter('motion', 'backoffActivations', 1);
+
+      const suppressedFramesBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+      this.pendingSuppressedFramesBeforeTrigger = 0;
 
       const payload: EventPayload = {
         ts,
@@ -267,7 +296,7 @@ export class MotionDetector {
           areaInflation,
           debounceMultiplier,
           backoffMultiplier,
-          suppressedFramesBeforeTrigger: suppressedFramesSnapshot
+          suppressedFramesBeforeTrigger
         }
       };
 
@@ -275,6 +304,23 @@ export class MotionDetector {
     } finally {
       metrics.observeDetectorLatency('motion', performance.now() - start);
     }
+  }
+
+  private resetAdaptiveState(options: { preserveReference?: boolean } = {}) {
+    const preserveReference = options.preserveReference ?? false;
+
+    if (!preserveReference) {
+      this.previousFrame = null;
+      this.baselineFrame = null;
+    }
+
+    this.areaBaseline = 0;
+    this.noiseLevel = 0;
+    this.areaTrendMomentum = 0;
+    this.activationFrames = 0;
+    this.backoffFrames = 0;
+    this.suppressedFrames = 0;
+    this.pendingSuppressedFramesBeforeTrigger = 0;
   }
 }
 

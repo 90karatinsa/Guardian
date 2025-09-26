@@ -80,6 +80,7 @@ export class VideoSource extends EventEmitter {
   private buffer = Buffer.alloc(0);
   private startTimer: NodeJS.Timeout | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
+  private streamIdleTimer: NodeJS.Timeout | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
   private killTimer: NodeJS.Timeout | null = null;
   private commandExitPromise: Promise<void> | null = null;
@@ -124,6 +125,7 @@ export class VideoSource extends EventEmitter {
         this.clearStartTimer();
       }
 
+      this.resetStreamIdleTimer();
       this.resetWatchdogTimer();
       this.buffer = Buffer.concat([this.buffer, chunk]);
       const { frames, remainder, corrupted } = this.extractFrames(this.buffer);
@@ -134,6 +136,7 @@ export class VideoSource extends EventEmitter {
       }
 
       if (corrupted) {
+        this.buffer = Buffer.alloc(0);
         this.emit('error', new Error('Corrupted frame encountered'));
         this.scheduleRecovery('corrupted-frame');
       }
@@ -176,6 +179,7 @@ export class VideoSource extends EventEmitter {
     this.hasReceivedFrame = false;
     this.resetStartTimer();
     this.clearWatchdogTimer();
+    this.clearStreamIdleTimer();
     const command = this.createCommand();
     this.command = command;
 
@@ -337,6 +341,7 @@ export class VideoSource extends EventEmitter {
 
     this.stream = null;
     this.buffer = Buffer.alloc(0);
+    this.clearStreamIdleTimer();
   }
 
   private scheduleRecovery(reason: string, context: RecoveryContext = {}) {
@@ -391,6 +396,7 @@ export class VideoSource extends EventEmitter {
 
     this.clearStartTimer();
     this.clearWatchdogTimer();
+    this.clearStreamIdleTimer();
     this.cleanupStream();
     const termination = this.terminateCommand(true);
     const waitForTermination = termination ?? Promise.resolve();
@@ -431,6 +437,7 @@ export class VideoSource extends EventEmitter {
     this.clearRestartTimer();
     this.clearStartTimer();
     this.clearWatchdogTimer();
+    this.clearStreamIdleTimer();
     this.clearKillTimer();
   }
 
@@ -536,14 +543,20 @@ export class VideoSource extends EventEmitter {
     }
   }
 
+  private clearStreamIdleTimer() {
+    if (this.streamIdleTimer) {
+      clearTimeout(this.streamIdleTimer);
+      this.streamIdleTimer = null;
+    }
+  }
+
   private resetWatchdogTimer() {
     this.clearWatchdogTimer();
     if (this.shouldStop) {
       return;
     }
 
-    const idleTimeout =
-      this.options.watchdogTimeoutMs ?? this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    const idleTimeout = this.options.watchdogTimeoutMs ?? 0;
 
     if (idleTimeout <= 0) {
       return;
@@ -556,6 +569,32 @@ export class VideoSource extends EventEmitter {
       }
       this.emit('error', new Error('Video source watchdog timeout'));
       this.scheduleRecovery('watchdog-timeout');
+    }, idleTimeout);
+  }
+
+  private resetStreamIdleTimer() {
+    this.clearStreamIdleTimer();
+    if (this.shouldStop) {
+      return;
+    }
+
+    if (!this.hasReceivedFrame) {
+      return;
+    }
+
+    const idleTimeout = this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+
+    if (idleTimeout <= 0) {
+      return;
+    }
+
+    this.streamIdleTimer = setTimeout(() => {
+      this.streamIdleTimer = null;
+      if (this.shouldStop) {
+        return;
+      }
+      this.emit('error', new Error('Video source stream idle timeout'));
+      this.scheduleRecovery('stream-idle');
     }, idleTimeout);
   }
 

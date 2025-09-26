@@ -62,6 +62,7 @@ type SuppressionSnapshot = {
     combinedHistoryCount?: number | null;
     rateLimit?: RateLimitConfig | null;
     cooldownMs?: number | null;
+    maxEvents?: number | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
 };
@@ -77,6 +78,7 @@ type SuppressionRuleSnapshot = {
     lastType: 'window' | 'rate-limit' | null;
     lastRateLimit: RateLimitConfig | null;
     lastCooldownMs: number | null;
+    lastMaxEvents: number | null;
   };
 };
 
@@ -89,6 +91,7 @@ type SuppressedEventMetric = {
   windowExpiresAt?: number;
   rateLimit?: RateLimitConfig;
   cooldownMs?: number;
+  maxEvents?: number;
   combinedHistoryCount?: number;
 };
 
@@ -236,6 +239,7 @@ class MetricsRegistry {
     combinedHistoryCount?: number | null;
     rateLimit?: RateLimitConfig | null;
     cooldownMs?: number | null;
+    maxEvents?: number | null;
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -383,7 +387,11 @@ class MetricsRegistry {
           ? normalizedDetail.combinedHistoryCount
           : null,
       rateLimit: normalizedDetail.rateLimit ?? null,
-      cooldownMs: cooldownValue
+      cooldownMs: cooldownValue,
+      maxEvents:
+        typeof normalizedDetail.maxEvents === 'number' && Number.isFinite(normalizedDetail.maxEvents)
+          ? normalizedDetail.maxEvents
+          : null
     };
     if (ruleId) {
       this.suppressionByRule.set(ruleId, (this.suppressionByRule.get(ruleId) ?? 0) + 1);
@@ -396,7 +404,8 @@ class MetricsRegistry {
         lastCombinedHistoryCount: null,
         lastType: null,
         lastRateLimit: null,
-        lastCooldownMs: null
+        lastCooldownMs: null,
+        lastMaxEvents: null
       };
       ruleState.total += 1;
       if (reason) {
@@ -421,6 +430,9 @@ class MetricsRegistry {
       }
       if (cooldownValue !== null) {
         ruleState.lastCooldownMs = cooldownValue;
+      }
+      if (typeof normalizedDetail.maxEvents === 'number' && Number.isFinite(normalizedDetail.maxEvents)) {
+        ruleState.lastMaxEvents = normalizedDetail.maxEvents;
       }
       this.suppressionRules.set(ruleId, ruleState);
     }
@@ -766,6 +778,7 @@ type SuppressionRuleState = {
   lastType: 'window' | 'rate-limit' | null;
   lastRateLimit: RateLimitConfig | null;
   lastCooldownMs: number | null;
+  lastMaxEvents: number | null;
 };
 
 type DetectorMetricState = {
@@ -842,7 +855,8 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
         lastCombinedCount: state.lastCombinedHistoryCount,
         lastType: state.lastType,
         lastRateLimit: state.lastRateLimit,
-        lastCooldownMs: state.lastCooldownMs
+        lastCooldownMs: state.lastCooldownMs,
+        lastMaxEvents: state.lastMaxEvents
       }
     };
   }

@@ -60,6 +60,7 @@ export type AudioRecoverEvent = {
     | 'process-exit'
     | 'stream-idle'
     | 'stream-silence'
+    | 'stream-error'
     | 'watchdog-timeout'
     | 'start-timeout'
     | 'device-discovery-timeout';
@@ -769,6 +770,7 @@ export class AudioSource extends EventEmitter {
       if (chunk.length % this.expectedSampleBytes !== 0) {
         this.emit('error', new Error('Audio chunk misaligned with sample alignment'));
         this.buffer = Buffer.alloc(0);
+        this.scheduleRetry('stream-error');
         return;
       }
     }

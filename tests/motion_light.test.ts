@@ -121,6 +121,80 @@ describe('MotionDetector', () => {
       snapshot.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0
     ).toBeGreaterThanOrEqual(meta.suppressedFramesBeforeTrigger ?? 0);
   });
+
+  it('MotionHotReloadResetsAdaptiveState rebuilds thresholds after updateOptions', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'hot-reload-camera',
+        diffThreshold: 3,
+        areaThreshold: 0.02,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 3,
+        noiseMultiplier: 1.4,
+        noiseSmoothing: 0.2,
+        areaSmoothing: 0.15,
+        areaInflation: 1.2,
+        areaDeltaThreshold: 0.015
+      },
+      bus
+    );
+
+    const base = createUniformFrame(12, 12, 10);
+    const softNoise = createUniformFrame(12, 12, 11);
+
+    detector.handleFrame(base, 0);
+    for (let i = 0; i < 3; i += 1) {
+      detector.handleFrame(softNoise, i + 1);
+    }
+
+    const beforeUpdate = metrics.snapshot();
+    expect(beforeUpdate.detectors.motion?.counters?.suppressedFrames ?? 0).toBeGreaterThan(0);
+
+    detector.updateOptions({ areaThreshold: 0.05, debounceFrames: 3 });
+
+    const suppressedBeforeReinit =
+      beforeUpdate.detectors.motion?.counters?.suppressedFrames ?? 0;
+
+    const recalibration = createUniformFrame(12, 12, 12);
+    detector.handleFrame(recalibration, 100);
+
+    const afterReinit = metrics.snapshot();
+    expect(afterReinit.detectors.motion?.counters?.suppressedFrames ?? 0).toBe(
+      suppressedBeforeReinit
+    );
+
+    const postUpdateSuppressed = createUniformFrame(12, 12, 13);
+
+    detector.handleFrame(postUpdateSuppressed, 101);
+    detector.handleFrame(postUpdateSuppressed, 102);
+
+    const snapshotBeforeTrigger = metrics.snapshot();
+    const baselineSuppressedBeforeTrigger =
+      snapshotBeforeTrigger.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0;
+
+    const activationFrames = [
+      createFrame(12, 12, (x, y) => (x < 6 ? 210 : 12)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 220 : 12)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 230 : 12))
+    ];
+
+    activationFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, 200 + idx);
+    });
+
+    expect(events).toHaveLength(1);
+    const meta = events[0].meta as Record<string, number>;
+    expect(meta.areaThreshold).toBeCloseTo(0.05, 5);
+    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(3);
+    expect(meta.suppressedFramesBeforeTrigger).toBe(2);
+
+    const snapshotAfterTrigger = metrics.snapshot();
+    const increment =
+      (snapshotAfterTrigger.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0) -
+      baselineSuppressedBeforeTrigger;
+    expect(increment).toBe(meta.suppressedFramesBeforeTrigger);
+  });
 });
 
 describe('LightDetector', () => {
@@ -202,6 +276,92 @@ describe('LightDetector', () => {
     expect(
       snapshot.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0
     ).toBeGreaterThanOrEqual(meta.suppressedFramesBeforeTrigger ?? 0);
+  });
+
+  it('LightOvernightWindowDebounce handles overnight hours and resets suppression state', () => {
+    const detector = new LightDetector(
+      {
+        source: 'test-camera-light',
+        deltaThreshold: 15,
+        smoothingFactor: 0.08,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 3,
+        noiseMultiplier: 2.2,
+        noiseSmoothing: 0.12,
+        normalHours: [{ start: 22, end: 6 }]
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(10, 10, 30);
+    const withinNight = createUniformFrame(10, 10, 33);
+    const outsideNight = createUniformFrame(10, 10, 38);
+
+    const tsNightBaseline = new Date(2024, 0, 1, 23, 0, 0).getTime();
+    detector.handleFrame(baseline, tsNightBaseline);
+
+    const tsNightAdjustment = new Date(2024, 0, 2, 2, 0, 0).getTime();
+    detector.handleFrame(withinNight, tsNightAdjustment);
+
+    const tsMorning = new Date(2024, 0, 2, 7, 0, 0).getTime();
+    detector.handleFrame(outsideNight, tsMorning);
+    detector.handleFrame(outsideNight, tsMorning + 1000);
+
+    const beforeUpdate = metrics.snapshot();
+    expect(beforeUpdate.detectors.light?.counters?.suppressedFrames ?? 0).toBeGreaterThan(0);
+
+    detector.updateOptions({
+      debounceFrames: 3,
+      normalHours: [{ start: 21, end: 5 }]
+    });
+
+    const suppressedBeforeReset =
+      beforeUpdate.detectors.light?.counters?.suppressedFrames ?? 0;
+
+    const tsNewBaseline = new Date(2024, 0, 3, 21, 30, 0).getTime();
+    const newBaselineFrame = createUniformFrame(10, 10, 32);
+    detector.handleFrame(newBaselineFrame, tsNewBaseline);
+
+    const tsWithinNewHours = new Date(2024, 0, 3, 22, 15, 0).getTime();
+    detector.handleFrame(createUniformFrame(10, 10, 34), tsWithinNewHours);
+
+    const afterReset = metrics.snapshot();
+    expect(afterReset.detectors.light?.counters?.suppressedFrames ?? 0).toBe(
+      suppressedBeforeReset
+    );
+
+    const tsSuppressedStart = new Date(2024, 0, 4, 6, 0, 0).getTime();
+    const suppressedPostUpdate = createUniformFrame(10, 10, 45);
+    detector.handleFrame(suppressedPostUpdate, tsSuppressedStart);
+    detector.handleFrame(suppressedPostUpdate, tsSuppressedStart + 1000);
+
+    const snapshotBeforeTrigger = metrics.snapshot();
+    const priorSuppressedBeforeTrigger =
+      snapshotBeforeTrigger.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0;
+
+    const triggerFrames = [
+      createUniformFrame(10, 10, 200),
+      createUniformFrame(10, 10, 210),
+      createUniformFrame(10, 10, 220),
+      createUniformFrame(10, 10, 230),
+      createUniformFrame(10, 10, 240)
+    ];
+    triggerFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, tsSuppressedStart + 2000 + idx * 400);
+    });
+
+    expect(events).toHaveLength(1);
+    const meta = events[0].meta as Record<string, number>;
+    expect(meta.delta).toBeGreaterThan(meta.deltaThreshold as number);
+    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(3);
+    expect(meta.suppressedFramesBeforeTrigger).toBe(2);
+
+    const snapshotAfterTrigger = metrics.snapshot();
+    const diff =
+      (snapshotAfterTrigger.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0) -
+      priorSuppressedBeforeTrigger;
+    expect(diff).toBe(meta.suppressedFramesBeforeTrigger);
   });
 });
 

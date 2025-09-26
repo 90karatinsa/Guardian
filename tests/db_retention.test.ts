@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import db, { clearEvents, storeEvent } from '../src/db.js';
+import * as dbModule from '../src/db.js';
 import { startRetentionTask } from '../src/tasks/retention.js';
 import { __test__ as guardTestUtils } from '../src/run-guard.ts';
 import { EventRecord } from '../src/types.js';
@@ -193,6 +194,99 @@ describe('RetentionMaintenance', () => {
     } finally {
       task.stop();
       renameSpy.mockRestore();
+    }
+  });
+
+  it('RetentionPerCameraQuota applies alias limits and skips on-change vacuum when idle', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 6, 1);
+    vi.setSystemTime(now);
+
+    const files = [
+      path.join(cameraOneDir, 'c1-a.jpg'),
+      path.join(cameraOneDir, 'c1-b.jpg'),
+      path.join(cameraOneDir, 'c1-c.jpg'),
+      path.join(cameraTwoDir, 'c2-a.jpg'),
+      path.join(cameraTwoDir, 'c2-b.jpg'),
+      path.join(cameraTwoDir, 'c2-c.jpg')
+    ];
+    for (const file of files) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, (now - 35 * dayMs) / 1000, (now - 35 * dayMs) / 1000);
+    }
+
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase');
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const task = startRetentionTask({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 500,
+      archiveDir,
+      snapshotDirs: [cameraOneDir, cameraTwoDir],
+      snapshot: {
+        mode: 'archive',
+        retentionDays: 10,
+        maxArchivesPerCamera: {
+          [path.basename(cameraOneDir)]: 1,
+          [path.basename(cameraTwoDir)]: 2
+        }
+      } as any,
+      logger,
+      metrics: metrics as any,
+      vacuum: {
+        mode: 'auto',
+        run: 'on-change'
+      }
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(vacuumSpy).toHaveBeenCalledTimes(1);
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      const camOneKey = path.basename(cameraOneDir);
+      const camTwoKey = path.basename(cameraTwoDir);
+      expect(runCall?.perCamera?.[camOneKey]).toMatchObject({
+        archivedSnapshots: expect.any(Number),
+        prunedArchives: expect.any(Number)
+      });
+      expect(runCall?.perCamera?.[camTwoKey]).toMatchObject({
+        archivedSnapshots: expect.any(Number),
+        prunedArchives: expect.any(Number)
+      });
+      expect(runCall?.perCamera?.[camOneKey]?.prunedArchives).toBeGreaterThanOrEqual(1);
+
+      const camOneFiles = collectArchiveFiles(path.join(archiveDir, camOneKey));
+      const camTwoFiles = collectArchiveFiles(path.join(archiveDir, camTwoKey));
+      expect(camOneFiles.length).toBeLessThanOrEqual(1);
+      expect(camTwoFiles.length).toBeLessThanOrEqual(2);
+
+      const initialVacuumCalls = vacuumSpy.mock.calls.length;
+      metrics.recordRetentionRun.mockClear();
+
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(vacuumSpy.mock.calls.length).toBe(initialVacuumCalls);
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+      const secondRun = metrics.recordRetentionRun.mock.calls[0]?.[0];
+      expect(secondRun).toMatchObject({
+        archivedSnapshots: 0,
+        prunedArchives: 0,
+        removedEvents: 0
+      });
+    } finally {
+      task.stop();
+      vacuumSpy.mockRestore();
     }
   });
 

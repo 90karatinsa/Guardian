@@ -22,7 +22,9 @@ export interface RetentionTaskOptions {
   maxArchivesPerCamera?: number;
   vacuumMode?: VacuumMode;
   vacuum?: VacuumMode | VacuumOptions;
-  snapshot?: SnapshotRotationOptions;
+  snapshot?: SnapshotRotationOptions & {
+    maxArchivesPerCamera?: number | Record<string, number>;
+  };
   logger?: RetentionLogger;
   metrics?: MetricsRegistry;
 }
@@ -189,8 +191,17 @@ function normalizeOptions(options: RetentionTaskOptions): NormalizedOptions {
   const intervalMs = Math.max(1000, Math.floor(options.intervalMs));
   const archiveDir = path.resolve(options.archiveDir);
   const snapshotDirs = dedupeDirectories(options.snapshotDirs);
+  const snapshotAliasLimit = extractSnapshotGlobalLimit(options.snapshot);
   const snapshot = normalizeSnapshotConfig(options.snapshot);
   const vacuum = normalizeVacuumConfig(options);
+  const explicitMax =
+    typeof options.maxArchivesPerCamera === 'number' &&
+    Number.isFinite(options.maxArchivesPerCamera) &&
+    options.maxArchivesPerCamera >= 0
+      ? Math.floor(options.maxArchivesPerCamera)
+      : undefined;
+  const maxArchivesPerCamera =
+    typeof explicitMax === 'number' ? explicitMax : snapshotAliasLimit;
 
   return {
     enabled: options.enabled !== false,
@@ -198,10 +209,7 @@ function normalizeOptions(options: RetentionTaskOptions): NormalizedOptions {
     intervalMs,
     archiveDir,
     snapshotDirs,
-    maxArchivesPerCamera:
-      typeof options.maxArchivesPerCamera === 'number' && options.maxArchivesPerCamera >= 0
-        ? Math.floor(options.maxArchivesPerCamera)
-        : undefined,
+    maxArchivesPerCamera,
     vacuum,
     snapshot
   };
@@ -236,7 +244,9 @@ function runPolicy(options: {
   return applyRetentionPolicy(policy);
 }
 
-function normalizeSnapshotConfig(snapshot?: SnapshotRotationOptions): SnapshotRotationOptions | undefined {
+function normalizeSnapshotConfig(
+  snapshot?: RetentionTaskOptions['snapshot']
+): SnapshotRotationOptions | undefined {
   if (!snapshot) {
     return undefined;
   }
@@ -245,16 +255,47 @@ function normalizeSnapshotConfig(snapshot?: SnapshotRotationOptions): SnapshotRo
   if (typeof snapshot.retentionDays === 'number' && Number.isFinite(snapshot.retentionDays)) {
     normalized.retentionDays = Math.max(0, Math.floor(snapshot.retentionDays));
   }
-  if (snapshot.perCameraMax && typeof snapshot.perCameraMax === 'object') {
-    const entries = Object.entries(snapshot.perCameraMax)
-      .filter(([camera, value]) => typeof camera === 'string' && camera.trim().length > 0)
-      .filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
-      .map(([camera, value]) => [camera, Math.floor(value)] as const);
-    if (entries.length > 0) {
-      normalized.perCameraMax = Object.fromEntries(entries);
-    }
+  const perCameraSource = resolvePerCameraSource(snapshot);
+  if (perCameraSource) {
+    normalized.perCameraMax = perCameraSource;
   }
   return normalized;
+}
+
+function resolvePerCameraSource(
+  snapshot: RetentionTaskOptions['snapshot']
+): Record<string, number> | undefined {
+  const candidate =
+    snapshot?.perCameraMax && typeof snapshot.perCameraMax === 'object'
+      ? snapshot.perCameraMax
+      : snapshot?.maxArchivesPerCamera && typeof snapshot.maxArchivesPerCamera === 'object'
+        ? snapshot.maxArchivesPerCamera
+        : undefined;
+
+  if (!candidate || Array.isArray(candidate)) {
+    return undefined;
+  }
+
+  const entries = Object.entries(candidate)
+    .filter(([camera, value]) => typeof camera === 'string' && camera.trim().length > 0)
+    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+    .map(([camera, value]) => [camera, Math.floor(value)] as const);
+
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  return Object.fromEntries(entries);
+}
+
+function extractSnapshotGlobalLimit(
+  snapshot?: RetentionTaskOptions['snapshot']
+): number | undefined {
+  const alias = snapshot?.maxArchivesPerCamera;
+  if (typeof alias === 'number' && Number.isFinite(alias) && alias >= 0) {
+    return Math.floor(alias);
+  }
+  return undefined;
 }
 
 function normalizeVacuumConfig(options: RetentionTaskOptions): Required<VacuumOptions> {
