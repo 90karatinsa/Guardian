@@ -78,10 +78,12 @@ describe('RestApiEvents', () => {
     return runtime;
   }
 
-  it('HttpEventsCameraFilter filters by camera, channel, and time range', async () => {
+  it('HttpApiSnapshotListing surfaces summary, metrics, and snapshot URLs', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'sample.png');
     fs.writeFileSync(snapshotPath, Buffer.from([0, 1, 2, 3]));
+    const faceSnapshotPath = path.join(snapshotDir, 'face.png');
+    fs.writeFileSync(faceSnapshotPath, Buffer.from([9, 9, 9, 9]));
 
     storeEvent({
       ts: now - 1000,
@@ -105,7 +107,7 @@ describe('RestApiEvents', () => {
       detector: 'person',
       severity: 'critical',
       message: 'Person detected',
-      meta: { channel: 'video:cam-2' }
+      meta: { channel: 'video:cam-2', faceSnapshot: faceSnapshotPath }
     });
 
     const { port } = await ensureServer();
@@ -118,6 +120,11 @@ describe('RestApiEvents', () => {
     expect(pagePayload.total).toBe(3);
     expect(pagePayload.items[0].detector).toBe('person');
     expect(pagePayload.items[1].detector).toBe('motion');
+    expect(pagePayload.summary.channels.length).toBeGreaterThan(0);
+    const personMeta = pagePayload.items[0].meta ?? {};
+    expect(typeof personMeta.snapshotUrl === 'string' || personMeta.snapshotUrl === undefined).toBe(true);
+    expect(personMeta.faceSnapshotUrl).toBe(`/api/events/${pagePayload.items[0].id}/face-snapshot`);
+    expect(pagePayload.metrics).toBeTruthy();
 
     const filterResponse = await fetch(`http://localhost:${port}/api/events?detector=motion`);
     expect(filterResponse.status).toBe(200);
@@ -162,6 +169,7 @@ describe('RestApiEvents', () => {
     const snapshotPayload = await snapshotResponse.json();
     expect(snapshotPayload.items).toHaveLength(1);
     expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
+    expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
   });
 
   it('HttpEventsChannelFilter limits REST and SSE streams by channel', async () => {
@@ -223,6 +231,7 @@ describe('RestApiEvents', () => {
     const decoder = new TextDecoder();
     let buffer = '';
     const receivedEvents: unknown[] = [];
+    const metricsEvents: unknown[] = [];
     let facesPayload: any = null;
 
     const readPromise = new Promise<void>((resolve, reject) => {
@@ -263,11 +272,13 @@ describe('RestApiEvents', () => {
 
           if (eventName === 'faces') {
             facesPayload = parsed;
+          } else if (eventName === 'metrics') {
+            metricsEvents.push(parsed);
           } else if (eventName !== 'stream-status' && eventName !== 'heartbeat') {
             receivedEvents.push(parsed);
           }
 
-          if (facesPayload && receivedEvents.length >= 1) {
+          if (facesPayload && receivedEvents.length >= 1 && metricsEvents.length >= 1) {
             resolve();
             return;
           }
@@ -315,6 +326,9 @@ describe('RestApiEvents', () => {
     expect(receivedEvents).toHaveLength(1);
     const streamed = receivedEvents[0] as { meta?: { channel?: string } };
     expect(streamed.meta?.channel).toBe('video:lobby');
+    expect(metricsEvents.length).toBeGreaterThan(0);
+    const metricsDigest = metricsEvents[0] as { pipelines?: { ffmpeg?: { channels?: unknown[] } } };
+    expect(Array.isArray(metricsDigest.pipelines?.ffmpeg?.channels)).toBe(true);
     expect(facesPayload?.faces?.length).toBe(2);
     expect(
       Array.isArray(facesPayload?.faces) &&

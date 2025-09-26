@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
-import loggerModule from './logger.js';
+import loggerModule, { setLogLevel } from './logger.js';
 import defaultBus, { EventBus } from './eventBus.js';
 import configManager, {
   CameraConfig,
@@ -40,6 +40,19 @@ type CameraPipelineState = {
   input: string;
   framesPerSecond: number;
   ffmpeg: CameraFfmpegConfig;
+  motion: {
+    diffThreshold: number;
+    areaThreshold: number;
+    minIntervalMs?: number;
+    debounceFrames?: number;
+    backoffFrames?: number;
+    noiseMultiplier?: number;
+    noiseSmoothing?: number;
+    areaSmoothing?: number;
+    areaInflation?: number;
+    areaDeltaThreshold?: number;
+    idleRebaselineMs?: number;
+  };
   person: {
     score: number;
     snapshotDir?: string;
@@ -168,6 +181,22 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   let syncPromise: Promise<void> = Promise.resolve();
   let handleConfigError: ((error: unknown) => void) | null = null;
   let audioRuntime: AudioRuntime | null = null;
+
+  const applyConfiguredLogLevel = (value: unknown) => {
+    if (typeof value !== 'string') {
+      return;
+    }
+    try {
+      setLogLevel(value);
+    } catch (error) {
+      logger.warn(
+        { err: error, level: value },
+        'Failed to apply configured log level'
+      );
+    }
+  };
+
+  applyConfiguredLogLevel(manager.getConfig().logging?.level);
 
   const configureRetention = (config: GuardConfig) => {
     const retentionOptions = buildRetentionOptions({
@@ -403,7 +432,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       noiseSmoothing: context.motion.noiseSmoothing,
       areaSmoothing: context.motion.areaSmoothing,
       areaInflation: context.motion.areaInflation,
-      areaDeltaThreshold: context.motion.areaDeltaThreshold
+      areaDeltaThreshold: context.motion.areaDeltaThreshold,
+      idleRebaselineMs: context.motion.idleRebaselineMs
     });
 
     const lightDetector = context.pipelineState.light
@@ -416,7 +446,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
           debounceFrames: context.pipelineState.light.debounceFrames,
           backoffFrames: context.pipelineState.light.backoffFrames,
           noiseMultiplier: context.pipelineState.light.noiseMultiplier,
-          noiseSmoothing: context.pipelineState.light.noiseSmoothing
+          noiseSmoothing: context.pipelineState.light.noiseSmoothing,
+          idleRebaselineMs: context.pipelineState.light.idleRebaselineMs
         })
       : null;
 
@@ -511,8 +542,34 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     source.start();
 
     logger.info(
-      { camera: camera.id, input: context.pipelineState.input, channel: context.pipelineState.channel },
-      'Starting guard pipeline'
+      {
+        camera: camera.id,
+        channel: context.pipelineState.channel,
+        input: context.pipelineState.input,
+        ffmpeg: {
+          framesPerSecond: context.pipelineState.framesPerSecond,
+          rtspTransport: context.pipelineState.ffmpeg.rtspTransport,
+          idleTimeoutMs: context.pipelineState.ffmpeg.idleTimeoutMs,
+          watchdogTimeoutMs: context.pipelineState.ffmpeg.watchdogTimeoutMs,
+          restartDelayMs: context.pipelineState.ffmpeg.restartDelayMs,
+          restartMaxDelayMs: context.pipelineState.ffmpeg.restartMaxDelayMs
+        },
+        detectors: {
+          motion: {
+            diffThreshold: context.motion.diffThreshold,
+            areaThreshold: context.motion.areaThreshold,
+            minIntervalMs: context.motion.minIntervalMs,
+            debounceFrames: context.motion.debounceFrames,
+            backoffFrames: context.motion.backoffFrames
+          },
+          person: {
+            score: context.pipelineState.person.score,
+            minIntervalMs: context.pipelineState.person.minIntervalMs,
+            classScoreThresholds: context.pipelineState.person.classScoreThresholds
+          }
+        }
+      },
+      'Starting video pipeline'
     );
 
     return runtime;
@@ -578,7 +635,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         noiseSmoothing: context.motion.noiseSmoothing,
         areaSmoothing: context.motion.areaSmoothing,
         areaInflation: context.motion.areaInflation,
-        areaDeltaThreshold: context.motion.areaDeltaThreshold
+        areaDeltaThreshold: context.motion.areaDeltaThreshold,
+        idleRebaselineMs: context.motion.idleRebaselineMs
       });
       if (context.pipelineState.light) {
         if (existing.lightDetector) {
@@ -590,7 +648,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
             debounceFrames: context.pipelineState.light.debounceFrames,
             backoffFrames: context.pipelineState.light.backoffFrames,
             noiseMultiplier: context.pipelineState.light.noiseMultiplier,
-            noiseSmoothing: context.pipelineState.light.noiseSmoothing
+            noiseSmoothing: context.pipelineState.light.noiseSmoothing,
+            idleRebaselineMs: context.pipelineState.light.idleRebaselineMs
           });
         } else {
           existing.lightDetector = new LightDetector({
@@ -602,7 +661,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
             debounceFrames: context.pipelineState.light.debounceFrames,
             backoffFrames: context.pipelineState.light.backoffFrames,
             noiseMultiplier: context.pipelineState.light.noiseMultiplier,
-            noiseSmoothing: context.pipelineState.light.noiseSmoothing
+            noiseSmoothing: context.pipelineState.light.noiseSmoothing,
+            idleRebaselineMs: context.pipelineState.light.idleRebaselineMs
           });
         }
       } else if (existing.lightDetector) {
@@ -633,6 +693,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     configureRetention(activeConfig);
     syncAudioRuntime(activeConfig);
 
+    applyConfiguredLogLevel(next.logging?.level);
+
     logger.info(
       {
         diffThreshold: activeConfig.motion?.diffThreshold,
@@ -659,6 +721,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       logger.warn(
         { err, configPath: manager.getPath(), action: 'reload', restored: true },
         'configuration reload failed'
+      );
+      logger.info(
+        { configPath: manager.getPath(), action: 'reload', restored: true },
+        'Configuration rollback applied'
       );
     };
     manager.on('error', handleConfigError);
@@ -786,7 +852,8 @@ function resolveCameraMotion(
     noiseSmoothing: cameraMotion?.noiseSmoothing ?? defaults.noiseSmoothing,
     areaSmoothing: cameraMotion?.areaSmoothing ?? defaults.areaSmoothing,
     areaInflation: cameraMotion?.areaInflation ?? defaults.areaInflation,
-    areaDeltaThreshold: cameraMotion?.areaDeltaThreshold ?? defaults.areaDeltaThreshold
+    areaDeltaThreshold: cameraMotion?.areaDeltaThreshold ?? defaults.areaDeltaThreshold,
+    idleRebaselineMs: cameraMotion?.idleRebaselineMs ?? defaults.idleRebaselineMs
   };
 }
 
@@ -809,6 +876,7 @@ function resolveLightConfig(
   let backoffFrames: number | undefined;
   let noiseMultiplier: number | undefined;
   let noiseSmoothing: number | undefined;
+  let idleRebaselineMs: number | undefined;
 
   for (const layer of layers) {
     if (!layer) {
@@ -839,6 +907,9 @@ function resolveLightConfig(
     if (typeof layer.noiseSmoothing === 'number') {
       noiseSmoothing = layer.noiseSmoothing;
     }
+    if (typeof layer.idleRebaselineMs === 'number') {
+      idleRebaselineMs = layer.idleRebaselineMs;
+    }
   }
 
   if (typeof deltaThreshold !== 'number') {
@@ -853,7 +924,8 @@ function resolveLightConfig(
     debounceFrames,
     backoffFrames,
     noiseMultiplier,
-    noiseSmoothing
+    noiseSmoothing,
+    idleRebaselineMs
   };
 }
 
@@ -886,11 +958,29 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   );
   const light = resolveLightConfig(config.light, channelConfig?.light, camera.light);
 
+  const motionDefaults = channelConfig?.motion
+    ? resolveCameraMotion(channelConfig.motion, config.motion)
+    : config.motion;
+  const motion = resolveCameraMotion(camera.motion, motionDefaults);
+
   const pipelineState: CameraPipelineState = {
     channel,
     input,
     framesPerSecond,
     ffmpeg,
+    motion: {
+      diffThreshold: motion.diffThreshold,
+      areaThreshold: motion.areaThreshold,
+      minIntervalMs: motion.minIntervalMs,
+      debounceFrames: motion.debounceFrames,
+      backoffFrames: motion.backoffFrames,
+      noiseMultiplier: motion.noiseMultiplier,
+      noiseSmoothing: motion.noiseSmoothing,
+      areaSmoothing: motion.areaSmoothing,
+      areaInflation: motion.areaInflation,
+      areaDeltaThreshold: motion.areaDeltaThreshold,
+      idleRebaselineMs: motion.idleRebaselineMs
+    },
     person: {
       score: camera.person?.score ?? channelConfig?.person?.score ?? config.person.score,
       snapshotDir:
@@ -908,11 +998,6 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
     objects: config.objects,
     light
   };
-
-  const motionDefaults = channelConfig?.motion
-    ? resolveCameraMotion(channelConfig.motion, config.motion)
-    : config.motion;
-  const motion = resolveCameraMotion(camera.motion, motionDefaults);
 
   const checkEvery = Math.max(
     1,
@@ -975,6 +1060,10 @@ function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelin
   }
 
   if (!objectConfigsEqual(previous.objects, next.objects)) {
+    return true;
+  }
+
+  if (!motionConfigsEqual(previous.motion, next.motion)) {
     return true;
   }
 
@@ -1085,6 +1174,25 @@ function objectConfigsEqual(a?: ObjectsConfig, b?: ObjectsConfig) {
   );
 }
 
+function motionConfigsEqual(
+  a: CameraPipelineState['motion'],
+  b: CameraPipelineState['motion']
+) {
+  return (
+    Math.abs(a.diffThreshold - b.diffThreshold) < 1e-6 &&
+    Math.abs(a.areaThreshold - b.areaThreshold) < 1e-6 &&
+    (a.minIntervalMs ?? null) === (b.minIntervalMs ?? null) &&
+    (a.debounceFrames ?? null) === (b.debounceFrames ?? null) &&
+    (a.backoffFrames ?? null) === (b.backoffFrames ?? null) &&
+    (a.noiseMultiplier ?? null) === (b.noiseMultiplier ?? null) &&
+    (a.noiseSmoothing ?? null) === (b.noiseSmoothing ?? null) &&
+    (a.areaSmoothing ?? null) === (b.areaSmoothing ?? null) &&
+    (a.areaInflation ?? null) === (b.areaInflation ?? null) &&
+    (a.areaDeltaThreshold ?? null) === (b.areaDeltaThreshold ?? null) &&
+    (a.idleRebaselineMs ?? null) === (b.idleRebaselineMs ?? null)
+  );
+}
+
 function arrayEqual<T>(a: T[] | undefined, b: T[] | undefined) {
   if (!a && !b) {
     return true;
@@ -1173,7 +1281,8 @@ function buildRetentionOptions(options: {
           analyze: vacuum.analyze,
           reindex: vacuum.reindex,
           optimize: vacuum.optimize,
-          pragmas: vacuum.pragmas
+          pragmas: vacuum.pragmas,
+          run: vacuum.run
         },
     snapshot: snapshot
       ? {
@@ -1323,6 +1432,8 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
       stats.totalDelayMs += event.delayMs;
       if (event.reason === 'watchdog-timeout') {
         stats.watchdogBackoffMs += event.delayMs;
+        metrics.observeLatency('pipeline.ffmpeg.watchdog.delay', event.delayMs);
+        metrics.observeHistogram('pipeline.ffmpeg.watchdog.delay', event.delayMs);
       }
     }
     const restartChannel = record.channel ?? runtime.channel;

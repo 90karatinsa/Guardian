@@ -133,10 +133,10 @@ type SuppressedEventMetric = {
   cooldownMs?: number;
   maxEvents?: number;
   combinedHistoryCount?: number;
-   channel?: string;
-   channels?: string[];
-   windowRemainingMs?: number;
-   cooldownRemainingMs?: number;
+  channel?: string;
+  channels?: string[];
+  windowRemainingMs?: number;
+  cooldownRemainingMs?: number;
 };
 
 type RetentionTotals = {
@@ -172,6 +172,7 @@ type RetentionRunContext = RetentionTotals & {
 
 type DetectorSnapshot = {
   counters: CounterMap;
+  gauges: CounterMap;
   lastRunAt: string | null;
   lastErrorAt: string | null;
   lastErrorMessage: string | null;
@@ -212,6 +213,16 @@ type HistogramConfig = {
 
 const DEFAULT_HISTOGRAM: HistogramConfig = {
   buckets: [25, 50, 100, 250, 500, 1000, 2000, 5000, 10000],
+  format: (bucket, previous) => {
+    if (typeof previous === 'undefined') {
+      return `<${bucket}`;
+    }
+    return previous === bucket ? `${bucket}` : `${previous}-${bucket}`;
+  }
+};
+
+const COUNTER_HISTOGRAM: HistogramConfig = {
+  buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000],
   format: (bucket, previous) => {
     if (typeof previous === 'undefined') {
       return `<${bucket}`;
@@ -263,6 +274,8 @@ class MetricsRegistry {
   private readonly severityCounters = new Map<string, number>();
   private readonly latencyStats = new Map<string, { count: number; totalMs: number; minMs: number; maxMs: number }>();
   private readonly histograms = new Map<string, Map<string, number>>();
+  private readonly histogramConfigs = new Map<string, HistogramConfig>();
+  private readonly reservedHistograms: Array<{ metric: string; config: HistogramConfig }> = [];
   private readonly ffmpegRestartReasons = new Map<string, number>();
   private readonly audioRestartReasons = new Map<string, number>();
   private readonly ffmpegRestartsByChannel = new Map<string, PipelineChannelState>();
@@ -318,6 +331,16 @@ class MetricsRegistry {
   };
   private readonly retentionTotalsByCamera = new Map<string, RetentionCameraTotals>();
 
+  constructor() {
+    this.registerReservedHistogram('logs.level', LOG_LEVEL_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.ffmpeg.restart.delay', DEFAULT_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.ffmpeg.restart.attempt', RESTART_ATTEMPT_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.ffmpeg.restarts', COUNTER_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.audio.restart.delay', DEFAULT_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.audio.restart.attempt', RESTART_ATTEMPT_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.audio.restarts', COUNTER_HISTOGRAM);
+  }
+
   reset() {
     this.logLevelCounters.clear();
     this.logLevelByDetector.clear();
@@ -326,6 +349,8 @@ class MetricsRegistry {
     this.severityCounters.clear();
     this.latencyStats.clear();
     this.histograms.clear();
+    this.histogramConfigs.clear();
+    this.restoreReservedHistograms();
     this.ffmpegRestartReasons.clear();
     this.audioRestartReasons.clear();
     this.ffmpegRestartsByChannel.clear();
@@ -362,6 +387,31 @@ class MetricsRegistry {
     this.lastRetentionWarning = null;
     this.retentionTotals = { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 };
     this.retentionTotalsByCamera.clear();
+  }
+
+  private registerReservedHistogram(metric: string, config: HistogramConfig) {
+    this.reservedHistograms.push({ metric, config });
+    this.ensureHistogram(metric, config);
+  }
+
+  private restoreReservedHistograms() {
+    for (const entry of this.reservedHistograms) {
+      this.ensureHistogram(entry.metric, entry.config);
+    }
+  }
+
+  private ensureHistogram(metric: string, config: HistogramConfig) {
+    const histogram = this.histograms.get(metric);
+    if (histogram) {
+      if (!this.histogramConfigs.has(metric)) {
+        this.histogramConfigs.set(metric, config);
+      }
+      return histogram;
+    }
+    const map = new Map<string, number>();
+    this.histograms.set(metric, map);
+    this.histogramConfigs.set(metric, config);
+    return map;
   }
 
   incrementLogLevel(level: string, context?: { message?: string; detector?: string }) {
@@ -593,8 +643,16 @@ class MetricsRegistry {
     }
     const state = getDetectorMetricState(this.detectorMetrics, detector);
     const current = state.counters.get(counter) ?? 0;
-    state.counters.set(counter, current + amount);
+    const next = current + amount;
+    if (!Number.isFinite(next)) {
+      return;
+    }
+    state.counters.set(counter, next);
     state.lastRunAt = Date.now();
+    if (next >= 0) {
+      const metricName = `detector.${detector}.counter.${counter}`;
+      this.observeHistogram(metricName, next, COUNTER_HISTOGRAM);
+    }
   }
 
   resetDetectorCounters(detector: string, counters: string | string[]) {
@@ -610,13 +668,24 @@ class MetricsRegistry {
     state.lastRunAt = now;
   }
 
+  setDetectorGauge(detector: string, gauge: string, value: number) {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    const state = getDetectorMetricState(this.detectorMetrics, detector);
+    state.lastRunAt = Date.now();
+    state.gauges.set(gauge, value);
+  }
+
   recordDetectorError(detector: string, message: string) {
     const state = getDetectorMetricState(this.detectorMetrics, detector);
     state.lastRunAt = Date.now();
     state.lastErrorAt = Date.now();
     state.lastErrorMessage = message;
     const current = state.counters.get('errors') ?? 0;
-    state.counters.set('errors', current + 1);
+    const next = current + 1;
+    state.counters.set('errors', next);
+    this.observeHistogram(`detector.${detector}.counter.errors`, next, COUNTER_HISTOGRAM);
   }
 
   recordPipelineRestart(
@@ -641,6 +710,7 @@ class MetricsRegistry {
     const occurredAt = typeof meta?.at === 'number' ? meta.at : Date.now();
     if (type === 'ffmpeg') {
       this.ffmpegRestarts += 1;
+      this.observeHistogram('pipeline.ffmpeg.restarts', this.ffmpegRestarts, COUNTER_HISTOGRAM);
       this.lastFfmpegRestartAt = occurredAt;
       this.ffmpegRestartReasons.set(normalized, (this.ffmpegRestartReasons.get(normalized) ?? 0) + 1);
       const metaPayload: PipelineRestartMeta = {
@@ -676,6 +746,7 @@ class MetricsRegistry {
       }
     } else {
       this.audioRestarts += 1;
+      this.observeHistogram('pipeline.audio.restarts', this.audioRestarts, COUNTER_HISTOGRAM);
       this.lastAudioRestartAt = occurredAt;
       this.audioRestartReasons.set(normalized, (this.audioRestartReasons.get(normalized) ?? 0) + 1);
       const metaPayload: PipelineRestartMeta = {
@@ -754,13 +825,11 @@ class MetricsRegistry {
     this.latencyStats.set(metric, next);
   }
 
-  observeHistogram(metric: string, durationMs: number, config: HistogramConfig = DEFAULT_HISTOGRAM) {
-    const histogram = this.histograms.get(metric) ?? new Map<string, number>();
-    if (!this.histograms.has(metric)) {
-      this.histograms.set(metric, histogram);
-    }
+  observeHistogram(metric: string, duration: number, config: HistogramConfig = DEFAULT_HISTOGRAM) {
+    const histogramConfig = this.histogramConfigs.get(metric) ?? config;
+    const histogram = this.ensureHistogram(metric, histogramConfig);
 
-    const bucketLabel = resolveHistogramBucket(durationMs, config);
+    const bucketLabel = resolveHistogramBucket(duration, histogramConfig);
     histogram.set(bucketLabel, (histogram.get(bucketLabel) ?? 0) + 1);
   }
 
@@ -1020,6 +1089,7 @@ type SuppressionRuleState = {
 
 type DetectorMetricState = {
   counters: Map<string, number>;
+  gauges: Map<string, number>;
   lastRunAt: number | null;
   lastErrorAt: number | null;
   lastErrorMessage: string | null;
@@ -1157,6 +1227,7 @@ function mapFromDetectors(source: Map<string, DetectorMetricState>): Record<stri
       : [];
     result[detector] = {
       counters: mapFrom(state.counters),
+      gauges: mapFrom(state.gauges),
       lastRunAt: state.lastRunAt ? new Date(state.lastRunAt).toISOString() : null,
       lastErrorAt: state.lastErrorAt ? new Date(state.lastErrorAt).toISOString() : null,
       lastErrorMessage: state.lastErrorMessage,
@@ -1276,6 +1347,7 @@ function getDetectorMetricState(map: Map<string, DetectorMetricState>, detector:
   }
   const created: DetectorMetricState = {
     counters: new Map<string, number>(),
+    gauges: new Map<string, number>(),
     lastRunAt: null,
     lastErrorAt: null,
     lastErrorMessage: null,

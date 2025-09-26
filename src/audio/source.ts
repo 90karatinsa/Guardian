@@ -27,6 +27,7 @@ type AudioTimingOptions = {
   micFallbacks?: Record<string, MicCandidate[]>;
   random?: () => number;
   silenceCircuitBreakerThreshold?: number;
+  deviceDiscoveryTimeoutMs?: number;
 };
 
 export type AudioSourceOptions =
@@ -125,6 +126,7 @@ export class AudioSource extends EventEmitter {
   private circuitBreakerFailures = 0;
   private circuitBroken = false;
   private lastCircuitCandidateReason: AudioRecoverEvent['reason'] | null = null;
+  private startSequencePromise: Promise<void> | null = null;
 
   constructor(private options: AudioSourceOptions) {
     super();
@@ -132,7 +134,7 @@ export class AudioSource extends EventEmitter {
   }
 
   start() {
-    if (this.process || this.restartTimer) {
+    if (this.process || this.restartTimer || this.startSequencePromise) {
       return;
     }
 
@@ -159,6 +161,39 @@ export class AudioSource extends EventEmitter {
       this.micCandidateIndex = 0;
     }
     this.alignChunks = this.options.type === 'ffmpeg' && this.options.input === 'pipe:0';
+    this.startPipeline();
+  }
+
+  private startPipeline() {
+    if (this.startSequencePromise) {
+      return;
+    }
+
+    const sequence = this.runStartSequence();
+    const guarded = sequence.finally(() => {
+      if (this.startSequencePromise === guarded) {
+        this.startSequencePromise = null;
+      }
+    });
+    this.startSequencePromise = guarded;
+  }
+
+  private async runStartSequence() {
+    if (this.shouldStop || this.circuitBroken) {
+      return;
+    }
+
+    if (this.options.type === 'mic') {
+      const proceed = await this.prepareMicCandidates();
+      if (!proceed) {
+        return;
+      }
+    }
+
+    if (this.shouldStop || this.circuitBroken) {
+      return;
+    }
+
     this.startProcess();
   }
 
@@ -210,7 +245,21 @@ export class AudioSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
     this.lastCircuitCandidateReason = null;
+    this.startSequencePromise = null;
     this.terminateProcess(true, { skipForceDelay: true });
+  }
+
+  triggerDeviceDiscoveryTimeout(error?: Error) {
+    if (this.shouldStop || this.circuitBroken) {
+      return;
+    }
+
+    const err = error ?? new Error('Audio device discovery timed out');
+    metrics.recordAudioDeviceDiscovery('device-discovery-timeout', {
+      channel: this.options.channel
+    });
+    this.emit('error', err);
+    this.scheduleRetry('device-discovery-timeout', err);
   }
 
   consume(stream: Readable, sampleRate = DEFAULT_SAMPLE_RATE, channels = DEFAULT_CHANNELS) {
@@ -293,6 +342,53 @@ export class AudioSource extends EventEmitter {
 
   static clearDeviceCache() {
     DEVICE_DISCOVERY_CACHE.clear();
+  }
+
+  private async prepareMicCandidates(): Promise<boolean> {
+    if (this.shouldStop || this.circuitBroken) {
+      return false;
+    }
+
+    if (this.options.type !== 'mic') {
+      return true;
+    }
+
+    const timeoutConfig = this.options.deviceDiscoveryTimeoutMs;
+    if (timeoutConfig === 0) {
+      return true;
+    }
+
+    const timeoutMs = Math.max(
+      0,
+      timeoutConfig ?? DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS
+    );
+
+    if (timeoutMs === 0) {
+      return true;
+    }
+
+    const format = this.options.inputFormat ?? 'auto';
+
+    try {
+      await AudioSource.listDevices(format, {
+        timeoutMs,
+        channel: this.options.channel
+      });
+    } catch (error) {
+      if (isTimeoutError(error)) {
+        const err = error instanceof Error ? error : new Error('Audio device discovery timed out');
+        this.triggerDeviceDiscoveryTimeout(err);
+        return false;
+      }
+
+      this.emit('error', error as Error);
+    }
+
+    if (this.shouldStop || this.circuitBroken) {
+      return false;
+    }
+
+    return true;
   }
 
   private startProcess() {
@@ -571,7 +667,7 @@ export class AudioSource extends EventEmitter {
           if (this.shouldStop || this.circuitBroken) {
             return;
           }
-          this.startProcess();
+          this.startPipeline();
         });
     }, Math.max(0, timing.delayMs));
   }
@@ -769,7 +865,9 @@ export class AudioSource extends EventEmitter {
     if (
       this.options.type !== 'mic' ||
       this.micInputArgs.length <= 1 ||
-      (reason !== 'stream-silence' && reason !== 'watchdog-timeout')
+      (reason !== 'stream-silence' &&
+        reason !== 'watchdog-timeout' &&
+        reason !== 'device-discovery-timeout')
     ) {
       return;
     }

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import db, { clearEvents, storeEvent } from '../src/db.js';
 import * as dbModule from '../src/db.js';
-import { startRetentionTask } from '../src/tasks/retention.js';
+import { runRetentionOnce, startRetentionTask } from '../src/tasks/retention.js';
 import { __test__ as guardTestUtils } from '../src/run-guard.ts';
 import { EventRecord } from '../src/types.js';
 
@@ -91,6 +91,91 @@ describe('RetentionMaintenance', () => {
       task.stop();
       execSpy.mockRestore();
       vacuumSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('RetentionVacuumRotation enforces per-camera quotas and returns vacuum summary', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 8, 1);
+    vi.setSystemTime(now);
+
+    const files = [
+      path.join(cameraOneDir, 'cam1-old-a.jpg'),
+      path.join(cameraOneDir, 'cam1-old-b.jpg'),
+      path.join(cameraTwoDir, 'cam2-old-a.jpg'),
+      path.join(cameraTwoDir, 'cam2-old-b.jpg'),
+      path.join(cameraTwoDir, 'cam2-old-c.jpg')
+    ];
+    for (const file of files) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, (now - 40 * dayMs) / 1000, (now - 40 * dayMs) / 1000);
+    }
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir, cameraTwoDir],
+        vacuum: {
+          mode: 'full',
+          run: 'always',
+          analyze: true,
+          reindex: true,
+          optimize: true,
+          pragmas: ['PRAGMA optimize']
+        },
+        snapshot: {
+          mode: 'archive',
+          retentionDays: 10,
+          maxArchivesPerCamera: {
+            [path.basename(cameraOneDir)]: 1,
+            [path.basename(cameraTwoDir)]: 2
+          }
+        },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(result.vacuum.ran).toBe(true);
+      expect(result.vacuum.mode).toBe('full');
+      expect(result.vacuum.runMode).toBe('always');
+      expect(result.vacuum.analyze).toBe(true);
+      expect(result.vacuum.reindex).toBe(true);
+      expect(result.vacuum.optimize).toBe(true);
+      expect(result.vacuum.pragmas).toEqual(['PRAGMA optimize']);
+
+      expect(metrics.recordRetentionRun).toHaveBeenCalled();
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall).toMatchObject({ archivedSnapshots: expect.any(Number) });
+
+      const perCamera = result.outcome?.perCamera ?? {};
+      const camOneKey = path.basename(cameraOneDir);
+      const camTwoKey = path.basename(cameraTwoDir);
+      expect(perCamera[camOneKey]?.archivedSnapshots).toBeDefined();
+      expect(perCamera[camTwoKey]?.archivedSnapshots).toBeDefined();
+
+      const camOneFiles = collectArchiveFiles(path.join(archiveDir, camOneKey));
+      const camTwoFiles = collectArchiveFiles(path.join(archiveDir, camTwoKey));
+      expect(camOneFiles.length).toBeLessThanOrEqual(1);
+      expect(camTwoFiles.length).toBeLessThanOrEqual(2);
+
+      const completionCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(completionCall?.[0]).toMatchObject({ vacuumRunMode: 'always', vacuumMode: 'full' });
+    } finally {
       vi.useRealTimers();
     }
   });

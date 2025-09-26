@@ -32,6 +32,7 @@ export interface AudioAnomalyThresholdSchedule {
   default?: AudioAnomalyThresholds;
   day?: AudioAnomalyThresholds;
   night?: AudioAnomalyThresholds;
+  blendMinutes?: number;
 }
 
 export interface NightHoursConfig {
@@ -48,13 +49,20 @@ const DEFAULT_MIN_TRIGGER_DURATION_MS = 100;
 const DEFAULT_RMS_WINDOW_MS = 200;
 const DEFAULT_CENTROID_WINDOW_MS = 300;
 
+type ThresholdBlendWeights = {
+  default?: number;
+  day?: number;
+  night?: number;
+};
+
 type ResolvedThresholds = {
-  profile: 'default' | 'day' | 'night';
+  profile: 'default' | 'day' | 'night' | 'transition';
   rms: number;
   centroidJump: number;
   rmsWindowMs: number;
   centroidWindowMs: number;
   minTriggerDurationMs: number;
+  weights?: ThresholdBlendWeights;
 };
 
 export class AudioAnomalyDetector {
@@ -238,10 +246,10 @@ export class AudioAnomalyDetector {
 
       this.buffer.splice(0, this.hopSize);
       const rmsBaselineUpdate = triggeredByRms
-        ? baselineRms + (rms - baselineRms) * 0.25
+        ? baselineRms + (rms - baselineRms) * 0.1
         : rms;
       const centroidBaselineUpdate = triggeredByCentroid
-        ? baselineCentroid + (centroid - baselineCentroid) * 0.25
+        ? baselineCentroid + (centroid - baselineCentroid) * 0.1
         : centroid;
       this.pushValue(this.rmsValues, rmsBaselineUpdate, this.rmsWindowFrames);
       this.pushValue(this.centroidValues, centroidBaselineUpdate, this.centroidWindowFrames);
@@ -306,7 +314,8 @@ export class AudioAnomalyDetector {
             minTriggerDurationMs: thresholds.minTriggerDurationMs,
             rmsWindowMs: thresholds.rmsWindowMs,
             centroidWindowMs: thresholds.centroidWindowMs,
-            profile: thresholds.profile
+            profile: thresholds.profile,
+            weights: thresholds.weights
           },
           triggeredBy,
           window: {
@@ -397,6 +406,62 @@ export class AudioAnomalyDetector {
     const isNight = this.isNight(ts);
     const hasNight = Boolean(schedule.night);
     const hasDay = Boolean(schedule.day);
+    const resolvedDefault = this.mergeThresholdEntry(schedule.default, {
+      rms: baseRms,
+      centroidJump: baseCentroid,
+      rmsWindowMs: baseRmsWindowMs,
+      centroidWindowMs: baseCentroidWindowMs,
+      minTriggerDurationMs: baseMinTrigger
+    });
+    const resolvedDay = this.mergeThresholdEntry(schedule.day, resolvedDefault);
+    const resolvedNight = this.mergeThresholdEntry(schedule.night, resolvedDefault);
+
+    const blendWeights = this.resolveBlendWeights(ts, schedule, Boolean(schedule.day), Boolean(schedule.night));
+    if (blendWeights) {
+      const entries: Array<{ weight: number; values: typeof resolvedDefault; profile: keyof ThresholdBlendWeights }>
+        = [];
+      if (blendWeights.day && blendWeights.day > 0) {
+        entries.push({ weight: blendWeights.day, values: resolvedDay, profile: 'day' });
+      }
+      if (blendWeights.night && blendWeights.night > 0) {
+        entries.push({ weight: blendWeights.night, values: resolvedNight, profile: 'night' });
+      }
+      const defaultWeight = blendWeights.default && blendWeights.default > 0 ? blendWeights.default : 0;
+      if (defaultWeight > 0) {
+        entries.push({ weight: defaultWeight, values: resolvedDefault, profile: 'default' });
+      }
+
+      const total = entries.reduce((sum, entry) => sum + entry.weight, 0);
+      if (total > 0) {
+        let rms = 0;
+        let centroid = 0;
+        let rmsWindow = 0;
+        let centroidWindow = 0;
+        let minTrigger = 0;
+        for (const entry of entries) {
+          const ratio = entry.weight / total;
+          rms += entry.values.rms * ratio;
+          centroid += entry.values.centroidJump * ratio;
+          rmsWindow += entry.values.rmsWindowMs * ratio;
+          centroidWindow += entry.values.centroidWindowMs * ratio;
+          minTrigger += entry.values.minTriggerDurationMs * ratio;
+        }
+        return this.applyThresholdProfile({
+          profile: 'transition',
+          rms,
+          centroidJump: centroid,
+          rmsWindowMs: rmsWindow,
+          centroidWindowMs: centroidWindow,
+          minTriggerDurationMs: minTrigger,
+          weights: {
+            day: blendWeights.day,
+            night: blendWeights.night,
+            default: defaultWeight > 0 ? defaultWeight : undefined
+          }
+        });
+      }
+    }
+
     const usingNight = isNight && hasNight;
     const usingDay = !isNight && hasDay;
     const profile: ResolvedThresholds['profile'] = usingNight
@@ -405,19 +470,107 @@ export class AudioAnomalyDetector {
         ? 'day'
         : 'default';
     const chosen = usingNight
-      ? schedule.night ?? schedule.default ?? {}
+      ? resolvedNight
       : usingDay
-        ? schedule.day ?? schedule.default ?? {}
-        : schedule.default ?? {};
+        ? resolvedDay
+        : resolvedDefault;
 
     return this.applyThresholdProfile({
       profile,
-      rms: chosen.rms ?? baseRms,
-      centroidJump: chosen.centroidJump ?? baseCentroid,
-      rmsWindowMs: chosen.rmsWindowMs ?? baseRmsWindowMs,
-      centroidWindowMs: chosen.centroidWindowMs ?? baseCentroidWindowMs,
-      minTriggerDurationMs: chosen.minTriggerDurationMs ?? baseMinTrigger
+      rms: chosen.rms,
+      centroidJump: chosen.centroidJump,
+      rmsWindowMs: chosen.rmsWindowMs,
+      centroidWindowMs: chosen.centroidWindowMs,
+      minTriggerDurationMs: chosen.minTriggerDurationMs,
+      weights:
+        profile === 'default'
+          ? { default: 1 }
+          : profile === 'day'
+            ? { day: 1 }
+            : { night: 1 }
     });
+  }
+
+  private mergeThresholdEntry(
+    entry: AudioAnomalyThresholds | undefined,
+    base: { rms: number; centroidJump: number; rmsWindowMs: number; centroidWindowMs: number; minTriggerDurationMs: number }
+  ) {
+    if (!entry) {
+      return { ...base };
+    }
+
+    return {
+      rms: entry.rms ?? base.rms,
+      centroidJump: entry.centroidJump ?? base.centroidJump,
+      rmsWindowMs: entry.rmsWindowMs ?? base.rmsWindowMs,
+      centroidWindowMs: entry.centroidWindowMs ?? base.centroidWindowMs,
+      minTriggerDurationMs: entry.minTriggerDurationMs ?? base.minTriggerDurationMs
+    };
+  }
+
+  private resolveBlendWeights(
+    ts: number,
+    schedule: AudioAnomalyThresholdSchedule,
+    hasDay: boolean,
+    hasNight: boolean
+  ): ThresholdBlendWeights | null {
+    const hoursConfig = this.options.nightHours;
+    const blendMinutes = schedule.blendMinutes;
+    if (!hoursConfig || !blendMinutes || blendMinutes <= 0 || !hasDay || !hasNight) {
+      return null;
+    }
+
+    const halfWindow = Math.min(blendMinutes / 2, 720);
+    if (halfWindow <= 0) {
+      return null;
+    }
+
+    const startMinutes = normalizeMinutes(hoursToMinutes(hoursConfig.start));
+    const endMinutes = normalizeMinutes(hoursToMinutes(hoursConfig.end));
+    if (startMinutes === endMinutes) {
+      return null;
+    }
+
+    const now = new Date(ts);
+    const nowMinutes = normalizeMinutes(
+      now.getHours() * 60 +
+        now.getMinutes() +
+        now.getSeconds() / 60 +
+        now.getMilliseconds() / 60000
+    );
+
+    const distanceToStart = circularDistance(nowMinutes, startMinutes);
+    const distanceToEnd = circularDistance(nowMinutes, endMinutes);
+
+    let boundary: 'start' | 'end' = 'start';
+    let boundaryMinutes = startMinutes;
+    let distance = distanceToStart;
+    if (distanceToEnd < distanceToStart) {
+      boundary = 'end';
+      boundaryMinutes = endMinutes;
+      distance = distanceToEnd;
+    }
+
+    if (distance > halfWindow) {
+      return null;
+    }
+
+    const forward = forwardDistance(boundaryMinutes, nowMinutes);
+    const afterBoundary = forward <= halfWindow;
+    const ratio = halfWindow === 0 ? 0 : Math.max(0, Math.min(1, distance / halfWindow));
+    const eased = 1 - ratio * ratio;
+    const targetWeight = eased;
+    const otherWeight = 1 - targetWeight;
+
+    if (boundary === 'start') {
+      return afterBoundary
+        ? { night: targetWeight, day: otherWeight }
+        : { day: targetWeight, night: otherWeight };
+    }
+
+    return afterBoundary
+      ? { day: targetWeight, night: otherWeight }
+      : { night: targetWeight, day: otherWeight };
   }
 
   private applyThresholdProfile(resolved: ResolvedThresholds): ResolvedThresholds {
@@ -525,6 +678,9 @@ function cloneThresholdSchedule(
   if (nightEntry) {
     cloned.night = nightEntry;
   }
+  if (typeof schedule.blendMinutes === 'number' && Number.isFinite(schedule.blendMinutes)) {
+    cloned.blendMinutes = Math.max(0, schedule.blendMinutes);
+  }
   return cloned;
 }
 
@@ -559,6 +715,32 @@ function computeAverage(values: number[]): number {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+const MINUTES_PER_DAY = 24 * 60;
+
+function normalizeMinutes(value: number) {
+  let normalized = value % MINUTES_PER_DAY;
+  if (normalized < 0) {
+    normalized += MINUTES_PER_DAY;
+  }
+  return normalized;
+}
+
+function hoursToMinutes(hours: number) {
+  const whole = Math.trunc(hours);
+  const remainder = hours - whole;
+  return whole * 60 + remainder * 60;
+}
+
+function circularDistance(a: number, b: number) {
+  const diff = Math.abs(a - b);
+  return Math.min(diff, MINUTES_PER_DAY - diff);
+}
+
+function forwardDistance(from: number, to: number) {
+  const diff = (to - from) % MINUTES_PER_DAY;
+  return diff < 0 ? diff + MINUTES_PER_DAY : diff;
 }
 
 export default AudioAnomalyDetector;

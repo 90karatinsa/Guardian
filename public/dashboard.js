@@ -14,6 +14,10 @@ const channelFilterOptions = document.getElementById('channel-filter-options');
 const channelFilterEmpty = document.getElementById('channel-filter-empty');
 const pipelineMetricsContainer = document.getElementById('pipeline-metrics');
 const pipelineMetricsEmpty = document.getElementById('pipeline-metrics-empty');
+const threatSummaryContainer = document.getElementById('threat-summary');
+const threatSummaryEmpty = document.getElementById('threat-summary-empty');
+const channelStatusContainer = document.getElementById('channel-status');
+const channelStatusEmpty = document.getElementById('channel-status-empty');
 
 if (previewImage) {
   previewImage.addEventListener('load', () => {
@@ -52,7 +56,9 @@ const state = {
     pending: false,
     lastFetched: null,
     data: null
-  }
+  },
+  summary: null,
+  digest: null
 };
 
 function getSelectedChannels() {
@@ -281,14 +287,26 @@ function showPreview(event) {
   const description = `${event.detector} · ${event.source}`;
   previewCaption.textContent = `${description} — ${timestamp}`;
 
-  if (event.meta?.snapshot) {
-    if (typeof event.id === 'number') {
-      const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
-      previewImage.src = `/api/events/${event.id}/snapshot?cacheBust=${cacheKey}`;
-    } else {
-      const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
-      previewImage.src = `${event.meta.snapshot}?cacheBust=${cacheKey}`;
-    }
+  const meta = event.meta ?? {};
+  const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : null;
+  const snapshotUrl = typeof meta.snapshotUrl === 'string' ? meta.snapshotUrl : null;
+  const faceSnapshotUrl = typeof meta.faceSnapshotUrl === 'string' ? meta.faceSnapshotUrl : null;
+
+  let resolvedUrl = snapshotUrl;
+  if (!resolvedUrl && typeof event.id === 'number' && snapshotPath) {
+    resolvedUrl = `/api/events/${event.id}/snapshot`;
+  } else if (!resolvedUrl && snapshotPath) {
+    resolvedUrl = snapshotPath;
+  }
+
+  if (!resolvedUrl && faceSnapshotUrl) {
+    resolvedUrl = faceSnapshotUrl;
+  }
+
+  if (resolvedUrl) {
+    const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
+    const separator = resolvedUrl.includes('?') ? '&' : '?';
+    previewImage.src = `${resolvedUrl}${separator}cacheBust=${cacheKey}`;
     previewImage.dataset.channel = getEventChannel(event) || '';
     previewImage.dataset.state = 'loading';
     previewImage.alt = `Snapshot for ${description}`;
@@ -370,6 +388,10 @@ async function loadInitial() {
       state.events = sortEvents(payload.items.map(withKey));
       rebuildChannelsFromEvents();
       renderEvents();
+      updateSummaries(payload.summary);
+      if (payload.metrics) {
+        setMetricsDigest(payload.metrics);
+      }
     }
   } catch (error) {
     console.error('Failed to load events', error);
@@ -391,6 +413,7 @@ function insertEvent(event) {
   const ts = typeof keyed.ts === 'number' ? keyed.ts : Date.now();
   registerChannel(getEventChannel(keyed), ts);
   renderEvents();
+  updateSummaries();
   return keyed;
 }
 
@@ -421,6 +444,178 @@ function renderMetricsMessage(message) {
   note.className = 'meta';
   note.textContent = message;
   pipelineMetricsContainer.appendChild(note);
+}
+
+function createMetricsRow(label, detail) {
+  const item = document.createElement('div');
+  item.className = 'metrics-channel';
+  const name = document.createElement('span');
+  name.textContent = label;
+  const text = document.createElement('small');
+  text.textContent = detail;
+  item.append(name, text);
+  return item;
+}
+
+function renderThreatSummary(summary) {
+  if (!threatSummaryContainer) {
+    return;
+  }
+  threatSummaryContainer.innerHTML = '';
+  if (!summary) {
+    if (threatSummaryEmpty) {
+      threatSummaryEmpty.hidden = false;
+    }
+    return;
+  }
+  if (threatSummaryEmpty) {
+    threatSummaryEmpty.hidden = true;
+  }
+
+  const severityEntries = Object.entries(summary.totals?.bySeverity ?? {});
+  const detectorEntries = Object.entries(summary.totals?.byDetector ?? {});
+
+  const severitySection = document.createElement('section');
+  severitySection.className = 'metrics-section';
+  const severityHeading = document.createElement('h3');
+  severityHeading.textContent = 'Severity distribution';
+  severitySection.appendChild(severityHeading);
+  if (severityEntries.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No severity data yet.';
+    severitySection.appendChild(empty);
+  } else {
+    const list = document.createElement('div');
+    list.className = 'metrics-channels';
+    severityEntries
+      .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+      .forEach(([level, count]) => {
+        list.appendChild(createMetricsRow(level, `${count} events`));
+      });
+    severitySection.appendChild(list);
+  }
+  threatSummaryContainer.appendChild(severitySection);
+
+  const detectorSection = document.createElement('section');
+  detectorSection.className = 'metrics-section';
+  const detectorHeading = document.createElement('h3');
+  detectorHeading.textContent = 'Top detectors';
+  detectorSection.appendChild(detectorHeading);
+  if (detectorEntries.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No detector events yet.';
+    detectorSection.appendChild(empty);
+  } else {
+    const list = document.createElement('div');
+    list.className = 'metrics-channels';
+    detectorEntries
+      .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+      .slice(0, 5)
+      .forEach(([detector, count]) => {
+        list.appendChild(createMetricsRow(detector, `${count} events`));
+      });
+    detectorSection.appendChild(list);
+  }
+  threatSummaryContainer.appendChild(detectorSection);
+}
+
+function renderChannelStatus() {
+  if (!channelStatusContainer) {
+    return;
+  }
+  channelStatusContainer.innerHTML = '';
+  const summary = state.summary;
+  const digest = state.digest;
+  if (!summary && !digest) {
+    if (channelStatusEmpty) {
+      channelStatusEmpty.hidden = false;
+    }
+    return;
+  }
+  if (channelStatusEmpty) {
+    channelStatusEmpty.hidden = true;
+  }
+
+  const channelMap = new Map();
+  if (summary?.channels) {
+    summary.channels.forEach(channel => {
+      channelMap.set(channel.id, {
+        id: channel.id,
+        events: channel.total,
+        lastEventTs: channel.lastEventTs,
+        severity: channel.bySeverity ?? {},
+        snapshots: channel.snapshots ?? 0,
+        restarts: 0,
+        lastRestartAt: null,
+        lastRestartReason: null,
+        watchdogBackoffMs: null
+      });
+    });
+  }
+  const pipelineChannels = digest?.pipelines?.ffmpeg?.channels ?? [];
+  pipelineChannels.forEach(entry => {
+    const existing = channelMap.get(entry.channel) ?? {
+      id: entry.channel,
+      events: 0,
+      lastEventTs: null,
+      severity: {},
+      snapshots: 0,
+      restarts: 0,
+      lastRestartAt: null,
+      lastRestartReason: null,
+      watchdogBackoffMs: null
+    };
+    existing.restarts = entry.restarts ?? 0;
+    existing.lastRestartAt = entry.lastRestartAt ?? null;
+    existing.lastRestartReason = entry.lastRestart?.reason ?? null;
+    existing.watchdogBackoffMs = entry.watchdogBackoffMs ?? null;
+    channelMap.set(entry.channel, existing);
+  });
+
+  const entries = Array.from(channelMap.values()).sort((a, b) => {
+    if ((b.events ?? 0) !== (a.events ?? 0)) {
+      return (b.events ?? 0) - (a.events ?? 0);
+    }
+    const lastA = a.lastEventTs ?? 0;
+    const lastB = b.lastEventTs ?? 0;
+    if (lastB !== lastA) {
+      return lastB - lastA;
+    }
+    return a.id.localeCompare(b.id);
+  });
+
+  if (entries.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = 'No channel activity yet.';
+    channelStatusContainer.appendChild(empty);
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'metrics-channels';
+  entries.slice(0, 6).forEach(entry => {
+    const parts = [`${entry.events} events`];
+    const criticalCount = entry.severity?.critical ?? 0;
+    if (criticalCount > 0) {
+      parts.push(`${criticalCount} critical`);
+    }
+    if (entry.snapshots > 0) {
+      parts.push(`${entry.snapshots} snapshots`);
+    }
+    if ((entry.restarts ?? 0) > 0) {
+      const reason = entry.lastRestartReason ?? 'restart';
+      parts.push(`${entry.restarts} restarts (${reason})`);
+    }
+    if (typeof entry.watchdogBackoffMs === 'number' && entry.watchdogBackoffMs > 0) {
+      parts.push(`${Math.round(entry.watchdogBackoffMs)}ms watchdog delay`);
+    }
+    const detail = parts.join(' · ');
+    list.appendChild(createMetricsRow(entry.id, detail));
+  });
+  channelStatusContainer.appendChild(list);
 }
 
 function renderPipelineSection(label, snapshot) {
@@ -668,6 +863,68 @@ function rebuildChannelsFromEvents() {
   updateChannelFilterControls();
 }
 
+function computeSummaryFromEvents(events) {
+  const totalsByDetector = {};
+  const totalsBySeverity = {};
+  const channelMap = new Map();
+
+  events.forEach(event => {
+    const detector = event.detector ?? 'unknown';
+    const severity = event.severity ?? 'info';
+    totalsByDetector[detector] = (totalsByDetector[detector] ?? 0) + 1;
+    totalsBySeverity[severity] = (totalsBySeverity[severity] ?? 0) + 1;
+    const meta = event.meta ?? {};
+    const resolvedChannels = Array.isArray(meta.resolvedChannels)
+      ? meta.resolvedChannels.filter(channel => typeof channel === 'string')
+      : [getEventChannel(event)].filter(Boolean);
+    const channels = resolvedChannels.length > 0 ? resolvedChannels : ['unassigned'];
+    const ts = typeof event.ts === 'number' ? event.ts : Date.now();
+    const hasSnapshot = Boolean(meta.snapshotUrl || meta.snapshot || meta.faceSnapshotUrl);
+
+    channels.forEach(channel => {
+      const existing = channelMap.get(channel) ?? {
+        id: channel,
+        total: 0,
+        byDetector: {},
+        bySeverity: {},
+        lastEventTs: null,
+        snapshots: 0
+      };
+      existing.total += 1;
+      existing.byDetector[detector] = (existing.byDetector[detector] ?? 0) + 1;
+      existing.bySeverity[severity] = (existing.bySeverity[severity] ?? 0) + 1;
+      existing.lastEventTs = existing.lastEventTs ? Math.max(existing.lastEventTs, ts) : ts;
+      if (hasSnapshot) {
+        existing.snapshots += 1;
+      }
+      channelMap.set(channel, existing);
+    });
+  });
+
+  return {
+    totals: {
+      byDetector: totalsByDetector,
+      bySeverity: totalsBySeverity
+    },
+    channels: Array.from(channelMap.values())
+  };
+}
+
+function updateSummaries(serverSummary) {
+  if (serverSummary) {
+    state.summary = serverSummary;
+  } else {
+    state.summary = computeSummaryFromEvents(state.events);
+  }
+  renderThreatSummary(state.summary);
+  renderChannelStatus();
+}
+
+function setMetricsDigest(digest) {
+  state.digest = digest ?? null;
+  renderChannelStatus();
+}
+
 function updateChannelFilterControls() {
   if (!channelFilterOptions || !channelFilterEmpty) {
     return;
@@ -799,6 +1056,15 @@ function subscribe() {
       }
     } catch (error) {
       console.debug('Failed to parse faces payload', error);
+    }
+  });
+
+  source.addEventListener('metrics', event => {
+    try {
+      const payload = JSON.parse(event.data);
+      setMetricsDigest(payload);
+    } catch (error) {
+      console.debug('Failed to parse metrics payload', error);
     }
   });
 

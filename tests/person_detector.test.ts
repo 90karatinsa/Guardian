@@ -77,6 +77,11 @@ describe('YoloParser utilities', () => {
     return Math.log(probability / (1 - probability));
   };
 
+  const sigmoid = (value: number) => {
+    const clamped = Math.max(-20, Math.min(20, value));
+    return 1 / (1 + Math.exp(-clamped));
+  };
+
   it('YoloParserMultiClass applies class thresholds and rescales boxes', () => {
     const classCount = 3;
     const attributes = YOLO_CLASS_START_INDEX + classCount;
@@ -147,16 +152,120 @@ describe('YoloParser utilities', () => {
     expect(results.some(result => result.classId === 2)).toBe(false);
 
     const person = results.find(result => result.classId === 0);
-    expect(person?.score ?? 0).toBeGreaterThan(0.7);
+    expect(person?.score ?? 0).toBeCloseTo(sigmoid(2.4 + 2.1), 5);
 
     const packageDetection = results.find(result => result.classId === 1);
     expect(packageDetection).toBeDefined();
-    expect(packageDetection?.score ?? 0).toBeGreaterThan(0.6);
+    expect(packageDetection?.score ?? 0).toBeCloseTo(sigmoid(1.9 + 1.8), 5);
     expect(packageDetection?.bbox.left ?? 0).toBeCloseTo(500, 1);
     expect(packageDetection?.bbox.top ?? 0).toBeCloseTo(275, 1);
     expect(packageDetection?.bbox.width ?? 0).toBeCloseTo(200, 1);
     expect(packageDetection?.bbox.height ?? 0).toBeCloseTo(250, 1);
     expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
+  });
+
+  it('YoloParserPersonConfidence prioritizes person detections across projections', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      values.classProbabilities.forEach((prob, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit(prob);
+      });
+    };
+
+    assign(0, {
+      cx: 0.55,
+      cy: 0.45,
+      width: 0.18,
+      height: 0.36,
+      objectness: 0.78,
+      classProbabilities: [0.74, 0.82]
+    });
+
+    assign(1, {
+      cx: 0.52,
+      cy: 0.48,
+      width: 0.22,
+      height: 0.4,
+      objectness: 0.81,
+      classProbabilities: [0.69, 0.9]
+    });
+
+    assign(2, {
+      cx: 0.4,
+      cy: 0.5,
+      width: 0.12,
+      height: 0.3,
+      objectness: 0.6,
+      classProbabilities: [0.55, 0.6]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 1,
+      padX: 32,
+      padY: 24,
+      originalWidth: 1280,
+      originalHeight: 720,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 640 / 1280,
+      scaleY: 640 / 720,
+      variants: [
+        {
+          padX: 0,
+          padY: 0,
+          originalWidth: 1280,
+          originalHeight: 720,
+          resizedWidth: 704,
+          resizedHeight: 704,
+          scaleX: 704 / 1280,
+          scaleY: 704 / 720
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndex: 0,
+      classIndices: [0, 1],
+      scoreThreshold: 0.2,
+      maxDetections: 2
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results[0]?.classId).toBe(0);
+    const person = results[0]!;
+    const packageCandidate = results[1]!;
+
+    expect(person.score).toBeCloseTo(sigmoid(logit(0.78) + logit(0.74)), 5);
+    expect(person.projectionIndex).toBe(0);
+    expect(person.normalizedProjection).toBe(true);
+    expect(person.bbox.width).toBeGreaterThan(150);
+    expect(person.bbox.width).toBeLessThan(400);
+    expect(person.areaRatio).toBeGreaterThan(0.02);
+    expect(person.areaRatio).toBeLessThan(0.2);
+    expect(packageCandidate.score).toBeLessThan(person.score + 0.05);
+    expect(packageCandidate.projectionIndex).toBeGreaterThanOrEqual(0);
   });
 
   it('YoloParserNmsChannelLast suppresses overlapping boxes in channel-last tensors', () => {

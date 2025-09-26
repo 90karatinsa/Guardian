@@ -2,7 +2,7 @@ import process from 'node:process';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
-import logger from './logger.js';
+import logger, { getAvailableLogLevels, getLogLevel, setLogLevel } from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
 import { collectHealthChecks, runShutdownHooks } from './app.js';
 import configManager, { loadConfigFromFile, type GuardianConfig } from './config/index.js';
@@ -61,6 +61,21 @@ type HealthPayload = {
   };
 };
 
+type ReadinessPayload = {
+  ready: boolean;
+  status: HealthStatus;
+  state: ServiceStatus;
+  timestamp: string;
+  startedAt: string | null;
+  reason: string | null;
+  metrics: {
+    restarts: {
+      video: number;
+      audio: number;
+    };
+  };
+};
+
 const DEFAULT_IO: CliIo = { stdout: process.stdout, stderr: process.stderr };
 
 const HEALTH_EXIT_CODES: Record<HealthStatus, number> = {
@@ -69,6 +84,19 @@ const HEALTH_EXIT_CODES: Record<HealthStatus, number> = {
   starting: 2,
   stopping: 3
 };
+
+const USAGE_LINES = [
+  'Guardian CLI',
+  '',
+  'Usage:',
+  '  guardian start        Start the detector daemon',
+  '  guardian stop         Stop the running daemon',
+  '  guardian status       Print service status summary',
+  '  guardian health       Print health JSON',
+  '  guardian ready        Print readiness JSON',
+  '  guardian log-level    Get or set the active log level',
+  '  guardian retention run [--config path]  Run retention once with current config'
+];
 
 const RETENTION_USAGE = [
   'Guardian retention commands',
@@ -79,6 +107,18 @@ const RETENTION_USAGE = [
   'Options:',
   '  -c, --config <path>   Use an alternate configuration file',
   '  -h, --help            Show this help message'
+].join('\n');
+
+const LOG_LEVEL_USAGE = [
+  'Guardian log level commands',
+  '',
+  'Usage:',
+  '  guardian log-level            Show the current log level',
+  '  guardian log-level get        Show the current log level',
+  '  guardian log-level set <level>  Change the active log level',
+  '  guardian log-level <level>      Shortcut for set',
+  '',
+  `Available levels: ${getAvailableLogLevels().join(', ')}`
 ].join('\n');
 
 const state: {
@@ -194,6 +234,10 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
     return outputHealth(io);
   }
 
+  if (argv.includes('--ready')) {
+    return outputReadiness(io);
+  }
+
   const command = argv[0] ?? 'start';
 
   switch (command) {
@@ -210,24 +254,19 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
     case 'health': {
       return outputHealth(io);
     }
+    case 'ready': {
+      return outputReadiness(io);
+    }
+    case 'log-level': {
+      return runLogLevelCommand(argv.slice(1), io);
+    }
     case 'retention': {
       return runRetentionCommand(argv.slice(1), io);
     }
     case 'help':
     case '--help':
     case '-h': {
-      io.stdout.write(
-        [
-          'Guardian CLI',
-          '',
-          'Usage:',
-          '  guardian start        Start the detector daemon',
-          '  guardian stop         Stop the running daemon',
-          '  guardian status       Print service status summary',
-          '  guardian health       Print health JSON',
-          '  guardian retention run [--config path]  Run retention once with current config'
-        ].join('\n') + '\n'
-      );
+      io.stdout.write(`${USAGE_LINES.join('\n')}\n`);
       return 0;
     }
     default: {
@@ -258,6 +297,57 @@ async function runRetentionCommand(args: string[], io: CliIo): Promise<number> {
 
   io.stderr.write(`Unknown retention subcommand: ${first}\n`);
   return 1;
+}
+
+async function runLogLevelCommand(args: string[], io: CliIo): Promise<number> {
+  const [first, second] = args;
+  const available = getAvailableLogLevels();
+
+  if (!first || first === 'get') {
+    io.stdout.write(`${getLogLevel()}\n`);
+    return 0;
+  }
+
+  if (first === 'help' || first === '--help' || first === '-h') {
+    io.stdout.write(`${LOG_LEVEL_USAGE}\n`);
+    return 0;
+  }
+
+  if (first === 'set') {
+    if (!second) {
+      io.stderr.write('Missing value for log level\n');
+      io.stderr.write(`${LOG_LEVEL_USAGE}\n`);
+      return 1;
+    }
+    return applyLogLevel(second, io);
+  }
+
+  if (first.startsWith('-')) {
+    io.stderr.write(`Unknown option: ${first}\n`);
+    io.stderr.write(`${LOG_LEVEL_USAGE}\n`);
+    return 1;
+  }
+
+  if (!available.includes(first.toLowerCase())) {
+    io.stderr.write(
+      `Unknown log level "${first}" (available: ${available.join(', ')})\n`
+    );
+    return 1;
+  }
+
+  return applyLogLevel(first, io);
+}
+
+function applyLogLevel(level: string, io: CliIo): number {
+  try {
+    const normalized = setLogLevel(level);
+    io.stdout.write(`Log level set to ${normalized}\n`);
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    io.stderr.write(`${message}\n`);
+    return 1;
+  }
 }
 
 async function runRetentionRun(args: string[], io: CliIo): Promise<number> {
@@ -487,6 +577,8 @@ function resolveHealthExitCode(status: HealthStatus) {
   return HEALTH_EXIT_CODES[status] ?? 1;
 }
 
+export { resolveHealthExitCode };
+
 async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise<Error | null> {
   if (state.status === 'idle' || state.status === 'stopped') {
     return null;
@@ -544,6 +636,18 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
           });
         }
         state.lastShutdownHooks = hookSummaries;
+        const summary = hookSummaries.reduce(
+          (acc, hook) => {
+            if (hook.status === 'error') {
+              acc.failed += 1;
+            } else {
+              acc.ok += 1;
+            }
+            return acc;
+          },
+          { ok: 0, failed: 0 }
+        );
+        logger.info({ hooks: hookSummaries, summary }, 'Shutdown hooks completed');
       } catch (hookError) {
         const err = hookError as Error;
         logger.error({ err }, 'Shutdown hooks threw unexpectedly');
@@ -597,3 +701,40 @@ async function outputHealth(io: CliIo): Promise<number> {
   io.stdout.write(`${JSON.stringify(payload)}\n`);
   return resolveHealthExitCode(payload.status);
 }
+
+function buildReadinessPayload(health: HealthPayload): ReadinessPayload {
+  const ready = health.status === 'ok' && health.state === 'running';
+  let reason: string | null = null;
+
+  if (!ready) {
+    if (health.state !== 'running') {
+      reason = `service-${health.state}`;
+    } else if (health.status !== 'ok') {
+      reason = `health-${health.status}`;
+    }
+  }
+
+  return {
+    ready,
+    status: health.status,
+    state: health.state,
+    timestamp: health.timestamp,
+    startedAt: health.startedAt,
+    reason,
+    metrics: {
+      restarts: {
+        video: health.runtime.pipelines.videoRestarts,
+        audio: health.runtime.pipelines.audioRestarts
+      }
+    }
+  } satisfies ReadinessPayload;
+}
+
+async function outputReadiness(io: CliIo): Promise<number> {
+  const health = await buildHealthPayload();
+  const readiness = buildReadinessPayload(health);
+  io.stdout.write(`${JSON.stringify(readiness)}\n`);
+  return readiness.ready ? 0 : 1;
+}
+
+export { buildReadinessPayload };

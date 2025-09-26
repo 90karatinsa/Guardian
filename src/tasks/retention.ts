@@ -48,6 +48,7 @@ export type RetentionVacuumSummary = {
   reindex: boolean;
   optimize: boolean;
   target?: string;
+  pragmas?: string[];
 };
 
 export type RetentionRunResult = {
@@ -354,8 +355,9 @@ async function executeRetentionRun(
     metrics.recordRetentionWarning(summary);
   }
 
+  let vacuumResult: Required<VacuumOptions> | null = null;
   if (shouldVacuum) {
-    vacuumDatabase(options.vacuum);
+    vacuumResult = vacuumDatabase(options.vacuum);
   }
 
   metrics.recordRetentionRun({
@@ -367,12 +369,13 @@ async function executeRetentionRun(
 
   const vacuumSummary: RetentionVacuumSummary = {
     ran: shouldVacuum,
-    runMode: options.vacuum.run,
-    mode: shouldVacuum ? options.vacuum.mode ?? 'auto' : 'skipped',
-    analyze: shouldVacuum ? options.vacuum.analyze === true : false,
-    reindex: shouldVacuum ? options.vacuum.reindex === true : false,
-    optimize: shouldVacuum ? options.vacuum.optimize === true : false,
-    target: shouldVacuum ? options.vacuum.target ?? undefined : undefined
+    runMode: vacuumResult?.run ?? options.vacuum.run,
+    mode: shouldVacuum ? vacuumResult?.mode ?? options.vacuum.mode ?? 'auto' : 'skipped',
+    analyze: shouldVacuum ? vacuumResult?.analyze === true : false,
+    reindex: shouldVacuum ? vacuumResult?.reindex === true : false,
+    optimize: shouldVacuum ? vacuumResult?.optimize === true : false,
+    target: shouldVacuum ? vacuumResult?.target ?? options.vacuum.target ?? undefined : undefined,
+    pragmas: shouldVacuum ? vacuumResult?.pragmas : undefined
   };
 
   logger.info(
@@ -385,10 +388,11 @@ async function executeRetentionRun(
       vacuumRunMode: options.vacuum.run,
       vacuumTasks: shouldVacuum
         ? {
-            analyze: options.vacuum.analyze === true,
-            reindex: options.vacuum.reindex === true,
-            optimize: options.vacuum.optimize === true,
-            target: options.vacuum.target
+            analyze: vacuumSummary.analyze,
+            reindex: vacuumSummary.reindex,
+            optimize: vacuumSummary.optimize,
+            target: vacuumSummary.target,
+            pragmas: vacuumSummary.pragmas
           }
         : undefined,
       perCamera: outcome.perCamera

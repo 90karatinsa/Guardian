@@ -23,9 +23,14 @@ export type PoseForecast = {
   horizonMs: number;
   velocity: number[];
   acceleration: number[];
+  velocityMagnitude: number[];
+  accelerationMagnitude: number[];
+  smoothedVelocity: number[];
+  smoothedAcceleration: number[];
   movementFlags: boolean[];
   confidence: number;
   movingJointCount?: number;
+  movingJointRatio?: number;
   dominantJoint?: number | null;
   threatSummary?: ThreatSummary | null;
 };
@@ -110,9 +115,17 @@ export class PoseEstimator {
         return null;
       }
 
+      const smoothingFactor = clamp(
+        2 / Math.max(2, (this.options.smoothingWindow ?? DEFAULT_SMOOTHING) + 1),
+        0.05,
+        0.8
+      );
+
       const forecast = interpretForecast(output, {
         horizonMs: this.options.forecastHorizonMs ?? DEFAULT_HORIZON_MS,
-        minMovement: this.options.minMovement ?? DEFAULT_MIN_MOVEMENT
+        minMovement: this.options.minMovement ?? DEFAULT_MIN_MOVEMENT,
+        previous: this.lastForecast,
+        smoothingFactor
       });
       const threatSummary = summarizeThreatMetadata(motionMeta);
       const enrichedForecast = enrichForecast(forecast, threatSummary);
@@ -127,6 +140,11 @@ export class PoseEstimator {
       if (movementCount > 0) {
         metrics.incrementDetectorCounter('pose', 'movementFlags', movementCount);
       }
+      metrics.setDetectorGauge('pose', 'movingJointCount', movementCount);
+      const movementRatio = forecast.movingJointRatio ?? (forecast.movementFlags.length
+        ? movementCount / forecast.movementFlags.length
+        : 0);
+      metrics.setDetectorGauge('pose', 'movingJointRatio', movementRatio);
 
       const payload: EventPayload = {
         ts,
@@ -139,8 +157,13 @@ export class PoseEstimator {
           velocity: enrichedForecast.velocity,
           acceleration: enrichedForecast.acceleration,
           movementFlags: enrichedForecast.movementFlags,
+          velocityMagnitude: enrichedForecast.velocityMagnitude,
+          accelerationMagnitude: enrichedForecast.accelerationMagnitude,
+          smoothedVelocity: enrichedForecast.smoothedVelocity,
+          smoothedAcceleration: enrichedForecast.smoothedAcceleration,
           confidence: enrichedForecast.confidence,
           movingJointCount: enrichedForecast.movingJointCount,
+          movingJointRatio: enrichedForecast.movingJointRatio,
           dominantJoint: enrichedForecast.dominantJoint,
           motion: combinedMotion,
           threats: threatSummary,
@@ -218,7 +241,7 @@ function buildPoseTensor(history: PoseFrame[]) {
 
 function interpretForecast(
   output: ort.OnnxValue,
-  options: { horizonMs: number; minMovement: number }
+  options: { horizonMs: number; minMovement: number; previous?: PoseForecast | null; smoothingFactor?: number }
 ): PoseForecast {
   const data = output.data as Float32Array | number[] | undefined;
   if (!data || data.length === 0) {
@@ -226,6 +249,10 @@ function interpretForecast(
       horizonMs: options.horizonMs,
       velocity: [],
       acceleration: [],
+      velocityMagnitude: [],
+      accelerationMagnitude: [],
+      smoothedVelocity: [],
+      smoothedAcceleration: [],
       movementFlags: [],
       confidence: 0
     };
@@ -236,42 +263,54 @@ function interpretForecast(
   const velocity = values.slice(0, joints);
   const acceleration = values.slice(joints);
 
-  const movementFlags = velocity.map((value, index) => {
-    const accel = Math.abs(acceleration[index] ?? 0);
-    return Math.abs(value) + accel > options.minMovement;
+  const axes = velocity.length % 3 === 0 ? 3 : 1;
+  const velocityVectors = chunkSeries(velocity, axes);
+  const accelerationVectors = chunkSeries(acceleration, axes);
+  const velocityMagnitude = velocityVectors.map(vectorMagnitude);
+  const accelerationMagnitude = accelerationVectors.map(vectorMagnitude);
+
+  const smoothingFactor = clamp(options.smoothingFactor ?? 0.5, 0.05, 0.9);
+  const previousVelocity = options.previous?.smoothedVelocity ?? options.previous?.velocityMagnitude ?? [];
+  const previousAcceleration =
+    options.previous?.smoothedAcceleration ?? options.previous?.accelerationMagnitude ?? [];
+
+  const smoothedVelocity = smoothSeries(velocityMagnitude, previousVelocity, smoothingFactor);
+  const smoothedAcceleration = smoothSeries(accelerationMagnitude, previousAcceleration, smoothingFactor);
+
+  const movementFlags = smoothedVelocity.map((value, index) => {
+    const accel = Math.abs(smoothedAcceleration[index] ?? 0);
+    return value + accel > options.minMovement;
   });
 
-  const confidence = movementFlags.reduce((acc, flag) => acc + (flag ? 1 : 0), 0) / (movementFlags.length || 1);
+  const movingJointCount = movementFlags.filter(Boolean).length;
+  const movingJointRatio = movementFlags.length === 0 ? 0 : movingJointCount / movementFlags.length;
+  const confidence = movementFlags.length === 0 ? 0 : movingJointCount / movementFlags.length;
+
+  const dominantJoint = resolveDominantJoint(smoothedVelocity, smoothedAcceleration);
 
   return {
     horizonMs: options.horizonMs,
     velocity,
     acceleration,
+    velocityMagnitude,
+    accelerationMagnitude,
+    smoothedVelocity,
+    smoothedAcceleration,
     movementFlags,
-    confidence
+    confidence,
+    movingJointCount,
+    movingJointRatio,
+    dominantJoint
   };
 }
 
 function enrichForecast(forecast: PoseForecast, threatSummary: ThreatSummary | null): PoseForecast {
-  const movementFlags = [...forecast.movementFlags];
-  const movingJointCount = movementFlags.filter(Boolean).length;
-  let dominantJoint: number | null = null;
-  let dominantMagnitude = -Infinity;
-  for (let i = 0; i < movementFlags.length; i += 1) {
-    const velocity = Math.abs(forecast.velocity[i] ?? 0);
-    const acceleration = Math.abs(forecast.acceleration[i] ?? 0);
-    const magnitude = velocity + acceleration;
-    if (magnitude > dominantMagnitude) {
-      dominantMagnitude = magnitude;
-      dominantJoint = magnitude > 0 ? i : dominantJoint;
-    }
-  }
-
   return {
     ...forecast,
-    movementFlags,
-    movingJointCount,
-    dominantJoint: typeof dominantJoint === 'number' ? dominantJoint : null,
+    movementFlags: [...forecast.movementFlags],
+    movingJointCount: forecast.movingJointCount,
+    movingJointRatio: forecast.movingJointRatio,
+    dominantJoint: typeof forecast.dominantJoint === 'number' ? forecast.dominantJoint : null,
     threatSummary
   };
 }
@@ -286,9 +325,12 @@ function mergeMotionMeta(
     ...base,
     futureMovementFlags: [...forecast.movementFlags],
     movingJointCount: forecast.movingJointCount ?? forecast.movementFlags.filter(Boolean).length,
+    movingJointRatio: forecast.movingJointRatio ?? null,
     dominantJoint: typeof forecast.dominantJoint === 'number' ? forecast.dominantJoint : null,
     forecastConfidence: forecast.confidence,
-    horizonMs: forecast.horizonMs
+    horizonMs: forecast.horizonMs,
+    futureVelocityMagnitude: [...forecast.smoothedVelocity],
+    futureAccelerationMagnitude: [...forecast.smoothedAcceleration]
   };
 
   if (threatSummary) {
@@ -321,6 +363,57 @@ function roundFloat(value: number, precision = 6) {
   }
   const factor = 10 ** precision;
   return Math.round(value * factor) / factor;
+}
+
+function chunkSeries(series: number[], chunkSize: number) {
+  const size = Math.max(1, chunkSize);
+  const result: number[][] = [];
+  for (let i = 0; i < series.length; i += size) {
+    result.push(series.slice(i, i + size));
+  }
+  if (result.length === 0) {
+    result.push([]);
+  }
+  return result;
+}
+
+function vectorMagnitude(values: number[]) {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sumSq = values.reduce((acc, value) => acc + value * value, 0);
+  return roundFloat(Math.sqrt(Math.max(0, sumSq)));
+}
+
+function smoothSeries(current: number[], previous: number[], smoothingFactor: number) {
+  if (!previous || previous.length === 0) {
+    return current.map(value => roundFloat(value));
+  }
+  return current.map((value, index) => {
+    const prev = Number.isFinite(previous[index]) ? previous[index]! : value;
+    const smoothed = prev * (1 - smoothingFactor) + value * smoothingFactor;
+    return roundFloat(smoothed);
+  });
+}
+
+function resolveDominantJoint(smoothedVelocity: number[], smoothedAcceleration: number[]) {
+  let dominantIndex: number | null = null;
+  let dominantMagnitude = -Infinity;
+  for (let i = 0; i < smoothedVelocity.length; i += 1) {
+    const magnitude = Math.abs(smoothedVelocity[i] ?? 0) + Math.abs(smoothedAcceleration[i] ?? 0);
+    if (magnitude > dominantMagnitude) {
+      dominantMagnitude = magnitude;
+      dominantIndex = magnitude > 0 ? i : dominantIndex;
+    }
+  }
+  return dominantIndex;
+}
+
+function clamp(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, value));
 }
 
 export default PoseEstimator;

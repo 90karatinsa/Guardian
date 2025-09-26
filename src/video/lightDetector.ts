@@ -84,7 +84,7 @@ export class LightDetector {
     if (baselineResetNeeded) {
       this.resetAdaptiveState(false);
     } else if (countersResetNeeded) {
-      this.resetAdaptiveState(true);
+      this.resetAdaptiveState(true, true);
     }
   }
 
@@ -112,9 +112,11 @@ export class LightDetector {
       this.lastFrameTs = ts;
 
       const grayscale = readFrameAsGrayscale(frame);
-      const blurred = gaussianBlur(grayscale);
-      const smoothed = medianFilter(blurred);
-      const luminance = averageLuminance(smoothed);
+      const baseGaussian = gaussianBlur(grayscale);
+      const baseMedian = medianFilter(baseGaussian);
+      let smoothed = baseMedian;
+      let denoiseStrategy = 'gaussian-median';
+      let luminance = averageLuminance(smoothed);
 
       if (this.baseline === null) {
         this.baseline = luminance;
@@ -123,6 +125,7 @@ export class LightDetector {
         this.backoffFrames = 0;
         this.suppressedFrames = 0;
         this.deltaTrend = 0;
+        this.lastDenoiseStrategy = denoiseStrategy;
         return;
       }
 
@@ -133,9 +136,49 @@ export class LightDetector {
       const baseNoiseSmoothing = this.options.noiseSmoothing ?? DEFAULT_NOISE_SMOOTHING;
 
       const deltaThreshold = this.options.deltaThreshold ?? DEFAULT_DELTA_THRESHOLD;
-      const delta = Math.abs(luminance - this.baseline);
-      const noiseFloor = this.noiseLevel === 0 ? delta : this.noiseLevel;
-      const noiseRatio = noiseFloor === 0 ? 1 : delta / Math.max(noiseFloor, 1);
+      const evaluateCandidate = (frameCandidate: ReturnType<typeof medianFilter>) => {
+        const candidateLuminance = averageLuminance(frameCandidate);
+        const deltaValue = Math.abs(candidateLuminance - this.baseline!);
+        const floor = this.noiseLevel === 0 ? deltaValue : this.noiseLevel;
+        const ratio = floor === 0 ? 1 : deltaValue / Math.max(floor, 1);
+        return {
+          frame: frameCandidate,
+          luminance: candidateLuminance,
+          delta: deltaValue,
+          noiseFloor: floor,
+          noiseRatio: ratio
+        } as const;
+      };
+
+      let candidate = evaluateCandidate(smoothed);
+
+      if (
+        candidate.noiseRatio > 1.6 ||
+        (candidate.delta < deltaThreshold * 0.5 && candidate.noiseRatio > 1.2)
+      ) {
+        const heavyCandidate = evaluateCandidate(medianFilter(gaussianBlur(baseMedian)));
+        if (
+          heavyCandidate.delta <= candidate.delta &&
+          heavyCandidate.noiseRatio <= candidate.noiseRatio * 0.95
+        ) {
+          candidate = heavyCandidate;
+          denoiseStrategy = 'gaussian-median-gaussian-median';
+        }
+      } else if (candidate.noiseRatio > 1.3) {
+        const medianFirst = medianFilter(grayscale);
+        const hybridCandidate = evaluateCandidate(medianFilter(gaussianBlur(medianFirst)));
+        if (hybridCandidate.noiseRatio <= candidate.noiseRatio * 0.95) {
+          candidate = hybridCandidate;
+          denoiseStrategy = 'median-gaussian-median';
+        }
+      }
+
+      smoothed = candidate.frame;
+      luminance = candidate.luminance;
+      const delta = candidate.delta;
+      const noiseFloor = candidate.noiseFloor;
+      let noiseRatio = candidate.noiseRatio;
+
       const deltaTrendSmoothing = clamp(baseNoiseSmoothing * 1.2, 0.05, 0.35);
       this.deltaTrend =
         this.deltaTrend === 0
@@ -162,6 +205,8 @@ export class LightDetector {
       );
       const adaptiveThreshold = baseAdaptiveThreshold * noiseSuppressionFactor;
       const intensityRatio = adaptiveThreshold === 0 ? 0 : stabilizedDelta / adaptiveThreshold;
+
+      this.lastDenoiseStrategy = denoiseStrategy;
 
       const effectiveSmoothing = clamp(
         delta < adaptiveThreshold
@@ -287,7 +332,8 @@ export class LightDetector {
           noiseMultiplier,
           debounceMultiplier,
           backoffMultiplier,
-          suppressedFramesBeforeTrigger
+          suppressedFramesBeforeTrigger,
+          denoiseStrategy: this.lastDenoiseStrategy
         }
       };
 
@@ -305,7 +351,7 @@ export class LightDetector {
     this.baseline = this.baseline * (1 - smoothing) + luminance * smoothing;
   }
 
-  private resetAdaptiveState(preserveBaseline: boolean) {
+  private resetAdaptiveState(preserveBaseline: boolean, preserveSuppression = false) {
     if (!preserveBaseline) {
       this.baseline = null;
       this.lastFrameTs = null;
@@ -313,9 +359,12 @@ export class LightDetector {
     this.noiseLevel = 0;
     this.pendingFrames = 0;
     this.backoffFrames = 0;
-    this.suppressedFrames = 0;
+    if (!preserveSuppression) {
+      this.suppressedFrames = 0;
+      this.pendingSuppressedFramesBeforeTrigger = 0;
+    }
     this.deltaTrend = 0;
-    this.pendingSuppressedFramesBeforeTrigger = 0;
+    this.lastDenoiseStrategy = 'gaussian-median';
   }
 
   private isWithinNormalHours(ts: number) {

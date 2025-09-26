@@ -1,9 +1,16 @@
+import { EventEmitter } from 'node:events';
 import pino from 'pino';
 import config from 'config';
 import metrics from './metrics/index.js';
 
 const level = config.has('logging.level') ? config.get<string>('logging.level') : 'info';
 const name = config.has('app.name') ? config.get<string>('app.name') : 'Guardian';
+
+const AVAILABLE_LOG_LEVELS = new Set(
+  Object.keys(pino.levels.values).map(level => level.toLowerCase())
+);
+
+const levelEvents = new EventEmitter();
 
 type LogContext = {
   message?: string;
@@ -53,5 +60,51 @@ const logger = pino({
     }
   }
 });
+
+let currentLevel = logger.level;
+
+function normalizeLevel(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function assertLevel(level: string) {
+  if (!AVAILABLE_LOG_LEVELS.has(level)) {
+    const available = Array.from(AVAILABLE_LOG_LEVELS).sort().join(', ');
+    throw new Error(`Unknown log level "${level}" (available: ${available})`);
+  }
+}
+
+export function getLogLevel(): string {
+  return currentLevel;
+}
+
+export function getAvailableLogLevels(): string[] {
+  return Array.from(AVAILABLE_LOG_LEVELS).sort();
+}
+
+export function setLogLevel(nextLevel: string): string {
+  const normalized = normalizeLevel(nextLevel);
+  assertLevel(normalized);
+  const previous = currentLevel;
+  if (previous === normalized) {
+    return currentLevel;
+  }
+
+  logger.level = normalized as pino.LevelWithSilent;
+  currentLevel = logger.level;
+  levelEvents.emit('change', currentLevel, previous);
+  logger.info({ level: currentLevel }, 'Log level updated');
+  return currentLevel;
+}
+
+export function onLogLevelChange(listener: (level: string, previous: string | null) => void) {
+  const wrapper = (level: string, previous: string | null) => {
+    listener(level, previous);
+  };
+  levelEvents.on('change', wrapper);
+  return () => {
+    levelEvents.off('change', wrapper);
+  };
+}
 
 export default logger;

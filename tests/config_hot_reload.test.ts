@@ -477,6 +477,88 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigHotReloadCameraValidation enforces channel and threshold constraints with rollback', async () => {
+    const baseConfig = createConfig({ diffThreshold: 28 });
+    baseConfig.video.channels = { 'video:cam-1': {} };
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({ logger, configManager: manager });
+
+    const originalRaw = fs.readFileSync(configPath, 'utf-8');
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const invalidChannel = JSON.parse(JSON.stringify(baseConfig)) as GuardianConfig;
+      if (invalidChannel.video.cameras) {
+        invalidChannel.video.cameras[0].channel = '   ';
+      }
+      invalidChannel.audio = {
+        channel: '   ',
+        micFallbacks: {
+          linux: [{ device: '   ' }]
+        }
+      } as GuardianConfig['audio'];
+
+      fs.writeFileSync(configPath, JSON.stringify(invalidChannel, null, 2));
+
+      await waitFor(() =>
+        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+      );
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied')
+      );
+
+      const channelWarn = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      expect(channelWarn?.[0]?.err).toBeInstanceOf(Error);
+      const channelMessage = channelWarn?.[0]?.err?.message ?? '';
+      expect(channelMessage).toContain('must specify a non-empty channel');
+      expect(channelMessage).toContain('must be a non-empty string');
+
+      await waitFor(() => fs.readFileSync(configPath, 'utf-8') === originalRaw);
+      expect(manager.getConfig().motion.diffThreshold).toBe(baseConfig.motion.diffThreshold);
+
+      await new Promise(resolve => setTimeout(resolve, 250));
+
+      logger.warn.mockClear();
+      logger.info.mockClear();
+
+      const invalidThreshold = JSON.parse(JSON.stringify(baseConfig)) as GuardianConfig;
+      invalidThreshold.motion.diffThreshold = -5;
+
+      fs.writeFileSync(configPath, JSON.stringify(invalidThreshold, null, 2));
+
+      await waitFor(() =>
+        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+      );
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied')
+      );
+
+      const thresholdWarn = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      expect(thresholdWarn?.[0]?.err).toBeInstanceOf(Error);
+      const thresholdMessage = thresholdWarn?.[0]?.err?.message ?? '';
+      expect(thresholdMessage).toContain('config.motion.diffThreshold must be >= 0');
+
+      await waitFor(() => fs.readFileSync(configPath, 'utf-8') === originalRaw);
+      expect(manager.getConfig().motion.diffThreshold).toBe(baseConfig.motion.diffThreshold);
+      expect(MockVideoSource.instances.length).toBe(1);
+
+      await new Promise(resolve => setTimeout(resolve, 250));
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigReloadRestartsPipelines stops removed cameras', async () => {
     const initialConfig = createConfig({
       diffThreshold: 20,

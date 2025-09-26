@@ -93,6 +93,7 @@ export class PersonDetector {
       }
 
       const detections = parseYoloDetections(output, meta, {
+        classIndex: PERSON_CLASS_INDEX,
         classIndices: this.classIndices,
         scoreThreshold: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
         classScoreThresholds: this.classScoreThresholds,
@@ -130,6 +131,9 @@ export class PersonDetector {
           objectness: primaryDetection.objectness,
           classProbability: primaryDetection.classProbability,
           areaRatio: primaryDetection.areaRatio,
+          combinedLogit: primaryDetection.combinedLogit,
+          projectionIndex: primaryDetection.projectionIndex,
+          normalizedProjection: primaryDetection.normalizedProjection,
           thresholds: {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
             nms: DEFAULT_NMS_IOU_THRESHOLD,
@@ -205,7 +209,10 @@ function serializeDetection(detection: YoloDetection) {
     bbox: detection.bbox,
     objectness: detection.objectness,
     classProbability: detection.classProbability,
-    areaRatio: detection.areaRatio
+    areaRatio: detection.areaRatio,
+    combinedLogit: detection.combinedLogit,
+    projectionIndex: detection.projectionIndex,
+    normalizedProjection: detection.normalizedProjection
   };
 }
 

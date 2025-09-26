@@ -50,6 +50,7 @@ export class MotionDetector {
   private suppressedFrames = 0;
   private pendingSuppressedFramesBeforeTrigger = 0;
   private lastFrameTs: number | null = null;
+  private lastDenoiseStrategy = 'gaussian-median';
 
   constructor(
     private options: MotionDetectorOptions,
@@ -77,14 +78,16 @@ export class MotionDetector {
       hasOptionChanged('areaDeltaThreshold');
 
     const countersResetNeeded =
-      referenceResetNeeded || hasOptionChanged('debounceFrames') || hasOptionChanged('backoffFrames');
+      referenceResetNeeded ||
+      hasOptionChanged('debounceFrames') ||
+      hasOptionChanged('backoffFrames');
 
     this.options = next;
 
     if (referenceResetNeeded) {
       this.resetAdaptiveState();
     } else if (countersResetNeeded) {
-      this.resetAdaptiveState({ preserveReference: true });
+      this.resetAdaptiveState({ preserveReference: true, preserveSuppressionCounters: true });
     }
   }
 
@@ -111,8 +114,10 @@ export class MotionDetector {
       this.lastFrameTs = ts;
 
       const grayscale = readFrameAsGrayscale(frame);
-      const blurred = gaussianBlur(grayscale);
-      const smoothed = medianFilter(blurred);
+      const baseGaussian = gaussianBlur(grayscale);
+      const baseMedian = medianFilter(baseGaussian);
+      let smoothed = baseMedian;
+      let denoiseStrategy = 'gaussian-median';
 
       if (!this.previousFrame) {
         this.previousFrame = smoothed;
@@ -133,11 +138,43 @@ export class MotionDetector {
         this.options.areaDeltaThreshold ?? DEFAULT_AREA_DELTA_THRESHOLD;
 
       const referenceFrame = this.baselineFrame ?? this.previousFrame;
-      const stats = frameDiffStats(referenceFrame, smoothed);
-      this.previousFrame = smoothed;
+      let stats = frameDiffStats(referenceFrame, smoothed);
+      const evaluateNoise = (candidate: typeof stats) => {
+        const prior = this.noiseLevel === 0 ? candidate.meanDelta : this.noiseLevel;
+        const ratio = prior === 0 ? 1 : candidate.meanDelta / Math.max(prior, 1);
+        return { prior, ratio } as const;
+      };
 
-      const priorNoiseFloor = this.noiseLevel === 0 ? stats.meanDelta : this.noiseLevel;
-      const noiseRatio = priorNoiseFloor === 0 ? 1 : stats.meanDelta / Math.max(priorNoiseFloor, 1);
+      let { prior: priorNoiseFloor, ratio: noiseRatio } = evaluateNoise(stats);
+
+      if (noiseRatio > 1.6 || stats.maxDelta > diffThreshold * 2) {
+        const heavyCandidate = medianFilter(gaussianBlur(baseMedian));
+        const heavyStats = frameDiffStats(referenceFrame, heavyCandidate);
+        const heavyNoise = evaluateNoise(heavyStats);
+        if (heavyStats.meanDelta < stats.meanDelta * 0.9) {
+          smoothed = heavyCandidate;
+          stats = heavyStats;
+          priorNoiseFloor = heavyNoise.prior;
+          noiseRatio = heavyNoise.ratio;
+          denoiseStrategy = 'gaussian-median-gaussian-median';
+        }
+      } else if (noiseRatio > 1.25 || stats.maxDelta > diffThreshold * 1.5) {
+        const medianFirst = medianFilter(grayscale);
+        const hybridCandidate = medianFilter(gaussianBlur(medianFirst));
+        const hybridStats = frameDiffStats(referenceFrame, hybridCandidate);
+        const hybridNoise = evaluateNoise(hybridStats);
+        if (hybridStats.meanDelta <= stats.meanDelta * 0.95) {
+          smoothed = hybridCandidate;
+          stats = hybridStats;
+          priorNoiseFloor = hybridNoise.prior;
+          noiseRatio = hybridNoise.ratio;
+          denoiseStrategy = 'median-gaussian-median';
+        }
+      }
+
+      this.previousFrame = smoothed;
+      this.lastDenoiseStrategy = denoiseStrategy;
+
       const noiseDelta = stats.meanDelta - priorNoiseFloor;
 
       const effectiveNoiseSmoothing = clamp(
@@ -318,7 +355,8 @@ export class MotionDetector {
           areaInflation,
           debounceMultiplier,
           backoffMultiplier,
-          suppressedFramesBeforeTrigger
+          suppressedFramesBeforeTrigger,
+          denoiseStrategy
         }
       };
 
@@ -328,8 +366,9 @@ export class MotionDetector {
     }
   }
 
-  private resetAdaptiveState(options: { preserveReference?: boolean } = {}) {
+  private resetAdaptiveState(options: { preserveReference?: boolean; preserveSuppressionCounters?: boolean } = {}) {
     const preserveReference = options.preserveReference ?? false;
+    const preserveSuppression = options.preserveSuppressionCounters ?? false;
 
     if (!preserveReference) {
       this.previousFrame = null;
@@ -342,8 +381,11 @@ export class MotionDetector {
     this.areaTrendMomentum = 0;
     this.activationFrames = 0;
     this.backoffFrames = 0;
-    this.suppressedFrames = 0;
-    this.pendingSuppressedFramesBeforeTrigger = 0;
+    if (!preserveSuppression) {
+      this.suppressedFrames = 0;
+      this.pendingSuppressedFramesBeforeTrigger = 0;
+    }
+    this.lastDenoiseStrategy = 'gaussian-median';
   }
 }
 

@@ -9,6 +9,21 @@ const audioConfig: AudioConfig | undefined = config.has('audio')
   ? config.get<AudioConfig>('audio')
   : undefined;
 
+const parseEnvInt = (value: string | undefined, fallback: number) => {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const simulateDiscoveryTimeout = process.env.GUARDIAN_SIMULATE_AUDIO_DEVICE_TIMEOUT ?? '1';
+const discoveryDelayMs = parseEnvInt(
+  process.env.GUARDIAN_SIMULATE_AUDIO_DEVICE_TIMEOUT_DELAY_MS,
+  1500
+);
+
 const source = new AudioSource({
   type: 'mic',
   channel: 'audio:microphone',
@@ -21,6 +36,7 @@ const source = new AudioSource({
   restartMaxDelayMs: audioConfig?.restartMaxDelayMs,
   restartJitterFactor: audioConfig?.restartJitterFactor,
   forceKillTimeoutMs: audioConfig?.forceKillTimeoutMs,
+  deviceDiscoveryTimeoutMs: audioConfig?.deviceDiscoveryTimeoutMs,
   micFallbacks: audioConfig?.micFallbacks
 });
 
@@ -95,6 +111,14 @@ if (Number.isFinite(mockIdleMs) && mockIdleMs > 0) {
 }
 
 source.start();
+
+if (simulateDiscoveryTimeout !== '0') {
+  setTimeout(() => {
+    source.triggerDeviceDiscoveryTimeout(
+      new Error('Simulated audio device discovery timeout')
+    );
+  }, Math.max(0, discoveryDelayMs));
+}
 
 process.on('SIGINT', () => {
   logger.info('Stopping audio detector');
