@@ -32,5 +32,6 @@ export interface EventSuppressionRule {
   channel?: string | string[];
   suppressForMs?: number;
   rateLimit?: RateLimitConfig;
+  maxEvents?: number;
   reason: string;
 }

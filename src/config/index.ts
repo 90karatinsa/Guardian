@@ -35,7 +35,8 @@ export type RetentionSnapshotMode = 'archive' | 'delete' | 'ignore';
 export type RetentionSnapshotConfig = {
   mode?: RetentionSnapshotMode;
   retentionDays?: number;
-  maxArchivesPerCamera?: number;
+  maxArchivesPerCamera?: number | Record<string, number>;
+  perCameraMax?: Record<string, number>;
 };
 
 export type RetentionConfig = {
@@ -375,7 +376,19 @@ const guardianConfigSchema: JsonSchema = {
               properties: {
                 mode: { type: 'string', enum: ['archive', 'delete', 'ignore'] },
                 retentionDays: { type: 'number', minimum: 0 },
-                maxArchivesPerCamera: { type: 'number', minimum: 0 }
+                maxArchivesPerCamera: {
+                  anyOf: [
+                    { type: 'number', minimum: 0 },
+                    {
+                      type: 'object',
+                      additionalProperties: { type: 'number', minimum: 0 }
+                    }
+                  ]
+                },
+                perCameraMax: {
+                  type: 'object',
+                  additionalProperties: { type: 'number', minimum: 0 }
+                }
               }
             }
           }
@@ -947,6 +960,25 @@ function validateLogicalConfig(config: GuardianConfig) {
 
   const suppressionRules = config.events?.suppression?.rules ?? [];
   suppressionRules.forEach((rule, index) => {
+    if (typeof rule.suppressForMs !== 'undefined') {
+      if (!Number.isInteger(rule.suppressForMs) || rule.suppressForMs <= 0) {
+        messages.push(
+          `config.events.suppression.rules[${index}].suppressForMs must be a positive integer`
+        );
+      }
+    }
+    if (typeof rule.maxEvents !== 'undefined') {
+      if (!Number.isInteger(rule.maxEvents) || rule.maxEvents <= 0) {
+        messages.push(
+          `config.events.suppression.rules[${index}].maxEvents must be a positive integer`
+        );
+      }
+      if (typeof rule.suppressForMs === 'undefined' || rule.suppressForMs <= 0) {
+        messages.push(
+          `config.events.suppression.rules[${index}].suppressForMs must be set when maxEvents is defined`
+        );
+      }
+    }
     const rateLimit = rule.rateLimit;
     if (!rateLimit) {
       return;

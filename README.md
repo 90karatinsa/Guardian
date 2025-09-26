@@ -123,8 +123,9 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
           "id": "lobby-motion-cooldown",
           "channel": "video:lobby",
           "detector": "motion",
-          "windowMs": 30000,
-          "maxEvents": 3
+          "suppressForMs": 30000,
+          "maxEvents": 3,
+          "reason": "cooldown window"
         }
       ]
     },
@@ -157,8 +158,8 @@ Guardian, mikrofon fallback zincirlerini ve anomaly dedektör eşiklerini çalı
 ### Retention ve arşiv döngüsü
 Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir retention görevine sahiptir:
 - `events.retention.retentionDays`: SQLite üzerindeki olay kayıtlarının kaç gün saklanacağını belirtir. Silinen satır sayısı `VACUUM`/`VACUUM FULL` adımlarının tetiklenip tetiklenmeyeceğini belirler.
-- `events.retention.archiveDir` ve `events.retention.maxArchives`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`snapshots/2024-03-18/` gibi). Limit aşıldığında en eski klasörler taşınır ve silinir.
-- Görev her çalıştırmada loglara `Retention task completed` satırını bırakır; `archivedSnapshots` değeri 0’dan büyükse arşiv döngüsünün devrede olduğu anlaşılır.
+- `events.retention.archiveDir`, `events.retention.maxArchivesPerCamera` ve `events.retention.snapshot.maxArchivesPerCamera`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`snapshots/2024-03-18/` gibi). Limit aşıldığında en eski klasörler taşınır ve silinir. `snapshot.maxArchivesPerCamera` anahtarı `snapshot.perCameraMax` ile eşdeğer olup kamera kimliği → kota eşlemesini kabul eder; tanımlanmadığında üst düzey `maxArchivesPerCamera` değeri kullanılır.
+- Görev her çalıştırmada loglara `Retention task completed` satırını bırakır; `archivedSnapshots` değeri 0’dan büyükse arşiv döngüsünün devrede olduğu anlaşılır. `vacuum.run` değeriniz `on-change` ise, önceki çalıştırmada hiçbir satır/snapshot temizlenmediyse VACUUM adımı atlanır.
 
 Bakım sırasında retention politikasını manuel olarak tetiklemek için:
 

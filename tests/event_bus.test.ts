@@ -82,6 +82,41 @@ describe('EventSuppressionRateLimit', () => {
     });
     expect(metricArgs[1]).toMatchObject({ type: 'window', ruleId: 'channel-limit' });
   });
+
+  it('EventSuppressionMaxEvents enforces burst limits with history metadata', () => {
+    bus.configureSuppression([
+      {
+        id: 'burst-limit',
+        detector: 'test-detector',
+        suppressForMs: 500,
+        maxEvents: 3,
+        reason: 'burst limited'
+      }
+    ]);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0 })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 100 })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 200 })).toBe(true);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 250 })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 600 })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 801 })).toBe(true);
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta);
+    expect(suppressedMeta).toHaveLength(2);
+    const burstSuppression = suppressedMeta[0];
+    expect(burstSuppression?.suppressedBy?.[0]?.historyCount).toBe(3);
+
+    const metricArgs = metricsMock.recordSuppressedEvent.mock.calls.map(call => call[0]);
+    expect(metricArgs[0]).toMatchObject({
+      ruleId: 'burst-limit',
+      historyCount: 3,
+      maxEvents: 3
+    });
+    expect(metricArgs[0]?.history?.length).toBe(3);
+  });
 });
 
 describe('EventSuppressionWindowRecovery', () => {

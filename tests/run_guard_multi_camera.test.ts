@@ -1,7 +1,8 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigManager, GuardianConfig } from '../src/config/index.js';
-import metrics from '../src/metrics/index.js';
+
+let metrics: typeof import('../src/metrics/index.js').default;
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
@@ -114,8 +115,9 @@ vi.mock('../src/tasks/retention.js', () => ({
 }));
 
 describe('run-guard multi camera orchestration', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
+    ({ default: metrics } = await import('../src/metrics/index.js'));
     MockVideoSource.instances = [];
     MockPersonDetector.instances = [];
     MockPersonDetector.calls = [];
@@ -244,6 +246,121 @@ describe('run-guard multi camera orchestration', () => {
     });
 
     runtime.stop();
+  });
+
+  it('MultiCameraChannelOverrides applies per-channel person thresholds and restart metrics', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const bus = new EventEmitter();
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const restartSpy = vi.spyOn(metrics, 'recordPipelineRestart');
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 6,
+          ffmpeg: { restartDelayMs: 100, restartMaxDelayMs: 100, restartJitterFactor: 0 },
+          channels: {
+            'video:cam-1': {
+              person: {
+                classScoreThresholds: { 0: 0.6, 1: 0.7 }
+              }
+            },
+            'video:cam-2': {
+              person: {
+                classScoreThresholds: { 0: 0.4 }
+              }
+            }
+          },
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream',
+              person: {
+                classScoreThresholds: { 0: 0.75 }
+              }
+            },
+            {
+              id: 'cam-2',
+              channel: 'video:cam-2',
+              input: 'rtsp://camera-2/stream'
+            }
+          ]
+        },
+        person: {
+          modelPath: 'model.onnx',
+          score: 0.5,
+          classScoreThresholds: { 0: 0.3, 2: 0.9 }
+        },
+        motion: {
+          diffThreshold: 20,
+          areaThreshold: 0.02
+        },
+        events: {
+          thresholds: { info: 0, warning: 1, critical: 2 }
+        }
+      }
+    });
+
+    try {
+      await Promise.resolve();
+
+      expect(MockPersonDetector.instances).toHaveLength(2);
+      const [cam1Detector, cam2Detector] = MockPersonDetector.instances;
+      expect(cam1Detector.options.classScoreThresholds).toEqual({ 0: 0.75, 1: 0.7, 2: 0.9 });
+      expect(cam2Detector.options.classScoreThresholds).toEqual({ 0: 0.4, 2: 0.9 });
+
+      expect(MockVideoSource.instances).toHaveLength(2);
+      const [cam1Source, cam2Source] = MockVideoSource.instances;
+      expect(cam1Source.listenerCount('recover')).toBeGreaterThan(0);
+      expect(cam2Source.listenerCount('recover')).toBeGreaterThan(0);
+      cam1Source.emit('recover', {
+        reason: 'stream-idle',
+        attempt: 1,
+        delayMs: 100,
+        meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+      });
+      cam2Source.emit('recover', {
+        reason: 'corrupted-frame',
+        attempt: 2,
+        delayMs: 150,
+        meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+      });
+
+      await Promise.resolve();
+
+      const cam1Runtime = runtime.pipelines.get('video:cam-1');
+      const cam2Runtime = runtime.pipelines.get('video:cam-2');
+      expect(cam1Runtime?.restartStats.total).toBe(1);
+      expect(cam2Runtime?.restartStats.total).toBe(1);
+      expect(restartSpy).toHaveBeenCalledWith(
+        'ffmpeg',
+        'stream-idle',
+        expect.objectContaining({ channel: 'video:cam-1' })
+      );
+      expect(restartSpy).toHaveBeenCalledWith(
+        'ffmpeg',
+        'corrupted-frame',
+        expect.objectContaining({ channel: 'video:cam-2' })
+      );
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.restarts).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.byReason?.['stream-idle']).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.byReason?.['corrupted-frame']).toBe(1);
+    } finally {
+      restartSpy.mockRestore();
+      runtime.stop();
+    }
   });
 
   it('CameraChannelOverrideValidation rejects cameras without channels', async () => {

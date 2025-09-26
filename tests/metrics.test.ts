@@ -251,6 +251,32 @@ describe('MetricsSnapshotEnrichment', () => {
     expect(metricsCheck?.details?.lastSuppressed?.ruleId).toBe('window-1');
   });
 
+  it('MetricsAudioDeviceDiscovery exposes audio device discovery counters in health snapshots', async () => {
+    metrics.recordAudioDeviceDiscovery('probe-failed', { channel: 'audio:lobby' });
+    metrics.recordAudioDeviceDiscovery('probe-failed');
+    metrics.recordAudioDeviceDiscovery('probe-success', { channel: 'audio:lobby' });
+
+    const unregister = registerHealthIndicator('audio-device-discovery', context => {
+      expect(context.metrics?.pipelines.audio.deviceDiscovery['probe-failed']).toBeGreaterThanOrEqual(2);
+      expect(
+        context.metrics?.pipelines.audio.deviceDiscoveryByChannel['audio:lobby']['probe-failed']
+      ).toBe(1);
+      return { status: 'ok' };
+    });
+
+    const checks = await collectHealthChecks({
+      service: { status: 'running', startedAt: Date.now() }
+    });
+    unregister();
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.audio.deviceDiscovery['probe-failed']).toBeGreaterThanOrEqual(2);
+    expect(snapshot.pipelines.audio.deviceDiscoveryByChannel['audio:lobby']['probe-failed']).toBe(1);
+
+    const deviceCheck = checks.find(check => check.name === 'audio-device-discovery');
+    expect(deviceCheck?.status).toBe('ok');
+  });
+
   it('MetricsPipelineRestartHistogram tracks restart attempts and detector latency histograms', () => {
     metrics.recordPipelineRestart('ffmpeg', 'watchdog', {
       delayMs: 1200,

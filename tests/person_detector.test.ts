@@ -247,6 +247,108 @@ describe('YoloParser utilities', () => {
     expect(duplicate).toHaveLength(1);
     expect(results[0].score).toBeGreaterThan(results[1].score ?? 0);
   });
+
+  it('YoloParserClampedBoxes clamps coordinates and applies class-specific thresholds', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      values.classProbabilities.forEach((probability, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit(probability);
+      });
+    };
+
+    assign(0, {
+      cx: 20,
+      cy: 200,
+      width: 400,
+      height: 500,
+      objectness: 0.9,
+      classProbabilities: [0.75, 0.55]
+    });
+
+    assign(1, {
+      cx: 620,
+      cy: 620,
+      width: 400,
+      height: 500,
+      objectness: 0.82,
+      classProbabilities: [0.15, 0.82]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 0.5,
+      padX: 0,
+      padY: 140,
+      originalWidth: 1280,
+      originalHeight: 720,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 0.5,
+      scaleY: 0.5
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0, 1],
+      scoreThreshold: 0.5,
+      classScoreThresholds: { 1: 0.6 },
+      maxDetections: 5
+    });
+
+    expect(results).toHaveLength(2);
+    const first = results.find(result => result.classId === 0);
+    const second = results.find(result => result.classId === 1);
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+
+    expect(first?.score ?? 0).toBeCloseTo(0.9 * 0.75, 5);
+    expect(second?.score ?? 0).toBeCloseTo(0.82 * 0.82, 5);
+
+    const bounds = { width: meta.originalWidth, height: meta.originalHeight };
+
+    for (const detection of results) {
+      const { left, top, width, height } = detection.bbox;
+      expect(left).toBeGreaterThanOrEqual(0);
+      expect(top).toBeGreaterThanOrEqual(0);
+      expect(width).toBeGreaterThan(0);
+      expect(height).toBeGreaterThan(0);
+      expect(left + width).toBeLessThanOrEqual(bounds.width);
+      expect(top + height).toBeLessThanOrEqual(bounds.height);
+    }
+
+    expect(first?.bbox.left ?? 0).toBe(0);
+    expect(first?.bbox.top ?? 0).toBe(0);
+    expect(first?.bbox.width ?? 0).toBeCloseTo(440, 5);
+    expect(first?.bbox.height ?? 0).toBeCloseTo(620, 5);
+
+    expect(second?.bbox.left ?? 0).toBeCloseTo(840, 5);
+    expect(second?.bbox.top ?? 0).toBeCloseTo(460, 5);
+    expect(second?.bbox.width ?? 0).toBeCloseTo(440, 5);
+    expect(second?.bbox.height ?? 0).toBeCloseTo(260, 5);
+
+    expect(first?.areaRatio ?? 0).toBeCloseTo((440 * 620) / (1280 * 720), 5);
+    expect(second?.areaRatio ?? 0).toBeCloseTo((440 * 260) / (1280 * 720), 5);
+  });
 });
 
 describe('PersonDetector', () => {

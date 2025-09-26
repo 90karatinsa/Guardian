@@ -247,6 +247,58 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoFfmpegIdleTimeout restarts idle streams with metrics reason tracking', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:idle-test',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 15,
+      watchdogTimeoutMs: 0,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => {
+          command.emit('start');
+          command.pushFrame(SAMPLE_PNG);
+        }, 1);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(16);
+      await Promise.resolve();
+
+      const idleEvent = recoverEvents.find(event => event.reason === 'stream-idle');
+      expect(idleEvent).toBeDefined();
+      expect(idleEvent?.channel).toBe('video:idle-test');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['stream-idle']).toBeGreaterThanOrEqual(1);
+    } finally {
+      source.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('VideoFfmpegExitBackoff escalates delays when ffmpeg exits unexpectedly', async () => {
     vi.useFakeTimers();
 
@@ -346,12 +398,14 @@ describe('VideoSource', () => {
     const internals = source as unknown as {
       startTimer: NodeJS.Timeout | null;
       watchdogTimer: NodeJS.Timeout | null;
+      streamIdleTimer: NodeJS.Timeout | null;
       restartTimer: NodeJS.Timeout | null;
       killTimer: NodeJS.Timeout | null;
     };
 
     expect(internals.startTimer).toBeNull();
     expect(internals.watchdogTimer).toBeNull();
+    expect(internals.streamIdleTimer).toBeNull();
     expect(internals.restartTimer).toBeNull();
     expect(internals.killTimer).toBeNull();
 
@@ -362,6 +416,64 @@ describe('VideoSource', () => {
     expect(commands[0].killedSignals).toContain('SIGKILL');
 
     vi.useRealTimers();
+  });
+
+  it('VideoFfmpegCorruptedFrameRecovery retries when corrupted frames are detected', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+    const errors: Error[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:corrupted-test',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      maxBufferBytes: 32,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => {
+          command.emit('start');
+          command.stream.write(Buffer.alloc(64, 0));
+        }, 1);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', err => {
+      errors.push(err);
+    });
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(errors.some(error => error.message.includes('Corrupted frame'))).toBe(true);
+
+      const recovery = recoverEvents.find(event => event.reason === 'corrupted-frame');
+      expect(recovery).toBeDefined();
+      expect(recovery?.channel).toBe('video:corrupted-test');
+      expect(recovery?.reason).toBe('corrupted-frame');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('corrupted-frame');
+      expect(snapshot.pipelines.ffmpeg.byReason['corrupted-frame']).toBeGreaterThanOrEqual(1);
+    } finally {
+      source.stop();
+      vi.useRealTimers();
+    }
   });
 
   it('removes stream listeners when the stream closes', async () => {

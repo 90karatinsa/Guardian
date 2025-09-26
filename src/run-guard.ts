@@ -1128,10 +1128,14 @@ function buildRetentionOptions(options: {
   const intervalMinutes = retention.intervalMinutes ?? 60;
   const vacuum = retention.vacuum ?? 'auto';
   const snapshot = retention.snapshot;
+  const snapshotAliasLimit = resolveSnapshotGlobalLimit(snapshot);
   const maxArchives =
-    typeof retention.maxArchivesPerCamera === 'number'
+    typeof retention.maxArchivesPerCamera === 'number' &&
+    Number.isFinite(retention.maxArchivesPerCamera) &&
+    retention.maxArchivesPerCamera >= 0
       ? retention.maxArchivesPerCamera
-      : snapshot?.maxArchivesPerCamera;
+      : snapshotAliasLimit;
+  const perCameraMax = resolveSnapshotPerCameraMax(snapshot);
 
   return {
     enabled: retention.enabled !== false,
@@ -1153,11 +1157,46 @@ function buildRetentionOptions(options: {
     snapshot: snapshot
       ? {
           mode: snapshot.mode,
-          retentionDays: snapshot.retentionDays
+          retentionDays: snapshot.retentionDays,
+          perCameraMax,
+          maxArchivesPerCamera:
+            typeof snapshot?.maxArchivesPerCamera !== 'number' ? snapshot?.maxArchivesPerCamera : undefined
         }
       : undefined,
     logger: options.logger
   } satisfies RetentionTaskOptions;
+}
+
+function resolveSnapshotPerCameraMax(
+  snapshot?: RetentionConfig['snapshot']
+): Record<string, number> | undefined {
+  const candidate =
+    snapshot?.perCameraMax && typeof snapshot.perCameraMax === 'object'
+      ? snapshot.perCameraMax
+      : snapshot?.maxArchivesPerCamera && typeof snapshot.maxArchivesPerCamera === 'object'
+        ? snapshot.maxArchivesPerCamera
+        : undefined;
+
+  if (!candidate || Array.isArray(candidate)) {
+    return undefined;
+  }
+
+  const entries = Object.entries(candidate)
+    .filter(([camera, value]) => typeof camera === 'string' && camera.trim().length > 0)
+    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+    .map(([camera, value]) => [camera, Math.floor(value)] as const);
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function resolveSnapshotGlobalLimit(
+  snapshot?: RetentionConfig['snapshot']
+): number | undefined {
+  const alias = snapshot?.maxArchivesPerCamera;
+  if (typeof alias === 'number' && Number.isFinite(alias) && alias >= 0) {
+    return Math.floor(alias);
+  }
+  return undefined;
 }
 
 function collectSnapshotDirectories(video: VideoConfig, person: PersonConfig): string[] {

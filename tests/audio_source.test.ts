@@ -129,6 +129,48 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioPipeMisalignTriggersRecovery restarts pipe streams on misaligned chunks', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 20,
+      restartDelayMs: 100,
+      restartMaxDelayMs: 100,
+      restartJitterFactor: 0,
+      random: () => 0.5
+    });
+
+    const recoverSpy = vi.fn();
+    const errorSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', errorSpy);
+
+    const stream = new PassThrough();
+    (source as any).alignChunks = true;
+    (source as any).expectedSampleBytes = 2;
+
+    source.consume(stream, 16000, 1);
+
+    stream.write(Buffer.alloc(3));
+
+    await Promise.resolve();
+
+    expect(errorSpy).toHaveBeenCalled();
+    expect(recoverSpy).toHaveBeenCalledTimes(1);
+    const event = recoverSpy.mock.calls[0][0];
+    expect(event.reason).toBe('stream-error');
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.audio.byReason['stream-error']).toBe(1);
+
+    await vi.runOnlyPendingTimersAsync();
+    source.stop();
+  });
+
   it('AudioWatchdogSilenceReset recovers from silence and restarts on watchdog timeout', async () => {
     vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
