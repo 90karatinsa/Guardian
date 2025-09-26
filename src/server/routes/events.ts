@@ -185,7 +185,7 @@ export class EventsRouter {
     });
 
     if (facesRequest.includeFaces) {
-      void this.pushFacesSnapshot(res, facesRequest.query);
+      void this.pushFacesSnapshot(res, facesRequest.query, filters.channels);
     }
 
     const cleanup = () => {
@@ -469,7 +469,7 @@ export class EventsRouter {
     sendJson(res, 503, { error: 'Face registry unavailable' });
   }
 
-  private async pushFacesSnapshot(target: ServerResponse, query: string | null) {
+  private async pushFacesSnapshot(target: ServerResponse, query: string | null, channels?: string[]) {
     const registry = await this.ensureFaceRegistry();
     if (!registry) {
       try {
@@ -481,7 +481,7 @@ export class EventsRouter {
       return;
     }
 
-    const faces = filterFaces(registry.list(), query);
+    const faces = filterFaces(registry.list(), query, channels);
     const payload = faces.map(face => ({
       id: face.id,
       label: face.label,
@@ -514,7 +514,7 @@ export class EventsRouter {
       if (!state.includeFaces) {
         continue;
       }
-      tasks.push(this.pushFacesSnapshot(client, state.facesQuery));
+      tasks.push(this.pushFacesSnapshot(client, state.facesQuery, state.filters.channels));
     }
 
     if (tasks.length > 0) {
@@ -542,6 +542,7 @@ function parseListOptions(url: URL): ListEventsOptions {
   const offset = toNumber(params.get('offset'));
   const since = resolveDateParam(params.get('since')) ?? resolveDateParam(params.get('from'));
   const until = resolveDateParam(params.get('until')) ?? resolveDateParam(params.get('to'));
+  const channelParams = parseChannelParams(params);
 
   if (typeof limit === 'number') {
     options.limit = limit;
@@ -554,6 +555,13 @@ function parseListOptions(url: URL): ListEventsOptions {
   }
   if (typeof until === 'number') {
     options.until = until;
+  }
+
+  if (channelParams.length > 0) {
+    options.channel = channelParams[0];
+    if (channelParams.length > 1) {
+      options.channels = Array.from(new Set(channelParams));
+    }
   }
 
   const detector = params.get('detector');
@@ -569,11 +577,6 @@ function parseListOptions(url: URL): ListEventsOptions {
   const severity = params.get('severity');
   if (severity) {
     options.severity = severity as ListEventsOptions['severity'];
-  }
-
-  const channel = params.get('channel');
-  if (channel) {
-    options.channel = channel;
   }
 
   const camera = params.get('camera');
@@ -690,9 +693,10 @@ function extractSnapshotPath(event: EventRecordWithId): string | null {
 
 function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boolean {
   const meta = (event.meta ?? {}) as Record<string, unknown>;
-  const metaChannel = typeof meta.channel === 'string' ? meta.channel : undefined;
   const metaCamera = typeof meta.camera === 'string' ? meta.camera : undefined;
   const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : '';
+  const eventChannels = resolveEventChannels(meta);
+  const channelFilters = collectChannelFilters(filters);
 
   if (filters.detector && event.detector !== filters.detector) {
     return false;
@@ -700,12 +704,15 @@ function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boole
   if (filters.source && event.source !== filters.source) {
     return false;
   }
-  if (filters.channel && metaChannel !== filters.channel) {
-    return false;
+  if (channelFilters.length > 0) {
+    const matchesChannel = eventChannels.some(channel => channelFilters.includes(channel));
+    if (!matchesChannel) {
+      return false;
+    }
   }
   if (filters.camera) {
     const cameraMatch =
-      event.source === filters.camera || metaCamera === filters.camera || metaChannel === filters.camera;
+      event.source === filters.camera || metaCamera === filters.camera || eventChannels.includes(filters.camera);
     if (!cameraMatch) {
       return false;
     }
@@ -732,7 +739,7 @@ function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boole
       event.detector,
       event.source,
       snapshotPath,
-      metaChannel,
+      ...eventChannels,
       metaCamera
     ]
       .filter((value): value is string => typeof value === 'string')
@@ -779,24 +786,99 @@ function resolveFacesRequest(params: URLSearchParams): { includeFaces: boolean; 
   return { includeFaces: true, query: normalized };
 }
 
-function filterFaces(faces: FaceRecord[], search: string | null): FaceRecord[] {
-  if (!search) {
-    return faces;
+function parseChannelParams(params: URLSearchParams): string[] {
+  const values: string[] = [];
+  values.push(...params.getAll('channel'));
+  const multi = params.getAll('channels');
+  for (const entry of multi) {
+    values.push(entry);
+  }
+  return values
+    .flatMap(value => value.split(','))
+    .map(value => value.trim())
+    .filter(value => value.length > 0);
+}
+
+function collectChannelFilters(source: { channel?: string; channels?: string[] | undefined }): string[] {
+  const set = new Set<string>();
+  if (typeof source.channel === 'string') {
+    const trimmed = source.channel.trim();
+    if (trimmed) {
+      set.add(trimmed);
+    }
+  }
+  if (Array.isArray(source.channels)) {
+    for (const candidate of source.channels) {
+      if (typeof candidate !== 'string') {
+        continue;
+      }
+      const trimmed = candidate.trim();
+      if (trimmed) {
+        set.add(trimmed);
+      }
+    }
+  }
+  return Array.from(set);
+}
+
+function resolveEventChannels(meta: Record<string, unknown>): string[] {
+  const channels: string[] = [];
+  const candidate = meta.channel;
+  if (typeof candidate === 'string') {
+    const trimmed = candidate.trim();
+    if (trimmed) {
+      channels.push(trimmed);
+    }
+  } else if (Array.isArray(candidate)) {
+    for (const value of candidate) {
+      if (typeof value !== 'string') {
+        continue;
+      }
+      const trimmed = value.trim();
+      if (trimmed) {
+        channels.push(trimmed);
+      }
+    }
+  }
+  return channels;
+}
+
+function filterFaces(faces: FaceRecord[], search: string | null, channels?: string[]): FaceRecord[] {
+  let filtered = faces;
+
+  if (search) {
+    const query = search.trim().toLowerCase();
+    if (query) {
+      filtered = filtered.filter(face => {
+        if (face.label.toLowerCase().includes(query)) {
+          return true;
+        }
+        if (face.metadata) {
+          const metadataString = JSON.stringify(face.metadata).toLowerCase();
+          return metadataString.includes(query);
+        }
+        return false;
+      });
+    }
   }
 
-  const query = search.trim().toLowerCase();
-  if (!query) {
-    return faces;
+  const channelFilters = collectChannelFilters({ channels });
+  if (channelFilters.length === 0) {
+    return filtered;
   }
 
-  return faces.filter(face => {
-    if (face.label.toLowerCase().includes(query)) {
-      return true;
+  const channelSet = new Set(channelFilters);
+  return filtered.filter(face => {
+    const metadata = face.metadata;
+    const candidateChannel =
+      metadata && typeof (metadata as Record<string, unknown>).channel === 'string'
+        ? ((metadata as Record<string, unknown>).channel as string).trim()
+        : metadata && typeof (metadata as Record<string, unknown>).camera === 'string'
+        ? ((metadata as Record<string, unknown>).camera as string).trim()
+        : '';
+    if (!candidateChannel) {
+      return false;
     }
-    if (face.metadata) {
-      const metadataString = JSON.stringify(face.metadata).toLowerCase();
-      return metadataString.includes(query);
-    }
-    return false;
+    return channelSet.has(candidateChannel);
   });
 }

@@ -40,6 +40,24 @@ type NormalizedOptions = {
   snapshot?: SnapshotRotationOptions;
 };
 
+export type RetentionVacuumSummary = {
+  ran: boolean;
+  runMode: Required<VacuumOptions>['run'];
+  mode: VacuumMode | 'skipped';
+  analyze: boolean;
+  reindex: boolean;
+  optimize: boolean;
+  target?: string;
+};
+
+export type RetentionRunResult = {
+  skipped: boolean;
+  reason?: 'disabled';
+  outcome?: RetentionOutcome;
+  warnings: RetentionWarningSnapshot[];
+  vacuum: RetentionVacuumSummary;
+};
+
 export class RetentionTask {
   private options: NormalizedOptions;
   private readonly logger: RetentionLogger;
@@ -104,71 +122,7 @@ export class RetentionTask {
     this.running = true;
 
     try {
-      if (!this.options.enabled) {
-        this.logger.info({ enabled: false }, 'Retention task skipped');
-        return;
-      }
-
-      const snapshotDirs = dedupeDirectories(this.options.snapshotDirs);
-      const archiveDir = this.options.archiveDir;
-
-      const outcome = runPolicy({
-        retentionDays: this.options.retentionDays,
-        archiveDir,
-        snapshotDirs,
-        maxArchivesPerCamera: this.options.maxArchivesPerCamera,
-        snapshot: this.options.snapshot
-      });
-
-      const shouldVacuum =
-        this.options.vacuum.run === 'always' ||
-        (this.options.vacuum.run !== 'always' &&
-          (outcome.removedEvents > 0 || outcome.archivedSnapshots > 0 || outcome.prunedArchives > 0));
-
-      for (const warning of outcome.warnings) {
-        this.logger.warn(
-          { path: warning.path, camera: warning.camera, err: warning.error },
-          'Retention archive warning'
-        );
-        this.metrics.recordRetentionWarning({
-          camera: warning.camera,
-          path: warning.path,
-          reason: warning.error.message ?? warning.error.name
-        });
-      }
-
-      if (shouldVacuum) {
-        vacuumDatabase(this.options.vacuum);
-      }
-
-      this.metrics.recordRetentionRun({
-        removedEvents: outcome.removedEvents,
-        archivedSnapshots: outcome.archivedSnapshots,
-        prunedArchives: outcome.prunedArchives,
-        perCamera: outcome.perCamera
-      });
-
-      this.logger.info(
-        {
-          removedEvents: outcome.removedEvents,
-          archivedSnapshots: outcome.archivedSnapshots,
-          prunedArchives: outcome.prunedArchives,
-          retentionDays: this.options.retentionDays,
-          vacuumMode: shouldVacuum ? this.options.vacuum.mode ?? 'auto' : 'skipped',
-          vacuumRunMode: this.options.vacuum.run,
-          vacuumTasks:
-            shouldVacuum
-              ? {
-                  analyze: this.options.vacuum.analyze === true,
-                  reindex: this.options.vacuum.reindex === true,
-                  optimize: this.options.vacuum.optimize === true,
-                  target: this.options.vacuum.target
-                }
-              : undefined,
-          perCamera: outcome.perCamera
-        },
-        'Retention task completed'
-      );
+      await executeRetentionRun(this.options, this.logger, this.metrics);
     } catch (error) {
       this.logger.error({ err: error }, 'Retention task failed');
     } finally {
@@ -185,6 +139,13 @@ export function startRetentionTask(options: RetentionTaskOptions): RetentionTask
   const task = new RetentionTask(options);
   task.start();
   return task;
+}
+
+export async function runRetentionOnce(options: RetentionTaskOptions): Promise<RetentionRunResult> {
+  const normalized = normalizeOptions(options);
+  const logger = options.logger ?? loggerModule;
+  const metrics = options.metrics ?? metricsModule;
+  return executeRetentionRun(normalized, logger, metrics);
 }
 
 function normalizeOptions(options: RetentionTaskOptions): NormalizedOptions {
@@ -344,5 +305,101 @@ function normalizeVacuumConfig(options: RetentionTaskOptions): Required<VacuumOp
     optimize: false,
     pragmas: undefined,
     run: 'on-change'
+  };
+}
+
+async function executeRetentionRun(
+  options: NormalizedOptions,
+  logger: RetentionLogger,
+  metrics: MetricsRegistry
+): Promise<RetentionRunResult> {
+  if (!options.enabled) {
+    const vacuum: RetentionVacuumSummary = {
+      ran: false,
+      runMode: options.vacuum.run,
+      mode: 'skipped',
+      analyze: false,
+      reindex: false,
+      optimize: false
+    };
+    logger.info({ enabled: false }, 'Retention task skipped');
+    return { skipped: true, reason: 'disabled', warnings: [], vacuum };
+  }
+
+  const snapshotDirs = dedupeDirectories(options.snapshotDirs);
+  const archiveDir = options.archiveDir;
+
+  const outcome = runPolicy({
+    retentionDays: options.retentionDays,
+    archiveDir,
+    snapshotDirs,
+    maxArchivesPerCamera: options.maxArchivesPerCamera,
+    snapshot: options.snapshot
+  });
+
+  const shouldVacuum =
+    options.vacuum.run === 'always' ||
+    (options.vacuum.run !== 'always' &&
+      (outcome.removedEvents > 0 || outcome.archivedSnapshots > 0 || outcome.prunedArchives > 0));
+
+  const warnings: RetentionWarningSnapshot[] = [];
+  for (const warning of outcome.warnings) {
+    const summary: RetentionWarningSnapshot = {
+      camera: warning.camera ?? null,
+      path: warning.path,
+      reason: warning.error.message ?? warning.error.name
+    };
+    warnings.push(summary);
+    logger.warn({ path: warning.path, camera: warning.camera, err: warning.error }, 'Retention archive warning');
+    metrics.recordRetentionWarning(summary);
+  }
+
+  if (shouldVacuum) {
+    vacuumDatabase(options.vacuum);
+  }
+
+  metrics.recordRetentionRun({
+    removedEvents: outcome.removedEvents,
+    archivedSnapshots: outcome.archivedSnapshots,
+    prunedArchives: outcome.prunedArchives,
+    perCamera: outcome.perCamera
+  });
+
+  const vacuumSummary: RetentionVacuumSummary = {
+    ran: shouldVacuum,
+    runMode: options.vacuum.run,
+    mode: shouldVacuum ? options.vacuum.mode ?? 'auto' : 'skipped',
+    analyze: shouldVacuum ? options.vacuum.analyze === true : false,
+    reindex: shouldVacuum ? options.vacuum.reindex === true : false,
+    optimize: shouldVacuum ? options.vacuum.optimize === true : false,
+    target: shouldVacuum ? options.vacuum.target ?? undefined : undefined
+  };
+
+  logger.info(
+    {
+      removedEvents: outcome.removedEvents,
+      archivedSnapshots: outcome.archivedSnapshots,
+      prunedArchives: outcome.prunedArchives,
+      retentionDays: options.retentionDays,
+      vacuumMode: vacuumSummary.mode,
+      vacuumRunMode: options.vacuum.run,
+      vacuumTasks: shouldVacuum
+        ? {
+            analyze: options.vacuum.analyze === true,
+            reindex: options.vacuum.reindex === true,
+            optimize: options.vacuum.optimize === true,
+            target: options.vacuum.target
+          }
+        : undefined,
+      perCamera: outcome.perCamera
+    },
+    'Retention task completed'
+  );
+
+  return {
+    skipped: false,
+    outcome,
+    warnings,
+    vacuum: vacuumSummary
   };
 }

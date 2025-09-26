@@ -164,6 +164,166 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
   });
 
+  it('HttpEventsChannelFilter limits REST and SSE streams by channel', async () => {
+    const now = Date.now();
+    storeEvent({
+      ts: now - 1000,
+      source: 'video:lobby',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Lobby movement',
+      meta: { channel: 'video:lobby' }
+    });
+    storeEvent({
+      ts: now - 800,
+      source: 'video:door',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Door movement',
+      meta: { channel: 'video:door' }
+    });
+    storeEvent({
+      ts: now - 600,
+      source: 'video:perimeter',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Perimeter movement',
+      meta: { channel: 'video:perimeter' }
+    });
+
+    const faces = [
+      { id: 1, label: 'Lobby Face', createdAt: now - 500, metadata: { channel: 'video:lobby' }, embedding: [] },
+      { id: 2, label: 'Door Face', createdAt: now - 400, metadata: { channel: 'video:door' }, embedding: [] },
+      { id: 3, label: 'Perimeter Face', createdAt: now - 300, metadata: { channel: 'video:perimeter' }, embedding: [] }
+    ];
+    const registry = new StubFaceRegistry(faces as any);
+
+    const { port } = await ensureServer({ faceRegistry: registry as any });
+
+    const channelQuery = `channel=${encodeURIComponent('video:lobby')}&channel=${encodeURIComponent('video:door')}`;
+    const restResponse = await fetch(`http://localhost:${port}/api/events?${channelQuery}`);
+    expect(restResponse.status).toBe(200);
+    const restPayload = await restResponse.json();
+    expect(restPayload.items).toHaveLength(2);
+    expect(
+      restPayload.items.every((item: { meta?: { channel?: string } }) =>
+        ['video:lobby', 'video:door'].includes(item.meta?.channel ?? '')
+      )
+    ).toBe(true);
+
+    const controller = new AbortController();
+    const streamResponse = await fetch(
+      `http://localhost:${port}/api/events/stream?faces=1&${channelQuery}`,
+      { signal: controller.signal }
+    );
+    expect(streamResponse.status).toBe(200);
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const receivedEvents: unknown[] = [];
+    let facesPayload: any = null;
+
+    const readPromise = new Promise<void>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+
+      const processChunk = (chunk: string) => {
+        buffer += chunk;
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          boundary = buffer.indexOf('\n\n');
+
+          const lines = block.split('\n');
+          let eventName = 'message';
+          const dataLines: string[] = [];
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5).trim());
+            }
+          }
+          if (dataLines.length === 0) {
+            continue;
+          }
+          const dataText = dataLines.join('\n');
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(dataText);
+          } catch (error) {
+            reject(error);
+            return;
+          }
+
+          if (eventName === 'faces') {
+            facesPayload = parsed;
+          } else if (eventName !== 'stream-status' && eventName !== 'heartbeat') {
+            receivedEvents.push(parsed);
+          }
+
+          if (facesPayload && receivedEvents.length >= 1) {
+            resolve();
+            return;
+          }
+        }
+      };
+
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              resolve();
+              return;
+            }
+            processChunk(decoder.decode(value, { stream: true }));
+            readNext();
+          })
+          .catch(reject);
+      };
+
+      readNext();
+    });
+
+    bus.emit('event', {
+      ts: now - 200,
+      source: 'video:lobby',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Lobby follow-up',
+      meta: { channel: 'video:lobby' }
+    });
+
+    bus.emit('event', {
+      ts: now - 100,
+      source: 'video:perimeter',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Perimeter follow-up',
+      meta: { channel: 'video:perimeter' }
+    });
+
+    await readPromise;
+    controller.abort();
+
+    expect(receivedEvents).toHaveLength(1);
+    const streamed = receivedEvents[0] as { meta?: { channel?: string } };
+    expect(streamed.meta?.channel).toBe('video:lobby');
+    expect(facesPayload?.faces?.length).toBe(2);
+    expect(
+      Array.isArray(facesPayload?.faces) &&
+        facesPayload.faces.every((face: { metadata?: { channel?: string } }) =>
+          ['video:lobby', 'video:door'].includes(face.metadata?.channel ?? '')
+        )
+    ).toBe(true);
+  });
+
   it('HttpMetricsStream returns pipeline metrics snapshot', async () => {
     metrics.reset();
     metrics.recordPipelineRestart('ffmpeg', 'spawn-error', { channel: 'video:lobby' });

@@ -31,6 +31,70 @@ describe('RetentionMaintenance', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('DatabaseChannelIndexMaintenance validates channel index and on-change vacuum', async () => {
+    const indexes = db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }>;
+    const indexNames = indexes.map(entry => entry.name);
+    expect(indexNames).toContain('idx_events_channel');
+
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 7, 1);
+    vi.setSystemTime(now);
+
+    const execSpy = vi.spyOn(db, 'exec');
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase');
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const task = startRetentionTask({
+      enabled: true,
+      retentionDays: 1,
+      intervalMs: 500,
+      archiveDir,
+      snapshotDirs: [],
+      vacuum: { mode: 'auto', run: 'on-change' },
+      logger,
+      metrics: metrics as any
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+      let vacuumCalls = execSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.startsWith('VACUUM'));
+      expect(vacuumCalls.length).toBe(0);
+      expect(vacuumSpy).not.toHaveBeenCalled();
+
+      execSpy.mockClear();
+      vacuumSpy.mockClear();
+
+      storeEvent({
+        ts: now - 3 * dayMs,
+        source: 'cam-index',
+        detector: 'motion',
+        severity: 'info',
+        message: 'stale event',
+        meta: { channel: 'video:indexed' }
+      });
+
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.runOnlyPendingTimersAsync();
+
+      vacuumCalls = execSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.startsWith('VACUUM'));
+      expect(vacuumCalls.length).toBeGreaterThanOrEqual(1);
+      expect(vacuumSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      task.stop();
+      execSpy.mockRestore();
+      vacuumSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionVacuumPolicy honors run mode and emits metrics', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 0, 1);

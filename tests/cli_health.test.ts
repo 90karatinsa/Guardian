@@ -1,12 +1,22 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { Writable } from 'node:stream';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import metrics from '../src/metrics/index.js';
 import { registerShutdownHook, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
+import logger from '../src/logger.js';
+import configManager from '../src/config/index.js';
+import * as dbModule from '../src/db.js';
 
 const startGuardMock = vi.fn();
-vi.mock('../src/run-guard.js', () => ({
-  startGuard: startGuardMock
-}));
+vi.mock('../src/run-guard.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/run-guard.js')>('../src/run-guard.js');
+  return {
+    ...actual,
+    startGuard: startGuardMock
+  };
+});
 
 import { runCli, buildHealthPayload } from '../src/cli.js';
 
@@ -129,6 +139,78 @@ describe('GuardianCliHealthcheck', () => {
     expect(hookSummary?.status).toBe('ok');
 
     await expect(startPromise).resolves.toBe(0);
+  });
+});
+
+describe('GuardianCliRetention', () => {
+  it('CliRetentionRun executes retention task once and emits diagnostics', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-cli-retention-'));
+    const archiveDir = path.join(tempDir, 'archive');
+    const snapshotDir = path.join(tempDir, 'snapshots');
+    fs.mkdirSync(archiveDir, { recursive: true });
+    fs.mkdirSync(snapshotDir, { recursive: true });
+
+    const baseConfig = configManager.getConfig();
+    const retentionConfig = JSON.parse(JSON.stringify(baseConfig));
+    retentionConfig.events = retentionConfig.events ?? { thresholds: { info: 0, warning: 1, critical: 2 } };
+    retentionConfig.events.retention = {
+      ...retentionConfig.events.retention,
+      archiveDir,
+      enabled: true
+    };
+    retentionConfig.person = {
+      ...retentionConfig.person,
+      snapshotDir
+    };
+    if (Array.isArray(retentionConfig.video?.cameras)) {
+      retentionConfig.video.cameras = retentionConfig.video.cameras.map(camera => ({
+        ...camera,
+        person: { ...camera.person, snapshotDir }
+      }));
+    }
+
+    const configSpy = vi.spyOn(configManager, 'getConfig').mockReturnValue(retentionConfig);
+    const applySpy = vi.spyOn(dbModule, 'applyRetentionPolicy').mockReturnValue({
+      removedEvents: 3,
+      archivedSnapshots: 2,
+      prunedArchives: 1,
+      warnings: [],
+      perCamera: {}
+    });
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase').mockImplementation(() => {});
+    const runSpy = vi.spyOn(metrics, 'recordRetentionRun');
+    const warnSpy = vi.spyOn(metrics, 'recordRetentionWarning');
+    const infoSpy = vi.spyOn(logger, 'info');
+    const warnLogSpy = vi.spyOn(logger, 'warn');
+
+    const capture = createTestIo();
+
+    try {
+      const code = await runCli(['retention', 'run'], capture.io);
+
+      expect(code).toBe(0);
+      expect(capture.stdout()).toContain('Retention task completed');
+      expect(runSpy).toHaveBeenCalledWith({
+        removedEvents: 3,
+        archivedSnapshots: 2,
+        prunedArchives: 1,
+        perCamera: {}
+      });
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(vacuumSpy).toHaveBeenCalledTimes(1);
+      const completionCall = infoSpy.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(completionCall).toBeDefined();
+      expect(warnLogSpy).not.toHaveBeenCalled();
+    } finally {
+      configSpy.mockRestore();
+      applySpy.mockRestore();
+      vacuumSpy.mockRestore();
+      runSpy.mockRestore();
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+      warnLogSpy.mockRestore();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });
 

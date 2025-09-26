@@ -26,6 +26,7 @@ type AudioTimingOptions = {
   silenceDurationMs?: number;
   micFallbacks?: Record<string, MicCandidate[]>;
   random?: () => number;
+  silenceCircuitBreakerThreshold?: number;
 };
 
 export type AudioSourceOptions =
@@ -70,6 +71,13 @@ export type AudioRecoverEvent = {
   error?: Error;
 };
 
+export type AudioFatalEvent = {
+  reason: 'circuit-breaker';
+  channel: string | null;
+  attempts: number;
+  lastFailure: { reason: AudioRecoverEvent['reason'] };
+};
+
 const DEFAULT_SAMPLE_RATE = 16000;
 const DEFAULT_CHANNELS = 1;
 const DEFAULT_FRAME_DURATION_MS = 100;
@@ -83,6 +91,7 @@ const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
 const DEFAULT_SILENCE_THRESHOLD = 0.0025;
 const DEFAULT_SILENCE_DURATION_MS = 2000;
 const DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS = 2000;
+const DEFAULT_SILENCE_CIRCUIT_BREAKER_THRESHOLD = 4;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
@@ -113,6 +122,9 @@ export class AudioSource extends EventEmitter {
   private lastSuccessfulMicIndex: number | null = null;
   private silenceAccumulatedMs = 0;
   private silenceRestartPending = false;
+  private circuitBreakerFailures = 0;
+  private circuitBroken = false;
+  private lastCircuitCandidateReason: AudioRecoverEvent['reason'] | null = null;
 
   constructor(private options: AudioSourceOptions) {
     super();
@@ -131,6 +143,9 @@ export class AudioSource extends EventEmitter {
     this.currentBinaryIndex = this.lastSuccessfulIndex;
     this.clearAllTimers();
     this.resetSilenceState();
+    this.circuitBreakerFailures = 0;
+    this.circuitBroken = false;
+    this.lastCircuitCandidateReason = null;
     if (this.options.type === 'mic') {
       this.micInputArgs = buildMicInputArgs(
         process.platform,
@@ -192,6 +207,9 @@ export class AudioSource extends EventEmitter {
     this.activeMicCandidateIndex = null;
     this.clearAllTimers();
     this.resetSilenceState();
+    this.circuitBreakerFailures = 0;
+    this.circuitBroken = false;
+    this.lastCircuitCandidateReason = null;
     this.terminateProcess(true, { skipForceDelay: true });
   }
 
@@ -278,7 +296,7 @@ export class AudioSource extends EventEmitter {
   }
 
   private startProcess() {
-    if (this.shouldStop) {
+    if (this.shouldStop || this.circuitBroken) {
       return;
     }
 
@@ -464,7 +482,7 @@ export class AudioSource extends EventEmitter {
   }
 
   private scheduleRetry(reason: AudioRecoverEvent['reason'], error?: Error) {
-    if (this.shouldStop) {
+    if (this.shouldStop || this.circuitBroken) {
       return;
     }
 
@@ -474,6 +492,45 @@ export class AudioSource extends EventEmitter {
 
     this.retryCount += 1;
     const attempt = this.retryCount;
+    const isCircuitCandidate = reason === 'stream-silence' || reason === 'watchdog-timeout';
+    if (isCircuitCandidate) {
+      this.circuitBreakerFailures += 1;
+      this.lastCircuitCandidateReason = reason;
+    } else if (reason === 'process-exit' && this.lastCircuitCandidateReason) {
+      this.lastCircuitCandidateReason = null;
+    } else {
+      this.circuitBreakerFailures = 0;
+      this.lastCircuitCandidateReason = null;
+    }
+
+    const threshold =
+      this.options.silenceCircuitBreakerThreshold ?? DEFAULT_SILENCE_CIRCUIT_BREAKER_THRESHOLD;
+
+    if (isCircuitCandidate && threshold > 0 && this.circuitBreakerFailures >= threshold) {
+      this.circuitBroken = true;
+      this.shouldStop = true;
+      this.clearAllTimers();
+      this.resetSilenceState();
+      this.lastCircuitCandidateReason = null;
+      const termination = this.terminateProcess(true, { skipForceDelay: true });
+      metrics.recordPipelineRestart('audio', 'circuit-breaker', {
+        attempt,
+        channel: this.options.channel,
+        at: Date.now()
+      });
+      this.emit(
+        'fatal',
+        {
+          reason: 'circuit-breaker',
+          channel: this.options.channel ?? null,
+          attempts: attempt,
+          lastFailure: { reason }
+        } satisfies AudioFatalEvent
+      );
+      termination?.catch(() => {});
+      return;
+    }
+
     const timing = this.computeRestartDelay(attempt);
 
     metrics.recordPipelineRestart('audio', reason, {
@@ -483,20 +540,11 @@ export class AudioSource extends EventEmitter {
       minDelayMs: timing.meta.minDelayMs,
       maxDelayMs: timing.meta.maxDelayMs,
       jitterMs: timing.meta.appliedJitterMs,
-      channel: this.options.channel
+      channel: this.options.channel,
+      at: Date.now()
     });
 
-    if (
-      reason === 'stream-silence' &&
-      this.options.type === 'mic' &&
-      this.micInputArgs.length > 1
-    ) {
-      const currentIndex =
-        this.activeMicCandidateIndex !== null
-          ? this.activeMicCandidateIndex
-          : this.micCandidateIndex;
-      this.micCandidateIndex = (currentIndex + 1) % this.micInputArgs.length;
-    }
+    this.rotateMicFallback(reason);
 
     this.emit(
       'recover',
@@ -520,7 +568,7 @@ export class AudioSource extends EventEmitter {
       waitForTermination
         .catch(() => {})
         .then(() => {
-          if (this.shouldStop) {
+          if (this.shouldStop || this.circuitBroken) {
             return;
           }
           this.startProcess();
@@ -715,6 +763,22 @@ export class AudioSource extends EventEmitter {
   private resetSilenceState() {
     this.silenceAccumulatedMs = 0;
     this.silenceRestartPending = false;
+  }
+
+  private rotateMicFallback(reason: AudioRecoverEvent['reason']) {
+    if (
+      this.options.type !== 'mic' ||
+      this.micInputArgs.length <= 1 ||
+      (reason !== 'stream-silence' && reason !== 'watchdog-timeout')
+    ) {
+      return;
+    }
+
+    const currentIndex =
+      this.activeMicCandidateIndex !== null
+        ? this.activeMicCandidateIndex
+        : this.micCandidateIndex;
+    this.micCandidateIndex = (currentIndex + 1) % this.micInputArgs.length;
   }
 
   private computeRestartDelay(attempt: number) {

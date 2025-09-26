@@ -44,8 +44,11 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('"restartJitterFactor"');
     expect(readme).toContain('Audio source recovering (reason=ffmpeg-missing|stream-idle)');
     expect(readme).toContain('pipelines.ffmpeg.byChannel');
+    expect(readme).toContain('watchdogBackoffByChannel');
+    expect(readme).toContain('circuit-breaker');
     expect(readme).toContain('guardian status --json');
     expect(readme).toContain('guardian health');
+    expect(readme).toContain('guardian retention run');
     expect(readme).toContain('pnpm exec tsx src/cli.ts status --json');
 
     metrics.reset();

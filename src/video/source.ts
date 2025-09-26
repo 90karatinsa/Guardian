@@ -19,6 +19,7 @@ const DEFAULT_RESTART_MAX_DELAY_MS = 5000;
 const DEFAULT_RESTART_JITTER_FACTOR = 0.2;
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 3000;
 const DEFAULT_MAX_BUFFER_BYTES = 5 * 1024 * 1024;
+const DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 5;
 
 export type VideoSourceOptions = {
   file: string;
@@ -41,6 +42,7 @@ export type VideoSourceOptions = {
     rtspTransport?: string;
   }) => ffmpeg.FfmpegCommand;
   random?: () => number;
+  circuitBreakerThreshold?: number;
 };
 
 export type RecoverEventMeta = {
@@ -59,6 +61,18 @@ export type RecoverEvent = {
   errorCode: string | number | null;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
+};
+
+export type FatalEvent = {
+  reason: string;
+  channel: string | null;
+  attempts: number;
+  lastFailure: {
+    reason: string;
+    errorCode: string | number | null;
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+  };
 };
 
 type RecoveryContext = {
@@ -90,6 +104,8 @@ export class VideoSource extends EventEmitter {
   private recovering = false;
   private restartCount = 0;
   private hasReceivedFrame = false;
+  private circuitBreakerFailures = 0;
+  private circuitBroken = false;
 
   constructor(private readonly options: VideoSourceOptions) {
     super();
@@ -100,6 +116,8 @@ export class VideoSource extends EventEmitter {
     this.recovering = false;
     this.restartCount = 0;
     this.hasReceivedFrame = false;
+    this.circuitBreakerFailures = 0;
+    this.circuitBroken = false;
     this.clearAllTimers();
     this.startCommand();
   }
@@ -109,6 +127,8 @@ export class VideoSource extends EventEmitter {
     this.recovering = false;
     this.restartCount = 0;
     this.hasReceivedFrame = false;
+    this.circuitBreakerFailures = 0;
+    this.circuitBroken = false;
     this.clearAllTimers();
     this.cleanupStream();
     this.terminateCommand(true, { skipForceDelay: true });
@@ -345,7 +365,7 @@ export class VideoSource extends EventEmitter {
   }
 
   private scheduleRecovery(reason: string, context: RecoveryContext = {}) {
-    if (this.shouldStop) {
+    if (this.shouldStop || this.circuitBroken) {
       return;
     }
 
@@ -356,7 +376,6 @@ export class VideoSource extends EventEmitter {
     this.recovering = true;
     this.restartCount += 1;
     const attempt = this.restartCount;
-    const timing = this.computeRestartDelay(attempt);
 
     const channel = this.options.channel ?? null;
     const errorCode =
@@ -368,6 +387,56 @@ export class VideoSource extends EventEmitter {
     const exitCode = typeof context.exitCode === 'number' ? context.exitCode : null;
     const signal = context.signal ?? null;
 
+    const isCircuitCandidate = reason === 'start-timeout' || reason === 'watchdog-timeout';
+    if (isCircuitCandidate) {
+      this.circuitBreakerFailures += 1;
+    } else {
+      this.circuitBreakerFailures = 0;
+    }
+
+    const threshold = this.options.circuitBreakerThreshold ?? DEFAULT_CIRCUIT_BREAKER_THRESHOLD;
+    const shouldTripCircuit = isCircuitCandidate && threshold > 0 && this.circuitBreakerFailures >= threshold;
+
+    this.clearStartTimer();
+    this.clearWatchdogTimer();
+    this.clearStreamIdleTimer();
+    this.cleanupStream();
+
+    const termination = this.terminateCommand(true, { skipForceDelay: shouldTripCircuit });
+    const waitForTermination = termination ?? Promise.resolve();
+
+    if (shouldTripCircuit) {
+      this.shouldStop = true;
+      this.recovering = false;
+      this.circuitBroken = true;
+      metrics.recordPipelineRestart('ffmpeg', 'circuit-breaker', {
+        attempt,
+        channel: channel ?? undefined,
+        errorCode: errorCode ?? undefined,
+        exitCode: exitCode ?? undefined,
+        signal: signal ?? undefined,
+        at: Date.now()
+      });
+      this.emit(
+        'fatal',
+        {
+          reason: 'circuit-breaker',
+          channel,
+          attempts: attempt,
+          lastFailure: {
+            reason,
+            errorCode: errorCode ?? null,
+            exitCode,
+            signal
+          }
+        } satisfies FatalEvent
+      );
+      waitForTermination.catch(() => {});
+      return;
+    }
+
+    const timing = this.computeRestartDelay(attempt);
+
     metrics.recordPipelineRestart('ffmpeg', reason, {
       attempt,
       delayMs: timing.delayMs,
@@ -378,7 +447,8 @@ export class VideoSource extends EventEmitter {
       channel: channel ?? undefined,
       errorCode: errorCode ?? undefined,
       exitCode: exitCode ?? undefined,
-      signal: signal ?? undefined
+      signal: signal ?? undefined,
+      at: Date.now()
     });
     this.emit(
       'recover',
@@ -393,13 +463,6 @@ export class VideoSource extends EventEmitter {
         signal
       } satisfies RecoverEvent
     );
-
-    this.clearStartTimer();
-    this.clearWatchdogTimer();
-    this.clearStreamIdleTimer();
-    this.cleanupStream();
-    const termination = this.terminateCommand(true);
-    const waitForTermination = termination ?? Promise.resolve();
 
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;

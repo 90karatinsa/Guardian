@@ -23,6 +23,7 @@ export interface MotionDetectorOptions {
   areaSmoothing?: number;
   areaInflation?: number;
   areaDeltaThreshold?: number;
+  idleRebaselineMs?: number;
 }
 
 const DEFAULT_DIFF_THRESHOLD = 25;
@@ -35,6 +36,7 @@ const DEFAULT_NOISE_SMOOTHING = 0.2;
 const DEFAULT_AREA_SMOOTHING = 0.2;
 const DEFAULT_AREA_INFLATION = 1.5;
 const DEFAULT_AREA_DELTA_THRESHOLD = 0.02;
+const DEFAULT_IDLE_REBASELINE_MS = 30_000;
 
 export class MotionDetector {
   private previousFrame: GrayscaleFrame | null = null;
@@ -47,6 +49,7 @@ export class MotionDetector {
   private backoffFrames = 0;
   private suppressedFrames = 0;
   private pendingSuppressedFramesBeforeTrigger = 0;
+  private lastFrameTs: number | null = null;
 
   constructor(
     private options: MotionDetectorOptions,
@@ -88,6 +91,25 @@ export class MotionDetector {
   handleFrame(frame: Buffer, ts = Date.now()) {
     const start = performance.now();
     try {
+      const previousFrameTs = this.lastFrameTs;
+      const idleRebaselineMs = this.options.idleRebaselineMs ?? DEFAULT_IDLE_REBASELINE_MS;
+      if (
+        previousFrameTs !== null &&
+        idleRebaselineMs > 0 &&
+        ts - previousFrameTs >= idleRebaselineMs
+      ) {
+        this.resetAdaptiveState();
+        metrics.resetDetectorCounters('motion', [
+          'suppressedFrames',
+          'suppressedFramesBeforeTrigger',
+          'backoffSuppressedFrames',
+          'backoffActivations'
+        ]);
+        metrics.incrementDetectorCounter('motion', 'idleResets', 1);
+      }
+
+      this.lastFrameTs = ts;
+
       const grayscale = readFrameAsGrayscale(frame);
       const blurred = gaussianBlur(grayscale);
       const smoothed = medianFilter(blurred);
@@ -312,6 +334,7 @@ export class MotionDetector {
     if (!preserveReference) {
       this.previousFrame = null;
       this.baselineFrame = null;
+      this.lastFrameTs = null;
     }
 
     this.areaBaseline = 0;

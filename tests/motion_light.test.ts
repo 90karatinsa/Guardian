@@ -195,6 +195,45 @@ describe('MotionDetector', () => {
       baselineSuppressedBeforeTrigger;
     expect(increment).toBe(meta.suppressedFramesBeforeTrigger);
   });
+
+  it('MotionDetectorIdleRebaseline clears suppression after prolonged inactivity', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'idle-camera',
+        diffThreshold: 4,
+        areaThreshold: 0.015,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        idleRebaselineMs: 50
+      },
+      bus
+    );
+
+    const base = createUniformFrame(10, 10, 12);
+    const lowNoise = createUniformFrame(10, 10, 14);
+
+    detector.handleFrame(base, 0);
+    detector.handleFrame(lowNoise, 1);
+    detector.handleFrame(lowNoise, 2);
+
+    const beforeReset = metrics.snapshot();
+    expect(beforeReset.detectors.motion?.counters?.suppressedFrames ?? 0).toBeGreaterThan(0);
+
+    const shifted = createUniformFrame(10, 10, 35);
+    detector.handleFrame(shifted, 200);
+
+    expect(events).toHaveLength(0);
+
+    const afterReset = metrics.snapshot();
+    expect(afterReset.detectors.motion?.counters?.suppressedFrames).toBe(0);
+    expect(afterReset.detectors.motion?.counters?.suppressedFramesBeforeTrigger).toBe(0);
+    expect(afterReset.detectors.motion?.counters?.idleResets).toBe(1);
+
+    const postReset = createUniformFrame(10, 10, 36);
+    detector.handleFrame(postReset, 201);
+    expect(events).toHaveLength(0);
+  });
 });
 
 describe('LightDetector', () => {
@@ -362,6 +401,46 @@ describe('LightDetector', () => {
       (snapshotAfterTrigger.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0) -
       priorSuppressedBeforeTrigger;
     expect(diff).toBe(meta.suppressedFramesBeforeTrigger);
+  });
+
+  it('LightDetectorIdleRebaseline rebuilds baseline after idle gaps', () => {
+    const detector = new LightDetector(
+      {
+        source: 'idle-light-camera',
+        deltaThreshold: 12,
+        smoothingFactor: 0.1,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 2.5,
+        noiseSmoothing: 0.15,
+        idleRebaselineMs: 1000
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(8, 8, 20);
+    const flicker = createUniformFrame(8, 8, 23);
+
+    detector.handleFrame(baseline, 0);
+    detector.handleFrame(flicker, 100);
+    detector.handleFrame(flicker, 200);
+
+    const beforeIdle = metrics.snapshot();
+    expect(beforeIdle.detectors.light?.counters?.suppressedFrames ?? 0).toBeGreaterThan(0);
+
+    const newBaseline = createUniformFrame(8, 8, 60);
+    detector.handleFrame(newBaseline, 2000);
+
+    expect(events).toHaveLength(0);
+
+    const afterIdle = metrics.snapshot();
+    expect(afterIdle.detectors.light?.counters?.suppressedFrames).toBe(0);
+    expect(afterIdle.detectors.light?.counters?.suppressedFramesBeforeTrigger).toBe(0);
+    expect(afterIdle.detectors.light?.counters?.idleResets).toBe(1);
+
+    detector.handleFrame(createUniformFrame(8, 8, 62), 2100);
+    expect(events).toHaveLength(0);
   });
 });
 

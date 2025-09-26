@@ -20,6 +20,7 @@ export interface LightDetectorOptions {
   backoffFrames?: number;
   noiseMultiplier?: number;
   noiseSmoothing?: number;
+  idleRebaselineMs?: number;
 }
 
 const DEFAULT_DELTA_THRESHOLD = 30;
@@ -29,6 +30,7 @@ const DEFAULT_DEBOUNCE_FRAMES = 2;
 const DEFAULT_BACKOFF_FRAMES = 3;
 const DEFAULT_NOISE_MULTIPLIER = 2.5;
 const DEFAULT_NOISE_SMOOTHING = 0.1;
+const DEFAULT_IDLE_REBASELINE_MS = 120_000;
 
 export class LightDetector {
   private options: LightDetectorOptions;
@@ -40,6 +42,7 @@ export class LightDetector {
   private suppressedFrames = 0;
   private deltaTrend = 0;
   private pendingSuppressedFramesBeforeTrigger = 0;
+  private lastFrameTs: number | null = null;
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
@@ -88,6 +91,26 @@ export class LightDetector {
   handleFrame(frame: Buffer, ts = Date.now()) {
     const start = performance.now();
     try {
+      const previousFrameTs = this.lastFrameTs;
+      const idleRebaselineMs = this.options.idleRebaselineMs ?? DEFAULT_IDLE_REBASELINE_MS;
+      if (
+        previousFrameTs !== null &&
+        idleRebaselineMs > 0 &&
+        ts - previousFrameTs >= idleRebaselineMs
+      ) {
+        this.resetAdaptiveState(false);
+        metrics.resetDetectorCounters('light', [
+          'suppressedFrames',
+          'suppressedFramesBeforeTrigger',
+          'backoffFrames',
+          'backoffSuppressedFrames',
+          'backoffActivations'
+        ]);
+        metrics.incrementDetectorCounter('light', 'idleResets', 1);
+      }
+
+      this.lastFrameTs = ts;
+
       const grayscale = readFrameAsGrayscale(frame);
       const blurred = gaussianBlur(grayscale);
       const smoothed = medianFilter(blurred);
@@ -285,6 +308,7 @@ export class LightDetector {
   private resetAdaptiveState(preserveBaseline: boolean) {
     if (!preserveBaseline) {
       this.baseline = null;
+      this.lastFrameTs = null;
     }
     this.noiseLevel = 0;
     this.pendingFrames = 0;

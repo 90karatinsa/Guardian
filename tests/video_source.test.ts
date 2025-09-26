@@ -183,6 +183,66 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoSourceCircuitBreaker stops retries and emits fatal event after threshold', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverReasons: string[] = [];
+    const fatalEvents: Array<{ reason: string }> = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:circuit',
+      startTimeoutMs: 5,
+      watchdogTimeoutMs: 5,
+      restartDelayMs: 2,
+      restartMaxDelayMs: 2,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 3,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverReasons.push(event.reason);
+    });
+    source.on('fatal', event => {
+      fatalEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    try {
+      expect(commands).toHaveLength(1);
+
+      for (let i = 0; i < 3; i += 1) {
+        await vi.advanceTimersByTimeAsync(10);
+        await Promise.resolve();
+      }
+
+      expect(commands).toHaveLength(3);
+      expect(fatalEvents).toHaveLength(1);
+      expect(fatalEvents[0]).toMatchObject({ reason: 'circuit-breaker' });
+      expect(recoverReasons).toHaveLength(2);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('circuit-breaker');
+      const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:circuit'];
+      expect(channelStats?.restartHistory.length ?? 0).toBeLessThanOrEqual(
+        channelStats?.historyLimit ?? 0
+      );
+    } finally {
+      source.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('VideoFfmpegSpawnFallbacks recovers when ffmpeg binary is missing', async () => {
     vi.useFakeTimers();
 

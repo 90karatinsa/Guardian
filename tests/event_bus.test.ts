@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/eventBus.js';
+import { MetricsRegistry } from '../src/metrics/index.js';
 import { EventPayload } from '../src/types.js';
 
 describe('EventSuppressionRateLimit', () => {
@@ -81,6 +82,52 @@ describe('EventSuppressionRateLimit', () => {
       cooldownMs: 800
     });
     expect(metricArgs[1]).toMatchObject({ type: 'window', ruleId: 'channel-limit' });
+  });
+
+  it('EventSuppressionChannelMetrics records channel and window metadata', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'channel-limit',
+        detector: 'test-detector',
+        channel: 'video:lobby',
+        rateLimit: { count: 1, perMs: 1000, cooldownMs: 400 },
+        suppressForMs: 500,
+        reason: 'lobby limited'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'video:lobby' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 100, meta: { channel: 'video:lobby' } })).toBe(false);
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressedMeta).toHaveLength(1);
+    const firstSuppression = suppressedMeta[0];
+    expect(firstSuppression.suppressionChannel).toBe('video:lobby');
+    expect(firstSuppression.suppressionChannels).toEqual(['video:lobby']);
+    expect(firstSuppression.rateLimitCooldownRemainingMs).toBe(400);
+    expect(firstSuppression.suppressionWindowRemainingMs).toBe(500);
+    expect(firstSuppression.suppressedBy?.[0]?.windowRemainingMs).toBe(500);
+    expect(firstSuppression.suppressedBy?.[0]?.cooldownRemainingMs).toBe(400);
+
+    const snapshot = metrics.snapshot();
+    const ruleHistory = snapshot.suppression.rules['channel-limit'];
+    expect(ruleHistory).toBeDefined();
+    expect(ruleHistory.history.lastChannel).toBe('video:lobby');
+    expect(ruleHistory.history.lastWindowRemainingMs).toBe(500);
+    expect(ruleHistory.history.lastCooldownRemainingMs).toBe(400);
+    expect(snapshot.suppression.lastEvent?.channel).toBe('video:lobby');
+    expect(snapshot.suppression.lastEvent?.windowRemainingMs).toBe(500);
+    expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(400);
   });
 
   it('EventSuppressionMaxEvents enforces burst limits with history metadata', () => {

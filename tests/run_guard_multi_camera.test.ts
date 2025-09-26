@@ -363,6 +363,79 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('RunGuardRestartHistoryCap limits restart history and tracks totals', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 5,
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream'
+            }
+          ]
+        },
+        person: { modelPath: 'model.onnx', score: 0.5 },
+        motion: { diffThreshold: 20, areaThreshold: 0.02 },
+        events: { thresholds: { info: 0, warning: 1, critical: 2 } }
+      }
+    });
+
+    try {
+      expect(MockVideoSource.instances).toHaveLength(1);
+      const source = MockVideoSource.instances[0];
+      const stats = runtime.pipelines.get('video:cam-1')?.restartStats;
+      const limit = stats?.historyLimit ?? 0;
+      expect(limit).toBeGreaterThan(0);
+
+      const iterations = limit + 25;
+      let totalDelay = 0;
+      let totalWatchdog = 0;
+      for (let i = 0; i < iterations; i += 1) {
+        const delayMs = i + 1;
+        totalDelay += delayMs;
+        const reason = i % 2 === 0 ? 'watchdog-timeout' : 'stream-idle';
+        if (reason === 'watchdog-timeout') {
+          totalWatchdog += delayMs;
+        }
+        source.emit('recover', {
+          reason,
+          attempt: i + 1,
+          delayMs,
+          meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 }
+        });
+      }
+
+      const updatedStats = runtime.pipelines.get('video:cam-1')?.restartStats;
+      expect(updatedStats?.history.length ?? 0).toBeLessThanOrEqual(limit);
+      expect(updatedStats?.totalDelayMs).toBe(totalDelay);
+      expect(updatedStats?.watchdogBackoffMs).toBe(totalWatchdog);
+
+      const snapshot = metrics.snapshot();
+      const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:cam-1'];
+      expect(channelStats?.restartHistory.length ?? 0).toBeLessThanOrEqual(limit);
+      expect(channelStats?.historyLimit).toBe(limit);
+      expect(channelStats?.droppedHistory).toBeGreaterThan(0);
+      expect(channelStats?.totalRestartDelayMs).toBe(totalDelay);
+      expect(channelStats?.totalWatchdogBackoffMs).toBe(totalWatchdog);
+      expect(snapshot.pipelines.ffmpeg.restartHistory.length ?? 0).toBeLessThanOrEqual(
+        snapshot.pipelines.ffmpeg.historyLimit
+      );
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('CameraChannelOverrideValidation rejects cameras without channels', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 

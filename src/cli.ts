@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import logger from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
 import { collectHealthChecks, runShutdownHooks } from './app.js';
+import configManager, { loadConfigFromFile, type GuardianConfig } from './config/index.js';
+import { runRetentionOnce, type RetentionTaskOptions } from './tasks/retention.js';
 import packageJson from '../package.json' assert { type: 'json' };
 
 type ServiceStatus = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
@@ -67,6 +69,17 @@ const HEALTH_EXIT_CODES: Record<HealthStatus, number> = {
   starting: 2,
   stopping: 3
 };
+
+const RETENTION_USAGE = [
+  'Guardian retention commands',
+  '',
+  'Usage:',
+  '  guardian retention run [--config path]  Run retention once with current config',
+  '',
+  'Options:',
+  '  -c, --config <path>   Use an alternate configuration file',
+  '  -h, --help            Show this help message'
+].join('\n');
 
 const state: {
   status: ServiceStatus;
@@ -197,6 +210,9 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
     case 'health': {
       return outputHealth(io);
     }
+    case 'retention': {
+      return runRetentionCommand(argv.slice(1), io);
+    }
     case 'help':
     case '--help':
     case '-h': {
@@ -208,7 +224,8 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
           '  guardian start        Start the detector daemon',
           '  guardian stop         Stop the running daemon',
           '  guardian status       Print service status summary',
-          '  guardian health       Print health JSON'
+          '  guardian health       Print health JSON',
+          '  guardian retention run [--config path]  Run retention once with current config'
         ].join('\n') + '\n'
       );
       return 0;
@@ -218,6 +235,140 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
       return 1;
     }
   }
+}
+
+async function runRetentionCommand(args: string[], io: CliIo): Promise<number> {
+  if (args.length === 0) {
+    return runRetentionRun(args, io);
+  }
+
+  const [first, ...rest] = args;
+  if (first === 'help' || first === '--help' || first === '-h') {
+    io.stdout.write(`${RETENTION_USAGE}\n`);
+    return 0;
+  }
+
+  if (first === 'run') {
+    return runRetentionRun(rest, io);
+  }
+
+  if (first.startsWith('-')) {
+    return runRetentionRun(args, io);
+  }
+
+  io.stderr.write(`Unknown retention subcommand: ${first}\n`);
+  return 1;
+}
+
+async function runRetentionRun(args: string[], io: CliIo): Promise<number> {
+  const parsed = parseRetentionRunArgs(args);
+  if (parsed.help) {
+    io.stdout.write(`${RETENTION_USAGE}\n`);
+    return 0;
+  }
+
+  if (parsed.errors.length > 0) {
+    for (const message of parsed.errors) {
+      io.stderr.write(`${message}\n`);
+    }
+    return 1;
+  }
+
+  let config: GuardianConfig;
+  try {
+    config = parsed.configPath ? loadConfigFromFile(parsed.configPath) : configManager.getConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    io.stderr.write(`Failed to load configuration: ${message}\n`);
+    logger.error({ err: error }, 'Retention CLI failed to load configuration');
+    return 1;
+  }
+
+  let retentionOptions: RetentionTaskOptions | null;
+  try {
+    const module = await import('./run-guard.js');
+    const buildRetentionOptions = module.buildRetentionOptions as typeof import('./run-guard.js')['buildRetentionOptions'];
+    retentionOptions = buildRetentionOptions({
+      retention: config.events?.retention,
+      video: config.video,
+      person: config.person,
+      logger
+    });
+  } catch (error) {
+    logger.error({ err: error }, 'Retention CLI failed to prepare options');
+    io.stderr.write('Failed to prepare retention options. Check logs for details.\n');
+    return 1;
+  }
+
+  if (!retentionOptions) {
+    io.stdout.write('Retention task skipped (retention disabled or not configured)\n');
+    return 0;
+  }
+
+  const runOptions: RetentionTaskOptions = { ...retentionOptions, metrics };
+
+  try {
+    const result = await runRetentionOnce(runOptions);
+    if (result.skipped) {
+      io.stdout.write('Retention task skipped (retention disabled or not configured)\n');
+      return 0;
+    }
+
+    const totals = result.outcome ?? {
+      removedEvents: 0,
+      archivedSnapshots: 0,
+      prunedArchives: 0,
+      warnings: [],
+      perCamera: {}
+    };
+    const warningCount = result.warnings.length;
+    const vacuumLabel = result.vacuum.ran
+      ? `${result.vacuum.mode} (run=${result.vacuum.runMode})`
+      : `skipped (run=${result.vacuum.runMode})`;
+
+    io.stdout.write(
+      `Retention task completed: removed=${totals.removedEvents}, archived=${totals.archivedSnapshots}, ` +
+        `pruned=${totals.prunedArchives}, warnings=${warningCount}, vacuum=${vacuumLabel}\n`
+    );
+    return 0;
+  } catch (error) {
+    logger.error({ err: error }, 'Retention CLI execution failed');
+    const message = error instanceof Error ? error.message : String(error);
+    io.stderr.write(`Retention task failed: ${message}\n`);
+    return 1;
+  }
+}
+
+type RetentionCliArgs = {
+  configPath?: string;
+  help?: boolean;
+  errors: string[];
+};
+
+function parseRetentionRunArgs(args: string[]): RetentionCliArgs {
+  const result: RetentionCliArgs = { errors: [] };
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (!token) {
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      result.help = true;
+      continue;
+    }
+    if (token === '--config' || token === '-c') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        result.errors.push('Missing value for --config');
+      } else {
+        result.configPath = value;
+        index += 1;
+      }
+      continue;
+    }
+    result.errors.push(`Unknown option: ${token}`);
+  }
+  return result;
 }
 
 async function startDaemon(io: CliIo): Promise<number> {
