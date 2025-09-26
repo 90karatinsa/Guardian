@@ -100,16 +100,18 @@ describe('MotionDetector', () => {
 
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('motion');
-    const meta = events[0].meta as Record<string, number>;
-    expect(meta.areaPct).toBeGreaterThan(0.05);
-    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
-    expect(meta.effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
-    expect(meta.noiseMultiplier).toBe(1.5);
-    expect(meta.areaInflation).toBe(1);
-    expect(meta.areaBaseline).toBeGreaterThan(0);
-    expect(meta.noiseSuppressionFactor).toBeGreaterThan(0);
-    expect(meta.suppressedFramesBeforeTrigger).toBeGreaterThanOrEqual(0);
-    expect(meta.noiseFloor).toBeGreaterThanOrEqual(0);
+    const meta = events[0].meta as Record<string, unknown>;
+    expect(typeof meta.denoiseStrategy).toBe('string');
+    expect(meta.denoiseStrategy).toContain('median');
+    expect(meta.areaPct as number).toBeGreaterThan(0.05);
+    expect(meta.effectiveDebounceFrames as number).toBeGreaterThanOrEqual(2);
+    expect(meta.effectiveBackoffFrames as number).toBeGreaterThanOrEqual(3);
+    expect(meta.noiseMultiplier as number).toBe(1.5);
+    expect(meta.areaInflation as number).toBe(1);
+    expect(meta.areaBaseline as number).toBeGreaterThan(0);
+    expect(meta.noiseSuppressionFactor as number).toBeGreaterThan(0);
+    expect(meta.suppressedFramesBeforeTrigger as number).toBeGreaterThanOrEqual(0);
+    expect(meta.noiseFloor as number).toBeGreaterThanOrEqual(0);
     expect(meta.stabilizedAreaTrend).toBeDefined();
 
     detector.handleFrame(motionFrames[2], 200);
@@ -184,10 +186,11 @@ describe('MotionDetector', () => {
     });
 
     expect(events).toHaveLength(1);
-    const meta = events[0].meta as Record<string, number>;
-    expect(meta.areaThreshold).toBeCloseTo(0.05, 5);
-    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(3);
+    const meta = events[0].meta as Record<string, unknown>;
+    expect(meta.areaThreshold as number).toBeCloseTo(0.05, 5);
+    expect(meta.effectiveDebounceFrames as number).toBeGreaterThanOrEqual(3);
     expect(meta.suppressedFramesBeforeTrigger).toBe(2);
+    expect(typeof meta.denoiseStrategy).toBe('string');
 
     const snapshotAfterTrigger = metrics.snapshot();
     const increment =
@@ -233,6 +236,111 @@ describe('MotionDetector', () => {
     const postReset = createUniformFrame(10, 10, 36);
     detector.handleFrame(postReset, 201);
     expect(events).toHaveLength(0);
+  });
+
+  it('MotionLightAdaptiveNoise preserves suppression counters across hot reloads', () => {
+    const motion = new MotionDetector(
+      {
+        source: 'combo-motion',
+        diffThreshold: 3,
+        areaThreshold: 0.02,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.3,
+        noiseSmoothing: 0.18,
+        areaSmoothing: 0.18,
+        idleRebaselineMs: 5_000
+      },
+      bus
+    );
+
+    const light = new LightDetector(
+      {
+        source: 'combo-light',
+        deltaThreshold: 10,
+        smoothingFactor: 0.06,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 2,
+        noiseSmoothing: 0.14,
+        idleRebaselineMs: 8_000
+      },
+      bus
+    );
+
+    const motionBase = createUniformFrame(12, 12, 10);
+    const lightBase = createUniformFrame(12, 12, 25);
+    motion.handleFrame(motionBase, 0);
+    light.handleFrame(lightBase, 0);
+
+    const motionNoise = createFrame(12, 12, (x, y) => 10 + ((x + y) % 4 === 0 ? 1 : 0));
+    const lightNoise = createUniformFrame(12, 12, 27);
+
+    for (let i = 1; i <= 4; i += 1) {
+      motion.handleFrame(motionNoise, i);
+      light.handleFrame(lightNoise, i);
+    }
+
+    const beforeUpdate = metrics.snapshot();
+    const motionSuppressedBefore = beforeUpdate.detectors.motion?.counters?.suppressedFrames ?? 0;
+    const lightSuppressedBefore = beforeUpdate.detectors.light?.counters?.suppressedFrames ?? 0;
+    expect(motionSuppressedBefore).toBeGreaterThan(0);
+    expect(lightSuppressedBefore).toBeGreaterThan(0);
+
+    motion.updateOptions({ debounceFrames: 3, backoffFrames: 4 });
+    light.updateOptions({ debounceFrames: 3, backoffFrames: 4 });
+
+    motion.handleFrame(motionNoise, 10);
+    light.handleFrame(lightNoise, 10);
+
+    const motionTriggers = [
+      createFrame(12, 12, (x, y) => (x < 6 ? 210 : 12)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 225 : 12)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 235 : 13)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 245 : 13))
+    ];
+    motionTriggers.forEach((frame, idx) => {
+      motion.handleFrame(frame, 20 + idx);
+    });
+
+    const lightTriggers = [
+      createUniformFrame(12, 12, 160),
+      createUniformFrame(12, 12, 175),
+      createUniformFrame(12, 12, 190),
+      createUniformFrame(12, 12, 205)
+    ];
+    lightTriggers.forEach((frame, idx) => {
+      light.handleFrame(frame, 40 + idx * 2);
+    });
+
+    const motionEvent = events.find(event => event.detector === 'motion');
+    let lightEvent = events.find(event => event.detector === 'light');
+    if (!lightEvent) {
+      const reinforcement = [
+        createUniformFrame(12, 12, 210),
+        createUniformFrame(12, 12, 225),
+        createUniformFrame(12, 12, 240)
+      ];
+      reinforcement.forEach((frame, idx) => {
+        light.handleFrame(frame, 60 + idx * 3);
+      });
+      lightEvent = events.find(event => event.detector === 'light');
+    }
+
+    expect(motionEvent).toBeDefined();
+    expect(lightEvent).toBeDefined();
+    expect(typeof motionEvent?.meta?.denoiseStrategy).toBe('string');
+    expect(typeof lightEvent?.meta?.denoiseStrategy).toBe('string');
+
+    const afterUpdate = metrics.snapshot();
+    expect(afterUpdate.detectors.motion?.counters?.suppressedFrames ?? 0).toBeGreaterThanOrEqual(
+      motionSuppressedBefore
+    );
+    expect(afterUpdate.detectors.light?.counters?.suppressedFrames ?? 0).toBeGreaterThanOrEqual(
+      lightSuppressedBefore
+    );
   });
 });
 
@@ -291,21 +399,24 @@ describe('LightDetector', () => {
 
     expect(events).toHaveLength(1);
     expect(events[0].detector).toBe('light');
-    const meta = events[0].meta as Record<string, number>;
-    expect(meta.delta).toBeGreaterThan(150);
-    expect(meta.rawAdaptiveThreshold).toBeGreaterThanOrEqual(meta.deltaThreshold);
-    expect(meta.adaptiveThreshold).toBeGreaterThan(meta.deltaThreshold);
-    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(2);
-    expect(meta.effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
-    expect(meta.noiseMultiplier).toBe(3);
-    expect(meta.debounceMultiplier).toBeGreaterThanOrEqual(1);
-    expect(meta.backoffMultiplier).toBeGreaterThanOrEqual(1);
-    expect(meta.suppressedFramesBeforeTrigger).toBeGreaterThanOrEqual(0);
-    expect(meta.noiseFloor).toBeGreaterThanOrEqual(0);
-    expect(meta.noiseSuppressionFactor).toBeGreaterThanOrEqual(1);
-    expect(meta.previousBaseline).toBeLessThan(meta.baseline);
-    expect(meta.baseline).toBeGreaterThan(20);
-    expect(meta.stabilizedDelta).toBeGreaterThan(0);
+    const meta = events[0].meta as Record<string, unknown>;
+    expect(meta.delta as number).toBeGreaterThan(150);
+    expect(meta.rawAdaptiveThreshold as number).toBeGreaterThanOrEqual(
+      meta.deltaThreshold as number
+    );
+    expect(meta.adaptiveThreshold as number).toBeGreaterThan(meta.deltaThreshold as number);
+    expect(meta.effectiveDebounceFrames as number).toBeGreaterThanOrEqual(2);
+    expect(meta.effectiveBackoffFrames as number).toBeGreaterThanOrEqual(3);
+    expect(meta.noiseMultiplier as number).toBe(3);
+    expect(meta.debounceMultiplier as number).toBeGreaterThanOrEqual(1);
+    expect(meta.backoffMultiplier as number).toBeGreaterThanOrEqual(1);
+    expect(meta.suppressedFramesBeforeTrigger as number).toBeGreaterThanOrEqual(0);
+    expect(meta.noiseFloor as number).toBeGreaterThanOrEqual(0);
+    expect(meta.noiseSuppressionFactor as number).toBeGreaterThanOrEqual(1);
+    expect(meta.previousBaseline as number).toBeLessThan(meta.baseline as number);
+    expect(meta.baseline as number).toBeGreaterThan(20);
+    expect(meta.stabilizedDelta as number).toBeGreaterThan(0);
+    expect(typeof meta.denoiseStrategy).toBe('string');
 
     detector.handleFrame(brightShift[2], ts0 + 20000);
     expect(events).toHaveLength(1);
@@ -391,10 +502,11 @@ describe('LightDetector', () => {
     });
 
     expect(events).toHaveLength(1);
-    const meta = events[0].meta as Record<string, number>;
-    expect(meta.delta).toBeGreaterThan(meta.deltaThreshold as number);
-    expect(meta.effectiveDebounceFrames).toBeGreaterThanOrEqual(3);
+    const meta = events[0].meta as Record<string, unknown>;
+    expect(meta.delta as number).toBeGreaterThan(meta.deltaThreshold as number);
+    expect(meta.effectiveDebounceFrames as number).toBeGreaterThanOrEqual(3);
     expect(meta.suppressedFramesBeforeTrigger).toBe(2);
+    expect(typeof meta.denoiseStrategy).toBe('string');
 
     const snapshotAfterTrigger = metrics.snapshot();
     const diff =

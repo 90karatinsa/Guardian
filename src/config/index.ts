@@ -78,6 +78,7 @@ export type MotionTuningConfig = {
   areaSmoothing?: number;
   areaInflation?: number;
   areaDeltaThreshold?: number;
+  idleRebaselineMs?: number;
 };
 
 export type CameraMotionConfig = MotionTuningConfig & {
@@ -176,6 +177,7 @@ export type LightTuningConfig = {
   backoffFrames?: number;
   noiseMultiplier?: number;
   noiseSmoothing?: number;
+  idleRebaselineMs?: number;
 };
 
 export type LightConfig = LightTuningConfig & {
@@ -188,12 +190,16 @@ export type AudioMicFallbackCandidate = { format?: string; device: string };
 export type AudioAnomalyThresholdConfig = {
   rms?: number;
   centroidJump?: number;
+  rmsWindowMs?: number;
+  centroidWindowMs?: number;
+  minTriggerDurationMs?: number;
 };
 
 export type AudioAnomalyThresholdScheduleConfig = {
   default?: AudioAnomalyThresholdConfig;
   day?: AudioAnomalyThresholdConfig;
   night?: AudioAnomalyThresholdConfig;
+  blendMinutes?: number;
 };
 
 export type AudioAnomalyNightHoursConfig = { start: number; end: number };
@@ -223,6 +229,7 @@ export type AudioConfig = {
   restartMaxDelayMs?: number;
   restartJitterFactor?: number;
   forceKillTimeoutMs?: number;
+  deviceDiscoveryTimeoutMs?: number;
   micFallbacks?: Record<string, AudioMicFallbackCandidate[]>;
   anomaly?: AudioAnomalyConfig;
 };
@@ -269,7 +276,10 @@ const anomalyThresholdSchema: JsonSchema = {
   additionalProperties: false,
   properties: {
     rms: { type: 'number', minimum: 0 },
-    centroidJump: { type: 'number', minimum: 0 }
+    centroidJump: { type: 'number', minimum: 0 },
+    rmsWindowMs: { type: 'number', minimum: 0 },
+    centroidWindowMs: { type: 'number', minimum: 0 },
+    minTriggerDurationMs: { type: 'number', minimum: 0 }
   }
 };
 
@@ -290,7 +300,7 @@ const cameraLightConfigSchema: JsonSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    deltaThreshold: { type: 'number' },
+    deltaThreshold: { type: 'number', minimum: 0 },
     normalHours: lightNormalHoursSchema,
     smoothingFactor: { type: 'number', minimum: 0, maximum: 1 },
     minIntervalMs: { type: 'number', minimum: 0 },
@@ -340,9 +350,9 @@ const guardianConfigSchema: JsonSchema = {
           required: ['info', 'warning', 'critical'],
           additionalProperties: false,
           properties: {
-            info: { type: 'number' },
-            warning: { type: 'number' },
-            critical: { type: 'number' }
+            info: { type: 'number', minimum: 0 },
+            warning: { type: 'number', minimum: 0 },
+            critical: { type: 'number', minimum: 0 }
           }
         },
         retention: {
@@ -501,8 +511,8 @@ const guardianConfigSchema: JsonSchema = {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
-                  diffThreshold: { type: 'number' },
-                  areaThreshold: { type: 'number' },
+                  diffThreshold: { type: 'number', minimum: 0 },
+                  areaThreshold: { type: 'number', minimum: 0 },
                   minIntervalMs: { type: 'number', minimum: 0 },
                   debounceFrames: { type: 'number', minimum: 0 },
                   backoffFrames: { type: 'number', minimum: 0 },
@@ -564,8 +574,8 @@ const guardianConfigSchema: JsonSchema = {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
-                  diffThreshold: { type: 'number' },
-                  areaThreshold: { type: 'number' },
+                  diffThreshold: { type: 'number', minimum: 0 },
+                  areaThreshold: { type: 'number', minimum: 0 },
                   minIntervalMs: { type: 'number', minimum: 0 },
                   debounceFrames: { type: 'number', minimum: 0 },
                   backoffFrames: { type: 'number', minimum: 0 },
@@ -624,8 +634,8 @@ const guardianConfigSchema: JsonSchema = {
       required: ['diffThreshold', 'areaThreshold'],
       additionalProperties: false,
       properties: {
-        diffThreshold: { type: 'number' },
-        areaThreshold: { type: 'number' },
+        diffThreshold: { type: 'number', minimum: 0 },
+        areaThreshold: { type: 'number', minimum: 0 },
         minIntervalMs: { type: 'number', minimum: 0 },
         debounceFrames: { type: 'number', minimum: 0 },
         backoffFrames: { type: 'number', minimum: 0 },
@@ -683,7 +693,7 @@ const guardianConfigSchema: JsonSchema = {
       required: ['deltaThreshold'],
       additionalProperties: false,
       properties: {
-        deltaThreshold: { type: 'number' },
+    deltaThreshold: { type: 'number', minimum: 0 },
         normalHours: lightNormalHoursSchema,
         smoothingFactor: { type: 'number', minimum: 0, maximum: 1 },
         minIntervalMs: { type: 'number', minimum: 0 },
@@ -741,7 +751,8 @@ const guardianConfigSchema: JsonSchema = {
               properties: {
                 default: anomalyThresholdSchema,
                 day: anomalyThresholdSchema,
-                night: anomalyThresholdSchema
+                night: anomalyThresholdSchema,
+                blendMinutes: { type: 'number', minimum: 0 }
               }
             },
             nightHours: {
@@ -938,6 +949,10 @@ function validateLogicalConfig(config: GuardianConfig) {
     config.video.cameras.forEach((camera, index) => {
       const label = camera.id ?? `#${index}`;
 
+      if (!camera.channel || camera.channel.trim().length === 0) {
+        messages.push(`config.video.cameras[${label}] must specify a non-empty channel`);
+      }
+
       if (channelDefinitions && !channelDefinitions.has(camera.channel)) {
         messages.push(`config.video.cameras[${label}] references undefined channel "${camera.channel}"`);
       }
@@ -976,6 +991,10 @@ function validateLogicalConfig(config: GuardianConfig) {
         }
       }
     });
+  }
+
+  if (typeof config.audio?.channel === 'string' && config.audio.channel.trim().length === 0) {
+    messages.push('config.audio.channel must be a non-empty string when provided');
   }
 
   const audioChannelCandidate =

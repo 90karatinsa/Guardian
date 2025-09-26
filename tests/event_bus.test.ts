@@ -164,6 +164,45 @@ describe('EventSuppressionRateLimit', () => {
     });
     expect(metricArgs[0]?.history?.length).toBe(3);
   });
+
+  it('EventSuppressionWindowBackoff deduplicates suppression history across repeated timestamps', () => {
+    bus.configureSuppression([
+      {
+        id: 'window-backoff',
+        detector: 'test-detector',
+        suppressForMs: 600,
+        reason: 'window backoff'
+      }
+    ]);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0 })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 200 })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 200 })).toBe(false);
+    expect(bus.emitEvent({ ...basePayload, ts: 400 })).toBe(false);
+
+    const suppressionCalls = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+
+    expect(suppressionCalls).toHaveLength(3);
+    expect(suppressionCalls[0]?.suppressedBy?.[0]?.history).toEqual([0, 200]);
+    expect(suppressionCalls[0]?.suppressionHistoryCount).toBe(2);
+    expect(suppressionCalls[1]?.suppressedBy?.[0]?.history).toEqual([0, 200]);
+    expect(suppressionCalls[1]?.suppressionHistoryCount).toBe(2);
+    expect(suppressionCalls[2]?.suppressedBy?.[0]?.history).toEqual([0, 200, 400]);
+    expect(suppressionCalls[2]?.suppressionHistoryCount).toBe(3);
+
+    const metricDetails = metricsMock.recordSuppressedEvent.mock.calls.map(call => call[0]);
+    expect(metricDetails).toHaveLength(3);
+    expect(metricDetails[0]).toMatchObject({
+      ruleId: 'window-backoff',
+      history: [0, 200],
+      historyCount: 2,
+      combinedHistoryCount: 2
+    });
+    expect(metricDetails[1]).toMatchObject({ history: [0, 200], historyCount: 2 });
+    expect(metricDetails[2]).toMatchObject({ history: [0, 200, 400], historyCount: 3 });
+  });
 });
 
 describe('EventSuppressionWindowRecovery', () => {
@@ -229,6 +268,62 @@ describe('EventSuppressionWindowRecovery', () => {
       reason: 'cooldown window',
       type: 'window'
     });
+  });
+});
+
+describe('MetricsSuppressionSnapshot', () => {
+  it('captures suppression history totals and channel metadata', () => {
+    const registry = new MetricsRegistry();
+    registry.reset();
+
+    registry.recordSuppressedEvent({
+      ruleId: 'window-backoff',
+      reason: 'window backoff',
+      type: 'window',
+      historyCount: 2,
+      combinedHistoryCount: 2,
+      channel: 'video:lobby',
+      channels: ['video:lobby'],
+      cooldownMs: 600,
+      windowExpiresAt: Date.now() + 600,
+      windowRemainingMs: 500,
+      cooldownRemainingMs: 400
+    });
+
+    registry.recordSuppressedEvent({
+      ruleId: 'window-backoff',
+      reason: 'window backoff',
+      type: 'window',
+      historyCount: 3,
+      combinedHistoryCount: 3,
+      channel: 'video:lobby',
+      channels: ['video:lobby', 'alerts'],
+      cooldownMs: 600,
+      windowExpiresAt: Date.now() + 400,
+      windowRemainingMs: 250,
+      cooldownRemainingMs: 200
+    });
+
+    const snapshot = registry.snapshot();
+    expect(snapshot.suppression.total).toBe(2);
+    expect(snapshot.suppression.historyTotals.historyCount).toBe(5);
+    expect(snapshot.suppression.historyTotals.combinedHistoryCount).toBe(5);
+    expect(snapshot.suppression.lastEvent?.channel).toBe('video:lobby');
+    expect(snapshot.suppression.lastEvent?.channels).toEqual(['video:lobby', 'alerts']);
+    expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(200);
+    expect(snapshot.suppression.lastEvent?.windowRemainingMs).toBe(250);
+
+    const ruleSnapshot = snapshot.suppression.rules['window-backoff'];
+    expect(ruleSnapshot.total).toBe(2);
+    expect(ruleSnapshot.history.total).toBe(5);
+    expect(ruleSnapshot.history.combinedTotal).toBe(5);
+    expect(ruleSnapshot.history.lastCount).toBe(3);
+    expect(ruleSnapshot.history.lastCombinedCount).toBe(3);
+    expect(ruleSnapshot.history.lastChannel).toBe('video:lobby');
+    expect(ruleSnapshot.history.lastChannels).toEqual(['video:lobby', 'alerts']);
+    expect(ruleSnapshot.history.lastCooldownMs).toBe(600);
+    expect(ruleSnapshot.history.lastCooldownRemainingMs).toBe(200);
+    expect(ruleSnapshot.history.lastWindowRemainingMs).toBe(250);
   });
 });
 

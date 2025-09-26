@@ -106,6 +106,7 @@ export class VideoSource extends EventEmitter {
   private hasReceivedFrame = false;
   private circuitBreakerFailures = 0;
   private circuitBroken = false;
+  private readonly commandClassifications = new Set<string>();
 
   constructor(private readonly options: VideoSourceOptions) {
     super();
@@ -118,6 +119,7 @@ export class VideoSource extends EventEmitter {
     this.hasReceivedFrame = false;
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
+    this.commandClassifications.clear();
     this.clearAllTimers();
     this.startCommand();
   }
@@ -129,6 +131,7 @@ export class VideoSource extends EventEmitter {
     this.hasReceivedFrame = false;
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
+    this.commandClassifications.clear();
     this.clearAllTimers();
     this.cleanupStream();
     this.terminateCommand(true, { skipForceDelay: true });
@@ -200,6 +203,7 @@ export class VideoSource extends EventEmitter {
     this.resetStartTimer();
     this.clearWatchdogTimer();
     this.clearStreamIdleTimer();
+    this.commandClassifications.clear();
     const command = this.createCommand();
     this.command = command;
 
@@ -255,6 +259,9 @@ export class VideoSource extends EventEmitter {
     command.once('error', onError);
     command.once('end', onEnd);
     command.once('close', onClose);
+    const onStderr = (line: string) => {
+      this.handleCommandStderr(line);
+    };
     const onStart = () => {
       this.clearStartTimer();
     };
@@ -265,7 +272,10 @@ export class VideoSource extends EventEmitter {
       command.off('end', onEnd);
       command.off('close', onClose);
       command.off('start', onStart);
+      command.off('stderr', onStderr);
     };
+
+    command.on('stderr', onStderr);
 
     try {
       const stream = command.pipe();
@@ -365,7 +375,7 @@ export class VideoSource extends EventEmitter {
   }
 
   private scheduleRecovery(reason: string, context: RecoveryContext = {}) {
-    if (this.shouldStop || this.circuitBroken) {
+    if (this.shouldStop || this.circuitBroken || this.recovering) {
       return;
     }
 
@@ -387,7 +397,11 @@ export class VideoSource extends EventEmitter {
     const exitCode = typeof context.exitCode === 'number' ? context.exitCode : null;
     const signal = context.signal ?? null;
 
-    const isCircuitCandidate = reason === 'start-timeout' || reason === 'watchdog-timeout';
+    const isCircuitCandidate =
+      reason === 'start-timeout' ||
+      reason === 'watchdog-timeout' ||
+      reason === 'stream-idle' ||
+      reason === 'rtsp-timeout';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
     } else {
@@ -720,6 +734,74 @@ export class VideoSource extends EventEmitter {
       signal: null
     };
   }
+
+  private handleCommandStderr(message: string) {
+    if (!message) {
+      return;
+    }
+
+    const lines = String(message)
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      const classification = classifyFfmpegStderr(line);
+      if (!classification) {
+        continue;
+      }
+
+      if (this.commandClassifications.has(classification.reason)) {
+        continue;
+      }
+
+      this.commandClassifications.add(classification.reason);
+
+      const context: RecoveryContext = {
+        errorCode: classification.errorCode ?? classification.reason,
+        exitCode: classification.exitCode ?? null,
+        signal: classification.signal ?? null
+      };
+
+      this.scheduleRecovery(classification.reason, context);
+      if (classification.breakAfter) {
+        break;
+      }
+    }
+  }
+}
+
+type FfmpegClassification = {
+  reason: string;
+  errorCode?: string | number | null;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  breakAfter?: boolean;
+};
+
+const RTSP_TIMEOUT_PATTERNS = [
+  /method\s+DESCRIBE\s+failed:.*timed out/i,
+  /RTSP\s+response\s+timeout/i,
+  /Connection\s+timed\s*out/i,
+  /Read\s+timeout\s+after\s+[0-9]+\s+ms/i
+];
+
+function classifyFfmpegStderr(message: string): FfmpegClassification | null {
+  if (!message) {
+    return null;
+  }
+
+  for (const pattern of RTSP_TIMEOUT_PATTERNS) {
+    if (pattern.test(message)) {
+      return {
+        reason: 'rtsp-timeout',
+        errorCode: 'rtsp-timeout',
+        breakAfter: true
+      };
+    }
+  }
+
+  return null;
 }
 
 export type SliceResult = {

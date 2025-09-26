@@ -1,15 +1,23 @@
 import type * as ort from 'onnxruntime-node';
 
-export type PreprocessMeta = {
-  scale: number;
+type ProjectionMeta = {
   padX: number;
   padY: number;
   originalWidth: number;
   originalHeight: number;
   resizedWidth: number;
   resizedHeight: number;
+  scale?: number;
+  scaleX?: number;
+  scaleY?: number;
+  normalized?: boolean;
+};
+
+export type PreprocessMeta = ProjectionMeta & {
+  scale: number;
   scaleX: number;
   scaleY: number;
+  variants?: ProjectionMeta[];
 };
 
 export type BoundingBox = {
@@ -26,6 +34,9 @@ export type YoloDetection = {
   objectness: number;
   classProbability: number;
   areaRatio: number;
+  combinedLogit: number;
+  projectionIndex?: number;
+  normalizedProjection?: boolean;
 };
 
 export interface ParseYoloDetectionsOptions {
@@ -53,6 +64,8 @@ export function parseYoloDetections(
   }
 
   const classIndices = resolveClassIndices(options, accessor.attributes);
+
+  const classPriority = buildClassPriority(options, classIndices);
 
   if (classIndices.length === 0) {
     return [];
@@ -87,7 +100,8 @@ export function parseYoloDetections(
       continue;
     }
 
-    const bbox = projectBoundingBox(cx, cy, width, height, meta);
+    const projected = projectBoundingBox(cx, cy, width, height, meta);
+    const bbox = projected.box;
 
     if (
       !isFiniteNumber(bbox.left) ||
@@ -100,7 +114,7 @@ export function parseYoloDetections(
       continue;
     }
 
-    const areaRatio = computeAreaRatio(bbox, meta);
+    const areaRatio = projected.areaRatio;
 
     if (!Number.isFinite(areaRatio) || areaRatio <= 0) {
       continue;
@@ -123,7 +137,8 @@ export function parseYoloDetections(
         continue;
       }
 
-      const score = clamp(objectness * classProbability, 0, 1);
+      const combinedLogit = objectnessLogit + classLogit;
+      const score = clamp(sigmoid(combinedLogit), 0, 1);
 
       const threshold = resolveThreshold(classId);
       if (score < threshold) {
@@ -136,7 +151,10 @@ export function parseYoloDetections(
         bbox,
         objectness,
         classProbability,
-        areaRatio
+        areaRatio,
+        combinedLogit,
+        projectionIndex: projected.projectionIndex,
+        normalizedProjection: projected.normalized
       });
     }
   }
@@ -161,7 +179,14 @@ export function parseYoloDetections(
     filtered.push(...nonMaxSuppression(candidates, nmsThreshold));
   }
 
-  filtered.sort((a, b) => b.score - a.score);
+  filtered.sort((a, b) => {
+    const priorityA = classPriority.get(a.classId) ?? Number.POSITIVE_INFINITY;
+    const priorityB = classPriority.get(b.classId) ?? Number.POSITIVE_INFINITY;
+    if (priorityA !== priorityB) {
+      return priorityA - priorityB;
+    }
+    return b.score - a.score;
+  });
 
   const maxDetections = options.maxDetections ?? filtered.length;
 
@@ -186,6 +211,43 @@ function resolveClassIndices(options: ParseYoloDetectionsOptions, attributeCount
     return [];
   }
   return [fallback];
+}
+
+function buildClassPriority(
+  options: ParseYoloDetectionsOptions,
+  indices: number[]
+) {
+  const priority = new Map<number, number>();
+  const baseOrder = [...indices];
+  if (typeof options.classIndex === 'number' && Number.isFinite(options.classIndex)) {
+    const normalized = Math.trunc(options.classIndex);
+    const existingIndex = baseOrder.indexOf(normalized);
+    if (existingIndex >= 0) {
+      baseOrder.splice(existingIndex, 1);
+    }
+    baseOrder.unshift(normalized);
+  } else if (Array.isArray(options.classIndices) && options.classIndices.length > 0) {
+    const explicitOrder = options.classIndices
+      .map(value => Math.trunc(value))
+      .filter(value => Number.isFinite(value));
+    if (explicitOrder.length > 0) {
+      const seen = new Set<number>();
+      const ordered = [...explicitOrder, ...baseOrder];
+      baseOrder.length = 0;
+      for (const candidate of ordered) {
+        if (!seen.has(candidate)) {
+          baseOrder.push(candidate);
+          seen.add(candidate);
+        }
+      }
+    }
+  }
+
+  baseOrder.forEach((classId, index) => {
+    priority.set(classId, index);
+  });
+
+  return priority;
 }
 
 function createTensorAccessor(tensor: ort.OnnxValue): TensorAccessor | null {
@@ -272,30 +334,126 @@ type TensorAccessor = {
   get: (detectionIndex: number, attributeIndex: number) => number;
 };
 
+type ProjectedBoundingBox = {
+  box: BoundingBox;
+  areaRatio: number;
+  projectionIndex: number;
+  normalized: boolean;
+  score: number;
+};
+
 function projectBoundingBox(
   cx: number,
   cy: number,
   width: number,
   height: number,
   meta: PreprocessMeta
+): ProjectedBoundingBox {
+  const projections = buildProjectionCandidates(meta);
+
+  const candidates: ProjectedBoundingBox[] = [];
+
+  projections.forEach((projection, projectionIndex) => {
+    const likelihoodNormalized = isLikelyNormalized(cx, cy, width, height, projection.resizedWidth, projection.resizedHeight);
+      const assumptions = projection.normalized === true
+        ? [true]
+        : projection.normalized === false
+          ? [false]
+          : likelihoodNormalized
+            ? [true, false]
+            : [false, true];
+
+    for (const assumeNormalized of assumptions) {
+      const box = projectWithProjection(cx, cy, width, height, projection, assumeNormalized);
+      const areaRatio = computeAreaRatio(box, projection.originalWidth, projection.originalHeight);
+
+      if (areaRatio <= 0) {
+        continue;
+      }
+
+      const centerX = box.left + box.width / 2;
+      const centerY = box.top + box.height / 2;
+      const exceedsWidth = centerX < -projection.originalWidth * 0.15 || centerX > projection.originalWidth * 1.15;
+      const exceedsHeight = centerY < -projection.originalHeight * 0.15 || centerY > projection.originalHeight * 1.15;
+      if (exceedsWidth || exceedsHeight) {
+        continue;
+      }
+
+      const maxWidth = projection.originalWidth * 1.1;
+      const maxHeight = projection.originalHeight * 1.1;
+      if (box.width <= 0 || box.height <= 0 || box.width > maxWidth || box.height > maxHeight) {
+        continue;
+      }
+
+      const score = (areaRatio <= 1 ? areaRatio : 1 / Math.max(areaRatio, 1e-6)) - (assumeNormalized ? 0.02 : 0);
+      if (score <= 0) {
+        continue;
+      }
+
+      candidates.push({
+        box,
+        areaRatio,
+        projectionIndex,
+        normalized: assumeNormalized,
+        score
+      });
+    }
+  });
+
+  if (candidates.length === 0) {
+    const fallback = projectWithProjection(cx, cy, width, height, projections[0], projections[0].normalized ?? false);
+    return {
+      box: fallback,
+      areaRatio: computeAreaRatio(fallback, projections[0].originalWidth, projections[0].originalHeight),
+      projectionIndex: 0,
+      normalized: projections[0].normalized ?? false,
+      score: 0
+    };
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0];
+}
+
+function buildProjectionCandidates(meta: PreprocessMeta): ProjectionMeta[] {
+  const variants: ProjectionMeta[] = Array.isArray(meta.variants) ? meta.variants.map(variant => ({ ...variant })) : [];
+  return [meta, ...variants];
+}
+
+function projectWithProjection(
+  cx: number,
+  cy: number,
+  width: number,
+  height: number,
+  projection: ProjectionMeta,
+  assumeNormalized: boolean
 ): BoundingBox {
-  const left = cx - width / 2;
-  const top = cy - height / 2;
-  const right = cx + width / 2;
-  const bottom = cy + height / 2;
+  const scaleX = resolveScale(projection.scaleX, projection.scale);
+  const scaleY = resolveScale(projection.scaleY, projection.scale);
 
-  const scaleX = resolveScale(meta.scaleX, meta.scale);
-  const scaleY = resolveScale(meta.scaleY, meta.scale);
+  const resizedWidth = projection.resizedWidth || projection.originalWidth * scaleX;
+  const resizedHeight = projection.resizedHeight || projection.originalHeight * scaleY;
 
-  const mappedLeft = (left - meta.padX) / scaleX;
-  const mappedTop = (top - meta.padY) / scaleY;
-  const mappedRight = (right - meta.padX) / scaleX;
-  const mappedBottom = (bottom - meta.padY) / scaleY;
+  const normalized = assumeNormalized;
+  const normalizedCx = normalized ? cx * resizedWidth : cx;
+  const normalizedCy = normalized ? cy * resizedHeight : cy;
+  const normalizedWidth = normalized ? width * resizedWidth : width;
+  const normalizedHeight = normalized ? height * resizedHeight : height;
 
-  const clampedLeft = clamp(mappedLeft, 0, meta.originalWidth);
-  const clampedTop = clamp(mappedTop, 0, meta.originalHeight);
-  const clampedRight = clamp(mappedRight, 0, meta.originalWidth);
-  const clampedBottom = clamp(mappedBottom, 0, meta.originalHeight);
+  const left = normalizedCx - normalizedWidth / 2;
+  const top = normalizedCy - normalizedHeight / 2;
+  const right = normalizedCx + normalizedWidth / 2;
+  const bottom = normalizedCy + normalizedHeight / 2;
+
+  const mappedLeft = (left - projection.padX) / scaleX;
+  const mappedTop = (top - projection.padY) / scaleY;
+  const mappedRight = (right - projection.padX) / scaleX;
+  const mappedBottom = (bottom - projection.padY) / scaleY;
+
+  const clampedLeft = clamp(mappedLeft, 0, projection.originalWidth);
+  const clampedTop = clamp(mappedTop, 0, projection.originalHeight);
+  const clampedRight = clamp(mappedRight, 0, projection.originalWidth);
+  const clampedBottom = clamp(mappedBottom, 0, projection.originalHeight);
 
   return {
     left: clampedLeft,
@@ -305,8 +463,27 @@ function projectBoundingBox(
   };
 }
 
-function computeAreaRatio(bbox: BoundingBox, meta: PreprocessMeta) {
-  const totalArea = meta.originalWidth * meta.originalHeight;
+function isLikelyNormalized(
+  cx: number,
+  cy: number,
+  width: number,
+  height: number,
+  resizedWidth: number,
+  resizedHeight: number
+) {
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return false;
+  }
+  const withinUnit = Math.abs(cx) <= 1.2 && Math.abs(cy) <= 1.2 && width <= 1.2 && height <= 1.2;
+  if (withinUnit) {
+    return true;
+  }
+  const maxDimension = Math.max(resizedWidth, resizedHeight, 1);
+  return Math.max(width, height) <= maxDimension * 0.1;
+}
+
+function computeAreaRatio(bbox: BoundingBox, originalWidth: number, originalHeight: number) {
+  const totalArea = originalWidth * originalHeight;
 
   if (totalArea <= 0) {
     return 0;

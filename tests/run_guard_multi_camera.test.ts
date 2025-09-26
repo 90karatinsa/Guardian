@@ -114,6 +114,26 @@ vi.mock('../src/tasks/retention.js', () => ({
   RetentionTask: class {}
 }));
 
+class MockAudioSource extends EventEmitter {
+  static instances: MockAudioSource[] = [];
+  constructor() {
+    super();
+    MockAudioSource.instances.push(this);
+  }
+  start() {
+    this.emit('ready');
+  }
+  stop() {
+    this.emit('stopped');
+  }
+  updateOptions() {}
+}
+
+vi.mock('../src/audio/source.js', () => ({
+  AudioSource: MockAudioSource,
+  default: MockAudioSource
+}));
+
 describe('run-guard multi camera orchestration', () => {
   beforeEach(async () => {
     vi.resetModules();
@@ -123,6 +143,7 @@ describe('run-guard multi camera orchestration', () => {
     MockPersonDetector.calls = [];
     MockMotionDetector.instances = [];
     MockLightDetector.instances = [];
+    MockAudioSource.instances = [];
     metrics.reset();
   });
 
@@ -132,7 +153,7 @@ describe('run-guard multi camera orchestration', () => {
     retentionMock.stop.mockReset();
   });
 
-  it('MultiCameraRtspWatchdog applies camera-specific ffmpeg and motion options', async () => {
+  it('RunGuardMultiCameraThresholds applies camera overrides and logs startup state', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 
     const bus = new EventEmitter();
@@ -220,6 +241,24 @@ describe('run-guard multi camera orchestration', () => {
     await Promise.resolve();
 
     expect(logger.error).not.toHaveBeenCalled();
+    const startLogs = logger.info.mock.calls.filter(([, message]) => message === 'Starting video pipeline');
+    expect(startLogs).toHaveLength(2);
+    expect(startLogs[0]?.[0]).toMatchObject({
+      camera: 'cam-1',
+      channel: 'video:cam-1',
+      detectors: {
+        motion: { diffThreshold: 40, areaThreshold: 0.03 },
+        person: { score: 0.6 }
+      }
+    });
+    expect(startLogs[1]?.[0]).toMatchObject({
+      camera: 'cam-2',
+      channel: 'video:cam-2',
+      detectors: {
+        motion: { diffThreshold: 22, areaThreshold: 0.018 },
+        person: { score: 0.7 }
+      }
+    });
     expect(runtime.pipelines.size).toBe(2);
     expect(MockVideoSource.instances).toHaveLength(2);
     const [rtspSource, httpSource] = MockVideoSource.instances;

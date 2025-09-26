@@ -366,7 +366,7 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   return { removedEvents, archivedSnapshots, prunedArchives, warnings, perCamera };
 }
 
-export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto') {
+export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto'): Required<VacuumOptions> {
   const normalized = normalizeVacuumOptions(options);
   const { run: _run, ...vacuum } = normalized;
 
@@ -395,6 +395,8 @@ export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto') {
       db.exec(trimmed);
     }
   }
+
+  return normalized;
 }
 
 type SnapshotDirectory = {

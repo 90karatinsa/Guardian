@@ -9,13 +9,15 @@ Environment=GUARDIAN_CONFIG=/etc/guardian/config.json
 Environment=GUARDIAN_DATA_DIR=/var/lib/guardian
 Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
+ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts --health
 ExecStart=/usr/bin/env pnpm start
 ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts status --json
 ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop
+ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts
 KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target

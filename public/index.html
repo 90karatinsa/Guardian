@@ -407,6 +407,12 @@
             <dd id="stream-updated">—</dd>
           </dl>
         </section>
+        <section class="metrics-widget" aria-live="polite" aria-label="Threat summary">
+          <h2>Threat summary</h2>
+          <div id="threat-summary" class="metrics-grid">
+            <p class="meta" id="threat-summary-empty">Awaiting event data…</p>
+          </div>
+        </section>
         <section
           class="metrics-widget"
           aria-live="polite"
@@ -415,6 +421,16 @@
           <h2>Pipeline health</h2>
           <div id="pipeline-metrics" class="metrics-grid" aria-live="polite">
             <p class="meta" id="pipeline-metrics-empty">Loading metrics…</p>
+          </div>
+        </section>
+        <section
+          class="metrics-widget"
+          aria-live="polite"
+          aria-label="Channel status overview"
+        >
+          <h2>Channel status</h2>
+          <div id="channel-status" class="metrics-grid">
+            <p class="meta" id="channel-status-empty">No channel metrics available yet.</p>
           </div>
         </section>
         <section

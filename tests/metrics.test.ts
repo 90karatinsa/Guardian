@@ -190,6 +190,36 @@ describe('MetricsCounters', () => {
     expect(snapshot.detectors.light.counters.backoffActivations).toBe(1);
     expect(snapshot.detectors.light.counters.backoffSuppressedFrames).toBe(4);
   });
+
+  it('MetricsDetectorCounters exposes pipeline and detector histograms', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout');
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout');
+    registry.recordPipelineRestart('audio', 'spawn-error');
+
+    registry.incrementDetectorCounter('motion', 'detections');
+    registry.incrementDetectorCounter('motion', 'detections', 4);
+    registry.recordDetectorError('motion', 'forecast-missed');
+
+    const snapshot = registry.snapshot();
+
+    expect(snapshot.histograms['pipeline.ffmpeg.restarts']).toMatchObject({
+      '1-2': 1,
+      '2-5': 1
+    });
+    expect(snapshot.histograms['pipeline.audio.restarts']).toMatchObject({
+      '1-2': 1
+    });
+    expect(snapshot.histograms['detector.motion.counter.detections']).toMatchObject({
+      '1-2': 1,
+      '5-10': 1
+    });
+    expect(snapshot.histograms['detector.motion.counter.errors']).toMatchObject({
+      '1-2': 1
+    });
+    expect(snapshot.histograms).toHaveProperty('logs.level');
+  });
 });
 
 describe('MetricsSnapshotEnrichment', () => {

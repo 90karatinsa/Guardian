@@ -4,6 +4,8 @@ import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import metrics from '../src/metrics/index.js';
 
+type AudioFatalEvent = import('../src/audio/source.js').AudioFatalEvent;
+
 const spawnMock = vi.fn();
 const execFileMock = vi.fn();
 const meydaExtractMock = vi.fn();
@@ -356,6 +358,133 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioSourceDeviceFallback handles discovery timeouts across platforms', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+    const scenarios: Array<{
+      platform: NodeJS.Platform;
+      format: 'alsa' | 'avfoundation' | 'dshow';
+      device: string;
+      fallbacks: string[];
+    }> = [
+      { platform: 'linux', format: 'alsa', device: 'default', fallbacks: ['hw:1', 'plughw:1'] },
+      { platform: 'darwin', format: 'avfoundation', device: ':0', fallbacks: ['0:0', '1:0'] },
+      {
+        platform: 'win32',
+        format: 'dshow',
+        device: 'audio="default"',
+        fallbacks: ['audio="Mic0"', 'audio="Mic1"']
+      }
+    ];
+
+    let currentPlatform = scenarios[0].platform;
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockImplementation(
+      () => currentPlatform
+    );
+
+    try {
+      for (const scenario of scenarios) {
+        currentPlatform = scenario.platform;
+        metrics.reset();
+        spawnMock.mockReset();
+        execFileMock.mockReset();
+        const processes: ReturnType<typeof createFakeProcess>[] = [];
+        spawnMock.mockImplementation((_cmd: string, _args: string[]) => {
+          const proc = createFakeProcess();
+          processes.push(proc);
+          return proc;
+        });
+
+        const source = new AudioSource({
+          type: 'mic',
+          channel: `audio:${scenario.platform}`,
+          sampleRate: 8000,
+          channels: 1,
+          frameDurationMs: 50,
+          silenceDurationMs: 100,
+          silenceThreshold: 0.0001,
+          restartDelayMs: 10,
+          restartMaxDelayMs: 10,
+          restartJitterFactor: 0,
+          forceKillTimeoutMs: 0,
+          watchdogTimeoutMs: 0,
+          silenceCircuitBreakerThreshold: 3,
+          deviceDiscoveryTimeoutMs: 0,
+          inputFormat: scenario.format,
+          device: scenario.device,
+          micFallbacks: {
+            [scenario.platform]: scenario.fallbacks.map(device => ({
+              format: scenario.format,
+              device
+            }))
+          },
+          random: () => 0.5
+        });
+
+        const recoverReasons: string[] = [];
+        const fatalEvents: AudioFatalEvent[] = [];
+        source.on('recover', event => recoverReasons.push(event.reason));
+        source.on('fatal', event => fatalEvents.push(event));
+        source.on('error', () => {});
+
+        try {
+          source.start();
+          await Promise.resolve();
+          expect(spawnMock).toHaveBeenCalledTimes(1);
+          await waitForCondition(() => !(source as any).startSequencePromise);
+
+          const attemptedDevices = () =>
+          spawnMock.mock.calls.map(call => {
+            const args = call[1] as string[];
+            const index = args.indexOf('-i');
+            return index >= 0 ? args[index + 1] : '';
+          });
+          expect(attemptedDevices()[0]).toBe(scenario.device);
+
+          source.triggerDeviceDiscoveryTimeout(new Error('test discovery timeout'));
+          await waitForCondition(() => recoverReasons.includes('device-discovery-timeout'));
+          await waitForCondition(() => spawnMock.mock.calls.length === 2);
+          const frameBytes = ((8000 * 50) / 1000) * 2;
+          const silentFrame = Buffer.alloc(frameBytes);
+
+          const secondProc = processes[1];
+          secondProc.stdout.emit('data', silentFrame);
+          secondProc.stdout.emit('data', silentFrame);
+
+          await waitForCondition(() => spawnMock.mock.calls.length === 3);
+          const thirdProc = processes[2];
+          thirdProc.stdout.emit('data', silentFrame);
+          thirdProc.stdout.emit('data', silentFrame);
+
+          await waitForCondition(() => spawnMock.mock.calls.length === 4);
+          const fourthProc = processes[3];
+          fourthProc.stdout.emit('data', silentFrame);
+          fourthProc.stdout.emit('data', silentFrame);
+
+          await waitForCondition(() => fatalEvents.length === 1);
+          expect(fatalEvents[0].lastFailure.reason).toBe('stream-silence');
+
+          const devices = attemptedDevices();
+          expect(devices.slice(0, 3)).toEqual([
+            scenario.device,
+            scenario.fallbacks[0],
+            scenario.fallbacks[1]
+          ]);
+
+          const snapshot = metrics.snapshot();
+          const channelStats =
+            snapshot.pipelines.audio.byChannel[`audio:${scenario.platform}`];
+          expect(channelStats.byReason['device-discovery-timeout']).toBeGreaterThanOrEqual(1);
+          expect(channelStats.byReason['stream-silence']).toBeGreaterThanOrEqual(2);
+          expect(channelStats.byReason['circuit-breaker']).toBe(1);
+        } finally {
+          source.stop();
+        }
+      }
+    } finally {
+      platformSpy.mockRestore();
+    }
+  });
+
   it('AudioSourceFallback parses device list output with fallback chain', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -461,4 +590,19 @@ function createExecFileChild() {
   const child = new EventEmitter() as unknown as ChildProcess & { kill: ReturnType<typeof vi.fn> };
   (child as any).kill = vi.fn(() => true);
   return child;
+}
+
+async function flushTimers(step = 20) {
+  await vi.advanceTimersByTimeAsync(step);
+  await Promise.resolve();
+}
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 500) {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error('Timed out waiting for condition');
+    }
+    await flushTimers();
+  }
 }

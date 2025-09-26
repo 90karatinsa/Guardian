@@ -18,7 +18,7 @@ vi.mock('../src/run-guard.js', async () => {
   };
 });
 
-import { runCli, buildHealthPayload } from '../src/cli.js';
+import { runCli, buildHealthPayload, buildReadinessPayload, resolveHealthExitCode } from '../src/cli.js';
 
 type TestIo = {
   io: { stdout: NodeJS.WritableStream; stderr: NodeJS.WritableStream };
@@ -66,6 +66,51 @@ afterEach(async () => {
 });
 
 describe('GuardianCliHealthcheck', () => {
+  it('CliHealthExitCodes maps health states to exit codes and readiness payload', async () => {
+    expect(resolveHealthExitCode('ok')).toBe(0);
+    expect(resolveHealthExitCode('degraded')).toBe(1);
+    expect(resolveHealthExitCode('starting')).toBe(2);
+    expect(resolveHealthExitCode('stopping')).toBe(3);
+
+    const initialHealth = await buildHealthPayload();
+    const readiness = buildReadinessPayload(initialHealth);
+    expect(readiness.ready).toBe(false);
+    expect(readiness.reason).toBe('service-idle');
+
+    const initialReady = createTestIo();
+    const initialReadyCode = await runCli(['--ready'], initialReady.io);
+    expect(initialReadyCode).toBe(1);
+    const initialPayload = JSON.parse(initialReady.stdout().trim());
+    expect(initialPayload.ready).toBe(false);
+    expect(initialPayload.reason).toBe('service-idle');
+
+    const stopSpy = vi.fn();
+    startGuardMock.mockResolvedValue({ stop: stopSpy });
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const readyIo = createTestIo();
+    const readyCode = await runCli(['--ready'], readyIo.io);
+    expect(readyCode).toBe(0);
+    const readyPayload = JSON.parse(readyIo.stdout().trim());
+    expect(readyPayload.ready).toBe(true);
+    expect(readyPayload.reason).toBeNull();
+
+    metrics.incrementLogLevel('error', { message: 'detector error' });
+    const degradedIo = createTestIo();
+    const degradedCode = await runCli(['--ready'], degradedIo.io);
+    expect(degradedCode).toBe(1);
+    const degradedPayload = JSON.parse(degradedIo.stdout().trim());
+    expect(degradedPayload.ready).toBe(false);
+    expect(degradedPayload.reason).toBe('health-degraded');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('HealthcheckMetricsSnapshot includes runtime fields and degraded status', async () => {
     const capture = createTestIo();
     const flagCode = await runCli(['--health'], capture.io);

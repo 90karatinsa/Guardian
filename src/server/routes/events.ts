@@ -86,7 +86,8 @@ export class EventsRouter {
   }
 
   private readonly handleBusEvent = (event: EventRecord) => {
-    const payload = JSON.stringify(event);
+    const payload = JSON.stringify(formatEventForClient(event));
+    const digest = createMetricsDigest(this.metrics.snapshot());
     for (const [client, state] of this.clients) {
       if (client.writableEnded) {
         clearInterval(state.heartbeat);
@@ -100,6 +101,8 @@ export class EventsRouter {
 
       try {
         client.write(`data: ${payload}\n\n`);
+        client.write(`event: metrics\n`);
+        client.write(`data: ${JSON.stringify(digest)}\n\n`);
       } catch (error) {
         clearInterval(state.heartbeat);
         client.end();
@@ -115,12 +118,17 @@ export class EventsRouter {
 
     const options = parseListOptions(url);
     const result = listEvents(options);
+    const items = result.items.map(formatEventForClient);
+    const summary = summarizeEvents(items);
+    const digest = createMetricsDigest(this.metrics.snapshot());
 
     sendJson(res, 200, {
-      items: result.items,
+      items,
       total: result.total,
       limit: options.limit ?? undefined,
-      offset: options.offset ?? undefined
+      offset: options.offset ?? undefined,
+      summary,
+      metrics: digest
     });
 
     return true;
@@ -159,6 +167,9 @@ export class EventsRouter {
     res.write(`retry: ${retryMs}\n`);
     res.write(`event: stream-status\n`);
     res.write(`data: ${JSON.stringify({ status: 'connected', retryMs, filters })}\n\n`);
+    const initialDigest = createMetricsDigest(this.metrics.snapshot());
+    res.write(`event: metrics\n`);
+    res.write(`data: ${JSON.stringify(initialDigest)}\n\n`);
 
     const heartbeat = setInterval(() => {
       if (res.writableEnded) {
@@ -206,7 +217,7 @@ export class EventsRouter {
       return false;
     }
 
-    const snapshotMatch = url.pathname.match(/^\/api\/events\/([^/]+)\/snapshot$/);
+    const snapshotMatch = url.pathname.match(/^\/api\/events\/([^/]+)\/(face-)?snapshot$/);
     if (!snapshotMatch) {
       return false;
     }
@@ -217,46 +228,20 @@ export class EventsRouter {
       return true;
     }
 
+    const variant = snapshotMatch[2] ? 'face' : 'default';
+
     const event = getEventById(eventId);
     if (!event) {
       sendJson(res, 404, { error: 'Event not found' });
       return true;
     }
 
-    const snapshotPath = extractSnapshotPath(event);
+    const snapshotPath = variant === 'face' ? extractFaceSnapshotPath(event) : extractSnapshotPath(event);
     if (!snapshotPath) {
       sendJson(res, 404, { error: 'Snapshot not available' });
       return true;
     }
-
-    let stats: fs.Stats;
-    try {
-      stats = fs.statSync(snapshotPath);
-    } catch (error) {
-      sendJson(res, 404, { error: 'Snapshot missing' });
-      return true;
-    }
-
-    if (!stats.isFile()) {
-      sendJson(res, 404, { error: 'Snapshot not available' });
-      return true;
-    }
-
-    const stream = fs.createReadStream(snapshotPath);
-    stream.on('error', () => {
-      if (!res.headersSent) {
-        sendJson(res, 500, { error: 'Failed to read snapshot' });
-      } else {
-        res.destroy();
-      }
-    });
-
-    res.writeHead(200, {
-      'Content-Type': guessMimeType(snapshotPath)
-    });
-
-    stream.pipe(res);
-    return true;
+    return serveSnapshotFile(res, snapshotPath);
   }
 
   private handleFaces(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
@@ -691,6 +676,148 @@ function extractSnapshotPath(event: EventRecordWithId): string | null {
   return null;
 }
 
+function extractFaceSnapshotPath(event: EventRecordWithId): string | null {
+  const meta = event.meta ?? {};
+  const direct = (meta as Record<string, unknown>).faceSnapshot;
+  if (typeof direct === 'string' && direct.trim()) {
+    return path.resolve(direct);
+  }
+  const nested = (meta as Record<string, unknown>).face;
+  if (nested && typeof nested === 'object' && nested !== null) {
+    const snapshot = (nested as Record<string, unknown>).snapshot;
+    if (typeof snapshot === 'string' && snapshot.trim()) {
+      return path.resolve(snapshot);
+    }
+  }
+  return null;
+}
+
+function formatEventForClient<T extends EventRecord | EventRecordWithId>(
+  event: T
+): T & { meta?: Record<string, unknown> } {
+  const originalMeta = (event.meta as Record<string, unknown> | undefined) ?? undefined;
+  const meta = originalMeta ? { ...originalMeta } : {};
+  const resolvedChannels = resolveEventChannels(meta);
+  if (resolvedChannels.length > 0) {
+    meta.resolvedChannels = Array.from(new Set(resolvedChannels));
+  }
+  const typed = { ...event, meta } as T & { meta?: Record<string, unknown> };
+  const id = (event as EventRecordWithId).id;
+  if (typeof id === 'number') {
+    const snapshotPath = extractSnapshotPath(event as EventRecordWithId);
+    const faceSnapshotPath = extractFaceSnapshotPath(event as EventRecordWithId);
+    if (snapshotPath) {
+      meta.snapshotUrl = `/api/events/${id}/snapshot`;
+    }
+    if (faceSnapshotPath) {
+      meta.faceSnapshotUrl = `/api/events/${id}/face-snapshot`;
+    }
+  }
+  return typed;
+}
+
+type SummarizedEvent = EventRecordWithId & { meta?: Record<string, unknown> };
+
+function summarizeEvents(events: SummarizedEvent[]) {
+  const totalsByDetector: Record<string, number> = {};
+  const totalsBySeverity: Record<string, number> = {};
+  const channelMap = new Map<
+    string,
+    {
+      total: number;
+      byDetector: Record<string, number>;
+      bySeverity: Record<string, number>;
+      lastEventTs: number | null;
+      snapshots: number;
+    }
+  >();
+
+  for (const event of events) {
+    const detector = event.detector ?? 'unknown';
+    const severity = event.severity ?? 'info';
+    totalsByDetector[detector] = (totalsByDetector[detector] ?? 0) + 1;
+    totalsBySeverity[severity] = (totalsBySeverity[severity] ?? 0) + 1;
+    const meta = (event.meta as Record<string, unknown> | undefined) ?? {};
+    const resolvedChannels = Array.isArray(meta.resolvedChannels)
+      ? (meta.resolvedChannels as unknown[]).filter((value): value is string => typeof value === 'string')
+      : resolveEventChannels(meta);
+    const fallbackChannel =
+      (typeof meta.channel === 'string' && meta.channel.trim()) || event.source || 'unassigned';
+    const channels = resolvedChannels.length > 0 ? resolvedChannels : [fallbackChannel];
+    const tsCandidate =
+      typeof event.ts === 'number' ? event.ts : typeof event.ts === 'string' ? Date.parse(event.ts) : null;
+    const hasSnapshot = Boolean(meta.snapshotUrl || meta.snapshot || meta.faceSnapshotUrl);
+
+    for (const channel of channels) {
+      const state = channelMap.get(channel) ?? {
+        total: 0,
+        byDetector: {},
+        bySeverity: {},
+        lastEventTs: null,
+        snapshots: 0
+      };
+      state.total += 1;
+      state.byDetector[detector] = (state.byDetector[detector] ?? 0) + 1;
+      state.bySeverity[severity] = (state.bySeverity[severity] ?? 0) + 1;
+      if (typeof tsCandidate === 'number') {
+        state.lastEventTs = state.lastEventTs ? Math.max(state.lastEventTs, tsCandidate) : tsCandidate;
+      }
+      if (hasSnapshot) {
+        state.snapshots += 1;
+      }
+      channelMap.set(channel, state);
+    }
+  }
+
+  const channels = Array.from(channelMap.entries()).map(([id, stats]) => ({
+    id,
+    total: stats.total,
+    lastEventTs: stats.lastEventTs,
+    byDetector: stats.byDetector,
+    bySeverity: stats.bySeverity,
+    snapshots: stats.snapshots
+  }));
+
+  return {
+    totals: {
+      byDetector: totalsByDetector,
+      bySeverity: totalsBySeverity
+    },
+    channels
+  };
+}
+
+function createMetricsDigest(snapshot: ReturnType<MetricsRegistry['snapshot']>) {
+  const ffmpegChannels = Object.entries(snapshot.pipelines.ffmpeg.byChannel ?? {}).map(
+    ([channel, data]) => ({
+      channel,
+      restarts: data.restarts,
+      lastRestartAt: data.lastRestartAt,
+      watchdogBackoffMs: data.watchdogBackoffMs,
+      totalWatchdogBackoffMs: data.totalWatchdogBackoffMs,
+      totalDelayMs: data.totalRestartDelayMs,
+      lastRestart: data.lastRestart
+    })
+  );
+
+  return {
+    fetchedAt: snapshot.createdAt,
+    events: snapshot.events,
+    pipelines: {
+      ffmpeg: {
+        restarts: snapshot.pipelines.ffmpeg.restarts,
+        lastRestartAt: snapshot.pipelines.ffmpeg.lastRestartAt,
+        channels: ffmpegChannels
+      },
+      audio: {
+        restarts: snapshot.pipelines.audio.restarts,
+        lastRestartAt: snapshot.pipelines.audio.lastRestartAt,
+        watchdogBackoffMs: snapshot.pipelines.audio.watchdogBackoffMs
+      }
+    }
+  };
+}
+
 function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boolean {
   const meta = (event.meta ?? {}) as Record<string, unknown>;
   const metaCamera = typeof meta.camera === 'string' ? meta.camera : undefined;
@@ -819,6 +946,36 @@ function collectChannelFilters(source: { channel?: string; channels?: string[] |
     }
   }
   return Array.from(set);
+}
+
+function serveSnapshotFile(res: ServerResponse, snapshotPath: string): boolean {
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(snapshotPath);
+  } catch {
+    sendJson(res, 404, { error: 'Snapshot missing' });
+    return true;
+  }
+
+  if (!stats.isFile()) {
+    sendJson(res, 404, { error: 'Snapshot not available' });
+    return true;
+  }
+
+  const stream = fs.createReadStream(snapshotPath);
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: 'Failed to read snapshot' });
+    } else {
+      res.destroy();
+    }
+  });
+
+  res.writeHead(200, {
+    'Content-Type': guessMimeType(snapshotPath)
+  });
+  stream.pipe(res);
+  return true;
 }
 
 function resolveEventChannels(meta: Record<string, unknown>): string[] {

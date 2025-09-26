@@ -24,6 +24,8 @@ const sampleSource = videoConfig.testFile ?? 'assets/test-video.mp4';
 const videoFile = ensureSampleVideo(sampleSource);
 const ffmpegConfig: CameraFfmpegConfig | undefined = videoConfig.ffmpeg;
 
+const simulateRtspTimeout = process.env.GUARDIAN_SIMULATE_VIDEO_RTSP_TIMEOUT ?? '1';
+
 const source = new VideoSource({
   file: videoFile,
   framesPerSecond: videoConfig.framesPerSecond,
@@ -35,24 +37,61 @@ const source = new VideoSource({
   restartDelayMs: ffmpegConfig?.restartDelayMs,
   restartMaxDelayMs: ffmpegConfig?.restartMaxDelayMs,
   restartJitterFactor: ffmpegConfig?.restartJitterFactor,
-  commandFactory: ({ file, framesPerSecond }) =>
-    ffmpeg(file)
+  commandFactory: ({ file, framesPerSecond }) => {
+    const command = ffmpeg(file)
       .inputOptions('-stream_loop', '-1')
       .outputOptions('-vf', `fps=${framesPerSecond}`)
       .outputOptions('-f', 'image2pipe')
-      .outputOptions('-vcodec', 'png')
+      .outputOptions('-vcodec', 'png');
+
+    if (simulateRtspTimeout !== '0') {
+      const timeoutMs = parseMs(process.env.GUARDIAN_SIMULATE_VIDEO_RTSP_TIMEOUT_DELAY_MS, 2500);
+      let timer: NodeJS.Timeout | null = null;
+      const scheduleInjection = () => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        timer = setTimeout(() => {
+          timer = null;
+          command.emit('stderr', 'method DESCRIBE failed: Connection timed out');
+        }, Math.max(0, timeoutMs));
+      };
+
+      command.once('start', scheduleInjection);
+      command.once('end', () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      });
+      command.once('close', () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      });
+      command.once('error', () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      });
+    }
+
+    return command;
+  }
 });
 
 const simulateWatchdog = process.env.GUARDIAN_SIMULATE_VIDEO_WATCHDOG ?? '1';
 
-const parseMs = (value: string | undefined, fallback: number) => {
+function parseMs(value: string | undefined, fallback: number) {
   if (!value) {
     return fallback;
   }
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
-};
+}
 
 const stallDelayMs = parseMs(process.env.GUARDIAN_SIMULATE_VIDEO_WATCHDOG_DELAY_MS, 2000);
 const stallDurationMs = parseMs(process.env.GUARDIAN_SIMULATE_VIDEO_WATCHDOG_DURATION_MS, 7000);

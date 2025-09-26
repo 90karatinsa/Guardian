@@ -115,6 +115,7 @@ class EventBus extends EventEmitter {
           : undefined;
       const combinedHistory = mergeSuppressionHistory(evaluation.hits, normalized.ts);
       const suppressedBy = evaluation.hits.map(hit => {
+        const history = dedupeAndSortHistory(hit.history);
         const windowRemainingMs =
           typeof hit.windowExpiresAt === 'number'
             ? Math.max(0, hit.windowExpiresAt - normalized.ts)
@@ -136,8 +137,8 @@ class EventBus extends EventEmitter {
           rateLimit: hit.rule.rateLimit,
           maxEvents: hit.rule.maxEvents,
           windowExpiresAt: hit.windowExpiresAt,
-          history: [...hit.history],
-          historyCount: hit.history.length,
+          history,
+          historyCount: history.length,
           rateLimitWindowMs: hit.rateLimit?.perMs,
           cooldownMs: hit.cooldownMs,
           channel: primaryChannel ?? undefined,
@@ -172,12 +173,13 @@ class EventBus extends EventEmitter {
 
       evaluation.hits.forEach((hit, index) => {
         const suppressedMeta = suppressedBy[index];
+        const history = dedupeAndSortHistory(hit.history);
         const detail: SuppressedEventMetric = {
           ruleId: hit.rule.id,
           reason: hit.reason,
           type: hit.type,
-          historyCount: hit.history.length,
-          history: [...hit.history],
+          historyCount: history.length,
+          history,
           windowExpiresAt: hit.windowExpiresAt,
           rateLimit: hit.rateLimit,
           cooldownMs: hit.cooldownMs,
@@ -241,11 +243,12 @@ class EventBus extends EventEmitter {
           rule.history.splice(0, rule.history.length - normalizedMaxEvents);
         }
         const windowCooldown = rule.rateLimit ? normalizeCooldownMs(rule.rateLimit.cooldownMs) : 0;
+        const history = dedupeAndSortHistory(rule.history);
         hits.push({
           rule,
           type: 'window',
           reason: rule.reason,
-          history: [...rule.history],
+          history,
           windowExpiresAt: rule.suppressedUntil,
           rateLimit: rule.rateLimit,
           cooldownMs: windowCooldown > 0 ? windowCooldown : undefined
@@ -260,7 +263,7 @@ class EventBus extends EventEmitter {
         if (windowExpiresAt > 0 && windowExpiresAt > rule.suppressedUntil) {
           rule.suppressedUntil = windowExpiresAt;
         }
-        const historyForMeta = historySnapshot.slice(-normalizedMaxEvents);
+        const historyForMeta = dedupeAndSortHistory(historySnapshot.slice(-normalizedMaxEvents));
         hits.push({
           rule,
           type: 'window',
@@ -285,7 +288,7 @@ class EventBus extends EventEmitter {
           historyLimit && historyLimit > 0
             ? historySnapshot.slice(-historyLimit)
             : [...historySnapshot];
-        const rateLimitHistory = [...relevantSnapshot, event.ts];
+        const rateLimitHistory = dedupeAndSortHistory([...relevantSnapshot, event.ts]);
         const cooldownMs = normalizeCooldownMs(rateLimitConfig.cooldownMs);
         let windowUntil: number | undefined;
         if (rule.suppressForMs || cooldownMs > 0) {
@@ -420,13 +423,36 @@ function pruneHistory(rule: InternalSuppressionRule, ts: number) {
     }
   }
 
+  if (rule.history.length > 1) {
+    sortHistory(rule.history);
+    dedupeSortedInPlace(rule.history);
+  }
+
   if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
     rule.history.splice(0, rule.history.length - rule.historyLimit);
   }
 }
 
 function recordHistory(rule: InternalSuppressionRule, ts: number) {
-  rule.history.push(ts);
+  if (!Number.isFinite(ts)) {
+    return;
+  }
+  if (rule.history.length === 0) {
+    rule.history.push(ts);
+  } else {
+    const last = rule.history[rule.history.length - 1];
+    if (ts >= last) {
+      if (ts !== last) {
+        rule.history.push(ts);
+      }
+    } else {
+      rule.history.push(ts);
+      sortHistory(rule.history);
+    }
+    if (rule.history.length > 1) {
+      dedupeSortedInPlace(rule.history);
+    }
+  }
   if (rule.historyLimit > 0 && rule.history.length > rule.historyLimit) {
     rule.history.splice(0, rule.history.length - rule.historyLimit);
   }
@@ -502,5 +528,44 @@ function mergeSuppressionHistory(hits: SuppressionHit[], eventTs: number): numbe
     }
   }
 
-  return [...merged].sort((a, b) => a - b);
+  return dedupeAndSortHistory([...merged]);
+}
+
+function sortHistory(history: number[]) {
+  history.sort((a, b) => a - b);
+}
+
+function dedupeSortedInPlace(history: number[]) {
+  if (history.length < 2) {
+    return;
+  }
+  let writeIndex = 1;
+  let previous = history[0];
+  for (let index = 1; index < history.length; index += 1) {
+    const value = history[index];
+    if (value === previous) {
+      continue;
+    }
+    previous = value;
+    history[writeIndex] = value;
+    writeIndex += 1;
+  }
+  history.length = writeIndex;
+}
+
+function dedupeAndSortHistory(history: number[]): number[] {
+  if (history.length <= 1) {
+    return history.slice();
+  }
+  const sorted = history.slice().sort((a, b) => a - b);
+  const result: number[] = [];
+  let previous: number | null = null;
+  for (const value of sorted) {
+    if (previous !== null && value === previous) {
+      continue;
+    }
+    result.push(value);
+    previous = value;
+  }
+  return result;
 }

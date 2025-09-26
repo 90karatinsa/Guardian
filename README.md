@@ -44,7 +44,13 @@ pnpm exec node -e "require('onnxruntime-node'); console.log('onnxruntime hazır'
 
 # Guardian CLI kurulumunu test edin
 pnpm exec tsx src/cli.ts --help
+
+# Sağlık özeti histogram anahtarlarını içerir ve status: ok döner
+pnpm tsx src/cli.ts --health
 ```
+
+`pnpm tsx src/cli.ts --health` çıktısı `status: "ok"` satırını ve `metrics.histograms.pipeline.ffmpeg.restarts`,
+`metrics.histograms.pipeline.audio.restarts` gibi anahtarları içerir; histogramlar sıfır değerlerle bile görünür.
 
 Bu adımlar tamamlandıktan sonra Guardian boru hattını çalıştırmaya hazırsınız.
 
@@ -198,6 +204,16 @@ guardian status
 guardian retention run
 ```
 
+Guardian log düzeyini çalışma anında değiştirmek için `guardian log-level` ailesini kullanabilirsiniz:
+
+```bash
+# Geçerli log seviyesini yazdırır ("guardian log-level" kısa yolu da aynı çıktıyı üretir)
+guardian log-level get
+
+# Daha ayrıntılı loglama için seviyi günceller
+guardian log-level set debug
+```
+
 - `guardian status --json` çıktısı `metrics` anlık görüntüsüne ek olarak `runtime.pipelines.videoChannels`, `runtime.pipelines.audioChannels` ve her boru hattının yeniden başlatma sayaçlarını (`videoRestarts`, `audioRestarts`) içerir. Ayrıca `application.shutdown` alanında son kapanış nedeni, sinyali ve hook özetleri raporlanır. Sağlık kodları; `0=ok`, `1=degraded`, `2=starting`, `3=stopping` olarak döner.
 - `guardian health` komutu aynı JSON gövdesini döndürmeye devam eder ancak yeni kurulamlarda `guardian status --json` tercih edilmelidir.
 
@@ -275,6 +291,25 @@ curl -N http://localhost:3000/api/events/stream
 
 REST API cevapları, pose tahminleri ve suppress edilmiş olayları `metrics.suppression.rules` alanlarıyla birlikte döndürerek dashboard’da kullanılan aynı veriyi sunar.
 
+## Platform farklılıkları
+Platform farklılıkları (ALSA/CoreAudio/Video4Linux) Guardian’ın mikrofon ve kamera kaynaklarını nasıl yönettiğini doğrudan etkiler:
+
+- **Linux (ALSA + Video4Linux2)**: `audio.micFallbacks.linux` listesine `hw:1,0` veya `plughw:2,0` gibi ALSA tanımlayıcıları ekleyin.
+  Video tarafında `Video4Linux2` cihazları (`/dev/video0`) ffmpeg tarafından okunur; `v4l2-ctl --list-devices` komutu mevcut girişleri
+  listeler. `sudo apt-get install -y ffmpeg alsa-utils v4l-utils` paketleri eksik sürücüleri tamamlar ve `guardian log-level set trace`
+  komutu ayrıntılı hata ayıklama sağlar.
+- **macOS (CoreAudio)**: `audio.micFallbacks.macos` altında `Built-in Microphone` gibi cihaz adları kullanılır. Homebrew üzerinden
+  `brew install ffmpeg` ile sağlanan ffmpeg, CoreAudio kaynaklarını otomatik tanır. Sorun giderirken `guardian log-level set debug`
+  komutu ve `pnpm tsx src/cli.ts --health` çıktısı (ör. `metrics.histograms.pipeline.audio.restarts`) hızlı geri bildirim verir.
+- **Windows (DirectShow/WASAPI)**: `audio.micFallbacks.win32` öğelerini `audio="Microphone (USB Audio Device)"` biçiminde
+  yazabilirsiniz. PATH’e ffmpeg eklenmediğinde CLI loglarında `Audio source recovering (reason=ffmpeg-missing)` ve `Video source
+  recovering (reason=ffmpeg-missing)` satırları görünür; `guardian log-level get` ve `guardian log-level set warn` komutlarıyla
+  seviye değiştirilebilir.
+
+Her platformda `pnpm tsx src/cli.ts --health` komutu `status: "ok"` satırıyla birlikte `metrics.histograms.pipeline.ffmpeg.restarts`
+ve `metrics.histograms.pipeline.audio.restarts` anahtarlarının çıktıda yer aldığını doğrular; bu bilgiler Docker veya systemd ortamlarında
+hazırlık kontrollerine entegre edilebilir.
+
 ## Dashboard
 `pnpm exec tsx src/server/http.ts` komutu HTTP sunucusunu başlatır. Ardından `http://localhost:3000` adresine giderek dashboard’u açabilirsiniz:
 
@@ -291,6 +326,7 @@ Guardian tüm metrikleri JSON olarak üretir:
 - HTTP sunucusu `/api/metrics` uç noktasıyla Prometheus uyumlu bir çıktıyı paylaşacak şekilde genişletilebilir.
 - `metrics.events` altında dedektör başına tetik sayıları, `metrics.detectors.pose.counters.forecasts` / `metrics.detectors.face.counters.matches` / `metrics.detectors.object.counters.threats` gibi değerler gerçek zamanlı çıkarımları raporlar.
 - `metrics.latency.detector.person` altında histogramlar, `metrics.pipelines.ffmpeg.byChannel['video:lobby']` altında kanal bazlı yeniden başlatma sayaçları bulunur.
+- `metrics.histograms.pipeline.ffmpeg.restarts` ve `metrics.histograms.detector.motion.counter.detections` anahtarları, boru hattı yeniden başlatma denemeleri ile dedektör sayaçlarının dağılımını gösterir; bu alanlar `guardian log-level set debug` sonrası artan olaylarda dolmaya devam eder.
 - Log düzeyleri `metrics.logs.byLevel.error` ve `metrics.logs.byDetector.motion.warning` gibi anahtarlarla etiketlenir; suppression kuralları için `metrics.suppression.rules['rule-id'].total` değeri takip edilir.
 
 ## Video ve ses boru hatları
@@ -333,6 +369,7 @@ Servis, ortam değişkenlerini unit dosyasındaki `Environment=` satırlarından
 1. Sistem paketlerini kurun: Debian/Ubuntu için `sudo apt-get install -y ffmpeg libgomp1`, macOS için `brew install ffmpeg`, Windows için resmi ffmpeg paketini PATH’e ekleyin.
 2. ONNX modeli için doğru mimariye uygun dosyayı indirin (`models/yolov8n.onnx`). Yanlış bir dosya `onnxruntime: Failed to load model` hatasına yol açar.
 3. Değişikliklerden sonra `pnpm install` komutunu yeniden çalıştırıp CLI’yi `pnpm exec tsx src/cli.ts status --json` ile doğrulayın; sağlık çıktısında `status: "ok"` ve `application.shutdown.hooks` bölümünde hook sonuçları görülmelidir.
+4. ffmpeg hâlâ bulunamazsa `guardian log-level set debug` veya `guardian log-level set trace` komutlarıyla log seviyesini yükseltip `pnpm tsx src/cli.ts --health` çıktısındaki `metrics.histograms.pipeline.ffmpeg.restarts` değerlerini kontrol edin; artış, yeniden deneme döngülerinin devam ettiğini gösterir.
 
 ### RTSP akışı bağlanmıyor
 - `ffmpeg -rtsp_transport tcp -i rtsp://...` komutunu elle çalıştırarak ağ gecikmesini test edin.

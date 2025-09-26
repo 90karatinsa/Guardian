@@ -478,6 +478,71 @@ describe('VideoSource', () => {
     vi.useRealTimers();
   });
 
+  it('VideoSourceRtspErrorClassification restarts on RTSP timeouts and records circuit events', async () => {
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+    const fatalEvents: Array<{ reason: string; lastFailure: { reason: string } }> = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp',
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      circuitBreakerThreshold: 2,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverEvents.push(event);
+    });
+    source.on('fatal', event => {
+      fatalEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      await waitFor(() => commands.length === 1, 500);
+      const first = commands[0];
+      first.emit('start');
+      first.emit('stderr', 'method DESCRIBE failed: Connection timed out');
+
+      await waitFor(
+        () => recoverEvents.some(event => event.reason === 'rtsp-timeout'),
+        1000
+      );
+
+      expect(recoverEvents[0].reason).toBe('rtsp-timeout');
+      expect(first.killedSignals).toContain('SIGTERM');
+      expect(first.killedSignals).toContain('SIGKILL');
+
+      await waitFor(() => commands.length >= 2, 1000);
+      const second = commands[commands.length - 1];
+      second.emit('start');
+      second.emit('stderr', 'Connection timed out during read operation');
+
+      await waitFor(() => fatalEvents.length === 1, 1000);
+      expect(fatalEvents[0].reason).toBe('circuit-breaker');
+      expect(fatalEvents[0].lastFailure.reason).toBe('rtsp-timeout');
+
+      const snapshot = metrics.snapshot();
+      const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:rtsp'];
+      expect(channelStats.byReason['rtsp-timeout']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.byReason['circuit-breaker']).toBe(1);
+    } finally {
+      source.stop();
+    }
+  });
+
   it('VideoFfmpegCorruptedFrameRecovery retries when corrupted frames are detected', async () => {
     vi.useFakeTimers();
 

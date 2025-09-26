@@ -41,6 +41,14 @@ function parseArgs(argv: string[]): VacuumOptions {
       continue;
     }
 
+    if (arg.startsWith('--run=')) {
+      const mode = arg.split('=')[1];
+      if (mode === 'always' || mode === 'on-change') {
+        options.run = mode;
+      }
+      continue;
+    }
+
     if (arg.startsWith('--pragma=')) {
       const pragma = arg.slice('--pragma='.length);
       if (pragma) {
@@ -62,8 +70,8 @@ async function main() {
   const options = parseArgs(args);
 
   logger.info({ options }, 'running manual vacuum');
-  vacuumDatabase(options);
-  logger.info('vacuum completed');
+  const summary = vacuumDatabase(options);
+  logger.info({ vacuum: summary }, 'VACUUM completed');
 }
 
 main().catch(error => {
