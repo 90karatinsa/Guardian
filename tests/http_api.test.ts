@@ -314,6 +314,247 @@ describe('RestApiEvents', () => {
     noneController.abort();
   });
 
+  it('HttpStreamRetentionMetricsToggle streams retention-only metrics and updates dashboard widget', async () => {
+    metrics.recordRetentionRun({
+      removedEvents: 3,
+      archivedSnapshots: 0,
+      prunedArchives: 0,
+      perCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0 } }
+    });
+
+    const { port } = await ensureServer();
+    const controller = new AbortController();
+    const response = await fetch(`http://localhost:${port}/api/events/stream?metrics=retention`, {
+      signal: controller.signal
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const metricsPayload = await new Promise<any>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readChunk = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              reject(new Error('stream ended'));
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (eventName === 'metrics' && dataLines.length > 0) {
+                resolve(JSON.parse(dataLines.join('')));
+                return;
+              }
+            }
+            readChunk();
+          })
+          .catch(reject);
+      };
+      readChunk();
+    });
+
+    controller.abort();
+    await reader?.cancel().catch(() => undefined);
+    expect(metricsPayload).toBeDefined();
+    expect(metricsPayload.events).toBeUndefined();
+    expect(metricsPayload.pipelines).toBeUndefined();
+    expect(metricsPayload.retention?.totals?.removedEvents).toBeGreaterThan(0);
+    expect(Object.keys(metricsPayload).sort()).toEqual(['fetchedAt', 'retention']);
+
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
+
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
+
+    const baselineMetrics = {
+      fetchedAt: new Date(1700004000000).toISOString(),
+      pipelines: {},
+      retention: {
+        runs: 0,
+        lastRunAt: null,
+        warnings: 0,
+        warningsByCamera: {},
+        lastWarning: null,
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 },
+        totalsByCamera: {}
+      }
+    };
+
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events?')) {
+        return new Response(JSON.stringify({ items: [], total: 0 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(JSON.stringify(baselineMetrics), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    type Listener = (event: MessageEvent) => void;
+    class RetentionEventSource {
+      static instances: RetentionEventSource[] = [];
+      public readyState = 0;
+      public url: string;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
+
+      constructor(url: string) {
+        this.url = url;
+        RetentionEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const payload = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(payload));
+      }
+
+      open() {
+        this.onopen?.(new window.Event('open'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.stubGlobal('EventSource', RetentionEventSource as unknown as typeof EventSource);
+
+    await import('../public/dashboard.js');
+    await Promise.resolve();
+    await vi.waitFor(() => {
+      const state = (window as any).__guardianDashboardState;
+      if (!state) {
+        throw new Error('dashboard state unavailable');
+      }
+    });
+
+    const instance = RetentionEventSource.instances[0];
+    expect(instance).toBeDefined();
+    instance?.open();
+
+    const retentionDigest = {
+      fetchedAt: new Date(1700005000000).toISOString(),
+      retention: {
+        runs: 2,
+        lastRunAt: new Date(1700004800000).toISOString(),
+        warnings: 1,
+        warningsByCamera: { 'video:test': 1 },
+        lastWarning: { camera: 'video:test', path: '/snapshots/test.jpg', reason: 'Missing file' },
+        totals: { removedEvents: 5, archivedSnapshots: 0, prunedArchives: 0 },
+        totalsByCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0 } }
+      }
+    };
+    instance?.dispatch('metrics', JSON.stringify(retentionDigest));
+
+    await vi.waitFor(() => {
+      const widget = window.document.getElementById('pipeline-metrics');
+      if (!widget) {
+        throw new Error('pipeline widget missing');
+      }
+      const content = widget.textContent ?? '';
+      expect(content.includes('Retention')).toBe(true);
+      expect(content.includes('5 removed')).toBe(true);
+      expect(content.includes('Video streams')).toBe(false);
+    });
+
+    dom.window.close();
+    vi.unstubAllGlobals();
+
+    if (originalWindow) {
+      globalThis.window = originalWindow;
+    } else {
+      // @ts-expect-error cleanup
+      delete globalThis.window;
+    }
+    if (originalDocument) {
+      globalThis.document = originalDocument;
+    } else {
+      // @ts-expect-error cleanup
+      delete globalThis.document;
+    }
+    if (originalEventSource) {
+      globalThis.EventSource = originalEventSource;
+    }
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    }
+    if (originalHTMLElement) {
+      globalThis.HTMLElement = originalHTMLElement;
+    }
+    if (originalMessageEvent) {
+      globalThis.MessageEvent = originalMessageEvent;
+    }
+    if (originalNavigator) {
+      globalThis.navigator = originalNavigator;
+    } else {
+      // @ts-expect-error cleanup navigator
+      delete globalThis.navigator;
+    }
+  });
+
   it('HttpApiPoseThreatPayload surfaces pose metadata and caches snapshots', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'pose.png');

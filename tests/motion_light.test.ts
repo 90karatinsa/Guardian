@@ -359,6 +359,65 @@ describe('MotionDetector', () => {
     expect(snapshot.detectors.motion?.gauges?.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(5);
   });
 
+  it('MotionDetectorOptionUpdatePreservesSuppression', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'option-preserve',
+        diffThreshold: 4,
+        areaThreshold: 0.03,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.25,
+        noiseSmoothing: 0.18,
+        areaSmoothing: 0.18,
+        noiseBackoffPadding: 1
+      },
+      bus
+    );
+
+    const base = createUniformFrame(12, 12, 20);
+    detector.handleFrame(base, 0);
+
+    const noiseFrames = [
+      createFrame(12, 12, (x, y) => 20 + ((x + y) % 3 === 0 ? 4 : -3)),
+      createFrame(12, 12, (x, y) => 20 + ((x * 2 + y) % 4 === 0 ? 5 : -4)),
+      createFrame(12, 12, (x, y) => 20 + ((x + 2 * y) % 5 === 0 ? 6 : -5))
+    ];
+
+    noiseFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, idx + 1);
+    });
+
+    const baselineSnapshot = metrics.snapshot();
+    const suppressedBefore = baselineSnapshot.detectors.motion?.counters?.suppressedFrames ?? 0;
+
+    expect(suppressedBefore).toBeGreaterThan(0);
+
+    detector.updateOptions({ noiseBackoffPadding: 3 });
+
+    const activationFrames = [
+      createFrame(12, 12, (x, y) => (x < 6 ? 255 : 18)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 255 : 19)),
+      createFrame(12, 12, (x, y) => (x < 6 ? 255 : 20))
+    ];
+
+    activationFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, 100 + idx);
+    });
+
+    const event = events.find(entry => entry.detector === 'motion');
+    expect(event).toBeDefined();
+    const meta = event?.meta as Record<string, number>;
+    expect(meta.noiseBackoffPadding).toBe(3);
+    expect(meta.suppressedFramesBeforeTrigger).toBe(suppressedBefore);
+
+    const afterSnapshot = metrics.snapshot();
+    const beforeMetric = baselineSnapshot.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0;
+    const afterMetric = afterSnapshot.detectors.motion?.counters?.suppressedFramesBeforeTrigger ?? 0;
+    expect(afterMetric - beforeMetric).toBe(suppressedBefore);
+  });
+
   it('MotionLightAdaptiveBackoff suppresses noise bursts and tracks suppression metrics', () => {
     const detector = new MotionDetector(
       {

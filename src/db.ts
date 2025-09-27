@@ -347,11 +347,12 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   const retentionMs = Math.max(retentionDays, 0) * 24 * 60 * 60 * 1000;
   const cutoffTs = now - retentionMs;
 
-  const removedEvents = pruneEventsOlderThan(cutoffTs);
+  let removedEvents = pruneEventsOlderThan(cutoffTs);
   const snapshotOptions = normalizeSnapshotOptions(options, now);
   const directories = snapshotOptions.mode === 'ignore' ? [] : collectSnapshotDirectories(options);
   let archivedSnapshots = 0;
   let prunedArchives = 0;
+  let removedSnapshots = 0;
   const perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number }> = {};
   const warnings: Array<{ path: string; error: Error; camera: string }> = [];
 
@@ -370,14 +371,22 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
       resolvedLimit,
       cameraId
     );
-    archivedSnapshots += rotation.moved;
+    if (snapshotOptions.mode === 'delete') {
+      removedSnapshots += rotation.moved;
+    } else {
+      archivedSnapshots += rotation.moved;
+    }
     prunedArchives += rotation.pruned;
     warnings.push(...rotation.warnings);
     const cameraStats = perCamera[cameraId] ?? { archivedSnapshots: 0, prunedArchives: 0 };
-    cameraStats.archivedSnapshots += rotation.moved;
+    if (snapshotOptions.mode !== 'delete') {
+      cameraStats.archivedSnapshots += rotation.moved;
+    }
     cameraStats.prunedArchives += rotation.pruned;
     perCamera[cameraId] = cameraStats;
   }
+
+  removedEvents += removedSnapshots;
 
   return { removedEvents, archivedSnapshots, prunedArchives, warnings, perCamera };
 }

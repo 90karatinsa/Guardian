@@ -274,6 +274,28 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('CliDaemonRestartUnknownChannel reports descriptive error for missing pipelines', async () => {
+    const stopSpy = vi.fn();
+    const resetSpy = vi.fn().mockReturnValue(false);
+    startGuardMock.mockResolvedValue({ stop: stopSpy, resetCircuitBreaker: resetSpy });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const restartIo = createTestIo();
+    const code = await runCli(['daemon', 'restart', '--channel', 'video:unknown'], restartIo.io);
+
+    expect(code).toBe(1);
+    expect(resetSpy).toHaveBeenCalledWith('video:unknown');
+    expect(restartIo.stderr()).toContain('Channel not found');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('CliSystemdIntegration reports integration manifest and matches packaged commands', async () => {
     const health = await buildHealthPayload();
     const manifest = health.integration;

@@ -201,6 +201,8 @@ Guardian, mikrofon fallback zincirlerini ve anomaly dedektör eşiklerini çalı
 - `audio.channel` alanı tanımlanmamışsa varsayılan `audio:microphone` kanalı kullanılır. Birden fazla örneği aynı kanala bağlamak istiyorsanız farklı değerler atayın.
 - `audio.anomaly` blokları içinde `rmsWindowMs`, `centroidWindowMs`, `minTriggerDurationMs` veya `thresholds` alanlarını değiştirmeniz halinde dedektör tamponları sıfırlanır ve yeni pencereler hemen uygulanır. `nightHours` aralığı güncellendiğinde profil geçişi bir sonraki karede tetiklenir.
 - Fallback ve eşik değişikliklerinin etkisini `guardian daemon status --json` komutuyla veya `/api/metrics/pipelines` uç noktasından alınan metriklerle doğrulayabilirsiniz.
+- `audio.silenceCircuitBreakerThreshold`, sessizlik pencereleri art arda bu eşiği aştığında devre kesiciyi tetikler. `0` değeri devre kesiciyi devre dışı bırakır; tetiklemeler sırasında `Audio source recovering (reason=silence-circuit-breaker)` satırlarını ve `guardian daemon status --json` çıktısındaki `pipelines.audio.byReason` sayaç artışlarını bekleyebilirsiniz.
+- `audio.deviceDiscoveryTimeoutMs`, fallback listesi taramasının kaç milisaniye sonra zaman aşımına uğrayacağını belirler. Süre dolduğunda loglar `Audio device discovery timed out after 2000ms` benzeri bir mesaj yazar, `pipelines.audio.deviceDiscovery` metriği denenen platformları sayar ve `guardian audio devices --json` çıktısı aynı zaman aşımı değerini `timeoutMs` alanı altında raporlar.
 
 ### Retention ve arşiv döngüsü
 Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir retention görevine sahiptir:

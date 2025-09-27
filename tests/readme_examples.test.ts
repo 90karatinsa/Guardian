@@ -107,6 +107,18 @@ describe('ReadmeExamples', () => {
   });
 });
 
+it('ReadmeAudioSilenceDocs documents silence circuit breaker and device discovery timeout expectations', () => {
+  const readme = readReadme();
+
+  expect(readme).toContain('audio.silenceCircuitBreakerThreshold');
+  expect(readme).toContain('Audio source recovering (reason=silence-circuit-breaker)');
+  expect(readme).toContain('pipelines.audio.byReason');
+  expect(readme).toContain('deviceDiscoveryTimeoutMs');
+  expect(readme).toContain('Audio device discovery timed out after');
+  expect(readme).toContain('pipelines.audio.deviceDiscovery');
+  expect(readme).toContain('guardian audio devices --json');
+});
+
 describe('OperationsDocLinks', () => {
   it('OperationsDocLinks ensures README links to operations manual and sections are present', () => {
     const readme = readReadme();

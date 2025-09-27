@@ -68,7 +68,10 @@ export function parseYoloDetections(
     return [];
   }
 
-  const classIndices = resolveClassIndices(options, accessors[0]!.attributes);
+  const resolvedIndices = resolveClassIndices(options, accessors[0]!.attributes);
+  const classIndices = resolvedIndices.filter(
+    (value, index) => index === 0 || value !== resolvedIndices[index - 1]
+  );
 
   const classPriority = buildClassPriority(options, classIndices);
 
@@ -107,6 +110,9 @@ export function parseYoloDetections(
       }
 
       const projected = projectBoundingBox(cx, cy, width, height, meta);
+      if (!isFiniteBoundingBox(projected.box)) {
+        continue;
+      }
       const bbox = clampBoundingBoxToFrame(projected.box, meta.originalWidth, meta.originalHeight);
 
       if (
@@ -621,6 +627,15 @@ function nonMaxSuppression(detections: YoloDetection[], threshold: number) {
   }
 
   return results;
+}
+
+function isFiniteBoundingBox(box: BoundingBox) {
+  return (
+    Number.isFinite(box.left) &&
+    Number.isFinite(box.top) &&
+    Number.isFinite(box.width) &&
+    Number.isFinite(box.height)
+  );
 }
 
 function clampBoundingBoxToFrame(box: BoundingBox, frameWidth: number, frameHeight: number): BoundingBox {

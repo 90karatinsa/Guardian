@@ -422,6 +422,51 @@ describe('EventSuppressionRateLimit', () => {
     expect(metricDetails[1]).toMatchObject({ history: [0, 200], historyCount: 2 });
     expect(metricDetails[2]).toMatchObject({ history: [0, 200, 400], historyCount: 3 });
   });
+
+  it('EventSuppressionMaxEventsWindow applies per-channel windows and updates histograms', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'channel-window',
+        detector: 'test-detector',
+        suppressForMs: 800,
+        maxEvents: 2,
+        reason: 'channel burst'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 120, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(false);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 210, meta: { channel: 'cam:b' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 750, meta: { channel: 'cam:a' } })).toBe(false);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1205, meta: { channel: 'cam:a' } })).toBe(true);
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressedMeta).toHaveLength(2);
+    const firstSuppression = suppressedMeta[0];
+    expect(firstSuppression.suppressionChannel).toBe('cam:a');
+    expect(firstSuppression.suppressedBy?.[0]?.historyCount).toBe(2);
+    expect(firstSuppression.suppressedBy?.[0]?.windowRemainingMs).toBe(800);
+    const secondSuppression = suppressedMeta[1];
+    expect(secondSuppression.suppressedBy?.[0]?.historyCount).toBe(2);
+    expect(Number(secondSuppression.suppressedBy?.[0]?.windowRemainingMs ?? 0)).toBeLessThanOrEqual(800);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.lastEvent?.historyCount).toBe(2);
+    expect(snapshot.suppression.lastEvent?.maxEvents).toBe(2);
+    const historyHistogram = snapshot.suppression.histogram.historyCount;
+    expect(historyHistogram['2-5']).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe('EventSuppressionWindowRecovery', () => {

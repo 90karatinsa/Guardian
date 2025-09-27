@@ -582,6 +582,28 @@ async function runDaemonRestartCommand(args: string[], io: CliIo): Promise<numbe
 
   const triggered = reset(channel);
   if (!triggered) {
+    const snapshot = metrics.snapshot();
+    const byChannel = snapshot.pipelines.ffmpeg.byChannel ?? {};
+    const normalized = channel.trim().toLowerCase();
+    const knownChannels = new Set<string>();
+
+    for (const key of Object.keys(byChannel)) {
+      const trimmed = key.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const normalizedKey = trimmed.toLowerCase();
+      knownChannels.add(normalizedKey);
+      if (trimmed.startsWith('video:')) {
+        knownChannels.add(trimmed.slice('video:'.length).trim().toLowerCase());
+      }
+    }
+
+    if (!knownChannels.has(normalized)) {
+      io.stderr.write(`Channel not found: ${channel}\n`);
+      return 1;
+    }
+
     io.stderr.write(`No circuit breaker reset performed for channel ${channel}\n`);
     return 1;
   }

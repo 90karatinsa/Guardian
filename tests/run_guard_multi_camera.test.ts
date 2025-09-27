@@ -8,7 +8,7 @@ class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
   static startCounts: number[] = [];
   constructor(
-    public readonly options: {
+    public options: {
       file: string;
       framesPerSecond: number;
       channel?: string;
@@ -21,6 +21,7 @@ class MockVideoSource extends EventEmitter {
       restartDelayMs?: number;
       restartMaxDelayMs?: number;
       restartJitterFactor?: number;
+      circuitBreakerThreshold?: number;
     }
   ) {
     super();
@@ -28,6 +29,11 @@ class MockVideoSource extends EventEmitter {
     MockVideoSource.startCounts.push(0);
   }
   public circuitBroken = false;
+  public updateOptions = vi.fn(
+    (options: Partial<MockVideoSource['options']>) => {
+      Object.assign(this.options, options);
+    }
+  );
   start() {
     const index = MockVideoSource.instances.indexOf(this);
     if (index >= 0) {
@@ -564,6 +570,152 @@ describe('run-guard multi camera orchestration', () => {
     expect(camBSnapshot.totalRestartDelayMs).toBe(600);
 
     runtime.stop();
+  });
+
+  it('RunGuardChannelIdleOverrides propagates ffmpeg timers without restart', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 4,
+        ffmpeg: {
+          idleTimeoutMs: 9000,
+          watchdogTimeoutMs: 13000,
+          restartDelayMs: 250,
+          restartMaxDelayMs: 1500,
+          restartJitterFactor: 0.1,
+          circuitBreakerThreshold: 5
+        },
+        channels: {
+          'video:cam-1': {
+            ffmpeg: {
+              idleTimeoutMs: 8000,
+              watchdogTimeoutMs: 11000,
+              circuitBreakerThreshold: 4
+            }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1/stream',
+            ffmpeg: {
+              idleTimeoutMs: 7500,
+              watchdogTimeoutMs: 9000,
+              circuitBreakerThreshold: 3
+            },
+            person: { score: 0.5 },
+            motion: { diffThreshold: 18, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'model.onnx', score: 0.5 },
+      motion: { diffThreshold: 18, areaThreshold: 0.02 },
+      events: { thresholds: { info: 0, warning: 5, critical: 10 } }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+      const source = MockVideoSource.instances[0];
+      expect(source.options.idleTimeoutMs).toBe(7500);
+      expect(source.options.watchdogTimeoutMs).toBe(9000);
+      expect(source.options.circuitBreakerThreshold).toBe(3);
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          ffmpeg: {
+            ...initialConfig.video.ffmpeg,
+            idleTimeoutMs: 6000,
+            watchdogTimeoutMs: 9000,
+            restartDelayMs: 180,
+            restartMaxDelayMs: 1100,
+            restartJitterFactor: 0.15,
+            circuitBreakerThreshold: 6
+          },
+          channels: {
+            'video:cam-1': {
+              ffmpeg: {
+                idleTimeoutMs: 5800,
+                watchdogTimeoutMs: 7200,
+                circuitBreakerThreshold: 2
+              }
+            }
+          },
+          cameras: [
+            {
+              ...initialConfig.video.cameras?.[0],
+              ffmpeg: {
+                idleTimeoutMs: 5200,
+                watchdogTimeoutMs: 6800,
+                circuitBreakerThreshold: 2,
+                restartDelayMs: 180,
+                restartMaxDelayMs: 1100,
+                restartJitterFactor: 0.15
+              }
+            }
+          ]
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => source.updateOptions.mock.calls.length > 0);
+
+      expect(MockVideoSource.instances.length).toBe(1);
+      expect(MockVideoSource.startCounts[0]).toBe(1);
+      expect(source.updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({
+          idleTimeoutMs: 5200,
+          watchdogTimeoutMs: 6800,
+          circuitBreakerThreshold: 2
+        })
+      );
+      expect(source.options).toMatchObject({
+        idleTimeoutMs: 5200,
+        watchdogTimeoutMs: 6800,
+        circuitBreakerThreshold: 2,
+        restartDelayMs: 180,
+        restartMaxDelayMs: 1100,
+        restartJitterFactor: 0.15
+      });
+
+      const pipeline = runtime.pipelines.get('video:cam-1');
+      expect(pipeline).toBeDefined();
+      const initialTotal = pipeline!.restartStats.total;
+      source.emit('recover', {
+        reason: 'watchdog-timeout',
+        attempt: 1,
+        delayMs: 200,
+        meta: {
+          minDelayMs: 180,
+          maxDelayMs: 1100,
+          baseDelayMs: 180,
+          appliedJitterMs: 20
+        },
+        channel: source.options.channel,
+        errorCode: null,
+        exitCode: null,
+        signal: null
+      });
+
+      expect(pipeline!.restartStats.total).toBe(initialTotal + 1);
+      expect(pipeline!.restartStats.last?.meta.minDelayMs).toBe(180);
+      expect(pipeline!.restartStats.byReason.get('watchdog-timeout')).toBeGreaterThanOrEqual(1);
+    } finally {
+      runtime.stop();
+    }
   });
 
   it('RunGuardMultiCameraChannels normalizes channels and isolates restart stats', async () => {

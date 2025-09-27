@@ -108,6 +108,60 @@ describe('VideoSource', () => {
     expect(recoverReasons.filter(reason => reason === 'watchdog-timeout')).not.toHaveLength(0);
   });
 
+  it('VideoSourceRtspErrorDedupes', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      restartDelayMs: 20,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => command.emit('start'), 0);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const recoverReasons: string[] = [];
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+
+      commands[0]!.emit('stderr', 'method DESCRIBE failed: timed out');
+
+      await Promise.resolve();
+      expect(recoverReasons).toEqual(['rtsp-timeout']);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(2);
+
+      commands[1]!.emit('stderr', 'method DESCRIBE failed: timed out');
+
+      await Promise.resolve();
+      await vi.runOnlyPendingTimersAsync();
+      expect(recoverReasons).toHaveLength(1);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byReason['rtsp-timeout']).toBe(1);
+  });
+
   it('VideoSourceWatchdogRecovery records jitter metrics and watchdog restart details', async () => {
     vi.useFakeTimers();
 
