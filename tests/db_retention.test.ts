@@ -31,6 +31,203 @@ describe('RetentionMaintenance', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('RetentionFaceSnapshotRotation archives nested face snapshots with snapshots', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 9, 1);
+    vi.setSystemTime(now);
+
+    const faceDir = path.join(cameraOneDir, 'faces');
+    const nestedDir = path.join(faceDir, 'nested');
+    fs.mkdirSync(nestedDir, { recursive: true });
+
+    const staleTs = now - 45 * dayMs;
+    const staleFiles = [
+      path.join(cameraOneDir, 'snapshot-old.png'),
+      path.join(faceDir, 'face-crop.png'),
+      path.join(nestedDir, 'face-nested.png')
+    ];
+
+    for (const file of staleFiles) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, staleTs / 1000, staleTs / 1000);
+    }
+
+    const freshFile = path.join(cameraOneDir, 'snapshot-fresh.png');
+    fs.writeFileSync(freshFile, freshFile);
+    fs.utimesSync(freshFile, now / 1000, now / 1000);
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        snapshot: { mode: 'archive', retentionDays: 10 },
+        vacuum: { mode: 'auto', run: 'on-change' },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(result.outcome?.archivedSnapshots).toBe(3);
+      const cameraKey = path.basename(cameraOneDir);
+      expect(result.outcome?.perCamera?.[cameraKey]?.archivedSnapshots).toBe(3);
+
+      const archiveDate = formatArchiveDate(staleTs);
+      const archiveRoot = path.join(archiveDir, cameraKey, archiveDate);
+      const archivedFiles = collectArchiveFiles(archiveRoot);
+      expect(archivedFiles).toEqual(
+        expect.arrayContaining([
+          path.join(archiveRoot, 'snapshot-old.png'),
+          path.join(archiveRoot, 'faces', 'face-crop.png'),
+          path.join(archiveRoot, 'faces', 'nested', 'face-nested.png')
+        ])
+      );
+
+      for (const file of staleFiles) {
+        expect(fs.existsSync(file)).toBe(false);
+      }
+      expect(fs.existsSync(freshFile)).toBe(true);
+
+      const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(infoCall?.[0]).toMatchObject({
+        archivedSnapshots: 3,
+        perCamera: {
+          [cameraKey]: { archivedSnapshots: 3, prunedArchives: 0 }
+        }
+      });
+
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall).toMatchObject({
+        archivedSnapshots: 3,
+        perCamera: {
+          [cameraKey]: { archivedSnapshots: 3, prunedArchives: 0 }
+        }
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('RetentionVacuumScheduling follows run policy and reports index maintenance', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 4, 5);
+    vi.setSystemTime(now);
+
+    const staleTs = now - 40 * dayMs;
+    const staleFile = path.join(cameraOneDir, 'rtsp-old.png');
+    fs.writeFileSync(staleFile, staleFile);
+    fs.utimesSync(staleFile, staleTs / 1000, staleTs / 1000);
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase');
+
+    const task = startRetentionTask({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 1000,
+      archiveDir,
+      snapshotDirs: [cameraOneDir],
+      snapshot: { mode: 'archive', retentionDays: 10 },
+      vacuum: { mode: 'auto', run: 'on-change', analyze: true, reindex: true },
+      logger,
+      metrics: metrics as any
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(vacuumSpy).toHaveBeenCalledTimes(1);
+      expect(vacuumSpy.mock.calls[0]?.[0]).toMatchObject({
+        run: 'on-change',
+        analyze: true,
+        reindex: true
+      });
+      const firstInfo = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(firstInfo?.[0]).toMatchObject({
+        vacuumMode: 'auto',
+        vacuumRunMode: 'on-change',
+        vacuumTasks: {
+          analyze: true,
+          reindex: true,
+          optimize: false,
+          target: undefined
+        }
+      });
+      const firstMetrics = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(firstMetrics).toMatchObject({ archivedSnapshots: 1 });
+
+      vacuumSpy.mockClear();
+      logger.info.mockClear();
+      metrics.recordRetentionRun.mockClear();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(vacuumSpy).not.toHaveBeenCalled();
+      const secondInfo = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(secondInfo?.[0]).toMatchObject({
+        vacuumMode: 'skipped',
+        vacuumRunMode: 'on-change'
+      });
+
+      task.configure({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 1000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        snapshot: { mode: 'archive', retentionDays: 10 },
+        vacuum: { mode: 'auto', run: 'always', analyze: false, reindex: true },
+        logger,
+        metrics: metrics as any
+      });
+
+      vacuumSpy.mockClear();
+      logger.info.mockClear();
+
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(vacuumSpy).toHaveBeenCalledTimes(1);
+      expect(vacuumSpy.mock.calls[0]?.[0]).toMatchObject({ run: 'always', reindex: true });
+      const thirdInfo = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(thirdInfo?.[0]).toMatchObject({
+        vacuumMode: 'auto',
+        vacuumRunMode: 'always',
+        vacuumTasks: {
+          analyze: false,
+          reindex: true,
+          optimize: false,
+          target: undefined
+        }
+      });
+    } finally {
+      task.stop();
+      vacuumSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('DatabaseChannelIndexMaintenance validates channel index and on-change vacuum', async () => {
     const indexes = db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }>;
     const indexNames = indexes.map(entry => entry.name);
@@ -548,5 +745,13 @@ function collectArchiveFiles(root: string): string[] {
     }
   }
   return files;
+}
+
+function formatArchiveDate(timestamp: number): string {
+  const date = new Date(timestamp);
+  const year = date.getUTCFullYear();
+  const month = `${date.getUTCMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getUTCDate()}`.padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 

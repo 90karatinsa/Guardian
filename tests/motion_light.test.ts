@@ -55,6 +55,149 @@ describe('MotionDetector', () => {
     metrics.reset();
   });
 
+  it('MotionLightNoiseWindowing expands windows under sustained noise and records gauges', () => {
+    const motion = new MotionDetector(
+      {
+        source: 'noise-motion',
+        diffThreshold: 6,
+        areaThreshold: 0.2,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.2,
+        noiseSmoothing: 0.2,
+        areaSmoothing: 0.18,
+        areaInflation: 1.1,
+        areaDeltaThreshold: 0.05
+      },
+      bus
+    );
+
+    const light = new LightDetector(
+      {
+        source: 'noise-light',
+        deltaThreshold: 18,
+        smoothingFactor: 0.08,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 2,
+        noiseSmoothing: 0.18
+      },
+      bus
+    );
+
+    const motionBase = createUniformFrame(16, 16, 96);
+    const lightBase = createUniformFrame(12, 12, 110);
+    motion.handleFrame(motionBase, 0);
+    light.handleFrame(lightBase, 0);
+
+    for (let i = 0; i < 36; i += 1) {
+      const motionNoise = createFrame(16, 16, (x, y) => 96 + ((x * y + i) % 5 === 0 ? 75 : -65));
+      const lightNoise = createFrame(12, 12, (x, y) => 110 + ((x + 2 * y + i) % 5 === 0 ? 55 : -45));
+      motion.handleFrame(motionNoise, i + 1);
+      light.handleFrame(lightNoise, i + 1);
+    }
+
+    const gaugeSnapshot = metrics.snapshot();
+    expect(gaugeSnapshot.detectors.motion?.gauges?.noiseWindowMedian ?? 0).toBeGreaterThan(0.1);
+    expect(gaugeSnapshot.detectors.motion?.gauges?.noiseWindowBoost ?? 0).toBeGreaterThan(1);
+    expect(gaugeSnapshot.detectors.light?.gauges?.noiseWindowMedian ?? 0).toBeGreaterThan(0.05);
+    expect(gaugeSnapshot.detectors.light?.gauges?.noiseWindowBoost ?? 0).toBeGreaterThanOrEqual(1);
+
+    const motionTrigger = [
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 8)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 10)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 12)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 14))
+    ];
+
+    motionTrigger.forEach((frame, idx) => {
+      motion.handleFrame(frame, 200 + idx);
+    });
+
+    const lightTrigger = [
+      createUniformFrame(12, 12, 200),
+      createUniformFrame(12, 12, 210),
+      createUniformFrame(12, 12, 220),
+      createUniformFrame(12, 12, 230)
+    ];
+
+    lightTrigger.forEach((frame, idx) => {
+      light.handleFrame(frame, 400 + idx * 2);
+    });
+
+    const motionEvent = events.find(event => event.detector === 'motion');
+    const lightEvent = events.find(event => event.detector === 'light');
+
+    expect(motionEvent).toBeDefined();
+    expect(lightEvent).toBeDefined();
+
+    const motionMeta = motionEvent?.meta as Record<string, number>;
+    const lightMeta = lightEvent?.meta as Record<string, number>;
+
+    expect(motionMeta.sustainedNoiseBoost ?? 0).toBeGreaterThan(1);
+    expect(motionMeta.noiseWindowMedian ?? 0).toBeGreaterThan(0.3);
+    expect(motionMeta.effectiveDebounceFrames ?? 0).toBeGreaterThanOrEqual(3);
+    expect(motionMeta.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(3);
+
+    expect(lightMeta.sustainedNoiseBoost ?? 0).toBeGreaterThanOrEqual(1);
+    expect(lightMeta.noiseWindowMedian ?? 0).toBeGreaterThan(0.2);
+    expect(lightMeta.effectiveDebounceFrames ?? 0).toBeGreaterThanOrEqual(3);
+    expect(lightMeta.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(3);
+  });
+
+  it('MotionAdaptiveTrendReset reduces sustained noise boost after calm frames', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'reset-motion',
+        diffThreshold: 5,
+        areaThreshold: 0.08,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.18,
+        areaSmoothing: 0.2,
+        areaInflation: 1.05
+      },
+      bus
+    );
+
+    const base = createUniformFrame(14, 14, 18);
+    detector.handleFrame(base, 0);
+
+    for (let i = 0; i < 28; i += 1) {
+      const noisy = createFrame(14, 14, (x, y) => 18 + ((x + y + i) % 4 === 0 ? 10 : -9));
+      detector.handleFrame(noisy, i + 1);
+    }
+
+    for (let i = 0; i < 20; i += 1) {
+      const calm = createFrame(14, 14, (x, y) => 18 + ((x + i) % 7 === 0 ? 1 : 0));
+      detector.handleFrame(calm, 100 + i);
+    }
+
+    const gaugeSnapshot = metrics.snapshot();
+    expect(gaugeSnapshot.detectors.motion?.gauges?.noiseWindowBoost ?? 0).toBeLessThanOrEqual(1.2);
+
+    const triggerFrames = [
+      createFrame(14, 14, (x, y) => (x < 7 ? 250 : 12)),
+      createFrame(14, 14, (x, y) => (x < 7 ? 252 : 12)),
+      createFrame(14, 14, (x, y) => (x < 7 ? 254 : 12))
+    ];
+
+    triggerFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, 200 + idx);
+    });
+
+    const event = events.find(entry => entry.detector === 'motion');
+    expect(event).toBeDefined();
+    const meta = event?.meta as Record<string, number>;
+    expect(meta.sustainedNoiseBoost ?? 0).toBeLessThanOrEqual(1.3);
+    expect(meta.noiseWindowPressure ?? 0).toBeLessThan(0.4);
+    expect(meta.areaWindowMedian ?? 0).toBeGreaterThan(0);
+  });
+
   it('MotionLightAdaptiveBackoff suppresses noise bursts and tracks suppression metrics', () => {
     const detector = new MotionDetector(
       {

@@ -51,6 +51,18 @@ interface SuppressionHit {
   channel: string | null;
 }
 
+type ChannelSuppressionState = {
+  hits: number;
+  reasons: Set<string>;
+  types: Set<SuppressionHitType>;
+  windowRemainingMs: number | null;
+  maxWindowRemainingMs: number | null;
+  cooldownRemainingMs: number | null;
+  maxCooldownRemainingMs: number | null;
+  historyCount: number;
+  combinedHistoryCount: number;
+};
+
 class EventBus extends EventEmitter {
   private suppressionRules: InternalSuppressionRule[] = [];
   private readonly store: (event: EventRecord) => void;
@@ -120,6 +132,7 @@ class EventBus extends EventEmitter {
             )
           : undefined;
       const combinedHistory = mergeSuppressionHistory(evaluation.hits, normalized.ts);
+      const channelStates = new Map<string, ChannelSuppressionState>();
       const suppressedBy = evaluation.hits.map(hit => {
         const history = dedupeAndSortHistory(hit.history);
         const windowRemainingMs =
@@ -153,6 +166,68 @@ class EventBus extends EventEmitter {
           cooldownRemainingMs
         };
       });
+      suppressedBy.forEach((suppressedMeta, index) => {
+        const hit = evaluation.hits[index];
+        if (!hit) {
+          return;
+        }
+        const candidateChannels = new Set<string>();
+        if (suppressedMeta.channel) {
+          candidateChannels.add(suppressedMeta.channel);
+        }
+        if (Array.isArray(suppressedMeta.channels)) {
+          for (const channel of suppressedMeta.channels) {
+            if (typeof channel === 'string' && channel.trim().length > 0) {
+              candidateChannels.add(channel);
+            }
+          }
+        }
+        if (candidateChannels.size === 0) {
+          return;
+        }
+        const historyCount =
+          typeof suppressedMeta.historyCount === 'number' && Number.isFinite(suppressedMeta.historyCount)
+            ? suppressedMeta.historyCount
+            : 0;
+        const combinedHistoryCount =
+          typeof suppressedMeta.combinedHistoryCount === 'number' &&
+          Number.isFinite(suppressedMeta.combinedHistoryCount)
+            ? suppressedMeta.combinedHistoryCount
+            : 0;
+        for (const channel of candidateChannels) {
+          const existing = channelStates.get(channel) ?? {
+            hits: 0,
+            reasons: new Set<string>(),
+            types: new Set<SuppressionHitType>(),
+            windowRemainingMs: null,
+            maxWindowRemainingMs: null,
+            cooldownRemainingMs: null,
+            maxCooldownRemainingMs: null,
+            historyCount: 0,
+            combinedHistoryCount: 0
+          } satisfies ChannelSuppressionState;
+          existing.hits += 1;
+          existing.reasons.add(hit.reason);
+          existing.types.add(hit.type);
+          if (typeof suppressedMeta.windowRemainingMs === 'number') {
+            existing.windowRemainingMs = suppressedMeta.windowRemainingMs;
+            existing.maxWindowRemainingMs =
+              existing.maxWindowRemainingMs === null
+                ? suppressedMeta.windowRemainingMs
+                : Math.max(existing.maxWindowRemainingMs, suppressedMeta.windowRemainingMs);
+          }
+          if (typeof suppressedMeta.cooldownRemainingMs === 'number') {
+            existing.cooldownRemainingMs = suppressedMeta.cooldownRemainingMs;
+            existing.maxCooldownRemainingMs =
+              existing.maxCooldownRemainingMs === null
+                ? suppressedMeta.cooldownRemainingMs
+                : Math.max(existing.maxCooldownRemainingMs, suppressedMeta.cooldownRemainingMs);
+          }
+          existing.historyCount = Math.max(existing.historyCount, historyCount);
+          existing.combinedHistoryCount = Math.max(existing.combinedHistoryCount, combinedHistoryCount);
+          channelStates.set(channel, existing);
+        }
+      });
       const meta = {
         ...normalized.meta,
         suppressed: true,
@@ -168,7 +243,23 @@ class EventBus extends EventEmitter {
         suppressedBy,
         suppressionChannel: primaryChannel,
         suppressionChannels: [...eventChannels],
-        suppressionWindowRemainingMs: primaryWindowRemainingMs
+        suppressionWindowRemainingMs: primaryWindowRemainingMs,
+        suppressionChannelStates: Object.fromEntries(
+          Array.from(channelStates.entries()).map(([channel, state]) => [
+            channel,
+            {
+              hits: state.hits,
+              reasons: Array.from(state.reasons),
+              types: Array.from(state.types),
+              windowRemainingMs: state.windowRemainingMs,
+              maxWindowRemainingMs: state.maxWindowRemainingMs,
+              cooldownRemainingMs: state.cooldownRemainingMs,
+              maxCooldownRemainingMs: state.maxCooldownRemainingMs,
+              historyCount: state.historyCount,
+              combinedHistoryCount: state.combinedHistoryCount
+            }
+          ])
+        )
       };
       normalized.meta = meta;
       if (payload.meta && typeof payload.meta === 'object') {

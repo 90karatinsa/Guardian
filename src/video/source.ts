@@ -100,6 +100,7 @@ export class VideoSource extends EventEmitter {
   private commandExitPromise: Promise<void> | null = null;
   private commandExitResolve: (() => void) | null = null;
   private terminatingCommand: ffmpeg.FfmpegCommand | null = null;
+  private stopPromise: Promise<void> | null = null;
   private shouldStop = false;
   private recovering = false;
   private restartCount = 0;
@@ -124,7 +125,25 @@ export class VideoSource extends EventEmitter {
     this.startCommand();
   }
 
-  stop() {
+  async stop(): Promise<void> {
+    if (this.stopPromise) {
+      await this.stopPromise;
+      return;
+    }
+
+    this.stopPromise = this.performStop().finally(() => {
+      this.stopPromise = null;
+    });
+
+    await this.stopPromise;
+  }
+
+  async dispose(): Promise<void> {
+    await this.stop();
+    this.removeAllListeners();
+  }
+
+  private async performStop(): Promise<void> {
     this.shouldStop = true;
     this.recovering = false;
     this.restartCount = 0;
@@ -132,9 +151,25 @@ export class VideoSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
     this.commandClassifications.clear();
-    this.clearAllTimers();
+    this.clearRestartTimer();
+    this.clearStartTimer();
+    this.clearWatchdogTimer();
+    this.clearStreamIdleTimer();
     this.cleanupStream();
-    this.terminateCommand(true, { skipForceDelay: true });
+    this.clearKillTimer();
+
+    const termination = this.terminateCommand(true) ?? Promise.resolve();
+
+    try {
+      await termination;
+    } finally {
+      this.clearRestartTimer();
+      this.clearStartTimer();
+      this.clearWatchdogTimer();
+      this.clearStreamIdleTimer();
+      this.clearKillTimer();
+      this.cleanupStream();
+    }
   }
 
   consume(stream: Readable) {
@@ -401,7 +436,8 @@ export class VideoSource extends EventEmitter {
       reason === 'start-timeout' ||
       reason === 'watchdog-timeout' ||
       reason === 'stream-idle' ||
-      reason === 'rtsp-timeout';
+      reason === 'rtsp-timeout' ||
+      reason === 'rtsp-connection-failure';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
     } else {

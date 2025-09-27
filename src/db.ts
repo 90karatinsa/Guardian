@@ -451,44 +451,78 @@ function rotateSnapshots(
     fs.mkdirSync(archiveDir, { recursive: true });
   }
 
-  const entries = fs.readdirSync(snapshotDir);
   let moved = 0;
   const warnings: Array<{ path: string; error: Error; camera: string }> = [];
+  const stack: Array<{ dir: string; relative: string }> = [{ dir: snapshotDir, relative: '.' }];
 
-  for (const entry of entries) {
-    const sourcePath = path.join(snapshotDir, entry);
-    if (path.resolve(sourcePath) === path.resolve(archiveDir)) {
-      continue;
-    }
+  while (stack.length > 0) {
+    const { dir, relative } = stack.pop()!;
 
-    let stats: fs.Stats;
+    let entries: fs.Dirent[];
     try {
-      stats = fs.statSync(sourcePath);
+      entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (error) {
-      warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
+      warnings.push({ path: dir, error: toError(error), camera: cameraId });
       continue;
     }
 
-    if (!stats.isFile()) {
-      continue;
-    }
-
-    if (stats.mtimeMs >= cutoffTs) {
-      continue;
-    }
-
-    try {
-      if (mode === 'delete') {
-        fs.rmSync(sourcePath, { force: true });
-        moved += 1;
-      } else {
-        const archivePath = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
-        const targetPath = ensureUniqueArchivePath(archivePath, entry);
-        fs.renameSync(sourcePath, targetPath);
-        moved += 1;
+    for (const entry of entries) {
+      const sourcePath = path.join(dir, entry.name);
+      if (path.resolve(sourcePath) === path.resolve(archiveDir)) {
+        continue;
       }
+
+      if (entry.isDirectory()) {
+        const nextRelative = relative === '.' ? entry.name : path.join(relative, entry.name);
+        stack.push({ dir: sourcePath, relative: nextRelative });
+        continue;
+      }
+
+      let stats: fs.Stats;
+      try {
+        stats = fs.statSync(sourcePath);
+      } catch (error) {
+        warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
+        continue;
+      }
+
+      if (stats.isDirectory()) {
+        const nextRelative = relative === '.' ? entry.name : path.join(relative, entry.name);
+        stack.push({ dir: sourcePath, relative: nextRelative });
+        continue;
+      }
+
+      if (!stats.isFile()) {
+        continue;
+      }
+
+      if (stats.mtimeMs >= cutoffTs) {
+        continue;
+      }
+
+      try {
+        if (mode === 'delete') {
+          fs.rmSync(sourcePath, { force: true });
+          moved += 1;
+        } else {
+          const archiveBase = buildArchivePath(archiveDir, snapshotDir, stats.mtimeMs);
+          const targetDir = relative === '.' ? archiveBase : path.join(archiveBase, relative);
+          fs.mkdirSync(targetDir, { recursive: true });
+          const targetPath = ensureUniqueArchivePath(targetDir, entry.name);
+          fs.renameSync(sourcePath, targetPath);
+          moved += 1;
+        }
+      } catch (error) {
+        warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
+      }
+    }
+  }
+
+  if (mode !== 'ignore' && fs.existsSync(snapshotDir)) {
+    try {
+      cleanupEmptyDirectories(snapshotDir);
     } catch (error) {
-      warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
+      warnings.push({ path: snapshotDir, error: toError(error), camera: cameraId });
     }
   }
 

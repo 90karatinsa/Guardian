@@ -181,6 +181,112 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
   });
 
+  it('HttpApiPoseThreatPayload surfaces pose metadata and caches snapshots', async () => {
+    const now = Date.now();
+    const snapshotPath = path.join(snapshotDir, 'pose.png');
+    const facePath = path.join(snapshotDir, 'pose-face.png');
+    fs.writeFileSync(snapshotPath, Buffer.from([1, 2, 3, 4]));
+    fs.writeFileSync(facePath, Buffer.from([9, 8, 7, 6]));
+
+    storeEvent({
+      ts: now,
+      source: 'video:pose-cam',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Pose telemetry captured',
+      meta: {
+        channel: 'video:pose-cam',
+        snapshot: snapshotPath,
+        faceSnapshot: facePath,
+        poseForecast: {
+          horizonMs: 900,
+          confidence: 0.82,
+          movingJointCount: 4,
+          movingJointRatio: 0.5,
+          movementFlags: [1, 0, 1],
+          velocity: [0.1, 0.2, 0.3],
+          history: [
+            {
+              ts: now - 500,
+              keypoints: [
+                { x: 0.1, y: 0.2, confidence: 0.9 },
+                { x: 0.4, y: 0.6, confidence: 0.8 }
+              ]
+            }
+          ]
+        },
+        poseThreatSummary: {
+          maxThreatScore: 0.91,
+          maxThreatLabel: 'intruder',
+          totalDetections: 3,
+          averageThreatScore: 0.74,
+          objects: [
+            { label: 'intruder', threatScore: 0.91, threat: true },
+            { label: 'bystander', threatScore: 0.3, threat: false }
+          ]
+        }
+      }
+    });
+
+    const { port } = await ensureServer();
+
+    const response = await fetch(`http://localhost:${port}/api/events`);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(Array.isArray(payload.items)).toBe(true);
+    expect(payload.items).toHaveLength(1);
+    const item = payload.items[0];
+    expect(item.meta.poseForecast.confidence).toBeCloseTo(0.82, 5);
+    expect(item.meta.poseForecast.movementFlags).toEqual([true, false, true]);
+    expect(item.meta.poseForecast.velocity).toEqual([0.1, 0.2, 0.3]);
+    expect(item.meta.poseForecast.history[0].keypoints[0].confidence).toBeCloseTo(0.9, 5);
+    expect(item.meta.poseThreatSummary.maxThreatLabel).toBe('intruder');
+    expect(item.meta.poseThreatSummary.maxThreatScore).toBeCloseTo(0.91, 5);
+    expect(Array.isArray(item.meta.poseThreatSummary.objects)).toBe(true);
+    expect(item.meta.poseThreatSummary.objects[0]).toMatchObject({ label: 'intruder', threat: true });
+    expect(payload.summary.pose.forecasts).toBe(1);
+    expect(payload.summary.pose.threats.maxThreat.label).toBe('intruder');
+    expect(payload.summary.pose.threats.maxThreat.threatScore).toBeCloseTo(0.91, 5);
+
+    const eventId = item.id;
+    expect(typeof eventId).toBe('number');
+
+    const snapshotResponse = await fetch(`http://localhost:${port}/api/events/${eventId}/snapshot`);
+    expect(snapshotResponse.status).toBe(200);
+    const snapshotEtag = snapshotResponse.headers.get('etag');
+    const snapshotModified = snapshotResponse.headers.get('last-modified');
+    expect(snapshotResponse.headers.get('cache-control')).toContain('max-age');
+    expect(snapshotEtag).toBeTruthy();
+    expect(snapshotModified).toBeTruthy();
+
+    const snapshotNotModified = await fetch(`http://localhost:${port}/api/events/${eventId}/snapshot`, {
+      headers: {
+        'If-None-Match': snapshotEtag ?? '',
+        'If-Modified-Since': snapshotModified ?? ''
+      }
+    });
+    expect(snapshotNotModified.status).toBe(304);
+
+    const faceResponse = await fetch(`http://localhost:${port}/api/events/${eventId}/face-snapshot`);
+    expect(faceResponse.status).toBe(200);
+    const faceEtag = faceResponse.headers.get('etag');
+    const faceModified = faceResponse.headers.get('last-modified');
+    expect(faceResponse.headers.get('cache-control')).toContain('max-age');
+
+    const faceNotModified = await fetch(`http://localhost:${port}/api/events/${eventId}/face-snapshot`, {
+      headers: {
+        'If-None-Match': faceEtag ?? '',
+        'If-Modified-Since': faceModified ?? ''
+      }
+    });
+    expect(faceNotModified.status).toBe(304);
+
+    const staleFace = await fetch(`http://localhost:${port}/api/events/${eventId}/face-snapshot`, {
+      headers: { 'If-Modified-Since': new Date(0).toUTCString() }
+    });
+    expect(staleFace.status).toBe(200);
+  });
+
   it('HttpEventsChannelFilter limits REST and SSE streams by channel', async () => {
     const now = Date.now();
     storeEvent({
@@ -781,6 +887,278 @@ describe('RestApiEvents', () => {
     expect(previewImg.dataset.channel).toBe('video:stream');
 
     await new Promise(resolve => setTimeout(resolve, 0));
+
+    instance?.close();
+    MockEventSource.instances.length = 0;
+    dom.window.close();
+    vi.unstubAllGlobals();
+
+    if (originalWindow) {
+      globalThis.window = originalWindow;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.window;
+    }
+    if (originalDocument) {
+      globalThis.document = originalDocument;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.document;
+    }
+    if (originalEventSource) {
+      globalThis.EventSource = originalEventSource;
+    }
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    }
+    if (originalHTMLElement) {
+      globalThis.HTMLElement = originalHTMLElement;
+    }
+    if (originalMessageEvent) {
+      globalThis.MessageEvent = originalMessageEvent;
+    }
+    if (originalNavigator) {
+      globalThis.navigator = originalNavigator;
+    } else {
+      // @ts-expect-error cleanup for navigator in node environment
+      delete globalThis.navigator;
+    }
+  });
+
+  it('DashboardSsePoseRender updates pose widgets via SSE events', async () => {
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
+
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
+
+    const metricsSnapshot = {
+      fetchedAt: new Date(1700001000000).toISOString(),
+      pipelines: {
+        ffmpeg: {
+          restarts: 0,
+          lastRestartAt: null,
+          byReason: {},
+          lastRestart: null,
+          attempts: {},
+          byChannel: {},
+          deviceDiscovery: {},
+          deviceDiscoveryByChannel: {},
+          delayHistogram: {},
+          attemptHistogram: {}
+        }
+      },
+      retention: {
+        runs: 0,
+        lastRunAt: null,
+        warnings: 0,
+        warningsByCamera: {},
+        lastWarning: null,
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 },
+        totalsByCamera: {}
+      }
+    };
+
+    const initialSummary = {
+      totals: { byDetector: { motion: 1 }, bySeverity: { info: 1 } },
+      channels: [],
+      pose: {
+        forecasts: 1,
+        averageConfidence: 0.6,
+        lastForecast: {
+          confidence: 0.6,
+          movingJointCount: 3,
+          movingJointRatio: 0.4,
+          ts: 1700001000100
+        },
+        threats: {
+          events: 1,
+          averageMaxThreatScore: 0.4,
+          totalDetections: 1,
+          maxThreat: {
+            label: 'none',
+            threatScore: 0.4,
+            ts: 1700001000100
+          }
+        }
+      }
+    };
+
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events')) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 7,
+                ts: 1700001000100,
+                source: 'video:pose-cam',
+                detector: 'motion',
+                severity: 'info',
+                message: 'initial pose event',
+                meta: {
+                  channel: 'video:pose-cam',
+                  snapshot: '/snapshots/pose.jpg',
+                  poseForecast: {
+                    confidence: 0.6,
+                    movingJointCount: 3,
+                    movingJointRatio: 0.4
+                  },
+                  poseThreatSummary: {
+                    maxThreatScore: 0.4,
+                    maxThreatLabel: 'none',
+                    totalDetections: 1
+                  }
+                }
+              }
+            ],
+            total: 1,
+            summary: initialSummary,
+            metrics: metricsSnapshot
+          }),
+          {
+            headers: { 'Content-Type': 'application/json' },
+            status: 200
+          }
+        );
+      }
+
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(JSON.stringify(metricsSnapshot), {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200
+        });
+      }
+
+      return new Response(
+        JSON.stringify({ items: [], total: 0, summary: { totals: { byDetector: {}, bySeverity: {} }, channels: [] } }),
+        {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200
+        }
+      );
+    });
+
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    type Listener = (event: MessageEvent) => void;
+    class MockEventSource {
+      static instances: MockEventSource[] = [];
+      public url: string;
+      public readyState = 0;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      public onerror: ((event: Event) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
+
+      constructor(url: string) {
+        this.url = url;
+        MockEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const payload = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(payload));
+      }
+
+      emitMessage(data: string) {
+        this.onmessage?.(new window.MessageEvent('message', { data }));
+      }
+
+      open() {
+        this.onopen?.(new window.Event('open'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+
+    await import('../public/dashboard.js');
+    await Promise.resolve();
+    await vi.waitFor(() => {
+      const state = (window as any).__guardianDashboardState;
+      if (!state) throw new Error('dashboard state unavailable');
+      expect(Array.isArray(state.events) && state.events.length > 0).toBe(true);
+    });
+
+    const poseConfidenceEl = window.document.getElementById('pose-confidence');
+    const poseMovementEl = window.document.getElementById('pose-movement');
+    const poseThreatEl = window.document.getElementById('pose-threat');
+    expect(poseConfidenceEl?.textContent).toBe('60%');
+    expect(poseMovementEl?.textContent).toBe('3 joints (40%)');
+    expect(poseThreatEl?.textContent).toBe('none (40%)');
+
+    const instance = MockEventSource.instances[0];
+    expect(instance).toBeDefined();
+    instance!.open();
+
+    instance!.emitMessage(
+      JSON.stringify({
+        id: 8,
+        ts: 1700001001200,
+        source: 'video:pose-cam',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'pose update',
+        meta: {
+          channel: 'video:pose-cam',
+          poseForecast: {
+            confidence: 0.95,
+            movingJointCount: 6,
+            movingJointRatio: 0.75
+          },
+          poseThreatSummary: {
+            maxThreatScore: 0.88,
+            maxThreatLabel: 'intruder',
+            totalDetections: 4
+          }
+        }
+      })
+    );
+
+    await vi.waitFor(() => {
+      expect(poseConfidenceEl?.textContent).toBe('95%');
+      expect(poseMovementEl?.textContent).toBe('6 joints (75%)');
+      expect(poseThreatEl?.textContent).toBe('intruder (88%)');
+    });
+
+    const dashboardState = (window as any).__guardianDashboardState;
+    expect(dashboardState.pose.lastForecast.confidence).toBeCloseTo(0.95, 5);
+    expect(dashboardState.pose.lastThreat.threatScore).toBeCloseTo(0.88, 5);
+    expect(dashboardState.pose.lastThreat.label).toBe('intruder');
 
     instance?.close();
     MockEventSource.instances.length = 0;

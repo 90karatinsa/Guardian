@@ -115,6 +115,7 @@ describe('ConfigHotReload', () => {
     configPath = path.join(tempDir, 'config.json');
     MockMotionDetector.instances = [];
     MockAudioSource.instances = [];
+    MockVideoSource.instances = [];
   });
 
   afterEach(() => {
@@ -558,6 +559,104 @@ describe('ConfigHotReload', () => {
       runtime.stop();
     }
   });
+
+  it('ConfigHotReloadChannelOverrides logs layered diff summaries for overrides', async () => {
+    const baseConfig = createConfig({ diffThreshold: 30 });
+    baseConfig.video.channels = {
+      'video:cam-1': {
+        person: { score: 0.55 }
+      }
+    };
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({ logger, configManager: manager });
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      logger.info.mockClear();
+
+      const updatedConfig = JSON.parse(JSON.stringify(baseConfig)) as GuardianConfig;
+      updatedConfig.video.channels = {
+        'video:cam-1': {
+          person: { score: 0.6, maxDetections: 3 },
+          motion: { diffThreshold: 42 },
+          pose: { minMovement: 0.2 }
+        },
+        'video:cam-2': {
+          person: { score: 0.5 },
+          ffmpeg: { restartDelayMs: 750 }
+        }
+      };
+      if (updatedConfig.video.cameras) {
+        updatedConfig.video.cameras[0].person = { score: 0.45 } as CameraConfig['person'];
+        updatedConfig.video.cameras[0].input = 'rtsp://cam-1-updated';
+        updatedConfig.video.cameras.push({
+          id: 'cam-2',
+          channel: 'video:cam-2',
+          input: 'rtsp://cam-2',
+          person: { score: 0.35 }
+        });
+      }
+
+      fs.writeFileSync(configPath, JSON.stringify(updatedConfig, null, 2));
+
+      await waitFor(
+        () => logger.info.mock.calls.some(([, message]) => message === 'configuration overrides diff'),
+        8000
+      );
+
+      expect(
+        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+      ).toBe(false);
+
+      const diffCall = logger.info.mock.calls.find(([, message]) => message === 'configuration overrides diff');
+      expect(diffCall).toBeTruthy();
+
+      const diffMeta = diffCall?.[0] as Record<string, any>;
+      expect(diffMeta.channels?.added?.['video:cam-2']).toMatchObject({
+        person: { score: 0.5 },
+        ffmpeg: { restartDelayMs: 750 }
+      });
+      expect(diffMeta.channels?.changed?.['video:cam-1']).toMatchObject({
+        next: expect.objectContaining({
+          motion: expect.objectContaining({ diffThreshold: 42 }),
+          pose: expect.objectContaining({ minMovement: 0.2 }),
+          person: expect.objectContaining({ score: 0.6, maxDetections: 3 })
+        })
+      });
+
+      expect(diffMeta.cameras?.added?.['cam-2']).toMatchObject({
+        channel: 'video:cam-2',
+        input: 'rtsp://cam-2',
+        person: { score: 0.35 }
+      });
+      expect(diffMeta.cameras?.changed?.['cam-1']).toMatchObject({
+        previous: expect.objectContaining({
+          person: expect.objectContaining({ score: 0.5 })
+        }),
+        next: expect.objectContaining({
+          input: 'rtsp://cam-1-updated',
+          person: expect.objectContaining({ score: 0.45 })
+        })
+      });
+
+      expect(
+        logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
+      ).toBe(true);
+    } finally {
+      runtime.stop();
+    }
+  }, 10000);
 
   it('ConfigReloadRestartsPipelines stops removed cameras', async () => {
     const initialConfig = createConfig({

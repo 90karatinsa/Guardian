@@ -63,6 +63,39 @@ class MockLightDetector {
   }
 }
 
+class MockPoseEstimator {
+  static instances: MockPoseEstimator[] = [];
+  public ingest = vi.fn();
+  public forecast = vi.fn(async () => ({}));
+  public mergeIntoMotionMeta = vi.fn(meta => meta ?? {});
+  constructor(public readonly options: Record<string, unknown>) {
+    MockPoseEstimator.instances.push(this);
+  }
+  static async create(options: Record<string, unknown>) {
+    return new MockPoseEstimator(options);
+  }
+}
+
+class MockObjectClassifier {
+  static instances: MockObjectClassifier[] = [];
+  constructor(public readonly options: Record<string, unknown>) {
+    MockObjectClassifier.instances.push(this);
+  }
+  static async create(options: Record<string, unknown>) {
+    return new MockObjectClassifier(options);
+  }
+  async classify(detections: unknown[]) {
+    return detections.map(detection => ({
+      label: 'object',
+      score: 0.5,
+      detection,
+      isThreat: false,
+      threatScore: 0,
+      probabilities: { object: 0.5 }
+    }));
+  }
+}
+
 class MockConfigManager extends EventEmitter {
   constructor(private current: GuardianConfig) {
     super();
@@ -98,6 +131,14 @@ vi.mock('../src/video/motionDetector.js', () => ({
 
 vi.mock('../src/video/lightDetector.js', () => ({
   default: MockLightDetector
+}));
+
+vi.mock('../src/video/poseEstimator.js', () => ({
+  default: MockPoseEstimator
+}));
+
+vi.mock('../src/video/objectClassifier.js', () => ({
+  default: MockObjectClassifier
 }));
 
 vi.mock('../src/video/sampleVideo.js', () => ({
@@ -143,6 +184,8 @@ describe('run-guard multi camera orchestration', () => {
     MockPersonDetector.calls = [];
     MockMotionDetector.instances = [];
     MockLightDetector.instances = [];
+    MockPoseEstimator.instances = [];
+    MockObjectClassifier.instances = [];
     MockAudioSource.instances = [];
     metrics.reset();
   });
@@ -336,6 +379,171 @@ describe('run-guard multi camera orchestration', () => {
     });
 
     runtime.stop();
+  });
+
+  it('RunGuardChannelPoseOverrides applies layered pose config and restarts on updates', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 6,
+        channels: {
+          'video:cam-1': {
+            pose: {
+              forecastHorizonMs: 650,
+              minMovement: 0.32
+            }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            pose: { minMovement: 0.28 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.55 },
+      motion: { diffThreshold: 12, areaThreshold: 0.025 },
+      pose: { modelPath: 'pose.onnx', forecastHorizonMs: 800, minMovement: 0.4 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(MockPoseEstimator.instances).toHaveLength(1);
+      const initialPoseOptions = MockPoseEstimator.instances[0]?.options as Record<string, unknown>;
+      expect(initialPoseOptions?.forecastHorizonMs).toBe(650);
+      expect(initialPoseOptions?.minMovement).toBe(0.28);
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        pose: { modelPath: 'pose.onnx', forecastHorizonMs: 900, minMovement: 0.35 },
+        video: {
+          ...initialConfig.video,
+          channels: {
+            'video:cam-1': {
+              pose: {
+                forecastHorizonMs: 950,
+                minMovement: 0.3
+              }
+            }
+          },
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream',
+              pose: { minMovement: 0.3 }
+            }
+          ]
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+
+      for (let attempt = 0; attempt < 5 && MockPoseEstimator.instances.length < 2; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      expect(MockPoseEstimator.instances).toHaveLength(2);
+      expect(MockVideoSource.instances.length).toBeGreaterThanOrEqual(2);
+
+      const latestPose = MockPoseEstimator.instances[1]?.options as Record<string, unknown>;
+      expect(latestPose?.forecastHorizonMs).toBe(950);
+      expect(latestPose?.minMovement).toBe(0.3);
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardObjectThreatThresholds layers object config per channel and restarts on change', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 8,
+        channels: {
+          'video:cam-1': {
+            objects: {
+              threatThreshold: 0.6
+            }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream'
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 10, areaThreshold: 0.02 },
+      objects: {
+        modelPath: 'objects.onnx',
+        labels: ['person', 'vehicle'],
+        threatLabels: ['vehicle'],
+        threatThreshold: 0.5
+      }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(MockObjectClassifier.instances).toHaveLength(1);
+      const initialOptions = MockObjectClassifier.instances[0]?.options as Record<string, unknown>;
+      expect(initialOptions?.threatThreshold).toBe(0.6);
+      expect(initialOptions?.labels).toEqual(['person', 'vehicle']);
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          channels: {
+            'video:cam-1': {
+              objects: {
+                threatThreshold: 0.75
+              }
+            }
+          },
+          cameras: [...initialConfig.video.cameras!]
+        },
+        objects: {
+          modelPath: 'objects.onnx',
+          labels: ['person', 'vehicle', 'package'],
+          threatLabels: ['vehicle', 'package'],
+          threatThreshold: 0.55
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+      for (let attempt = 0; attempt < 5 && MockObjectClassifier.instances.length < 2; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      expect(MockObjectClassifier.instances).toHaveLength(2);
+      const latest = MockObjectClassifier.instances[1]?.options as Record<string, unknown>;
+      expect(latest?.threatThreshold).toBe(0.75);
+      expect(latest?.labels).toEqual(['person', 'vehicle', 'package']);
+    } finally {
+      runtime.stop();
+    }
   });
 
   it('MultiCameraChannelOverrides applies per-channel person thresholds and restart metrics', async () => {

@@ -42,6 +42,9 @@ type PipelineChannelSnapshot = {
   totalWatchdogBackoffMs: number;
   watchdogBackoffMs: number;
   lastWatchdogJitterMs: number | null;
+  totalJitterMs: number;
+  lastJitterMs: number | null;
+  jitterHistogram: HistogramSnapshot;
   delayHistogram: HistogramSnapshot;
   attemptHistogram: HistogramSnapshot;
 };
@@ -80,6 +83,7 @@ type SuppressionSnapshot = {
   byRule: CounterMap;
   byReason: CounterMap;
   byType: CounterMap;
+  byChannel: CounterMap;
   historyTotals: {
     historyCount: number;
     combinedHistoryCount: number;
@@ -106,12 +110,18 @@ type SuppressionSnapshot = {
     cooldownMs: HistogramSnapshot;
     cooldownRemainingMs: HistogramSnapshot;
     windowRemainingMs: HistogramSnapshot;
+    channel: {
+      cooldownMs: Record<string, HistogramSnapshot>;
+      cooldownRemainingMs: Record<string, HistogramSnapshot>;
+      windowRemainingMs: Record<string, HistogramSnapshot>;
+    };
   };
 };
 
 type SuppressionRuleSnapshot = {
   total: number;
   byReason: CounterMap;
+  byChannel: CounterMap;
   history: {
     total: number;
     combinedTotal: number;
@@ -218,6 +228,12 @@ type HistogramConfig = {
   format: (bucket: number, previous?: number) => string;
 };
 
+type PrometheusHistogramOptions = {
+  metricName?: string;
+  help?: string;
+  labels?: Record<string, string>;
+};
+
 const DEFAULT_HISTOGRAM: HistogramConfig = {
   buckets: [25, 50, 100, 250, 500, 1000, 2000, 5000, 10000],
   format: (bucket, previous) => {
@@ -281,6 +297,7 @@ class MetricsRegistry {
   private readonly severityCounters = new Map<string, number>();
   private readonly latencyStats = new Map<string, { count: number; totalMs: number; minMs: number; maxMs: number }>();
   private readonly histograms = new Map<string, Map<string, number>>();
+  private readonly histogramStats = new Map<string, { sum: number; count: number }>();
   private readonly histogramConfigs = new Map<string, HistogramConfig>();
   private readonly reservedHistograms: Array<{ metric: string; config: HistogramConfig }> = [];
   private readonly ffmpegRestartReasons = new Map<string, number>();
@@ -298,7 +315,14 @@ class MetricsRegistry {
   private readonly suppressionByRule = new Map<string, number>();
   private readonly suppressionByReason = new Map<string, number>();
   private readonly suppressionByType = new Map<string, number>();
+  private readonly suppressionByChannel = new Map<string, number>();
   private readonly suppressionRules = new Map<string, SuppressionRuleState>();
+  private readonly suppressionChannelCooldownHistogram = new Map<string, Map<string, number>>();
+  private readonly suppressionChannelCooldownRemainingHistogram = new Map<
+    string,
+    Map<string, number>
+  >();
+  private readonly suppressionChannelWindowHistogram = new Map<string, Map<string, number>>();
   private lastSuppressedEvent: {
     ruleId?: string;
     reason?: string;
@@ -361,6 +385,7 @@ class MetricsRegistry {
     this.severityCounters.clear();
     this.latencyStats.clear();
     this.histograms.clear();
+    this.histogramStats.clear();
     this.histogramConfigs.clear();
     this.restoreReservedHistograms();
     this.ffmpegRestartReasons.clear();
@@ -378,7 +403,11 @@ class MetricsRegistry {
     this.suppressionByRule.clear();
     this.suppressionByReason.clear();
     this.suppressionByType.clear();
+    this.suppressionByChannel.clear();
     this.suppressionRules.clear();
+    this.suppressionChannelCooldownHistogram.clear();
+    this.suppressionChannelCooldownRemainingHistogram.clear();
+    this.suppressionChannelWindowHistogram.clear();
     this.lastSuppressedEvent = null;
     this.suppressionHistoryCount = 0;
     this.suppressionCombinedHistoryCount = 0;
@@ -470,6 +499,24 @@ class MetricsRegistry {
         : detail ?? {};
     const ruleId = normalizedDetail.ruleId;
     const reason = normalizedDetail.reason;
+    const recordSuppressionChannelHistogram = (
+      registry: Map<string, Map<string, number>>,
+      channel: string,
+      value: number
+    ) => {
+      if (!Number.isFinite(value) || value < 0) {
+        return;
+      }
+      const bucket = resolveHistogramBucket(value, DEFAULT_HISTOGRAM);
+      const histogram = registry.get(channel);
+      if (histogram) {
+        histogram.set(bucket, (histogram.get(bucket) ?? 0) + 1);
+        return;
+      }
+      const created = new Map<string, number>();
+      created.set(bucket, 1);
+      registry.set(channel, created);
+    };
     this.suppressionTotal += 1;
     if (reason) {
       this.suppressionByReason.set(reason, (this.suppressionByReason.get(reason) ?? 0) + 1);
@@ -541,6 +588,32 @@ class MetricsRegistry {
     if (typeof cooldownRemainingValue === 'number') {
       this.observeHistogram('suppression.cooldownRemainingMs', cooldownRemainingValue);
     }
+    if (channelList.length > 0) {
+      for (const channel of channelList) {
+        this.suppressionByChannel.set(channel, (this.suppressionByChannel.get(channel) ?? 0) + 1);
+        if (typeof cooldownValue === 'number') {
+          recordSuppressionChannelHistogram(
+            this.suppressionChannelCooldownHistogram,
+            channel,
+            cooldownValue
+          );
+        }
+        if (typeof windowRemainingValue === 'number') {
+          recordSuppressionChannelHistogram(
+            this.suppressionChannelWindowHistogram,
+            channel,
+            windowRemainingValue
+          );
+        }
+        if (typeof cooldownRemainingValue === 'number') {
+          recordSuppressionChannelHistogram(
+            this.suppressionChannelCooldownRemainingHistogram,
+            channel,
+            cooldownRemainingValue
+          );
+        }
+      }
+    }
     this.lastSuppressedEvent = {
       ruleId,
       reason,
@@ -568,6 +641,7 @@ class MetricsRegistry {
       const ruleState = this.suppressionRules.get(ruleId) ?? {
         total: 0,
         byReason: new Map<string, number>(),
+        byChannel: new Map<string, number>(),
         historyCount: 0,
         combinedHistoryCount: 0,
         lastHistoryCount: null,
@@ -585,6 +659,11 @@ class MetricsRegistry {
       ruleState.total += 1;
       if (reason) {
         ruleState.byReason.set(reason, (ruleState.byReason.get(reason) ?? 0) + 1);
+      }
+      if (channelList.length > 0) {
+        for (const channel of channelList) {
+          ruleState.byChannel.set(channel, (ruleState.byChannel.get(channel) ?? 0) + 1);
+        }
       }
       if (typeof normalizedDetail.historyCount === 'number' && Number.isFinite(normalizedDetail.historyCount)) {
         ruleState.historyCount += normalizedDetail.historyCount;
@@ -815,6 +894,16 @@ class MetricsRegistry {
       this.observeLatency(metric, delay);
       this.observeHistogram(metric, delay);
     }
+
+    if (typeof meta?.jitterMs === 'number' && Number.isFinite(meta.jitterMs)) {
+      const jitter = Math.abs(meta.jitterMs);
+      const jitterMetric = `pipeline.${type}.restart.jitter`;
+      this.observeHistogram(jitterMetric, jitter);
+      if (channel) {
+        const channelMetric = `${jitterMetric}.channel.${channel}`;
+        this.observeHistogram(channelMetric, jitter);
+      }
+    }
   }
 
   recordAudioDeviceDiscovery(reason: string, meta: { channel?: string } = {}) {
@@ -856,8 +945,28 @@ class MetricsRegistry {
     const histogramConfig = this.histogramConfigs.get(metric) ?? config;
     const histogram = this.ensureHistogram(metric, histogramConfig);
 
+    if (Number.isFinite(duration)) {
+      const stats = this.histogramStats.get(metric);
+      if (stats) {
+        stats.sum += duration;
+        stats.count += 1;
+      } else {
+        this.histogramStats.set(metric, { sum: duration, count: 1 });
+      }
+    }
+
     const bucketLabel = resolveHistogramBucket(duration, histogramConfig);
     histogram.set(bucketLabel, (histogram.get(bucketLabel) ?? 0) + 1);
+  }
+
+  exportHistogramForPrometheus(metric: string, options: PrometheusHistogramOptions = {}): string {
+    const histogram = this.histograms.get(metric);
+    if (!histogram) {
+      return '';
+    }
+    const histogramConfig = this.histogramConfigs.get(metric) ?? DEFAULT_HISTOGRAM;
+    const stats = this.histogramStats.get(metric);
+    return formatPrometheusHistogram(metric, histogram, histogramConfig, stats, options);
   }
 
   observeDetectorLatency(detector: string, durationMs: number) {
@@ -959,6 +1068,13 @@ class MetricsRegistry {
       : null;
     const logLevelSnapshot = mapLogLevelCounters(this.logLevelCounters);
     const logHistogramSnapshot = mapLogLevelCounters(this.logLevelHistogram);
+    const suppressionChannelHistogramSnapshot = {
+      cooldownMs: mapSuppressionChannelHistograms(this.suppressionChannelCooldownHistogram),
+      cooldownRemainingMs: mapSuppressionChannelHistograms(
+        this.suppressionChannelCooldownRemainingHistogram
+      ),
+      windowRemainingMs: mapSuppressionChannelHistograms(this.suppressionChannelWindowHistogram)
+    };
     const suppressionHistogramSnapshot = {
       historyCount: mapHistogram(this.histograms.get('suppression.historyCount') ?? new Map()),
       combinedHistoryCount: mapHistogram(
@@ -970,7 +1086,8 @@ class MetricsRegistry {
       ),
       windowRemainingMs: mapHistogram(
         this.histograms.get('suppression.windowRemainingMs') ?? new Map()
-      )
+      ),
+      channel: suppressionChannelHistogramSnapshot
     };
 
     return {
@@ -1003,6 +1120,9 @@ class MetricsRegistry {
           totalWatchdogBackoffMs: this.ffmpegRestartState.totalWatchdogBackoffMs,
           watchdogBackoffMs: this.ffmpegRestartState.totalWatchdogBackoffMs,
           lastWatchdogJitterMs: this.ffmpegRestartState.lastWatchdogJitterMs,
+          totalJitterMs: this.ffmpegRestartState.totalJitterMs,
+          lastJitterMs: this.ffmpegRestartState.lastJitterMs,
+          jitterHistogram: mapHistogram(this.ffmpegRestartState.jitterHistogram),
           attempts: mapFrom(this.ffmpegRestartAttempts),
           byChannel: ffmpegByChannel,
           watchdogBackoffByChannel: mapWatchdogBackoffByChannel(this.ffmpegRestartsByChannel),
@@ -1027,6 +1147,9 @@ class MetricsRegistry {
           totalWatchdogBackoffMs: this.audioRestartState.totalWatchdogBackoffMs,
           watchdogBackoffMs: this.audioRestartState.totalWatchdogBackoffMs,
           lastWatchdogJitterMs: this.audioRestartState.lastWatchdogJitterMs,
+          totalJitterMs: this.audioRestartState.totalJitterMs,
+          lastJitterMs: this.audioRestartState.lastJitterMs,
+          jitterHistogram: mapHistogram(this.audioRestartState.jitterHistogram),
           attempts: mapFrom(this.audioRestartAttempts),
           byChannel: audioByChannel,
           watchdogBackoffByChannel: mapWatchdogBackoffByChannel(this.audioRestartsByChannel),
@@ -1045,6 +1168,7 @@ class MetricsRegistry {
         byRule: mapFrom(this.suppressionByRule),
         byReason: mapFrom(this.suppressionByReason),
         byType: mapFrom(this.suppressionByType),
+        byChannel: mapFrom(this.suppressionByChannel),
         historyTotals: {
           historyCount: this.suppressionHistoryCount,
           combinedHistoryCount: this.suppressionCombinedHistoryCount
@@ -1115,6 +1239,7 @@ function mapHistory(entries: PipelineRestartHistoryRecord[]): PipelineRestartHis
 type SuppressionRuleState = {
   total: number;
   byReason: Map<string, number>;
+  byChannel: Map<string, number>;
   historyCount: number;
   combinedHistoryCount: number;
   lastHistoryCount: number | null;
@@ -1193,6 +1318,17 @@ function mapFromHistograms(source: Map<string, Map<string, number>>): Record<str
   return result;
 }
 
+function mapSuppressionChannelHistograms(
+  source: Map<string, Map<string, number>>
+): Record<string, HistogramSnapshot> {
+  const result: Record<string, HistogramSnapshot> = {};
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [channel, histogram] of ordered) {
+    result[channel] = mapHistogram(histogram);
+  }
+  return result;
+}
+
 function mapFromPipelineChannels(source: Map<string, PipelineChannelState>): Record<string, PipelineChannelSnapshot> {
   const result: Record<string, PipelineChannelSnapshot> = {};
   const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
@@ -1209,6 +1345,9 @@ function mapFromPipelineChannels(source: Map<string, PipelineChannelState>): Rec
       totalWatchdogBackoffMs: state.totalWatchdogBackoffMs,
       watchdogBackoffMs: state.totalWatchdogBackoffMs,
       lastWatchdogJitterMs: state.lastWatchdogJitterMs,
+      totalJitterMs: state.totalJitterMs,
+      lastJitterMs: state.lastJitterMs,
+      jitterHistogram: mapHistogram(state.jitterHistogram),
       delayHistogram: mapHistogram(state.delayHistogram),
       attemptHistogram: mapHistogram(state.attemptHistogram)
     };
@@ -1219,6 +1358,131 @@ function mapFromPipelineChannels(source: Map<string, PipelineChannelState>): Rec
 function mapHistogram(source: Map<string, number>): HistogramSnapshot {
   const ordered = Array.from(source.entries()).sort(([a], [b]) => compareHistogramKeys(a, b));
   return Object.fromEntries(ordered);
+}
+
+function sanitizeHistogramLabels(labels?: Record<string, string>): Record<string, string> {
+  if (!labels) {
+    return {};
+  }
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(labels)) {
+    if (key === 'le') {
+      continue;
+    }
+    result[key] = value;
+  }
+  return result;
+}
+
+function formatPrometheusHistogram(
+  metricKey: string,
+  histogram: Map<string, number>,
+  config: HistogramConfig,
+  stats: { sum: number; count: number } | undefined,
+  options: PrometheusHistogramOptions
+): string {
+  const defaultName = `guardian_${metricKey}`;
+  const metricName = sanitizePrometheusMetricName(options.metricName ?? defaultName);
+  const help = options.help ? escapePrometheusHelp(options.help) : null;
+  const lines: string[] = [];
+  if (help) {
+    lines.push(`# HELP ${metricName} ${help}`);
+  }
+  lines.push(`# TYPE ${metricName} histogram`);
+
+  const baseLabels = sanitizeHistogramLabels(options.labels);
+  const baseLabelString = formatPrometheusLabels(baseLabels);
+
+  let cumulative = 0;
+  let previous: number | undefined;
+  for (const bucket of config.buckets) {
+    const bucketKey = config.format(bucket, previous);
+    const count = histogram.get(bucketKey) ?? 0;
+    cumulative += count;
+    const bucketLabels = { ...baseLabels, le: formatPrometheusLe(bucket) };
+    lines.push(
+      `${metricName}_bucket${formatPrometheusLabels(bucketLabels)} ${formatPrometheusValue(cumulative)}`
+    );
+    previous = bucket;
+  }
+
+  const overflowLabel = `${config.buckets[config.buckets.length - 1]}+`;
+  const overflowCount = histogram.get(overflowLabel) ?? 0;
+  const recordedTotal = cumulative + overflowCount;
+  const totalCount = Math.max(recordedTotal, stats?.count ?? 0);
+  const infLabels = { ...baseLabels, le: '+Inf' };
+  lines.push(
+    `${metricName}_bucket${formatPrometheusLabels(infLabels)} ${formatPrometheusValue(totalCount)}`
+  );
+
+  const sumValue = stats?.sum ?? 0;
+  lines.push(`${metricName}_sum${baseLabelString} ${formatPrometheusValue(sumValue)}`);
+  lines.push(`${metricName}_count${baseLabelString} ${formatPrometheusValue(totalCount)}`);
+
+  return lines.join('\n');
+}
+
+function sanitizePrometheusMetricName(name: string): string {
+  const sanitized = name.replace(/[^A-Za-z0-9_]/g, '_');
+  const collapsed = sanitized.replace(/_{2,}/g, '_').replace(/^_+|_+$/g, '');
+  const lower = collapsed.toLowerCase();
+  if (!lower) {
+    return 'guardian_metric';
+  }
+  if (/^[0-9]/.test(lower)) {
+    return `guardian_${lower}`;
+  }
+  return lower;
+}
+
+function sanitizePrometheusLabelName(name: string): string {
+  const sanitized = name.replace(/[^A-Za-z0-9_]/g, '_');
+  const collapsed = sanitized.replace(/_{2,}/g, '_').replace(/^_+|_+$/g, '');
+  const lower = collapsed.toLowerCase();
+  if (!lower) {
+    return 'label';
+  }
+  if (/^[0-9]/.test(lower)) {
+    return `_${lower}`;
+  }
+  return lower;
+}
+
+function escapePrometheusLabelValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/"/g, '\\"');
+}
+
+function escapePrometheusHelp(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/\n/g, ' ');
+}
+
+function formatPrometheusLabels(labels: Record<string, string>): string {
+  const entries = Object.entries(labels);
+  if (entries.length === 0) {
+    return '';
+  }
+  const normalized = entries.map(([key, value]) => [sanitizePrometheusLabelName(key), value] as const);
+  normalized.sort(([a], [b]) => a.localeCompare(b));
+  const rendered = normalized.map(([key, value]) => `${key}="${escapePrometheusLabelValue(value)}"`);
+  return `{${rendered.join(',')}}`;
+}
+
+function formatPrometheusValue(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '0';
+  }
+  if (value === 0) {
+    return '0';
+  }
+  if (Number.isInteger(value)) {
+    return value.toString();
+  }
+  const fixed = value.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+  return fixed.length > 0 ? fixed : '0';
+}
+
+function formatPrometheusLe(value: number): string {
+  return formatPrometheusValue(value);
 }
 
 function mapWatchdogBackoffByChannel(
@@ -1239,6 +1503,7 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
     result[ruleId] = {
       total: state.total,
       byReason: mapFrom(state.byReason),
+      byChannel: mapFrom(state.byChannel),
       history: {
         total: state.historyCount,
         combinedTotal: state.combinedHistoryCount,
@@ -1320,6 +1585,9 @@ function createPipelineChannelState(): PipelineChannelState {
     totalDelayMs: 0,
     totalWatchdogBackoffMs: 0,
     lastWatchdogJitterMs: null,
+    totalJitterMs: 0,
+    lastJitterMs: null,
+    jitterHistogram: new Map<string, number>(),
     delayHistogram: new Map<string, number>(),
     attemptHistogram: new Map<string, number>()
   };
@@ -1335,6 +1603,9 @@ function resetPipelineChannelState(state: PipelineChannelState) {
   state.totalDelayMs = 0;
   state.totalWatchdogBackoffMs = 0;
   state.lastWatchdogJitterMs = null;
+  state.totalJitterMs = 0;
+  state.lastJitterMs = null;
+  state.jitterHistogram.clear();
   state.delayHistogram.clear();
   state.attemptHistogram.clear();
 }
@@ -1371,6 +1642,15 @@ function updatePipelineChannelState(
     }
   } else if (reason === 'watchdog-timeout' && typeof meta.jitterMs === 'number') {
     state.lastWatchdogJitterMs = meta.jitterMs;
+  }
+  if (typeof meta.jitterMs === 'number' && Number.isFinite(meta.jitterMs)) {
+    state.lastJitterMs = meta.jitterMs;
+    state.totalJitterMs += Math.abs(meta.jitterMs);
+    const jitterBucket = resolveHistogramBucket(Math.abs(meta.jitterMs), DEFAULT_HISTOGRAM);
+    state.jitterHistogram.set(jitterBucket, (state.jitterHistogram.get(jitterBucket) ?? 0) + 1);
+    if (reason === 'watchdog-timeout') {
+      state.lastWatchdogJitterMs = meta.jitterMs;
+    }
   }
   if (typeof meta.attempt === 'number' && meta.attempt >= 0) {
     const attemptBucket = resolveHistogramBucket(meta.attempt, RESTART_ATTEMPT_HISTOGRAM);
@@ -1460,7 +1740,8 @@ export type {
   SuppressionSnapshot,
   DetectorSnapshot,
   SuppressedEventMetric,
-  RetentionSnapshot
+  RetentionSnapshot,
+  PrometheusHistogramOptions
 };
 export { MetricsRegistry };
 export default defaultRegistry;

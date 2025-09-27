@@ -243,7 +243,7 @@ export class EventsRouter {
       sendJson(res, 404, { error: 'Snapshot not available' });
       return true;
     }
-    return serveSnapshotFile(res, snapshotPath);
+    return serveSnapshotFile(req, res, snapshotPath);
   }
 
   private handleFaces(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
@@ -702,7 +702,7 @@ function formatEventForClient<T extends EventRecord | EventRecordWithId>(
   event: T
 ): T & { meta?: Record<string, unknown> } {
   const originalMeta = (event.meta as Record<string, unknown> | undefined) ?? undefined;
-  const meta = originalMeta ? { ...originalMeta } : {};
+  const meta = sanitizeEventMeta(originalMeta);
   const resolvedChannels = resolveEventChannels(meta);
   if (resolvedChannels.length > 0) {
     meta.resolvedChannels = Array.from(new Set(resolvedChannels));
@@ -737,6 +737,7 @@ function summarizeEvents(events: SummarizedEvent[]) {
       snapshots: number;
     }
   >();
+  const poseAccumulator = createPoseAccumulator();
 
   for (const event of events) {
     const detector = event.detector ?? 'unknown';
@@ -750,9 +751,15 @@ function summarizeEvents(events: SummarizedEvent[]) {
     const fallbackChannel =
       (typeof meta.channel === 'string' && meta.channel.trim()) || event.source || 'unassigned';
     const channels = resolvedChannels.length > 0 ? resolvedChannels : [fallbackChannel];
-    const tsCandidate =
-      typeof event.ts === 'number' ? event.ts : typeof event.ts === 'string' ? Date.parse(event.ts) : null;
+    const tsCandidate = normalizeTimestamp(event.ts);
     const hasSnapshot = Boolean(meta.snapshotUrl || meta.snapshot || meta.faceSnapshotUrl);
+
+    accumulatePoseSummary(poseAccumulator, meta, {
+      eventId: typeof (event as EventRecordWithId).id === 'number' ? (event as EventRecordWithId).id : null,
+      ts: tsCandidate,
+      detector,
+      severity
+    });
 
     for (const channel of channels) {
       const state = channelMap.get(channel) ?? {
@@ -784,13 +791,20 @@ function summarizeEvents(events: SummarizedEvent[]) {
     snapshots: stats.snapshots
   }));
 
-  return {
+  const summary: Record<string, unknown> = {
     totals: {
       byDetector: totalsByDetector,
       bySeverity: totalsBySeverity
     },
     channels
   };
+
+  const poseSummary = finalizePoseSummary(poseAccumulator);
+  if (poseSummary) {
+    summary.pose = poseSummary;
+  }
+
+  return summary;
 }
 
 function createMetricsDigest(snapshot: ReturnType<MetricsRegistry['snapshot']>) {
@@ -967,7 +981,472 @@ function collectChannelFilters(source: { channel?: string; channels?: string[] |
   return Array.from(set);
 }
 
-function serveSnapshotFile(res: ServerResponse, snapshotPath: string): boolean {
+type PoseAccumulator = {
+  forecasts: number;
+  confidenceTotal: number;
+  confidenceCount: number;
+  lastForecast: {
+    ts: number | null;
+    eventId: number | null;
+    confidence: number | null;
+    movingJointCount: number | null;
+    movingJointRatio: number | null;
+    detector: string | null;
+    severity: string | null;
+  } | null;
+  highestThreat: {
+    threatScore: number;
+    label: string | null;
+    eventId: number | null;
+    ts: number | null;
+    detector: string | null;
+    severity: string | null;
+  } | null;
+  threatEvents: number;
+  threatScoreTotal: number;
+  threatDetections: number;
+};
+
+type PoseSummaryContext = {
+  eventId: number | null;
+  ts: number | null;
+  detector: string | null;
+  severity: string | null;
+};
+
+function createPoseAccumulator(): PoseAccumulator {
+  return {
+    forecasts: 0,
+    confidenceTotal: 0,
+    confidenceCount: 0,
+    lastForecast: null,
+    highestThreat: null,
+    threatEvents: 0,
+    threatScoreTotal: 0,
+    threatDetections: 0
+  };
+}
+
+function accumulatePoseSummary(
+  accumulator: PoseAccumulator,
+  meta: Record<string, unknown>,
+  context: PoseSummaryContext
+) {
+  const forecast = extractPoseForecast(meta);
+  if (forecast) {
+    accumulator.forecasts += 1;
+    if (typeof forecast.confidence === 'number') {
+      accumulator.confidenceTotal += forecast.confidence;
+      accumulator.confidenceCount += 1;
+    }
+    const latest = accumulator.lastForecast;
+    if (!latest || (typeof context.ts === 'number' && (latest.ts ?? -Infinity) <= context.ts)) {
+      accumulator.lastForecast = {
+        ts: context.ts ?? null,
+        eventId: context.eventId,
+        confidence: typeof forecast.confidence === 'number' ? forecast.confidence : null,
+        movingJointCount:
+          typeof forecast.movingJointCount === 'number' && Number.isFinite(forecast.movingJointCount)
+            ? forecast.movingJointCount
+            : null,
+        movingJointRatio:
+          typeof forecast.movingJointRatio === 'number' && Number.isFinite(forecast.movingJointRatio)
+            ? forecast.movingJointRatio
+            : null,
+        detector: context.detector ?? null,
+        severity: context.severity ?? null
+      };
+    }
+  }
+
+  const threat = extractPoseThreatSummary(meta);
+  if (threat) {
+    accumulator.threatEvents += 1;
+    const maxScore = typeof threat.maxThreatScore === 'number' ? threat.maxThreatScore : null;
+    if (maxScore !== null) {
+      accumulator.threatScoreTotal += maxScore;
+      const highest = accumulator.highestThreat;
+      if (!highest || highest.threatScore < maxScore) {
+        accumulator.highestThreat = {
+          threatScore: maxScore,
+          label: typeof threat.maxThreatLabel === 'string' ? threat.maxThreatLabel : null,
+          eventId: context.eventId,
+          ts: context.ts ?? null,
+          detector: context.detector ?? null,
+          severity: context.severity ?? null
+        };
+      }
+    }
+    if (typeof threat.totalDetections === 'number') {
+      accumulator.threatDetections += threat.totalDetections;
+    }
+  }
+}
+
+function finalizePoseSummary(accumulator: PoseAccumulator): Record<string, unknown> | null {
+  if (
+    accumulator.forecasts === 0 &&
+    accumulator.confidenceCount === 0 &&
+    accumulator.threatEvents === 0 &&
+    !accumulator.highestThreat
+  ) {
+    return null;
+  }
+
+  const summary: Record<string, unknown> = {
+    forecasts: accumulator.forecasts
+  };
+
+  if (accumulator.confidenceCount > 0) {
+    summary.averageConfidence = accumulator.confidenceTotal / accumulator.confidenceCount;
+  }
+
+  if (accumulator.lastForecast) {
+    summary.lastForecast = {
+      ts: accumulator.lastForecast.ts,
+      eventId: accumulator.lastForecast.eventId,
+      confidence: accumulator.lastForecast.confidence,
+      movingJointCount: accumulator.lastForecast.movingJointCount,
+      movingJointRatio: accumulator.lastForecast.movingJointRatio,
+      detector: accumulator.lastForecast.detector,
+      severity: accumulator.lastForecast.severity
+    };
+  }
+
+  if (accumulator.threatEvents > 0 || accumulator.highestThreat) {
+    const maxThreat = accumulator.highestThreat
+      ? {
+          label: accumulator.highestThreat.label,
+          threatScore: accumulator.highestThreat.threatScore,
+          eventId: accumulator.highestThreat.eventId,
+          ts: accumulator.highestThreat.ts,
+          detector: accumulator.highestThreat.detector,
+          severity: accumulator.highestThreat.severity
+        }
+      : null;
+    summary.threats = {
+      events: accumulator.threatEvents,
+      averageMaxThreatScore:
+        accumulator.threatEvents > 0 ? accumulator.threatScoreTotal / accumulator.threatEvents : null,
+      totalDetections: accumulator.threatDetections,
+      maxThreat
+    };
+  }
+
+  return summary;
+}
+
+function extractPoseForecast(meta: Record<string, unknown>): Record<string, unknown> | null {
+  const candidate = (meta as { poseForecast?: unknown }).poseForecast;
+  const sanitized = sanitizePoseForecast(candidate);
+  return sanitized;
+}
+
+function extractPoseThreatSummary(meta: Record<string, unknown>): Record<string, unknown> | null {
+  const candidate = (meta as { poseThreatSummary?: unknown; threats?: unknown }).poseThreatSummary ?? (
+    meta as { threats?: unknown }
+  ).threats;
+  const sanitized = sanitizeThreatSummary(candidate);
+  return sanitized;
+}
+
+function normalizeTimestamp(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function sanitizeEventMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> {
+  const clone = cloneSerializable(meta ?? {});
+  const forecast = sanitizePoseForecast(meta ? (meta as Record<string, unknown>)['poseForecast'] : undefined);
+  if (forecast) {
+    (clone as Record<string, unknown>).poseForecast = forecast;
+  } else {
+    delete (clone as Record<string, unknown>).poseForecast;
+  }
+
+  const threatCandidate = meta
+    ? (meta as Record<string, unknown>)['poseThreatSummary'] ?? (meta as Record<string, unknown>)['threats']
+    : undefined;
+  const threat = sanitizeThreatSummary(threatCandidate);
+  if (threat) {
+    (clone as Record<string, unknown>).poseThreatSummary = threat;
+  } else {
+    delete (clone as Record<string, unknown>).poseThreatSummary;
+  }
+
+  const threatsField = (clone as Record<string, unknown>).threats;
+  if (threatsField) {
+    const sanitizedThreats = sanitizeThreatSummary(threatsField);
+    if (sanitizedThreats) {
+      (clone as Record<string, unknown>).threats = sanitizedThreats;
+    } else {
+      delete (clone as Record<string, unknown>).threats;
+    }
+  }
+
+  return clone as Record<string, unknown>;
+}
+
+function sanitizePoseForecast(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const sanitized = cloneSerializable(record) as Record<string, unknown>;
+
+  const horizon = toFiniteNumber(record.horizonMs);
+  if (horizon !== null) {
+    sanitized.horizonMs = horizon;
+  }
+
+  const confidence = toFiniteNumber(record.confidence);
+  if (confidence !== null) {
+    sanitized.confidence = confidence;
+  }
+
+  const movingJointCount = toFiniteNumber(record.movingJointCount);
+  if (movingJointCount !== null) {
+    sanitized.movingJointCount = movingJointCount;
+  }
+
+  const movingJointRatio = toFiniteNumber(record.movingJointRatio);
+  if (movingJointRatio !== null) {
+    sanitized.movingJointRatio = movingJointRatio;
+  }
+
+  if ('dominantJoint' in record) {
+    const dominantJoint = record.dominantJoint;
+    if (dominantJoint === null) {
+      sanitized.dominantJoint = null;
+    } else if (typeof dominantJoint === 'number' && Number.isFinite(dominantJoint)) {
+      sanitized.dominantJoint = dominantJoint;
+    }
+  }
+
+  const booleanFlags = sanitizeBooleanArray(record.movementFlags);
+  if (booleanFlags) {
+    sanitized.movementFlags = booleanFlags;
+  }
+
+  for (const key of [
+    'velocity',
+    'acceleration',
+    'velocityMagnitude',
+    'accelerationMagnitude',
+    'smoothedVelocity',
+    'smoothedAcceleration'
+  ]) {
+    const array = sanitizeNumberArray(record[key as keyof typeof record]);
+    if (array) {
+      sanitized[key] = array;
+    }
+  }
+
+  if (Array.isArray(record.history)) {
+    sanitized.history = record.history
+      .map(item => {
+        if (!item || typeof item !== 'object') {
+          return null;
+        }
+        const frame = item as Record<string, unknown>;
+        const ts = toFiniteNumber(frame.ts);
+        const keypoints = Array.isArray(frame.keypoints)
+          ? frame.keypoints
+              .map(point => {
+                if (!point || typeof point !== 'object') {
+                  return null;
+                }
+                const kp = point as Record<string, unknown>;
+                const x = toFiniteNumber(kp.x);
+                const y = toFiniteNumber(kp.y);
+                if (x === null || y === null) {
+                  return null;
+                }
+                const cleaned: Record<string, unknown> = { x, y };
+                const z = toFiniteNumber(kp.z);
+                if (z !== null) {
+                  cleaned.z = z;
+                }
+                const c = toFiniteNumber(kp.confidence);
+                if (c !== null) {
+                  cleaned.confidence = c;
+                }
+                return cleaned;
+              })
+              .filter((entry): entry is Record<string, unknown> => entry !== null)
+          : [];
+        return {
+          ts: ts ?? null,
+          keypoints
+        };
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+  }
+
+  return sanitized;
+}
+
+function sanitizeThreatSummary(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const sanitized = cloneSerializable(record) as Record<string, unknown>;
+
+  const maxScore = toFiniteNumber(record.maxThreatScore);
+  if (maxScore !== null) {
+    sanitized.maxThreatScore = maxScore;
+  }
+
+  if ('maxThreatLabel' in record) {
+    const label = record.maxThreatLabel;
+    if (typeof label === 'string') {
+      sanitized.maxThreatLabel = label;
+    } else if (label === null) {
+      sanitized.maxThreatLabel = null;
+    }
+  }
+
+  const averageScore = toFiniteNumber(record.averageThreatScore);
+  if (averageScore !== null) {
+    sanitized.averageThreatScore = averageScore;
+  }
+
+  const detections = toFiniteNumber(record.totalDetections);
+  if (detections !== null) {
+    sanitized.totalDetections = detections;
+  }
+
+  if (Array.isArray(record.objects)) {
+    sanitized.objects = record.objects
+      .map(entry => sanitizeThreatEntry(entry))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+  }
+
+  return sanitized;
+}
+
+function sanitizeThreatEntry(entry: unknown): Record<string, unknown> | null {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const record = entry as Record<string, unknown>;
+  const threatScore = toFiniteNumber(record.threatScore ?? record.score ?? record.confidence);
+  if (threatScore === null) {
+    return null;
+  }
+  const sanitized: Record<string, unknown> = {
+    threatScore
+  };
+  if ('label' in record && typeof record.label === 'string') {
+    sanitized.label = record.label;
+  }
+  if ('threat' in record) {
+    sanitized.threat = Boolean(record.threat);
+  }
+  return sanitized;
+}
+
+function cloneSerializable<T>(input: T): T {
+  if (input === null || typeof input !== 'object') {
+    if (typeof input === 'bigint') {
+      return (input <= Number.MAX_SAFE_INTEGER && input >= Number.MIN_SAFE_INTEGER
+        ? Number(input)
+        : input.toString()) as T;
+    }
+    return input;
+  }
+  if (Array.isArray(input)) {
+    return input.map(item => cloneSerializable(item)) as unknown as T;
+  }
+  if (ArrayBuffer.isView(input)) {
+    return Array.from(input as unknown as ArrayLike<number>) as unknown as T;
+  }
+  if (input instanceof Date) {
+    return input.toISOString() as unknown as T;
+  }
+  if (input instanceof Map) {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of input.entries()) {
+      if (typeof key === 'string') {
+        result[key] = cloneSerializable(value);
+      }
+    }
+    return result as unknown as T;
+  }
+  if (input instanceof Set) {
+    return Array.from(input.values()).map(value => cloneSerializable(value)) as unknown as T;
+  }
+  const plain: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (value === undefined || typeof value === 'function') {
+      continue;
+    }
+    plain[key] = cloneSerializable(value);
+  }
+  return plain as unknown as T;
+}
+
+function sanitizeNumberArray(value: unknown): number[] | null {
+  if (!value) {
+    return null;
+  }
+  let entries: unknown[];
+  if (Array.isArray(value)) {
+    entries = value;
+  } else if (ArrayBuffer.isView(value)) {
+    entries = Array.from(value as ArrayLike<number>);
+  } else {
+    return null;
+  }
+  const numbers = entries
+    .map(item => toFiniteNumber(item))
+    .filter((item): item is number => item !== null);
+  return numbers.length > 0 ? numbers : null;
+}
+
+function sanitizeBooleanArray(value: unknown): boolean[] | null {
+  if (!value) {
+    return null;
+  }
+  let entries: unknown[];
+  if (Array.isArray(value)) {
+    entries = value;
+  } else if (ArrayBuffer.isView(value)) {
+    entries = Array.from(value as ArrayLike<number>);
+  } else {
+    return null;
+  }
+  const booleans = entries.map(item => Boolean(item));
+  return booleans.length > 0 ? booleans : null;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  if (typeof value === 'bigint') {
+    const asNumber = Number(value);
+    return Number.isFinite(asNumber) ? asNumber : null;
+  }
+  return null;
+}
+
+function serveSnapshotFile(req: IncomingMessage, res: ServerResponse, snapshotPath: string): boolean {
   let stats: fs.Stats;
   try {
     stats = fs.statSync(snapshotPath);
@@ -981,6 +1460,18 @@ function serveSnapshotFile(res: ServerResponse, snapshotPath: string): boolean {
     return true;
   }
 
+  const etag = createSnapshotEtag(stats);
+  const lastModified = stats.mtime.toUTCString();
+
+  if (isNotModified(req, etag, stats.mtimeMs)) {
+    res.statusCode = 304;
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.setHeader('Last-Modified', lastModified);
+    res.setHeader('ETag', etag);
+    res.end();
+    return true;
+  }
+
   const stream = fs.createReadStream(snapshotPath);
   stream.on('error', () => {
     if (!res.headersSent) {
@@ -991,10 +1482,55 @@ function serveSnapshotFile(res: ServerResponse, snapshotPath: string): boolean {
   });
 
   res.writeHead(200, {
-    'Content-Type': guessMimeType(snapshotPath)
+    'Content-Type': guessMimeType(snapshotPath),
+    'Content-Length': stats.size,
+    'Cache-Control': 'private, max-age=60',
+    'Last-Modified': lastModified,
+    ETag: etag
   });
   stream.pipe(res);
   return true;
+}
+
+function createSnapshotEtag(stats: fs.Stats): string {
+  const mtime = Math.floor(stats.mtimeMs);
+  return `W/"${stats.size.toString(16)}-${mtime.toString(16)}"`;
+}
+
+function isNotModified(req: IncomingMessage, etag: string, mtimeMs: number): boolean {
+  const ifNoneMatchRaw = req.headers['if-none-match'];
+  const etagMatches = typeof ifNoneMatchRaw === 'string'
+    ? checkEtagMatch(parseIfNoneMatch(ifNoneMatchRaw), etag)
+    : Array.isArray(ifNoneMatchRaw)
+    ? ifNoneMatchRaw.some(value => checkEtagMatch(parseIfNoneMatch(value), etag))
+    : false;
+  if (etagMatches) {
+    return true;
+  }
+
+  const modifiedSince = req.headers['if-modified-since'];
+  if (typeof modifiedSince === 'string') {
+    const parsed = Date.parse(modifiedSince);
+    if (!Number.isNaN(parsed) && parsed >= Math.floor(mtimeMs)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function parseIfNoneMatch(header: string): string[] {
+  return header
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function checkEtagMatch(candidates: string[], etag: string): boolean {
+  if (candidates.includes('*')) {
+    return true;
+  }
+  return candidates.includes(etag);
 }
 
 function resolveEventChannels(meta: Record<string, unknown>): string[] {

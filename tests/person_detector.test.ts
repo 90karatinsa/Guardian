@@ -462,6 +462,134 @@ describe('YoloParser utilities', () => {
     expect(second?.areaRatio ?? 0).toBeCloseTo((440 * 260) / (1280 * 720), 5);
   });
 
+  it('YoloParserMultiOutputPerson merges tensors and prioritizes person detections', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+
+    const scaleTensor = new Float32Array(attributes * 1).fill(0);
+    const assignScale = (
+      buffer: Float32Array,
+      detectionIndex: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      const detectionsCount = buffer.length / attributes;
+      buffer[0 * detectionsCount + detectionIndex] = values.cx;
+      buffer[1 * detectionsCount + detectionIndex] = values.cy;
+      buffer[2 * detectionsCount + detectionIndex] = values.width;
+      buffer[3 * detectionsCount + detectionIndex] = values.height;
+      buffer[OBJECTNESS_INDEX * detectionsCount + detectionIndex] = logit(values.objectness);
+      values.classProbabilities.forEach((probability, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        buffer[attributeIndex * detectionsCount + detectionIndex] = logit(probability);
+      });
+    };
+
+    assignScale(scaleTensor, 0, {
+      cx: 320,
+      cy: 320,
+      width: 150,
+      height: 260,
+      objectness: 0.92,
+      classProbabilities: [0.9, 0.15]
+    });
+
+    const headTensor = new Float32Array(2 * attributes).fill(0);
+    const assignHead = (
+      buffer: Float32Array,
+      detectionIndex: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      const base = detectionIndex * attributes;
+      buffer[base + 0] = values.cx;
+      buffer[base + 1] = values.cy;
+      buffer[base + 2] = values.width;
+      buffer[base + 3] = values.height;
+      buffer[base + OBJECTNESS_INDEX] = logit(values.objectness);
+      values.classProbabilities.forEach((prob, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        buffer[base + attributeIndex] = logit(prob);
+      });
+    };
+
+    assignHead(headTensor, 0, {
+      cx: 0.52,
+      cy: 0.5,
+      width: 0.26,
+      height: 0.44,
+      objectness: 0.85,
+      classProbabilities: [0.78, 0.2]
+    });
+
+    assignHead(headTensor, 1, {
+      cx: 0.58,
+      cy: 0.52,
+      width: 0.3,
+      height: 0.5,
+      objectness: 0.72,
+      classProbabilities: [0.22, 0.81]
+    });
+
+    const tensorA = new ort.Tensor('float32', scaleTensor, [1, attributes, 1]);
+    const tensorB = new ort.Tensor('float32', headTensor, [1, 2, attributes]);
+
+    const meta = {
+      scale: 1,
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 1,
+      scaleY: 640 / 480,
+      variants: [
+        {
+          padX: 16,
+          padY: 8,
+          originalWidth: 640,
+          originalHeight: 480,
+          resizedWidth: 704,
+          resizedHeight: 704,
+          scaleX: 704 / 640,
+          scaleY: 704 / 480,
+          normalized: true
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections([tensorA, tensorB], meta, {
+      classIndices: [0, 1],
+      classIndex: 0,
+      scoreThreshold: 0.35,
+      nmsThreshold: 0.45,
+      maxDetections: 3
+    });
+
+    expect(results.length).toBeGreaterThanOrEqual(2);
+    expect(results[0]?.classId).toBe(0);
+    expect(results[0]?.score ?? 0).toBeGreaterThan(results[1]?.score ?? 0);
+    expect(results[0]?.areaRatio ?? 0).toBeGreaterThan(0);
+    const classes = results.map(result => result.classId);
+    expect(classes).toContain(0);
+    expect(classes).toContain(1);
+    const projectionIndices = new Set(results.map(result => result.projectionIndex));
+    expect(projectionIndices.size).toBeGreaterThanOrEqual(1);
+  });
+
   it('YoloParserNaNResilience filters invalid numeric detections safely', () => {
     const classCount = 2;
     const attributes = YOLO_CLASS_START_INDEX + classCount;
@@ -761,6 +889,80 @@ describe('PersonDetector', () => {
     const candidates = meta?.detections as Array<Record<string, unknown>>;
     expect(candidates?.length).toBeGreaterThanOrEqual(1);
     expect(candidates?.[0]?.score).toBe(meta?.score);
+  });
+
+  it('PersonDetectorClassThresholds enforces per-class limits across multi outputs', async () => {
+    const attributes = 6;
+    const detectionsFirst = 1;
+    const detectionsSecond = 1;
+
+    const firstHead = new Float32Array(attributes * detectionsFirst);
+    setChannelFirstDetection(firstHead, detectionsFirst, 0, {
+      cx: 320,
+      cy: 320,
+      width: 200,
+      height: 200,
+      objectnessLogit: Math.log(0.85 / 0.15),
+      classLogit: Math.log(0.2 / 0.8)
+    });
+
+    const secondHead = new Float32Array(detectionsSecond * attributes);
+    setChannelLastDetection(secondHead, attributes, 0, {
+      cx: 315,
+      cy: 318,
+      width: 198,
+      height: 202,
+      objectnessLogit: Math.log(0.88 / 0.12),
+      classLogit: Math.log(0.2 / 0.8)
+    });
+
+    const frame = createUniformFrame(1280, 720, 45);
+
+    runMock.mockResolvedValueOnce({
+      output0: { data: firstHead, dims: [1, attributes, detectionsFirst] },
+      output1: { data: secondHead, dims: [1, detectionsSecond, attributes] }
+    });
+
+    const highThresholdDetector = await PersonDetector.create(
+      {
+        source: 'video:threshold-high',
+        modelPath: 'models/yolov8n.onnx',
+        scoreThreshold: 0.4,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0,
+        classScoreThresholds: { 0: 0.7 }
+      },
+      bus
+    );
+
+    await highThresholdDetector.handleFrame(frame, 10);
+    expect(events).toHaveLength(0);
+
+    events = [];
+    runMock.mockReset();
+    runMock.mockResolvedValueOnce({
+      output0: { data: firstHead, dims: [1, attributes, detectionsFirst] },
+      output1: { data: secondHead, dims: [1, detectionsSecond, attributes] }
+    });
+
+    const lowThresholdDetector = await PersonDetector.create(
+      {
+        source: 'video:threshold-low',
+        modelPath: 'models/yolov8n.onnx',
+        scoreThreshold: 0.4,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0,
+        classScoreThresholds: { 0: 0.5 }
+      },
+      bus
+    );
+
+    await lowThresholdDetector.handleFrame(frame, 20);
+    expect(events).toHaveLength(1);
+    const meta = events[0].meta as Record<string, unknown>;
+    expect(meta?.score).toBeGreaterThan(0);
+    expect(meta?.thresholds?.classScoreThresholds).toMatchObject({ 0: 0.5 });
+    expect((meta?.detections as Array<Record<string, unknown>>)?.length).toBe(1);
   });
 
   it('PersonMissingModel falls back to mock detections when ONNX model is absent', async () => {

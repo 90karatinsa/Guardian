@@ -54,17 +54,20 @@ const CLASS_START_INDEX = 5;
 const DEFAULT_NMS_IOU_THRESHOLD = 0.45;
 
 export function parseYoloDetections(
-  tensor: ort.OnnxValue,
+  tensor: ort.OnnxValue | ort.OnnxValue[],
   meta: PreprocessMeta,
   options: ParseYoloDetectionsOptions
 ): YoloDetection[] {
-  const accessor = createTensorAccessor(tensor);
+  const tensors = Array.isArray(tensor) ? tensor : [tensor];
+  const accessors = tensors
+    .map(value => createTensorAccessor(value))
+    .filter((candidate): candidate is TensorAccessor => candidate !== null);
 
-  if (!accessor) {
+  if (accessors.length === 0) {
     return [];
   }
 
-  const classIndices = resolveClassIndices(options, accessor.attributes);
+  const classIndices = resolveClassIndices(options, accessors[0]!.attributes);
 
   const classPriority = buildClassPriority(options, classIndices);
 
@@ -76,88 +79,90 @@ export function parseYoloDetections(
 
   const resolveThreshold = createThresholdResolver(options);
 
-  for (let detectionIndex = 0; detectionIndex < accessor.detections; detectionIndex += 1) {
-    const objectnessLogit = accessor.get(detectionIndex, OBJECTNESS_INDEX);
-    if (!isFiniteNumber(objectnessLogit)) {
-      continue;
-    }
-
-    const objectness = sigmoid(objectnessLogit);
-
-    if (!Number.isFinite(objectness) || objectness <= 0) {
-      continue;
-    }
-
-    const cx = accessor.get(detectionIndex, 0);
-    const cy = accessor.get(detectionIndex, 1);
-    const width = accessor.get(detectionIndex, 2);
-    const height = accessor.get(detectionIndex, 3);
-
-    if (!isFiniteNumber(cx) || !isFiniteNumber(cy) || !isFiniteNumber(width) || !isFiniteNumber(height)) {
-      continue;
-    }
-
-    if (width <= 0 || height <= 0) {
-      continue;
-    }
-
-    const projected = projectBoundingBox(cx, cy, width, height, meta);
-    const bbox = projected.box;
-
-    if (
-      !isFiniteNumber(bbox.left) ||
-      !isFiniteNumber(bbox.top) ||
-      !isFiniteNumber(bbox.width) ||
-      !isFiniteNumber(bbox.height) ||
-      bbox.width <= 0 ||
-      bbox.height <= 0
-    ) {
-      continue;
-    }
-
-    const areaRatio = projected.areaRatio;
-
-    if (!Number.isFinite(areaRatio) || areaRatio <= 0) {
-      continue;
-    }
-
-    for (const classId of classIndices) {
-      const attributeIndex = CLASS_START_INDEX + classId;
-      if (attributeIndex >= accessor.attributes) {
+  for (const accessor of accessors) {
+    for (let detectionIndex = 0; detectionIndex < accessor.detections; detectionIndex += 1) {
+      const objectnessLogit = accessor.get(detectionIndex, OBJECTNESS_INDEX);
+      if (!isFiniteNumber(objectnessLogit)) {
         continue;
       }
 
-      const classLogit = accessor.get(detectionIndex, attributeIndex);
-      if (!isFiniteNumber(classLogit)) {
+      const objectness = sigmoid(objectnessLogit);
+
+      if (!Number.isFinite(objectness) || objectness <= 0) {
         continue;
       }
 
-      const classProbability = sigmoid(classLogit);
+      const cx = accessor.get(detectionIndex, 0);
+      const cy = accessor.get(detectionIndex, 1);
+      const width = accessor.get(detectionIndex, 2);
+      const height = accessor.get(detectionIndex, 3);
 
-      if (!Number.isFinite(classProbability) || classProbability <= 0) {
+      if (!isFiniteNumber(cx) || !isFiniteNumber(cy) || !isFiniteNumber(width) || !isFiniteNumber(height)) {
         continue;
       }
 
-      const combinedLogit = objectnessLogit + classLogit;
-      const score = clamp(sigmoid(combinedLogit), 0, 1);
-
-      const threshold = resolveThreshold(classId);
-      if (score < threshold) {
+      if (width <= 0 || height <= 0) {
         continue;
       }
 
-      detections.push({
-        score,
-        classId,
-        bbox,
-        objectness,
-        classProbability,
-        areaRatio,
-        combinedLogit,
-        appliedThreshold: threshold,
-        projectionIndex: projected.projectionIndex,
-        normalizedProjection: projected.normalized
-      });
+      const projected = projectBoundingBox(cx, cy, width, height, meta);
+      const bbox = projected.box;
+
+      if (
+        !isFiniteNumber(bbox.left) ||
+        !isFiniteNumber(bbox.top) ||
+        !isFiniteNumber(bbox.width) ||
+        !isFiniteNumber(bbox.height) ||
+        bbox.width <= 0 ||
+        bbox.height <= 0
+      ) {
+        continue;
+      }
+
+      const areaRatio = clamp(projected.areaRatio, 0, 1);
+
+      if (!Number.isFinite(areaRatio) || areaRatio <= 0) {
+        continue;
+      }
+
+      for (const classId of classIndices) {
+        const attributeIndex = CLASS_START_INDEX + classId;
+        if (attributeIndex >= accessor.attributes) {
+          continue;
+        }
+
+        const classLogit = accessor.get(detectionIndex, attributeIndex);
+        if (!isFiniteNumber(classLogit)) {
+          continue;
+        }
+
+        const classProbability = sigmoid(classLogit);
+
+        if (!Number.isFinite(classProbability) || classProbability <= 0) {
+          continue;
+        }
+
+        const combinedLogit = objectnessLogit + classLogit;
+        const score = clamp(sigmoid(combinedLogit), 0, 1);
+
+        const threshold = resolveThreshold(classId);
+        if (score < threshold) {
+          continue;
+        }
+
+        detections.push({
+          score,
+          classId,
+          bbox,
+          objectness,
+          classProbability,
+          areaRatio,
+          combinedLogit,
+          appliedThreshold: threshold,
+          projectionIndex: projected.projectionIndex,
+          normalizedProjection: projected.normalized
+        });
+      }
     }
   }
 
@@ -165,20 +170,29 @@ export function parseYoloDetections(
     return [];
   }
 
-  const perClass = new Map<number, YoloDetection[]>();
+  const nmsThreshold = options.nmsThreshold ?? DEFAULT_NMS_IOU_THRESHOLD;
+  const perProjection = new Map<number, Map<number, YoloDetection[]>>();
+
   for (const detection of detections) {
-    const existing = perClass.get(detection.classId);
-    if (existing) {
-      existing.push(detection);
+    const projectionKey = detection.projectionIndex ?? -1;
+    let projectionGroup = perProjection.get(projectionKey);
+    if (!projectionGroup) {
+      projectionGroup = new Map();
+      perProjection.set(projectionKey, projectionGroup);
+    }
+    const classGroup = projectionGroup.get(detection.classId);
+    if (classGroup) {
+      classGroup.push(detection);
     } else {
-      perClass.set(detection.classId, [detection]);
+      projectionGroup.set(detection.classId, [detection]);
     }
   }
 
-  const nmsThreshold = options.nmsThreshold ?? DEFAULT_NMS_IOU_THRESHOLD;
   const filtered: YoloDetection[] = [];
-  for (const [, candidates] of perClass) {
-    filtered.push(...nonMaxSuppression(candidates, nmsThreshold));
+  for (const projectionGroup of perProjection.values()) {
+    for (const candidates of projectionGroup.values()) {
+      filtered.push(...nonMaxSuppression(candidates, nmsThreshold));
+    }
   }
 
   filtered.sort((a, b) => {

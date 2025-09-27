@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { EventBus } from '../src/eventBus.js';
 import metrics, { MetricsRegistry } from '../src/metrics/index.js';
 import { collectHealthChecks, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
+import logger, { getLogLevel, setLogLevel } from '../src/logger.js';
 
 function createBus() {
   const metrics = {
@@ -219,6 +220,56 @@ describe('MetricsCounters', () => {
       '1-2': 1
     });
     expect(snapshot.histograms).toHaveProperty('logs.level');
+  });
+
+  it('MetricsPipelineJitterExport renders Prometheus histogram output with labels', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', { jitterMs: 50 });
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', { jitterMs: 750 });
+
+    const output = registry.exportHistogramForPrometheus('pipeline.ffmpeg.restart.jitter', {
+      metricName: 'guardian_ffmpeg_restart_jitter',
+      help: 'FFmpeg restart jitter in milliseconds',
+      labels: { pipeline: 'ffmpeg' }
+    });
+
+    expect(output).toContain('# TYPE guardian_ffmpeg_restart_jitter histogram');
+    expect(output).toContain('# HELP guardian_ffmpeg_restart_jitter FFmpeg restart jitter in milliseconds');
+    expect(output).toMatch(/guardian_ffmpeg_restart_jitter_bucket\{[^}]*le="100"[^}]*\} 1/);
+    expect(output).toMatch(/guardian_ffmpeg_restart_jitter_bucket\{[^}]*le="1000"[^}]*\} 2/);
+    expect(output).toMatch(/guardian_ffmpeg_restart_jitter_bucket\{[^}]*le="\+Inf"[^}]*\} 2/);
+    expect(output).toMatch(/guardian_ffmpeg_restart_jitter_sum\{[^}]*pipeline="ffmpeg"[^}]*\} 800/);
+    expect(output).toMatch(/guardian_ffmpeg_restart_jitter_count\{[^}]*pipeline="ffmpeg"[^}]*\} 2/);
+  });
+
+  it('LoggerLevelMetrics captures level counters and per-detector histograms', () => {
+    const defaultLevel = getLogLevel();
+    setLogLevel('trace');
+    metrics.reset();
+
+    try {
+      logger.trace('trace baseline');
+      logger.debug({ detector: 'motion' }, 'debug baseline');
+      logger.info({ detector: 'pose' }, 'info baseline');
+      logger.warn({ detector: 'pose' }, 'warn baseline');
+      logger.error({ detector: 'pose' }, 'error baseline');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.logs.byLevel.trace).toBe(1);
+      expect(snapshot.logs.byLevel.debug).toBe(1);
+      expect(snapshot.logs.byLevel.info).toBe(1);
+      expect(snapshot.logs.byLevel.warn).toBe(1);
+      expect(snapshot.logs.byLevel.error).toBe(1);
+      expect(snapshot.logs.byDetector.pose.info).toBe(1);
+      expect(snapshot.logs.byDetector.pose.warn).toBe(1);
+      expect(snapshot.logs.byDetector.pose.error).toBe(1);
+      expect(snapshot.logs.histogram.trace).toBeGreaterThan(0);
+      expect(snapshot.logs.histogram.error).toBeGreaterThan(0);
+    } finally {
+      setLogLevel(defaultLevel);
+      metrics.reset();
+    }
   });
 });
 
