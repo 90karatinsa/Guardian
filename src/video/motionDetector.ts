@@ -130,6 +130,12 @@ export class MotionDetector {
       const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
       const paddedBackoff = baseBackoff + this.noiseBackoffPadding;
       this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
+      if (this.pendingSuppressedFramesBeforeTrigger > 0) {
+        this.pendingSuppressedFramesBeforeTrigger = Math.min(
+          this.pendingSuppressedFramesBeforeTrigger,
+          paddedBackoff
+        );
+      }
     }
 
     if (referenceResetNeeded) {

@@ -882,6 +882,61 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigAudioChannelCollision rejects reloads when audio channel conflicts with video definitions', async () => {
+    const baseConfig = createConfig({ diffThreshold: 24 });
+    baseConfig.video.channels = {
+      'video:lobby': {}
+    };
+    if (baseConfig.video.cameras) {
+      baseConfig.video.cameras[0].channel = 'video:lobby';
+    }
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const conflicting = JSON.parse(JSON.stringify(baseConfig)) as GuardianConfig;
+      conflicting.audio = { channel: 'video:lobby' };
+
+      fs.writeFileSync(configPath, JSON.stringify(conflicting, null, 2));
+
+      await waitFor(
+        () => logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed'),
+        4000
+      );
+      await waitFor(
+        () => logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied'),
+        4000
+      );
+
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      expect(warnCall?.[0]?.err).toBeInstanceOf(Error);
+      expect(warnCall?.[0]?.err?.message ?? '').toContain(
+        'config.audio.channel "video:lobby" conflicts with video channel definition "video:lobby"'
+      );
+
+      const restored = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as GuardianConfig;
+      expect(restored.audio).toBeUndefined();
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('AudioHotReloadThresholds refreshes audio fallbacks and anomaly windows', async () => {
     const initialConfig = createConfig({ diffThreshold: 20 });
     initialConfig.audio = {

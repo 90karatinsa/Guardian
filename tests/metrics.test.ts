@@ -155,6 +155,39 @@ describe('MetricsCounters', () => {
     expect(snapshot.suppression.rules['rule-2'].byReason['rate-limit']).toBe(1);
   });
 
+  it('MetricsJitterHistogramPerChannel records jitter buckets and exposes jitter bounds', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      channel: 'video:lobby',
+      jitterMs: 325,
+      minJitterMs: 120,
+      maxJitterMs: 480
+    });
+    registry.recordPipelineRestart('ffmpeg', 'spawn-error', {
+      channel: 'video:lobby',
+      jitterMs: 150,
+      minJitterMs: 80,
+      maxJitterMs: 210
+    });
+
+    const snapshot = registry.snapshot();
+    const histogram = snapshot.histograms['pipeline.ffmpeg.restart.jitter.channel.video:lobby'];
+
+    expect(histogram).toBeDefined();
+    expect(histogram['250-500']).toBe(1);
+    expect(histogram['100-250']).toBe(1);
+
+    const channelHistory = snapshot.pipelines.ffmpeg.byChannel['video:lobby'].restartHistory;
+    expect(channelHistory).toHaveLength(2);
+    expect(channelHistory[0]).toMatchObject({ minJitterMs: 120, maxJitterMs: 480 });
+    expect(channelHistory[1]).toMatchObject({ minJitterMs: 80, maxJitterMs: 210 });
+
+    const globalHistory = snapshot.pipelines.ffmpeg.restartHistory;
+    expect(globalHistory[0]).toMatchObject({ minJitterMs: 120, maxJitterMs: 480 });
+    expect(globalHistory[1]).toMatchObject({ minJitterMs: 80, maxJitterMs: 210 });
+  });
+
   it('MetricsLightCounters track detector counters for motion and light backoff', () => {
     const registry = new MetricsRegistry();
 

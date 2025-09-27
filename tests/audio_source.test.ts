@@ -297,6 +297,68 @@ describe('AudioSource resilience', () => {
     vi.useRealTimers();
   });
 
+  it('AudioSilenceCircuitBreakerDisabled retries without fatal events when threshold is zero', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    let activeProcess: (ChildProcessWithoutNullStreams & EventEmitter) | null = null;
+    const createProcess = () => {
+      const proc = new EventEmitter() as ChildProcessWithoutNullStreams & EventEmitter;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(proc, {
+        stdout,
+        stderr,
+        stdin: new PassThrough(),
+        kill: vi.fn(() => true)
+      });
+      return proc;
+    };
+
+    spawnMock.mockImplementation(() => {
+      activeProcess = createProcess();
+      return activeProcess as ChildProcessWithoutNullStreams;
+    });
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      channel: 'audio:test',
+      sampleRate: 8000,
+      channels: 1,
+      frameDurationMs: 50,
+      silenceDurationMs: 50,
+      silenceCircuitBreakerThreshold: 0,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      random: () => 0.5
+    });
+
+    const fatalSpy = vi.fn();
+    const recoverSpy = vi.fn();
+    source.on('fatal', fatalSpy);
+    source.on('recover', recoverSpy);
+    source.on('error', () => {});
+
+    source.start();
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(activeProcess).not.toBeNull();
+
+    const frameBytes = (8000 * 50) / 1000 * 2;
+    activeProcess!.stdout.emit('data', Buffer.alloc(frameBytes));
+
+    await waitForCondition(() => recoverSpy.mock.calls.length > 0, 1000);
+    expect(fatalSpy).not.toHaveBeenCalled();
+    expect(recoverSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'stream-silence' })
+    );
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+  });
+
   it('AudioPipeMisalignTriggersRecovery restarts pipe streams on misaligned chunks', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 

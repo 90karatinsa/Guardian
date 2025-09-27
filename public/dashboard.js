@@ -918,7 +918,10 @@ function renderRetentionSection(retention) {
   summary.className = 'metrics-summary';
   const totals = retention.totals ?? { archivedSnapshots: 0, prunedArchives: 0, removedEvents: 0 };
   const totalsLine = document.createElement('strong');
-  totalsLine.textContent = `${totals.archivedSnapshots} archived · ${totals.prunedArchives} pruned`;
+  const removed = typeof totals.removedEvents === 'number' ? totals.removedEvents : 0;
+  const archived = typeof totals.archivedSnapshots === 'number' ? totals.archivedSnapshots : 0;
+  const pruned = typeof totals.prunedArchives === 'number' ? totals.prunedArchives : 0;
+  totalsLine.textContent = `${removed} removed · ${archived} archived · ${pruned} pruned`;
   summary.appendChild(totalsLine);
   const runsLine = document.createElement('span');
   if (retention.runs > 0) {
@@ -981,7 +984,7 @@ function updatePipelineWidget(payload) {
     pipelineMetricsEmpty.remove();
   }
 
-  if (!payload) {
+  if (!payload || typeof payload !== 'object') {
     renderMetricsMessage('Metrics unavailable.');
     return;
   }
@@ -990,9 +993,10 @@ function updatePipelineWidget(payload) {
 
   const updatedAt = document.createElement('p');
   updatedAt.className = 'meta';
-  updatedAt.textContent = `Updated ${formatRelativeTime(payload.fetchedAt)}`;
+  updatedAt.textContent = `Updated ${formatRelativeTime(payload.fetchedAt ?? Date.now())}`;
   pipelineMetricsContainer.appendChild(updatedAt);
 
+  let sectionsRendered = 0;
   const pipelineEntries = [
     ['Video streams', payload.pipelines?.ffmpeg],
     ['Audio streams', payload.pipelines?.audio]
@@ -1001,15 +1005,17 @@ function updatePipelineWidget(payload) {
     const section = renderPipelineSection(label, snapshot);
     if (section) {
       pipelineMetricsContainer.appendChild(section);
+      sectionsRendered += 1;
     }
   });
 
   const retentionSection = renderRetentionSection(payload.retention);
   if (retentionSection) {
     pipelineMetricsContainer.appendChild(retentionSection);
+    sectionsRendered += 1;
   }
 
-  if (pipelineMetricsContainer.children.length === 1) {
+  if (sectionsRendered === 0) {
     const empty = document.createElement('p');
     empty.className = 'meta';
     empty.textContent = 'No pipeline metrics available yet.';
@@ -1383,6 +1389,20 @@ function setMetricsDigest(digest) {
   state.digest = digest ?? null;
   setHealthStatus(computeHealthStatus(state.digest));
   renderChannelStatus();
+  if (digest && typeof digest === 'object') {
+    state.metrics.data = digest;
+    state.metrics.lastFetched = Date.now();
+    const hasRetention = digest.retention && typeof digest.retention === 'object';
+    const pipelineSnapshot = digest.pipelines && typeof digest.pipelines === 'object'
+      ? digest.pipelines
+      : null;
+    const hasPipelines = !!(
+      pipelineSnapshot?.ffmpeg || pipelineSnapshot?.audio
+    );
+    if (hasRetention || hasPipelines) {
+      updatePipelineWidget(digest);
+    }
+  }
 }
 
 function setHealthStatus(status) {

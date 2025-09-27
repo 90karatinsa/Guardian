@@ -120,6 +120,71 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionSnapshotDeleteMode deletes stale snapshots without archiving and skips vacuum', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 10, 5);
+    vi.setSystemTime(now);
+
+    const staleTs = now - 60 * dayMs;
+    const staleFiles = [
+      path.join(cameraOneDir, 'delete-old-a.jpg'),
+      path.join(cameraOneDir, 'delete-old-b.jpg')
+    ];
+    for (const file of staleFiles) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, staleTs / 1000, staleTs / 1000);
+    }
+
+    const freshFile = path.join(cameraOneDir, 'delete-fresh.jpg');
+    fs.writeFileSync(freshFile, freshFile);
+    fs.utimesSync(freshFile, now / 1000, now / 1000);
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        snapshot: { mode: 'delete', retentionDays: 45 },
+        vacuum: { mode: 'auto', run: 'never' },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(result.outcome?.archivedSnapshots).toBe(0);
+      expect(result.outcome?.removedEvents).toBe(staleFiles.length);
+      expect(result.outcome?.prunedArchives).toBe(0);
+      const cameraKey = path.basename(cameraOneDir);
+      expect(result.outcome?.perCamera?.[cameraKey]?.archivedSnapshots ?? 0).toBe(0);
+      expect(result.vacuum.ran).toBe(false);
+      expect(result.vacuum.runMode).toBe('never');
+
+      staleFiles.forEach(file => {
+        expect(fs.existsSync(file)).toBe(false);
+      });
+      expect(fs.existsSync(freshFile)).toBe(true);
+
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall?.removedEvents).toBe(staleFiles.length);
+      const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(infoCall?.[0]).toMatchObject({ removedEvents: staleFiles.length, archivedSnapshots: 0, prunedArchives: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionVacuumScheduling follows run policy and reports index maintenance', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 4, 5);

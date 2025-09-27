@@ -654,6 +654,16 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       existing.pipelineState = context.pipelineState;
       existing.checkEvery = context.checkEvery;
       existing.maxDetections = context.maxDetections;
+      existing.source.updateOptions({
+        idleTimeoutMs: context.pipelineState.ffmpeg.idleTimeoutMs,
+        watchdogTimeoutMs: context.pipelineState.ffmpeg.watchdogTimeoutMs,
+        startTimeoutMs: context.pipelineState.ffmpeg.startTimeoutMs,
+        restartDelayMs: context.pipelineState.ffmpeg.restartDelayMs,
+        restartMaxDelayMs: context.pipelineState.ffmpeg.restartMaxDelayMs,
+        restartJitterFactor: context.pipelineState.ffmpeg.restartJitterFactor,
+        forceKillTimeoutMs: context.pipelineState.ffmpeg.forceKillTimeoutMs,
+        circuitBreakerThreshold: context.pipelineState.ffmpeg.circuitBreakerThreshold
+      });
       existing.motionDetector.updateOptions({
         diffThreshold: context.motion.diffThreshold,
         areaThreshold: context.motion.areaThreshold,
@@ -1324,17 +1334,7 @@ function classScoreThresholdsEqual(
 }
 
 function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
-  return (
-    arrayEqual(a.inputArgs, b.inputArgs) &&
-    a.rtspTransport === b.rtspTransport &&
-    a.idleTimeoutMs === b.idleTimeoutMs &&
-    a.startTimeoutMs === b.startTimeoutMs &&
-    a.watchdogTimeoutMs === b.watchdogTimeoutMs &&
-    a.forceKillTimeoutMs === b.forceKillTimeoutMs &&
-    a.restartDelayMs === b.restartDelayMs &&
-    a.restartMaxDelayMs === b.restartMaxDelayMs &&
-    a.restartJitterFactor === b.restartJitterFactor
-  );
+  return arrayEqual(a.inputArgs, b.inputArgs) && a.rtspTransport === b.rtspTransport;
 }
 
 function poseConfigsEqual(a?: PoseConfig | null, b?: PoseConfig | null) {
@@ -1460,6 +1460,42 @@ function summarizePipelineUpdates(
   );
   if (Object.keys(detectionChanges).length > 0) {
     updates.person = detectionChanges;
+  }
+
+  const ffmpegChanges = collectNumericChanges(
+    {
+      idleTimeoutMs: runtime.pipelineState.ffmpeg.idleTimeoutMs,
+      watchdogTimeoutMs: runtime.pipelineState.ffmpeg.watchdogTimeoutMs,
+      startTimeoutMs: runtime.pipelineState.ffmpeg.startTimeoutMs,
+      forceKillTimeoutMs: runtime.pipelineState.ffmpeg.forceKillTimeoutMs,
+      restartDelayMs: runtime.pipelineState.ffmpeg.restartDelayMs,
+      restartMaxDelayMs: runtime.pipelineState.ffmpeg.restartMaxDelayMs,
+      restartJitterFactor: runtime.pipelineState.ffmpeg.restartJitterFactor,
+      circuitBreakerThreshold: runtime.pipelineState.ffmpeg.circuitBreakerThreshold
+    },
+    {
+      idleTimeoutMs: next.pipelineState.ffmpeg.idleTimeoutMs,
+      watchdogTimeoutMs: next.pipelineState.ffmpeg.watchdogTimeoutMs,
+      startTimeoutMs: next.pipelineState.ffmpeg.startTimeoutMs,
+      forceKillTimeoutMs: next.pipelineState.ffmpeg.forceKillTimeoutMs,
+      restartDelayMs: next.pipelineState.ffmpeg.restartDelayMs,
+      restartMaxDelayMs: next.pipelineState.ffmpeg.restartMaxDelayMs,
+      restartJitterFactor: next.pipelineState.ffmpeg.restartJitterFactor,
+      circuitBreakerThreshold: next.pipelineState.ffmpeg.circuitBreakerThreshold
+    },
+    [
+      'idleTimeoutMs',
+      'watchdogTimeoutMs',
+      'startTimeoutMs',
+      'forceKillTimeoutMs',
+      'restartDelayMs',
+      'restartMaxDelayMs',
+      'restartJitterFactor',
+      'circuitBreakerThreshold'
+    ]
+  );
+  if (Object.keys(ffmpegChanges).length > 0) {
+    updates.ffmpeg = ffmpegChanges;
   }
 
   if (!lightConfigsEqual(runtime.pipelineState.light, next.pipelineState.light)) {

@@ -164,6 +164,93 @@ describe('YoloParser utilities', () => {
     expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
   });
 
+  it('YoloParserFiltersNonFiniteDetections', () => {
+    const classCount = 3;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const setDetection = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectnessLogit: number;
+        classLogits: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = values.objectnessLogit;
+      values.classLogits.forEach((logit, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit;
+      });
+    };
+
+    setDetection(0, {
+      cx: 300,
+      cy: 280,
+      width: 180,
+      height: 160,
+      objectnessLogit: 2.2,
+      classLogits: [-3, 2.4, -4]
+    });
+
+    setDetection(1, {
+      cx: 120,
+      cy: 160,
+      width: Number.NaN,
+      height: 140,
+      objectnessLogit: 2.5,
+      classLogits: [3, 3, 3]
+    });
+
+    setDetection(2, {
+      cx: 400,
+      cy: Number.POSITIVE_INFINITY,
+      width: 120,
+      height: 130,
+      objectnessLogit: 1.8,
+      classLogits: [2.2, 2.2, 2.2]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 480,
+      scale: 1,
+      scaleX: 1,
+      scaleY: 1
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [1, 0, 1, 2, 1],
+      scoreThreshold: 0.5,
+      classScoreThresholds: { 1: 0.6 }
+    });
+
+    expect(results).toHaveLength(1);
+    const detection = results[0]!;
+    expect(detection.classId).toBe(1);
+    expect(detection.appliedThreshold).toBe(0.6);
+    expect(Number.isFinite(detection.bbox.left)).toBe(true);
+    expect(Number.isFinite(detection.bbox.top)).toBe(true);
+    expect(Number.isFinite(detection.bbox.width)).toBe(true);
+    expect(Number.isFinite(detection.bbox.height)).toBe(true);
+    expect(detection.score).toBeGreaterThan(0.6);
+    expect('priorityScore' in detection).toBe(false);
+  });
+
   it('YoloBoundingBoxClamping clamps boxes to original frame dimensions', () => {
     const classCount = 1;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

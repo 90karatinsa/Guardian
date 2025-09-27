@@ -111,11 +111,53 @@ export class VideoSource extends EventEmitter {
   private circuitBroken = false;
   private lastCircuitCandidateReason: RecoverEvent['reason'] | null = null;
   private readonly commandClassifications = new Set<string>();
+  private commandGeneration = 0;
   private readonly channel: string | null;
 
-  constructor(private readonly options: VideoSourceOptions) {
+  constructor(private options: VideoSourceOptions) {
     super();
     this.channel = normalizeChannelId(options.channel);
+  }
+
+  updateOptions(
+    options: Partial<
+      Pick<
+        VideoSourceOptions,
+        |
+          'idleTimeoutMs'
+        | 'watchdogTimeoutMs'
+        | 'startTimeoutMs'
+        | 'restartDelayMs'
+        | 'restartMaxDelayMs'
+        | 'restartJitterFactor'
+        | 'forceKillTimeoutMs'
+        | 'circuitBreakerThreshold'
+      >
+    >
+  ) {
+    const previous = this.options;
+    const next: VideoSourceOptions = { ...previous, ...options };
+    const idleChanged =
+      Object.prototype.hasOwnProperty.call(options, 'idleTimeoutMs') &&
+      next.idleTimeoutMs !== previous.idleTimeoutMs;
+    const watchdogChanged =
+      Object.prototype.hasOwnProperty.call(options, 'watchdogTimeoutMs') &&
+      next.watchdogTimeoutMs !== previous.watchdogTimeoutMs;
+    const startTimeoutChanged =
+      Object.prototype.hasOwnProperty.call(options, 'startTimeoutMs') &&
+      next.startTimeoutMs !== previous.startTimeoutMs;
+
+    this.options = next;
+
+    if (idleChanged && this.streamIdleTimer) {
+      this.resetStreamIdleTimer();
+    }
+    if (watchdogChanged && this.watchdogTimer) {
+      this.resetWatchdogTimer();
+    }
+    if (startTimeoutChanged && this.startTimer) {
+      this.resetStartTimer();
+    }
   }
 
   start() {
@@ -125,7 +167,8 @@ export class VideoSource extends EventEmitter {
     this.hasReceivedFrame = false;
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
-    this.commandClassifications.clear();
+    this.commandGeneration = 0;
+    this.resetCommandClassifications();
     this.lastCircuitCandidateReason = null;
     this.clearAllTimers();
     this.startCommand();
@@ -173,7 +216,7 @@ export class VideoSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
     this.lastCircuitCandidateReason = null;
-    this.commandClassifications.clear();
+    this.resetCommandClassifications();
     this.clearRestartTimer();
     this.clearStartTimer();
     this.clearWatchdogTimer();
@@ -203,6 +246,7 @@ export class VideoSource extends EventEmitter {
     const onData = (chunk: Buffer) => {
       if (!this.hasReceivedFrame) {
         this.hasReceivedFrame = true;
+        this.clearPersistentCommandClassifications();
         this.clearStartTimer();
         this.restartCount = 0;
       }
@@ -262,7 +306,8 @@ export class VideoSource extends EventEmitter {
     this.resetStartTimer();
     this.clearWatchdogTimer();
     this.clearStreamIdleTimer();
-    this.commandClassifications.clear();
+    this.commandGeneration += 1;
+    this.resetCommandClassifications({ preservePersistent: true });
     const command = this.createCommand();
     this.command = command;
 
@@ -824,6 +869,36 @@ export class VideoSource extends EventEmitter {
     };
   }
 
+  private resetCommandClassifications(options: { preservePersistent?: boolean } = {}) {
+    const preservePersistent = options.preservePersistent ?? false;
+    if (!preservePersistent) {
+      this.commandClassifications.clear();
+      return;
+    }
+
+    for (const key of Array.from(this.commandClassifications)) {
+      if (!key.startsWith('persistent:')) {
+        this.commandClassifications.delete(key);
+      }
+    }
+  }
+
+  private clearPersistentCommandClassifications() {
+    for (const key of Array.from(this.commandClassifications)) {
+      if (key.startsWith('persistent:')) {
+        this.commandClassifications.delete(key);
+      }
+    }
+  }
+
+  private buildClassificationKey(classification: FfmpegClassification) {
+    const reason = classification.reason;
+    const prefix = isPersistentClassification(reason)
+      ? 'persistent'
+      : `transient:${this.commandGeneration}`;
+    return `${prefix}:${reason}`;
+  }
+
   private handleCommandStderr(message: string) {
     if (!message) {
       return;
@@ -840,11 +915,12 @@ export class VideoSource extends EventEmitter {
         continue;
       }
 
-      if (this.commandClassifications.has(classification.reason)) {
+      const key = this.buildClassificationKey(classification);
+      if (this.commandClassifications.has(key)) {
         continue;
       }
 
-      this.commandClassifications.add(classification.reason);
+      this.commandClassifications.add(key);
 
       const context: RecoveryContext = {
         errorCode: classification.errorCode ?? classification.reason,
@@ -867,6 +943,10 @@ type FfmpegClassification = {
   signal?: NodeJS.Signals | null;
   breakAfter?: boolean;
 };
+
+function isPersistentClassification(reason: string) {
+  return reason.startsWith('rtsp-');
+}
 
 const RTSP_TIMEOUT_PATTERNS = [
   /method\s+DESCRIBE\s+failed:.*timed out/i,
