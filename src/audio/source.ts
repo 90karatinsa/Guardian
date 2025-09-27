@@ -164,6 +164,22 @@ export class AudioSource extends EventEmitter {
     this.startPipeline();
   }
 
+  isCircuitBroken() {
+    return this.circuitBroken;
+  }
+
+  resetCircuitBreaker(options: { restart?: boolean } = {}) {
+    const wasBroken = this.circuitBroken;
+    this.circuitBroken = false;
+    this.circuitBreakerFailures = 0;
+    this.lastCircuitCandidateReason = null;
+    this.shouldStop = false;
+    if (options.restart !== false && wasBroken) {
+      this.startPipeline();
+    }
+    return wasBroken;
+  }
+
   private startPipeline() {
     if (this.startSequencePromise) {
       return;
@@ -332,11 +348,12 @@ export class AudioSource extends EventEmitter {
 
     try {
       const devices = await discovery;
+      const ordered = sortDiscoveredDevices(process.platform, devices);
       DEVICE_DISCOVERY_CACHE.set(
         cacheKey,
-        Promise.resolve(devices.map(device => ({ ...device })))
+        Promise.resolve(ordered.map(device => ({ ...device })))
       );
-      return devices.map(device => ({ ...device }));
+      return ordered.map(device => ({ ...device }));
     } catch (error) {
       DEVICE_DISCOVERY_CACHE.delete(cacheKey);
       throw error;
@@ -639,6 +656,19 @@ export class AudioSource extends EventEmitter {
       this.lastCircuitCandidateReason = null;
     }
 
+    const timing = this.computeRestartDelay(attempt);
+
+    metrics.recordPipelineRestart('audio', reason, {
+      attempt,
+      delayMs: timing.delayMs,
+      baseDelayMs: timing.meta.baseDelayMs,
+      minDelayMs: timing.meta.minDelayMs,
+      maxDelayMs: timing.meta.maxDelayMs,
+      jitterMs: timing.meta.appliedJitterMs,
+      channel: this.options.channel,
+      at: Date.now()
+    });
+
     const threshold =
       this.options.silenceCircuitBreakerThreshold ?? DEFAULT_SILENCE_CIRCUIT_BREAKER_THRESHOLD;
 
@@ -667,20 +697,8 @@ export class AudioSource extends EventEmitter {
       return;
     }
 
-    const timing = this.computeRestartDelay(attempt);
-
-    metrics.recordPipelineRestart('audio', reason, {
-      attempt,
-      delayMs: timing.delayMs,
-      baseDelayMs: timing.meta.baseDelayMs,
-      minDelayMs: timing.meta.minDelayMs,
-      maxDelayMs: timing.meta.maxDelayMs,
-      jitterMs: timing.meta.appliedJitterMs,
-      channel: this.options.channel,
-      at: Date.now()
-    });
-
     this.rotateMicFallback(reason);
+    this.rotateBinaryFallback(reason);
 
     this.emit(
       'recover',
@@ -919,6 +937,19 @@ export class AudioSource extends EventEmitter {
     this.micCandidateIndex = (currentIndex + 1) % this.micInputArgs.length;
   }
 
+  private rotateBinaryFallback(reason: AudioRecoverEvent['reason']) {
+    if (
+      FFMPEG_CANDIDATES.length <= 1 ||
+      (reason !== 'ffmpeg-missing' &&
+        reason !== 'stream-silence' &&
+        reason !== 'watchdog-timeout')
+    ) {
+      return;
+    }
+
+    this.currentBinaryIndex = (this.currentBinaryIndex + 1) % FFMPEG_CANDIDATES.length;
+  }
+
   private computeRestartDelay(attempt: number) {
     const minDelayMs = Math.max(
       0,
@@ -1094,6 +1125,25 @@ function defaultMicFormat(platform: NodeJS.Platform): AudioSourceOptions['inputF
     default:
       return 'alsa';
   }
+}
+
+function sortDiscoveredDevices(platform: NodeJS.Platform, devices: MicCandidate[]) {
+  const formatOrder = resolveDeviceFormats('auto', platform);
+  const priority = new Map<string, number>();
+  formatOrder.forEach((format, index) => {
+    priority.set(format, index);
+  });
+
+  return [...devices].sort((a, b) => {
+    const rankA = priority.get(a.format ?? '') ?? priority.size;
+    const rankB = priority.get(b.format ?? '') ?? priority.size;
+    if (rankA !== rankB) {
+      return rankA - rankB;
+    }
+    const deviceA = (a.device ?? '').toLowerCase();
+    const deviceB = (b.device ?? '').toLowerCase();
+    return deviceA.localeCompare(deviceB);
+  });
 }
 
 function resolveMicFormatValue(

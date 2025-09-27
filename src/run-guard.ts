@@ -143,6 +143,7 @@ export type GuardRuntime = {
   stop: () => void;
   pipelines: Map<string, CameraRuntime>;
   retention?: RetentionTask | null;
+  resetCircuitBreaker: (identifier: string) => boolean;
 };
 
 const DEFAULT_CHECK_EVERY = 3;
@@ -624,6 +625,14 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         continue;
       }
 
+      const updates = summarizePipelineUpdates(existing, context);
+      if (updates) {
+        logger.info(
+          { camera: existing.id, channel: existing.channel, updates },
+          'Updated guard pipeline configuration'
+        );
+      }
+
       existing.pipelineState = context.pipelineState;
       existing.checkEvery = context.checkEvery;
       existing.maxDetections = context.maxDetections;
@@ -638,7 +647,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         areaSmoothing: context.motion.areaSmoothing,
         areaInflation: context.motion.areaInflation,
         areaDeltaThreshold: context.motion.areaDeltaThreshold,
-        idleRebaselineMs: context.motion.idleRebaselineMs
+        idleRebaselineMs: context.motion.idleRebaselineMs,
+        noiseWarmupFrames: context.motion.noiseWarmupFrames,
+        noiseBackoffPadding: context.motion.noiseBackoffPadding
       });
       if (context.pipelineState.light) {
         if (existing.lightDetector) {
@@ -651,7 +662,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
             backoffFrames: context.pipelineState.light.backoffFrames,
             noiseMultiplier: context.pipelineState.light.noiseMultiplier,
             noiseSmoothing: context.pipelineState.light.noiseSmoothing,
-            idleRebaselineMs: context.pipelineState.light.idleRebaselineMs
+            idleRebaselineMs: context.pipelineState.light.idleRebaselineMs,
+            noiseWarmupFrames: context.pipelineState.light.noiseWarmupFrames,
+            noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding
           });
         } else {
           existing.lightDetector = new LightDetector({
@@ -664,7 +677,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
             backoffFrames: context.pipelineState.light.backoffFrames,
             noiseMultiplier: context.pipelineState.light.noiseMultiplier,
             noiseSmoothing: context.pipelineState.light.noiseSmoothing,
-            idleRebaselineMs: context.pipelineState.light.idleRebaselineMs
+            idleRebaselineMs: context.pipelineState.light.idleRebaselineMs,
+            noiseWarmupFrames: context.pipelineState.light.noiseWarmupFrames,
+            noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding
           });
         }
       } else if (existing.lightDetector) {
@@ -758,6 +773,41 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
   await runSync(activeConfig);
 
+  const resetPipelineCircuitBreaker = (identifier: string) => {
+    const runtime =
+      pipelines.get(identifier) ??
+      pipelinesById.get(identifier) ??
+      pipelinesById.get(identifier.replace(/^video:/, '')) ??
+      null;
+
+    const target = runtime ?? Array.from(pipelines.values()).find(candidate => {
+      return candidate.channel === identifier || candidate.id === identifier;
+    });
+
+    if (!target) {
+      return false;
+    }
+
+    if (!target.source.isCircuitBroken()) {
+      return false;
+    }
+
+    const wasBroken = target.source.resetCircuitBreaker();
+    if (!wasBroken) {
+      return false;
+    }
+
+    const channel = target.channel;
+    logger.info({ camera: target.id, channel }, 'Resetting video circuit breaker');
+    metrics.recordPipelineRestart('ffmpeg', 'manual-circuit-reset', {
+      channel,
+      at: Date.now(),
+      attempt: 0,
+      delayMs: 0
+    });
+    return true;
+  };
+
   const stop = () => {
     bus.off('event', eventHandler);
     if (!injectedConfig) {
@@ -785,7 +835,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     retentionTask?.stop();
   };
 
-  return { stop, pipelines, retention: retentionTask };
+  return { stop, pipelines, retention: retentionTask, resetCircuitBreaker: resetPipelineCircuitBreaker };
 }
 
 function buildCameraList(videoConfig: VideoConfig) {
@@ -863,7 +913,9 @@ function resolveCameraMotion(
     areaSmoothing: cameraMotion?.areaSmoothing ?? defaults.areaSmoothing,
     areaInflation: cameraMotion?.areaInflation ?? defaults.areaInflation,
     areaDeltaThreshold: cameraMotion?.areaDeltaThreshold ?? defaults.areaDeltaThreshold,
-    idleRebaselineMs: cameraMotion?.idleRebaselineMs ?? defaults.idleRebaselineMs
+    idleRebaselineMs: cameraMotion?.idleRebaselineMs ?? defaults.idleRebaselineMs,
+    noiseWarmupFrames: cameraMotion?.noiseWarmupFrames ?? defaults.noiseWarmupFrames,
+    noiseBackoffPadding: cameraMotion?.noiseBackoffPadding ?? defaults.noiseBackoffPadding
   };
 }
 
@@ -887,6 +939,8 @@ function resolveLightConfig(
   let noiseMultiplier: number | undefined;
   let noiseSmoothing: number | undefined;
   let idleRebaselineMs: number | undefined;
+  let noiseWarmupFrames: number | undefined;
+  let noiseBackoffPadding: number | undefined;
 
   for (const layer of layers) {
     if (!layer) {
@@ -920,6 +974,12 @@ function resolveLightConfig(
     if (typeof layer.idleRebaselineMs === 'number') {
       idleRebaselineMs = layer.idleRebaselineMs;
     }
+    if (typeof layer.noiseWarmupFrames === 'number') {
+      noiseWarmupFrames = layer.noiseWarmupFrames;
+    }
+    if (typeof layer.noiseBackoffPadding === 'number') {
+      noiseBackoffPadding = layer.noiseBackoffPadding;
+    }
   }
 
   if (typeof deltaThreshold !== 'number') {
@@ -935,7 +995,9 @@ function resolveLightConfig(
     backoffFrames,
     noiseMultiplier,
     noiseSmoothing,
-    idleRebaselineMs
+    idleRebaselineMs,
+    noiseWarmupFrames,
+    noiseBackoffPadding
   };
 }
 
@@ -1039,7 +1101,9 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
       areaSmoothing: motion.areaSmoothing,
       areaInflation: motion.areaInflation,
       areaDeltaThreshold: motion.areaDeltaThreshold,
-      idleRebaselineMs: motion.idleRebaselineMs
+      idleRebaselineMs: motion.idleRebaselineMs,
+      noiseWarmupFrames: motion.noiseWarmupFrames,
+      noiseBackoffPadding: motion.noiseBackoffPadding
     },
     person: {
       score: camera.person?.score ?? channelConfig?.person?.score ?? config.person.score,
@@ -1283,6 +1347,150 @@ function arrayEqual<T>(a: T[] | undefined, b: T[] | undefined) {
   }
 
   return a.every((value, index) => value === b[index]);
+}
+
+function summarizePipelineUpdates(
+  runtime: CameraRuntime,
+  next: ReturnType<typeof buildCameraContext>
+) {
+  const updates: Record<string, unknown> = {};
+
+  const motionChanges = collectNumericChanges(
+    runtime.pipelineState.motion,
+    next.pipelineState.motion,
+    ['noiseWarmupFrames', 'noiseBackoffPadding']
+  );
+  if (Object.keys(motionChanges).length > 0) {
+    updates.motion = motionChanges;
+  }
+
+  const detectionChanges = collectNumericChanges(
+    { checkEvery: runtime.checkEvery, maxDetections: runtime.maxDetections },
+    { checkEvery: next.checkEvery, maxDetections: next.maxDetections },
+    ['checkEvery', 'maxDetections']
+  );
+  if (Object.keys(detectionChanges).length > 0) {
+    updates.person = detectionChanges;
+  }
+
+  if (!lightConfigsEqual(runtime.pipelineState.light, next.pipelineState.light)) {
+    updates.light = {
+      previous: snapshotLightConfig(runtime.pipelineState.light),
+      next: snapshotLightConfig(next.pipelineState.light)
+    };
+  }
+
+  return Object.keys(updates).length > 0 ? updates : null;
+}
+
+function collectNumericChanges<
+  T extends Record<string, number | null | undefined>,
+  K extends keyof T
+>(
+  previous: T,
+  next: T,
+  fields: K[]
+) {
+  const changes: Record<string, { previous: number | null; next: number | null }> = {};
+
+  for (const field of fields) {
+    const prevValue = normalizeNumber(previous[field]);
+    const nextValue = normalizeNumber(next[field]);
+    if (prevValue !== nextValue) {
+      changes[field as string] = { previous: prevValue, next: nextValue };
+    }
+  }
+
+  return changes;
+}
+
+function normalizeNumber(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function snapshotLightConfig(config: LightConfig | null | undefined) {
+  if (!config) {
+    return null;
+  }
+
+  return {
+    deltaThreshold: normalizeNumber(config.deltaThreshold),
+    smoothingFactor: normalizeNumber(config.smoothingFactor),
+    minIntervalMs: normalizeNumber(config.minIntervalMs),
+    debounceFrames: normalizeNumber(config.debounceFrames),
+    backoffFrames: normalizeNumber(config.backoffFrames),
+    noiseMultiplier: normalizeNumber(config.noiseMultiplier),
+    noiseSmoothing: normalizeNumber(config.noiseSmoothing),
+    idleRebaselineMs: normalizeNumber(config.idleRebaselineMs),
+    noiseWarmupFrames: normalizeNumber(config.noiseWarmupFrames),
+    noiseBackoffPadding: normalizeNumber(config.noiseBackoffPadding),
+    normalHours: config.normalHours?.map(range => ({ ...range })) ?? null
+  };
+}
+
+function lightConfigsEqual(a: LightConfig | null | undefined, b: LightConfig | null | undefined) {
+  if (!a && !b) {
+    return true;
+  }
+
+  if (!a || !b) {
+    return false;
+  }
+
+  if (normalizeNumber(a.deltaThreshold) !== normalizeNumber(b.deltaThreshold)) {
+    return false;
+  }
+  if (normalizeNumber(a.smoothingFactor) !== normalizeNumber(b.smoothingFactor)) {
+    return false;
+  }
+  if (normalizeNumber(a.minIntervalMs) !== normalizeNumber(b.minIntervalMs)) {
+    return false;
+  }
+  if (normalizeNumber(a.debounceFrames) !== normalizeNumber(b.debounceFrames)) {
+    return false;
+  }
+  if (normalizeNumber(a.backoffFrames) !== normalizeNumber(b.backoffFrames)) {
+    return false;
+  }
+  if (normalizeNumber(a.noiseMultiplier) !== normalizeNumber(b.noiseMultiplier)) {
+    return false;
+  }
+  if (normalizeNumber(a.noiseSmoothing) !== normalizeNumber(b.noiseSmoothing)) {
+    return false;
+  }
+  if (normalizeNumber(a.idleRebaselineMs) !== normalizeNumber(b.idleRebaselineMs)) {
+    return false;
+  }
+  if (normalizeNumber(a.noiseWarmupFrames) !== normalizeNumber(b.noiseWarmupFrames)) {
+    return false;
+  }
+  if (normalizeNumber(a.noiseBackoffPadding) !== normalizeNumber(b.noiseBackoffPadding)) {
+    return false;
+  }
+
+  return lightHoursEqual(a.normalHours, b.normalHours);
+}
+
+function lightHoursEqual(
+  a?: Array<{ start: number; end: number }> | null,
+  b?: Array<{ start: number; end: number }> | null
+) {
+  if (!a && !b) {
+    return true;
+  }
+
+  if (!a || !b) {
+    return false;
+  }
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  return a.every((range, index) => {
+    const other = b[index];
+    return range.start === other.start && range.end === other.end;
+  });
 }
 
 function pickGuardConfig(config: GuardianConfig): GuardConfig {

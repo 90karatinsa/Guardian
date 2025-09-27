@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { EventBus } from '../src/eventBus.js';
 import metrics, { MetricsRegistry } from '../src/metrics/index.js';
 import { collectHealthChecks, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
-import logger, { getLogLevel, setLogLevel } from '../src/logger.js';
+import logger, { getLogLevel, getLogLevelMetrics, setLogLevel } from '../src/logger.js';
 
 function createBus() {
   const metrics = {
@@ -266,10 +266,69 @@ describe('MetricsCounters', () => {
       expect(snapshot.logs.byDetector.pose.error).toBe(1);
       expect(snapshot.logs.histogram.trace).toBeGreaterThan(0);
       expect(snapshot.logs.histogram.error).toBeGreaterThan(0);
+      const exported = getLogLevelMetrics();
+      expect(exported.byLevel.error).toBe(1);
+      expect(exported.histogram.error).toBeGreaterThan(0);
+      expect(exported.byDetector.pose.error).toBe(1);
+      expect(exported.lastErrorMessage).toBe('error baseline');
+      expect(exported.lastErrorAt).toMatch(/T/);
     } finally {
       setLogLevel(defaultLevel);
       metrics.reset();
     }
+  });
+
+  it('MetricsLogLevelCounters exports aggregated log level context', () => {
+    const registry = new MetricsRegistry();
+    registry.incrementLogLevel('INFO');
+    registry.incrementLogLevel('warn', { detector: 'motion' });
+    registry.incrementLogLevel('error', { detector: 'motion', message: 'pipeline failed' });
+
+    const exported = registry.exportLogLevelMetrics();
+    expect(exported.byLevel.info).toBe(1);
+    expect(exported.byLevel.warn).toBe(1);
+    expect(exported.byLevel.error).toBe(1);
+    expect(exported.histogram.warn).toBe(1);
+    expect(exported.histogram.error).toBe(1);
+    expect(exported.byDetector.motion.warn).toBe(1);
+    expect(exported.byDetector.motion.error).toBe(1);
+    expect(exported.lastErrorMessage).toBe('pipeline failed');
+    expect(exported.lastErrorAt).toMatch(/T/);
+  });
+
+  it('MetricsHistogramBuckets exports pipeline watchdog counters and detector latency histograms', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      delayMs: 500,
+      jitterMs: 50,
+      channel: 'video:yard'
+    });
+    registry.recordPipelineRestart('ffmpeg', 'spawn-error', { delayMs: 100 });
+    registry.recordPipelineRestart('audio', 'watchdog-timeout', {
+      delayMs: 250,
+      channel: 'audio:lobby'
+    });
+
+    registry.observeDetectorLatency('motion', 45);
+    registry.observeDetectorLatency('motion', 120);
+
+    const watchdogCounters = registry.exportPipelineWatchdogCounters();
+    expect(watchdogCounters.ffmpeg.total).toBe(1);
+    expect(watchdogCounters.ffmpeg.backoffMs).toBe(500);
+    expect(watchdogCounters.ffmpeg.byChannel['video:yard']).toBe(1);
+    expect(watchdogCounters.ffmpeg.backoffByChannel['video:yard']).toBe(500);
+    expect(watchdogCounters.audio.total).toBe(1);
+    expect(watchdogCounters.audio.backoffMs).toBe(250);
+    expect(watchdogCounters.audio.byChannel['audio:lobby']).toBe(1);
+
+    const prom = registry.exportDetectorLatencyHistogram('motion', {
+      metricName: 'guardian_motion_latency_ms',
+      labels: { detector: 'motion' }
+    });
+    expect(prom).toContain('guardian_motion_latency_ms_bucket');
+    expect(prom).toMatch(/detector="motion"/);
+    expect(prom).toMatch(/_count/);
   });
 });
 

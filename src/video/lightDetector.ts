@@ -21,6 +21,8 @@ export interface LightDetectorOptions {
   noiseMultiplier?: number;
   noiseSmoothing?: number;
   idleRebaselineMs?: number;
+  noiseWarmupFrames?: number;
+  noiseBackoffPadding?: number;
 }
 
 const DEFAULT_DELTA_THRESHOLD = 30;
@@ -50,48 +52,77 @@ export class LightDetector {
   private readonly deltaWindow: number[] = [];
   private sustainedNoiseBoost = 1;
   private lastDenoiseStrategy = 'gaussian-median';
+  private noiseWarmupRemaining: number;
+  private noiseBackoffPadding: number;
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
       ...options,
       normalHours: options.normalHours?.map(range => ({ ...range }))
     };
+    this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
+    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
   }
 
   updateOptions(options: Partial<Omit<LightDetectorOptions, 'source'>>) {
+    const previous = this.options;
     const next: LightDetectorOptions = {
-      ...this.options,
+      ...previous,
       ...options,
       normalHours: options.normalHours
         ? options.normalHours.map(range => ({ ...range }))
-        : this.options.normalHours
+        : previous.normalHours
     };
 
+    const hasOptionChanged = <K extends keyof Omit<LightDetectorOptions, 'source'>>(key: K) => {
+      if (!Object.prototype.hasOwnProperty.call(options, key)) {
+        return false;
+      }
+      return next[key] !== previous[key];
+    };
+
+    const normalHoursChanged =
+      Object.prototype.hasOwnProperty.call(options, 'normalHours') &&
+      !lightHoursEqual(previous.normalHours, options.normalHours);
+
     const baselineResetNeeded =
-      (typeof options.deltaThreshold === 'number' &&
-        options.deltaThreshold !== this.options.deltaThreshold) ||
-      (typeof options.smoothingFactor === 'number' &&
-        options.smoothingFactor !== this.options.smoothingFactor) ||
-      (typeof options.noiseMultiplier === 'number' &&
-        options.noiseMultiplier !== this.options.noiseMultiplier) ||
-      (typeof options.noiseSmoothing === 'number' &&
-        options.noiseSmoothing !== this.options.noiseSmoothing) ||
-      (options.normalHours !== undefined &&
-        !lightHoursEqual(this.options.normalHours, options.normalHours));
+      hasOptionChanged('deltaThreshold') ||
+      hasOptionChanged('smoothingFactor') ||
+      hasOptionChanged('noiseMultiplier') ||
+      hasOptionChanged('noiseSmoothing') ||
+      normalHoursChanged;
+
+    const warmupChanged = hasOptionChanged('noiseWarmupFrames');
+    const backoffPaddingChanged = hasOptionChanged('noiseBackoffPadding');
 
     const countersResetNeeded =
       baselineResetNeeded ||
-      (typeof options.debounceFrames === 'number' &&
-        options.debounceFrames !== this.options.debounceFrames) ||
-      (typeof options.backoffFrames === 'number' &&
-        options.backoffFrames !== this.options.backoffFrames);
+      hasOptionChanged('debounceFrames') ||
+      hasOptionChanged('backoffFrames') ||
+      warmupChanged ||
+      backoffPaddingChanged;
 
     this.options = next;
 
+    if (warmupChanged) {
+      this.noiseWarmupRemaining = Math.max(0, next.noiseWarmupFrames ?? 0);
+    }
+
+    if (backoffPaddingChanged) {
+      this.noiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
+      const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
+      const paddedBackoff = baseBackoff + this.noiseBackoffPadding;
+      this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
+    }
+
     if (baselineResetNeeded) {
-      this.resetAdaptiveState(false);
+      this.resetAdaptiveState({ preserveBaseline: false, preserveWarmup: !warmupChanged });
     } else if (countersResetNeeded) {
-      this.resetAdaptiveState(true, true);
+      this.resetAdaptiveState({
+        preserveBaseline: true,
+        preserveSuppression: true,
+        preserveWarmup: !warmupChanged
+      });
     }
   }
 
@@ -105,7 +136,7 @@ export class LightDetector {
         idleRebaselineMs > 0 &&
         ts - previousFrameTs >= idleRebaselineMs
       ) {
-        this.resetAdaptiveState(false);
+        this.resetAdaptiveState({ preserveBaseline: false });
         metrics.resetDetectorCounters('light', [
           'suppressedFrames',
           'suppressedFramesBeforeTrigger',
@@ -255,13 +286,31 @@ export class LightDetector {
         1,
         3
       );
-      const effectiveBackoff = Math.max(
+      const dynamicBackoff = Math.max(
         baseBackoff,
         Math.round(baseBackoff * backoffMultiplier * Math.max(1, this.sustainedNoiseBoost * 1.05))
       );
+      const effectiveBackoff = dynamicBackoff + this.noiseBackoffPadding;
 
       metrics.setDetectorGauge('light', 'effectiveDebounceFrames', effectiveDebounce);
       metrics.setDetectorGauge('light', 'effectiveBackoffFrames', effectiveBackoff);
+      metrics.setDetectorGauge('light', 'noiseBackoffPadding', this.noiseBackoffPadding);
+
+      if (this.noiseWarmupRemaining > 0) {
+        this.noiseWarmupRemaining -= 1;
+        metrics.setDetectorGauge('light', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+        this.updateBaseline(luminance, effectiveSmoothing);
+        if (this.backoffFrames > 0) {
+          this.backoffFrames = Math.max(0, this.backoffFrames - 1);
+        }
+        this.noiseLevel = updatedNoiseFloor;
+        this.pendingFrames = 0;
+        this.suppressedFrames += 1;
+        metrics.incrementDetectorCounter('light', 'suppressedFrames', 1);
+        return;
+      }
+
+      metrics.setDetectorGauge('light', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
 
       if (this.isWithinNormalHours(ts)) {
         this.updateBaseline(luminance, effectiveSmoothing);
@@ -369,7 +418,9 @@ export class LightDetector {
           debounceMultiplier,
           backoffMultiplier,
           suppressedFramesBeforeTrigger,
-          denoiseStrategy: this.lastDenoiseStrategy
+          denoiseStrategy: this.lastDenoiseStrategy,
+          noiseWarmupRemaining: this.noiseWarmupRemaining,
+          noiseBackoffPadding: this.noiseBackoffPadding
         }
       };
 
@@ -387,7 +438,13 @@ export class LightDetector {
     this.baseline = this.baseline * (1 - smoothing) + luminance * smoothing;
   }
 
-  private resetAdaptiveState(preserveBaseline: boolean, preserveSuppression = false) {
+  private resetAdaptiveState(
+    options: { preserveBaseline?: boolean; preserveSuppression?: boolean; preserveWarmup?: boolean } = {}
+  ) {
+    const preserveBaseline = options.preserveBaseline ?? false;
+    const preserveSuppression = options.preserveSuppression ?? false;
+    const preserveWarmup = options.preserveWarmup ?? false;
+
     if (!preserveBaseline) {
       this.baseline = null;
       this.lastFrameTs = null;
@@ -404,6 +461,10 @@ export class LightDetector {
     }
     this.deltaTrend = 0;
     this.lastDenoiseStrategy = 'gaussian-median';
+    if (!preserveWarmup) {
+      this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
+    }
+    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
   }
 
   private isWithinNormalHours(ts: number) {

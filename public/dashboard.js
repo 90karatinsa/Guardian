@@ -5,6 +5,9 @@ const previewEmpty = document.getElementById('preview-empty');
 const previewFigure = document.getElementById('preview-figure');
 const previewImage = document.getElementById('preview-image');
 const previewCaption = document.getElementById('preview-caption');
+const previewCaptionText = document.getElementById('preview-caption-text');
+const previewFaceImage = document.getElementById('preview-face-image');
+const previewFaceCaption = document.getElementById('preview-face-caption');
 const streamState = document.getElementById('stream-state');
 const streamHeartbeats = document.getElementById('stream-heartbeats');
 const streamEvents = document.getElementById('stream-events');
@@ -28,6 +31,15 @@ if (previewImage) {
   });
   previewImage.addEventListener('error', () => {
     previewImage.dataset.state = 'error';
+  });
+}
+
+if (previewFaceImage) {
+  previewFaceImage.addEventListener('load', () => {
+    previewFaceImage.dataset.state = 'loaded';
+  });
+  previewFaceImage.addEventListener('error', () => {
+    previewFaceImage.dataset.state = 'error';
   });
 }
 
@@ -293,12 +305,21 @@ function setActiveEvent(eventKey) {
 function showPreview(event) {
   const timestamp = new Date(event.ts).toLocaleString();
   const description = `${event.detector} · ${event.source}`;
-  previewCaption.textContent = `${description} — ${timestamp}`;
+  const captionValue = `${description} — ${timestamp}`;
+  if (previewCaptionText) {
+    previewCaptionText.textContent = captionValue;
+  } else if (previewCaption) {
+    previewCaption.textContent = captionValue;
+  }
 
   const meta = event.meta ?? {};
   const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : null;
   const snapshotUrl = typeof meta.snapshotUrl === 'string' ? meta.snapshotUrl : null;
   const faceSnapshotUrl = typeof meta.faceSnapshotUrl === 'string' ? meta.faceSnapshotUrl : null;
+  const faceSnapshotMeta =
+    typeof (meta.faceSnapshot ?? meta.face?.snapshot) === 'string'
+      ? (meta.faceSnapshot ?? meta.face?.snapshot)
+      : null;
 
   let resolvedUrl = snapshotUrl;
   if (!resolvedUrl && typeof event.id === 'number' && snapshotPath) {
@@ -307,17 +328,55 @@ function showPreview(event) {
     resolvedUrl = snapshotPath;
   }
 
-  if (!resolvedUrl && faceSnapshotUrl) {
-    resolvedUrl = faceSnapshotUrl;
+  let resolvedFaceUrl = faceSnapshotUrl;
+  if (!resolvedFaceUrl && typeof event.id === 'number' && typeof faceSnapshotMeta === 'string') {
+    resolvedFaceUrl = `/api/events/${event.id}/face-snapshot`;
+  } else if (!resolvedFaceUrl && typeof faceSnapshotMeta === 'string') {
+    resolvedFaceUrl = faceSnapshotMeta;
   }
 
-  if (resolvedUrl) {
-    const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
-    const separator = resolvedUrl.includes('?') ? '&' : '?';
-    previewImage.src = `${resolvedUrl}${separator}cacheBust=${cacheKey}`;
-    previewImage.dataset.channel = getEventChannel(event) || '';
-    previewImage.dataset.state = 'loading';
-    previewImage.alt = `Snapshot for ${description}`;
+  const hasMain = Boolean(resolvedUrl);
+  const hasFace = Boolean(resolvedFaceUrl);
+
+  if (previewImage) {
+    if (hasMain && resolvedUrl) {
+      const cacheKey = encodeURIComponent(buildSnapshotCacheKey(event));
+      const separator = resolvedUrl.includes('?') ? '&' : '?';
+      previewImage.hidden = false;
+      previewImage.src = `${resolvedUrl}${separator}cacheBust=${cacheKey}`;
+      previewImage.dataset.channel = getEventChannel(event) || '';
+      previewImage.dataset.state = 'loading';
+      previewImage.alt = `Snapshot for ${description}`;
+    } else {
+      previewImage.hidden = true;
+      previewImage.dataset.channel = '';
+      previewImage.dataset.state = 'idle';
+      previewImage.removeAttribute('src');
+    }
+  }
+
+  if (previewFaceImage) {
+    if (hasFace && resolvedFaceUrl) {
+      const cacheKey = encodeURIComponent(`${buildSnapshotCacheKey(event)}-face`);
+      const separator = resolvedFaceUrl.includes('?') ? '&' : '?';
+      previewFaceImage.hidden = false;
+      previewFaceImage.src = `${resolvedFaceUrl}${separator}cacheBust=${cacheKey}`;
+      previewFaceImage.dataset.channel = getEventChannel(event) || '';
+      previewFaceImage.dataset.state = 'loading';
+      previewFaceImage.alt = `Face snapshot for ${description}`;
+    } else {
+      previewFaceImage.hidden = true;
+      previewFaceImage.dataset.state = 'idle';
+      previewFaceImage.dataset.channel = '';
+      previewFaceImage.removeAttribute('src');
+    }
+  }
+
+  if (previewFaceCaption) {
+    previewFaceCaption.textContent = hasFace ? 'Face snapshot available' : '';
+  }
+
+  if (hasMain || hasFace) {
     previewFigure.hidden = false;
     previewEmpty.hidden = true;
   } else {
@@ -332,10 +391,25 @@ function clearPreview() {
   previewFigure.hidden = true;
   previewEmpty.hidden = false;
   previewEmpty.textContent = 'Select an event to view the latest snapshot.';
+  if (previewCaptionText) {
+    previewCaptionText.textContent = '';
+  } else if (previewCaption) {
+    previewCaption.textContent = '';
+  }
   if (previewImage) {
     previewImage.dataset.channel = '';
     previewImage.dataset.state = 'idle';
     previewImage.removeAttribute('src');
+    previewImage.hidden = true;
+  }
+  if (previewFaceImage) {
+    previewFaceImage.hidden = true;
+    previewFaceImage.dataset.state = 'idle';
+    previewFaceImage.dataset.channel = '';
+    previewFaceImage.removeAttribute('src');
+  }
+  if (previewFaceCaption) {
+    previewFaceCaption.textContent = '';
   }
 }
 

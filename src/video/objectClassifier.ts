@@ -125,11 +125,7 @@ export class ObjectClassifier {
       }
 
       const label = labels[bestIndex] ?? `class-${bestIndex}`;
-      const detectionConfidence = clamp(
-        Math.max(0, Math.min(1, detection.score), Math.min(1, detection.objectness ?? 0), Math.min(1, detection.classProbability)),
-        0,
-        1
-      );
+      const detectionConfidence = clamp(detection.score, 0, 1);
       const threatProbability = this.resolveThreatProbability(label, probabilityMap);
       const threatScore = clamp(threatProbability * detectionConfidence, 0, 1);
       const isThreat = threatScore >= this.threatThreshold;

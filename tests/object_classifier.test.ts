@@ -188,6 +188,54 @@ describe('ObjectThreatProbabilityFusion', () => {
     expect((meta.threat as Record<string, unknown>).label).toBe('threat');
     expect((meta.threat as Record<string, unknown>).confidence).toBe(threatObject?.confidence);
   });
+
+  it('ObjectClassifierThreatBlend respects detection confidence bounds', async () => {
+    const logits = new Float32Array([0.5, 1.2, 2.8]);
+    const detectionRun = vi.fn(async () => ({
+      output0: {
+        data: new Float32Array(),
+        dims: [1, YOLO_CLASS_START_INDEX + 1, 1]
+      }
+    }));
+    const classifierRun = vi.fn(async () => ({
+      logits: new Tensor('float32', logits, [1, 3])
+    }));
+
+    setRunMock('models/yolov8n.onnx', detectionRun);
+    setRunMock('models/object.onnx', classifierRun);
+
+    const classifier = await ObjectClassifier.create({
+      modelPath: 'models/object.onnx',
+      labels: ['package', 'pet', 'threat'],
+      threatLabels: ['threat'],
+      threatThreshold: 0.4
+    });
+
+    const detection = {
+      score: 0.55,
+      classId: 0,
+      bbox: { left: 100, top: 120, width: 200, height: 260 },
+      objectness: 0.94,
+      classProbability: 0.9,
+      areaRatio: 0.08,
+      combinedLogit: 0,
+      appliedThreshold: 0.3
+    } satisfies import('../src/video/yoloParser.js').YoloDetection;
+
+    const results = await classifier.classify([detection]);
+    expect(results).toHaveLength(1);
+    const object = results[0];
+
+    const max = Math.max(...logits);
+    const expValues = logits.map(value => Math.exp(value - max));
+    const sum = expValues.reduce((acc, value) => acc + value, 0);
+    const probabilities = expValues.map(value => value / sum);
+    const threatProbability = probabilities[2];
+    const expected = detection.score * threatProbability;
+
+    expect(object.threatScore).toBeCloseTo(expected, 5);
+    expect(object.threatScore).toBeLessThanOrEqual(detection.score);
+  });
 });
 
 function setDetection(

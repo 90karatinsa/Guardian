@@ -122,6 +122,11 @@ class EventBus extends EventEmitter {
         primary && typeof primary.windowExpiresAt === 'number'
           ? Math.max(0, primary.windowExpiresAt - normalized.ts)
           : undefined;
+      const primaryCooldownEndsAt =
+        primary && typeof primary.cooldownMs === 'number'
+          ? normalized.ts + primary.cooldownMs
+          : undefined;
+      const primaryWindowEndsAt = primary?.windowExpiresAt;
       const primaryCooldownRemainingMs =
         primary && typeof primary.cooldownMs === 'number'
           ? Math.max(
@@ -148,6 +153,12 @@ class EventBus extends EventEmitter {
                   : hit.cooldownMs
               )
             : undefined;
+        const cooldownExpiresAt =
+          typeof cooldownRemainingMs === 'number'
+            ? normalized.ts + cooldownRemainingMs
+            : typeof hit.cooldownMs === 'number'
+            ? normalized.ts + hit.cooldownMs
+            : undefined;
         return {
           ruleId: hit.rule.id,
           reason: hit.reason,
@@ -163,7 +174,8 @@ class EventBus extends EventEmitter {
           channel: hit.channel ?? undefined,
           channels: [...eventChannels],
           windowRemainingMs,
-          cooldownRemainingMs
+          cooldownRemainingMs,
+          cooldownExpiresAt
         };
       });
       suppressedBy.forEach((suppressedMeta, index) => {
@@ -235,9 +247,14 @@ class EventBus extends EventEmitter {
         suppressionType: primary?.type,
         suppressionRuleId: primary?.rule.id,
         suppressionWindowExpiresAt: primary?.windowExpiresAt,
+        suppressionWindowEndsAt: primaryWindowEndsAt,
         rateLimitWindowMs: primary?.rateLimit?.perMs,
         rateLimitCooldownMs: primary?.cooldownMs,
         rateLimitCooldownRemainingMs: primaryCooldownRemainingMs,
+        rateLimitCooldownEndsAt:
+          typeof primaryCooldownRemainingMs === 'number'
+            ? normalized.ts + primaryCooldownRemainingMs
+            : primaryCooldownEndsAt,
         suppressionHistory: combinedHistory,
         suppressionHistoryCount: combinedHistory.length,
         suppressedBy,
@@ -285,7 +302,8 @@ class EventBus extends EventEmitter {
           channel: hit.channel ?? undefined,
           channels: [...eventChannels],
           windowRemainingMs: suppressedMeta.windowRemainingMs,
-          cooldownRemainingMs: suppressedMeta.cooldownRemainingMs
+          cooldownRemainingMs: suppressedMeta.cooldownRemainingMs,
+          cooldownExpiresAt: suppressedMeta.cooldownExpiresAt
         };
         this.metrics.recordSuppressedEvent(detail);
       });

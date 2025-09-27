@@ -360,6 +360,110 @@ describe('YoloParser utilities', () => {
     expect(results[0].score).toBeGreaterThan(results[1].score ?? 0);
   });
 
+  it('YoloParserProjectionPriority suppresses duplicate person detections across projections', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      values.classProbabilities.forEach((prob, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit(prob);
+      });
+    };
+
+    assign(0, {
+      cx: 0.5,
+      cy: 0.5,
+      width: 0.32,
+      height: 0.45,
+      objectness: 0.82,
+      classProbabilities: [0.78, 0.28]
+    });
+
+    assign(1, {
+      cx: 381,
+      cy: 357,
+      width: 226,
+      height: 316,
+      objectness: 0.8,
+      classProbabilities: [0.75, 0.25]
+    });
+
+    assign(2, {
+      cx: 0.8,
+      cy: 0.4,
+      width: 0.1,
+      height: 0.12,
+      objectness: 0.7,
+      classProbabilities: [0.05, 0.82]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 1,
+      padX: 32,
+      padY: 24,
+      originalWidth: 1280,
+      originalHeight: 720,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 640 / 1280,
+      scaleY: 640 / 720,
+      normalized: true,
+      variants: [
+        {
+          padX: 64,
+          padY: 32,
+          originalWidth: 1280,
+          originalHeight: 720,
+          resizedWidth: 704,
+          resizedHeight: 704,
+          scaleX: 704 / 1280,
+          scaleY: 704 / 720,
+          normalized: false
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndex: 0,
+      classIndices: [0, 1],
+      scoreThreshold: 0.2,
+      nmsThreshold: 0.4,
+      maxDetections: 3
+    });
+
+    const personDetections = results.filter(result => result.classId === 0);
+    const packageDetections = results.filter(result => result.classId === 1);
+
+    expect(personDetections).toHaveLength(1);
+    expect(packageDetections.length).toBeGreaterThanOrEqual(1);
+    const person = personDetections[0]!;
+    expect(person.projectionIndex).toBe(0);
+    expect(person.normalizedProjection).toBe(true);
+    expect(person.bbox.width).toBeGreaterThan(300);
+    expect(person.bbox.width).toBeLessThan(500);
+    expect(person.priorityScore).toBeUndefined();
+  });
+
   it('YoloParserClampedBoxes clamps coordinates and applies class-specific thresholds', () => {
     const classCount = 2;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

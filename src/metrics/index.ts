@@ -23,6 +23,8 @@ type PipelineRestartMeta = {
   minDelayMs: number | null;
   maxDelayMs: number | null;
   jitterMs: number | null;
+  minJitterMs: number | null;
+  maxJitterMs: number | null;
   exitCode: number | null;
   errorCode: string | number | null;
   signal: NodeJS.Signals | null;
@@ -32,6 +34,7 @@ type PipelineRestartMeta = {
 
 type PipelineChannelSnapshot = {
   restarts: number;
+  watchdogRestarts: number;
   lastRestartAt: string | null;
   byReason: CounterMap;
   lastRestart: PipelineRestartMeta | null;
@@ -57,6 +60,8 @@ type PipelineRestartHistorySnapshot = {
   minDelayMs: number | null;
   maxDelayMs: number | null;
   jitterMs: number | null;
+  minJitterMs: number | null;
+  maxJitterMs: number | null;
   exitCode: number | null;
   errorCode: string | number | null;
   signal: NodeJS.Signals | null;
@@ -71,6 +76,7 @@ type PipelineSnapshot = PipelineChannelSnapshot & {
   delayHistogram: HistogramSnapshot;
   attemptHistogram: HistogramSnapshot;
   watchdogBackoffByChannel: Record<string, number>;
+  watchdogRestartsByChannel: Record<string, number>;
   lastWatchdogJitterMs: number | null;
   restartHistogram: {
     delay: HistogramSnapshot;
@@ -101,7 +107,9 @@ type SuppressionSnapshot = {
     channels?: string[] | null;
     windowExpiresAt?: string | null;
     windowRemainingMs?: number | null;
+    windowEndsAt?: string | null;
     cooldownRemainingMs?: number | null;
+    cooldownEndsAt?: string | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
   histogram: {
@@ -136,6 +144,7 @@ type SuppressionRuleSnapshot = {
     lastWindowExpiresAt: string | null;
     lastWindowRemainingMs: number | null;
     lastCooldownRemainingMs: number | null;
+    lastCooldownEndsAt: string | null;
   };
 };
 
@@ -154,6 +163,7 @@ type SuppressedEventMetric = {
   channels?: string[];
   windowRemainingMs?: number;
   cooldownRemainingMs?: number;
+  cooldownExpiresAt?: number;
 };
 
 type RetentionTotals = {
@@ -336,7 +346,9 @@ class MetricsRegistry {
     channels?: string[] | null;
     windowExpiresAt?: number | null;
     windowRemainingMs?: number | null;
+    windowEndsAt?: number | null;
     cooldownRemainingMs?: number | null;
+    cooldownEndsAt?: number | null;
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -579,6 +591,23 @@ class MetricsRegistry {
       Number.isFinite(normalizedDetail.cooldownRemainingMs)
         ? Math.max(0, normalizedDetail.cooldownRemainingMs)
         : null;
+    const cooldownExpiresAtValue =
+      typeof normalizedDetail.cooldownExpiresAt === 'number' &&
+      Number.isFinite(normalizedDetail.cooldownExpiresAt)
+        ? normalizedDetail.cooldownExpiresAt
+        : null;
+    let effectiveCooldownEndsAt = cooldownExpiresAtValue;
+    if (
+      effectiveCooldownEndsAt === null &&
+      typeof windowExpiresAtValue === 'number' &&
+      typeof windowRemainingValue === 'number' &&
+      typeof cooldownRemainingValue === 'number'
+    ) {
+      const eventTs = windowExpiresAtValue - windowRemainingValue;
+      if (Number.isFinite(eventTs)) {
+        effectiveCooldownEndsAt = eventTs + cooldownRemainingValue;
+      }
+    }
     if (typeof cooldownValue === 'number') {
       this.observeHistogram('suppression.cooldownMs', cooldownValue);
     }
@@ -634,7 +663,9 @@ class MetricsRegistry {
       channels: channelList.length > 0 ? [...channelList] : null,
       windowExpiresAt: windowExpiresAtValue,
       windowRemainingMs: windowRemainingValue,
-      cooldownRemainingMs: cooldownRemainingValue
+      cooldownRemainingMs: cooldownRemainingValue,
+      windowEndsAt: windowExpiresAtValue,
+      cooldownEndsAt: effectiveCooldownEndsAt
     };
     if (ruleId) {
       this.suppressionByRule.set(ruleId, (this.suppressionByRule.get(ruleId) ?? 0) + 1);
@@ -654,7 +685,8 @@ class MetricsRegistry {
         lastChannels: null,
         lastWindowExpiresAt: null,
         lastWindowRemainingMs: null,
-        lastCooldownRemainingMs: null
+        lastCooldownRemainingMs: null,
+        lastCooldownEndsAt: null
       };
       ruleState.total += 1;
       if (reason) {
@@ -693,6 +725,7 @@ class MetricsRegistry {
       ruleState.lastWindowExpiresAt = windowExpiresAtValue;
       ruleState.lastWindowRemainingMs = windowRemainingValue;
       ruleState.lastCooldownRemainingMs = cooldownRemainingValue;
+      ruleState.lastCooldownEndsAt = effectiveCooldownEndsAt;
       this.suppressionRules.set(ruleId, ruleState);
     }
   }
@@ -804,6 +837,8 @@ class MetricsRegistry {
       minDelayMs?: number;
       maxDelayMs?: number;
       jitterMs?: number;
+      minJitterMs?: number;
+      maxJitterMs?: number;
       channel?: string;
       exitCode?: number | null;
       errorCode?: string | number | null;
@@ -827,6 +862,8 @@ class MetricsRegistry {
         minDelayMs: typeof meta?.minDelayMs === 'number' ? meta?.minDelayMs : null,
         maxDelayMs: typeof meta?.maxDelayMs === 'number' ? meta?.maxDelayMs : null,
         jitterMs: typeof meta?.jitterMs === 'number' ? meta?.jitterMs : null,
+        minJitterMs: typeof meta?.minJitterMs === 'number' ? meta?.minJitterMs : null,
+        maxJitterMs: typeof meta?.maxJitterMs === 'number' ? meta?.maxJitterMs : null,
         exitCode: typeof meta?.exitCode === 'number' ? meta?.exitCode : null,
         errorCode:
           typeof meta?.errorCode === 'string' || typeof meta?.errorCode === 'number'
@@ -863,6 +900,8 @@ class MetricsRegistry {
         minDelayMs: typeof meta?.minDelayMs === 'number' ? meta?.minDelayMs : null,
         maxDelayMs: typeof meta?.maxDelayMs === 'number' ? meta?.maxDelayMs : null,
         jitterMs: typeof meta?.jitterMs === 'number' ? meta?.jitterMs : null,
+        minJitterMs: typeof meta?.minJitterMs === 'number' ? meta?.minJitterMs : null,
+        maxJitterMs: typeof meta?.maxJitterMs === 'number' ? meta?.maxJitterMs : null,
         exitCode: typeof meta?.exitCode === 'number' ? meta?.exitCode : null,
         errorCode:
           typeof meta?.errorCode === 'string' || typeof meta?.errorCode === 'number'
@@ -969,6 +1008,38 @@ class MetricsRegistry {
     return formatPrometheusHistogram(metric, histogram, histogramConfig, stats, options);
   }
 
+  exportLogLevelMetrics() {
+    return {
+      byLevel: mapLogLevelCounters(this.logLevelCounters),
+      byDetector: mapFromNested(this.logLevelByDetector),
+      histogram: mapLogLevelCounters(this.logLevelHistogram),
+      lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
+      lastErrorMessage: this.lastErrorMessage
+    };
+  }
+
+  exportPipelineWatchdogCounters() {
+    const project = (state: PipelineChannelState, channels: Map<string, PipelineChannelState>) => ({
+      total: state.watchdogRestarts,
+      backoffMs: state.totalWatchdogBackoffMs,
+      lastJitterMs: state.lastWatchdogJitterMs,
+      byChannel: mapWatchdogRestartsByChannel(channels),
+      backoffByChannel: mapWatchdogBackoffByChannel(channels)
+    });
+
+    return {
+      ffmpeg: project(this.ffmpegRestartState, this.ffmpegRestartsByChannel),
+      audio: project(this.audioRestartState, this.audioRestartsByChannel)
+    };
+  }
+
+  exportDetectorLatencyHistogram(
+    detector: string,
+    options: PrometheusHistogramOptions = {}
+  ): string {
+    return this.exportHistogramForPrometheus(`detector.${detector}.latency`, options);
+  }
+
   observeDetectorLatency(detector: string, durationMs: number) {
     const state = getDetectorMetricState(this.detectorMetrics, detector);
     state.lastRunAt = Date.now();
@@ -1060,9 +1131,17 @@ class MetricsRegistry {
             typeof this.lastSuppressedEvent.windowRemainingMs === 'number'
               ? this.lastSuppressedEvent.windowRemainingMs
               : null,
+          windowEndsAt:
+            typeof this.lastSuppressedEvent.windowEndsAt === 'number'
+              ? new Date(this.lastSuppressedEvent.windowEndsAt).toISOString()
+              : null,
           cooldownRemainingMs:
             typeof this.lastSuppressedEvent.cooldownRemainingMs === 'number'
               ? this.lastSuppressedEvent.cooldownRemainingMs
+              : null,
+          cooldownEndsAt:
+            typeof this.lastSuppressedEvent.cooldownEndsAt === 'number'
+              ? new Date(this.lastSuppressedEvent.cooldownEndsAt).toISOString()
               : null
         }
       : null;
@@ -1110,6 +1189,7 @@ class MetricsRegistry {
       pipelines: {
         ffmpeg: {
           restarts: this.ffmpegRestarts,
+          watchdogRestarts: this.ffmpegRestartState.watchdogRestarts,
           lastRestartAt: this.lastFfmpegRestartAt ? new Date(this.lastFfmpegRestartAt).toISOString() : null,
           byReason: mapFrom(this.ffmpegRestartReasons),
           lastRestart: this.lastFfmpegRestartMeta,
@@ -1126,6 +1206,7 @@ class MetricsRegistry {
           attempts: mapFrom(this.ffmpegRestartAttempts),
           byChannel: ffmpegByChannel,
           watchdogBackoffByChannel: mapWatchdogBackoffByChannel(this.ffmpegRestartsByChannel),
+          watchdogRestartsByChannel: mapWatchdogRestartsByChannel(this.ffmpegRestartsByChannel),
           deviceDiscovery: {},
           deviceDiscoveryByChannel: {},
           delayHistogram: ffmpegDelaySnapshot,
@@ -1137,6 +1218,7 @@ class MetricsRegistry {
         },
         audio: {
           restarts: this.audioRestarts,
+          watchdogRestarts: this.audioRestartState.watchdogRestarts,
           lastRestartAt: this.lastAudioRestartAt ? new Date(this.lastAudioRestartAt).toISOString() : null,
           byReason: mapFrom(this.audioRestartReasons),
           lastRestart: this.lastAudioRestartMeta,
@@ -1153,6 +1235,7 @@ class MetricsRegistry {
           attempts: mapFrom(this.audioRestartAttempts),
           byChannel: audioByChannel,
           watchdogBackoffByChannel: mapWatchdogBackoffByChannel(this.audioRestartsByChannel),
+          watchdogRestartsByChannel: mapWatchdogRestartsByChannel(this.audioRestartsByChannel),
           deviceDiscovery: mapFrom(this.audioDeviceDiscovery),
           deviceDiscoveryByChannel: mapFromNested(this.audioDeviceDiscoveryByChannel),
           delayHistogram: audioDelaySnapshot,
@@ -1193,6 +1276,7 @@ class MetricsRegistry {
 
 type PipelineChannelState = {
   restarts: number;
+  watchdogRestarts: number;
   lastRestartAt: number | null;
   byReason: Map<string, number>;
   lastRestart: PipelineRestartMeta | null;
@@ -1214,6 +1298,8 @@ type PipelineRestartHistoryRecord = {
   minDelayMs: number | null;
   maxDelayMs: number | null;
   jitterMs: number | null;
+  minJitterMs: number | null;
+  maxJitterMs: number | null;
   exitCode: number | null;
   errorCode: string | number | null;
   signal: NodeJS.Signals | null;
@@ -1229,6 +1315,8 @@ function mapHistory(entries: PipelineRestartHistoryRecord[]): PipelineRestartHis
     minDelayMs: entry.minDelayMs,
     maxDelayMs: entry.maxDelayMs,
     jitterMs: entry.jitterMs,
+    minJitterMs: entry.minJitterMs,
+    maxJitterMs: entry.maxJitterMs,
     exitCode: entry.exitCode,
     errorCode: entry.errorCode,
     signal: entry.signal,
@@ -1253,6 +1341,7 @@ type SuppressionRuleState = {
   lastWindowExpiresAt: number | null;
   lastWindowRemainingMs: number | null;
   lastCooldownRemainingMs: number | null;
+  lastCooldownEndsAt: number | null;
 };
 
 type DetectorMetricState = {
@@ -1335,6 +1424,7 @@ function mapFromPipelineChannels(source: Map<string, PipelineChannelState>): Rec
   for (const [channel, state] of ordered) {
     result[channel] = {
       restarts: state.restarts,
+      watchdogRestarts: state.watchdogRestarts,
       lastRestartAt: state.lastRestartAt ? new Date(state.lastRestartAt).toISOString() : null,
       byReason: mapFrom(state.byReason),
       lastRestart: state.lastRestart,
@@ -1496,6 +1586,17 @@ function mapWatchdogBackoffByChannel(
   return result;
 }
 
+function mapWatchdogRestartsByChannel(
+  source: Map<string, PipelineChannelState>
+): Record<string, number> {
+  const result: Record<string, number> = {};
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [channel, state] of ordered) {
+    result[channel] = state.watchdogRestarts;
+  }
+  return result;
+}
+
 function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Record<string, SuppressionRuleSnapshot> {
   const result: Record<string, SuppressionRuleSnapshot> = {};
   const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
@@ -1523,6 +1624,11 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
           typeof state.lastWindowRemainingMs === 'number' ? state.lastWindowRemainingMs : null,
         lastCooldownRemainingMs:
           typeof state.lastCooldownRemainingMs === 'number' ? state.lastCooldownRemainingMs : null
+        ,
+        lastCooldownEndsAt:
+          typeof state.lastCooldownEndsAt === 'number'
+            ? new Date(state.lastCooldownEndsAt).toISOString()
+            : null
       }
     };
   }
@@ -1576,6 +1682,7 @@ function mapFromDetectors(source: Map<string, DetectorMetricState>): Record<stri
 function createPipelineChannelState(): PipelineChannelState {
   return {
     restarts: 0,
+    watchdogRestarts: 0,
     lastRestartAt: null,
     byReason: new Map<string, number>(),
     lastRestart: null,
@@ -1595,6 +1702,7 @@ function createPipelineChannelState(): PipelineChannelState {
 
 function resetPipelineChannelState(state: PipelineChannelState) {
   state.restarts = 0;
+  state.watchdogRestarts = 0;
   state.lastRestartAt = null;
   state.byReason.clear();
   state.lastRestart = null;
@@ -1627,6 +1735,9 @@ function updatePipelineChannelState(
   occurredAt: number
 ) {
   state.restarts += 1;
+  if (reason === 'watchdog-timeout') {
+    state.watchdogRestarts += 1;
+  }
   state.lastRestartAt = occurredAt;
   state.byReason.set(reason, (state.byReason.get(reason) ?? 0) + 1);
   state.lastRestart = meta;
@@ -1667,6 +1778,8 @@ function updatePipelineChannelState(
     minDelayMs: meta.minDelayMs,
     maxDelayMs: meta.maxDelayMs,
     jitterMs: meta.jitterMs,
+    minJitterMs: meta.minJitterMs,
+    maxJitterMs: meta.maxJitterMs,
     exitCode: meta.exitCode,
     errorCode: meta.errorCode,
     signal: meta.signal,

@@ -79,7 +79,8 @@ describe('EventSuppressionRateLimit', () => {
       type: 'rate-limit',
       historyCount: 3,
       combinedHistoryCount: 3,
-      cooldownMs: 800
+      cooldownMs: 800,
+      cooldownExpiresAt: expect.any(Number)
     });
     expect(metricArgs[1]).toMatchObject({ type: 'window', ruleId: 'channel-limit' });
   });
@@ -163,6 +164,9 @@ describe('EventSuppressionRateLimit', () => {
     const secondSuppression = suppressionCalls[1];
     expect(firstSuppression.suppressionChannel).toBe('cam:a');
     expect(firstSuppression.suppressedBy?.[0]?.channel).toBe('cam:a');
+    expect(firstSuppression.suppressionWindowEndsAt).toBe(1000);
+    expect(firstSuppression.rateLimitCooldownEndsAt).toBe(1000);
+    expect(firstSuppression.suppressedBy?.[0]?.cooldownExpiresAt).toBe(1000);
     expect(Number(firstSuppression.cooldownRemainingMs ?? 0)).toBeLessThanOrEqual(800);
     expect(secondSuppression.suppressionChannel).toBe('cam:a');
     expect(secondSuppression.suppressedBy?.[0]?.channel).toBe('cam:a');
@@ -170,11 +174,15 @@ describe('EventSuppressionRateLimit', () => {
     expect(Number(secondSuppression.cooldownRemainingMs ?? 0)).toBeLessThan(
       Number(firstSuppression.cooldownRemainingMs ?? Infinity)
     );
+    expect(secondSuppression.rateLimitCooldownEndsAt).toBe(1000);
+    expect(secondSuppression.suppressedBy?.[0]?.cooldownExpiresAt).toBeDefined();
 
     const snapshot = metrics.snapshot();
     expect(snapshot.suppression.lastEvent?.channel).toBe('cam:a');
     expect(Number(snapshot.suppression.lastEvent?.cooldownRemainingMs ?? 0)).toBeLessThanOrEqual(800);
     expect(Number(snapshot.suppression.lastEvent?.cooldownRemainingMs ?? 0)).toBeGreaterThanOrEqual(0);
+    expect(snapshot.suppression.lastEvent?.windowEndsAt).toBeDefined();
+    expect(snapshot.suppression.lastEvent?.cooldownEndsAt).toMatch(/T/);
   });
 
   it('EventSuppressionChannelRateLimit exposes per-channel window metadata', () => {
@@ -251,6 +259,41 @@ describe('EventSuppressionRateLimit', () => {
     expect(Object.values(channelHist.cooldownMs['cam:a'])).not.toHaveLength(0);
     expect(channelHist.windowRemainingMs['cam:b']).toBeDefined();
     expect(Object.values(channelHist.windowRemainingMs['cam:b'])).not.toHaveLength(0);
+  });
+
+  it('EventSuppressionMetricsSnapshot exposes cooldown endpoints and history', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'window-limit',
+        detector: 'test-detector',
+        rateLimit: { count: 1, perMs: 500, cooldownMs: 900 },
+        suppressForMs: 600,
+        reason: 'window limit'
+      }
+    ]);
+
+    metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:z' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:z' } });
+
+    const snapshot = metrics.snapshot();
+    const lastEvent = snapshot.suppression.lastEvent;
+    expect(lastEvent?.cooldownEndsAt).toBeTruthy();
+    expect(lastEvent?.windowEndsAt).toBeTruthy();
+    const cooldownEndsAtTs = lastEvent?.cooldownEndsAt
+      ? Date.parse(lastEvent.cooldownEndsAt)
+      : Number.NaN;
+    expect(Number.isFinite(cooldownEndsAtTs)).toBe(true);
+    const ruleHistory = snapshot.suppression.rules['window-limit'];
+    expect(ruleHistory).toBeDefined();
+    expect(ruleHistory.history.lastCooldownEndsAt).toBe(lastEvent?.cooldownEndsAt ?? null);
   });
 
   it('EventSuppressionMaxEvents enforces burst limits with history metadata', () => {

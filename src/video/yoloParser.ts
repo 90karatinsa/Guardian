@@ -38,6 +38,7 @@ export type YoloDetection = {
   appliedThreshold: number;
   projectionIndex?: number;
   normalizedProjection?: boolean;
+  priorityScore?: number;
 };
 
 export interface ParseYoloDetectionsOptions {
@@ -189,10 +190,30 @@ export function parseYoloDetections(
   }
 
   const filtered: YoloDetection[] = [];
+  const primaryClassId = resolvePrimaryClassId(options, classIndices, classPriority);
+  const prioritized: YoloDetection[] = [];
+
   for (const projectionGroup of perProjection.values()) {
-    for (const candidates of projectionGroup.values()) {
+    for (const [classId, candidates] of projectionGroup.entries()) {
+      if (primaryClassId !== null && classId === primaryClassId) {
+        for (const detection of candidates) {
+          detection.priorityScore = computeProjectionPriority(detection);
+          prioritized.push(detection);
+        }
+        continue;
+      }
       filtered.push(...nonMaxSuppression(candidates, nmsThreshold));
     }
+  }
+
+  if (prioritized.length > 0) {
+    const suppressed = nonMaxSuppression(prioritized, nmsThreshold);
+    for (const detection of suppressed) {
+      if ('priorityScore' in detection) {
+        delete detection.priorityScore;
+      }
+    }
+    filtered.push(...suppressed);
   }
 
   filtered.sort((a, b) => {
@@ -264,6 +285,40 @@ function buildClassPriority(
   });
 
   return priority;
+}
+
+function resolvePrimaryClassId(
+  options: ParseYoloDetectionsOptions,
+  indices: number[],
+  classPriority: Map<number, number>
+) {
+  if (typeof options.classIndex === 'number' && Number.isFinite(options.classIndex)) {
+    const normalized = Math.trunc(options.classIndex);
+    if (indices.includes(normalized)) {
+      return normalized;
+    }
+  }
+
+  let bestClass: number | null = null;
+  let bestPriority = Number.POSITIVE_INFINITY;
+  for (const classId of indices) {
+    const priority = classPriority.get(classId) ?? Number.POSITIVE_INFINITY;
+    if (priority < bestPriority) {
+      bestPriority = priority;
+      bestClass = classId;
+    }
+  }
+  return bestClass;
+}
+
+function computeProjectionPriority(detection: YoloDetection) {
+  const base = detection.score;
+  const normalizedBonus = detection.normalizedProjection ? 0.05 : 0;
+  const areaWeight = clamp(detection.areaRatio, 0, 1) * 0.05;
+  const projectionBias = typeof detection.projectionIndex === 'number'
+    ? Math.max(0, 1 - Math.min(detection.projectionIndex, 4) * 0.05)
+    : 0;
+  return clamp(base + normalizedBonus + areaWeight + projectionBias, 0, 1.5);
 }
 
 function createTensorAccessor(tensor: ort.OnnxValue): TensorAccessor | null {
@@ -538,7 +593,14 @@ function resolveScale(primary?: number, fallback?: number) {
 }
 
 function nonMaxSuppression(detections: YoloDetection[], threshold: number) {
-  const sorted = [...detections].sort((a, b) => b.score - a.score);
+  const scoreOf = (detection: YoloDetection) => {
+    if (typeof detection.priorityScore === 'number' && Number.isFinite(detection.priorityScore)) {
+      return detection.priorityScore;
+    }
+    return detection.score;
+  };
+
+  const sorted = [...detections].sort((a, b) => scoreOf(b) - scoreOf(a));
   const results: YoloDetection[] = [];
 
   for (const detection of sorted) {

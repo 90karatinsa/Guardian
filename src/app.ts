@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import eventBus from './eventBus.js';
 import logger from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
+import { validateConfig, type GuardianConfig } from './config/index.js';
 
 type HealthStatus = 'ok' | 'starting' | 'stopping' | 'degraded';
 
@@ -127,13 +128,17 @@ export function resetAppLifecycle() {
 export async function bootstrap() {
   logger.info('Guardian bootstrap starting');
 
+  const loadedConfig = config.util.toObject(config) as unknown;
+  validateConfig(loadedConfig);
+  const guardianConfig = loadedConfig as GuardianConfig;
+
   eventBus.emitEvent({
     source: 'system',
     detector: 'bootstrap',
     severity: 'info',
     message: 'system up',
     meta: {
-      thresholds: config.get('events.thresholds')
+      thresholds: guardianConfig.events.thresholds
     }
   });
 

@@ -130,8 +130,14 @@
       <aside id="preview" aria-label="Snapshot preview">
         <div class="preview-empty" id="preview-empty">Select an event to view the latest snapshot.</div>
         <figure id="preview-figure" hidden>
-          <img id="preview-image" alt="Selected event snapshot" />
-          <figcaption class="meta" id="preview-caption"></figcaption>
+          <div class="preview-images">
+            <img id="preview-image" alt="Selected event snapshot" />
+            <img id="preview-face-image" alt="Selected face snapshot" hidden />
+          </div>
+          <figcaption class="meta" id="preview-caption">
+            <span id="preview-caption-text"></span>
+            <span id="preview-face-caption"></span>
+          </figcaption>
         </figure>
       </aside>
     </main>

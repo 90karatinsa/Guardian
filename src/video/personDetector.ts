@@ -117,6 +117,7 @@ export class PersonDetector {
       }
 
       const primaryDetection = personDetections[0];
+      const detectionConfidence = resolveDetectionConfidence(primaryDetection);
       const snapshotPath = saveSnapshot(frame, ts, this.options.snapshotDir);
       this.lastEventTs = ts;
 
@@ -142,6 +143,7 @@ export class PersonDetector {
           combinedLogit: primaryDetection.combinedLogit,
           projectionIndex: primaryDetection.projectionIndex,
           normalizedProjection: primaryDetection.normalizedProjection,
+          confidence: detectionConfidence,
           thresholds: {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
             nms: DEFAULT_NMS_IOU_THRESHOLD,
@@ -169,7 +171,7 @@ export class PersonDetector {
         const objects = classifiedObjects.map(object => ({
           label: object.label,
           score: object.score,
-          confidence: object.detection.score,
+          confidence: resolveDetectionConfidence(object.detection),
           threat: object.isThreat,
           threatScore: object.threatScore,
           detection: serializeDetection(object.detection),
@@ -181,7 +183,7 @@ export class PersonDetector {
           payload.meta!.threat = {
             label: threat.label,
             score: threat.threatScore,
-            confidence: threat.detection.score
+            confidence: resolveDetectionConfidence(threat.detection)
           };
         }
       }
@@ -226,7 +228,8 @@ function serializeDetection(detection: YoloDetection) {
     combinedLogit: detection.combinedLogit,
     appliedThreshold: detection.appliedThreshold,
     projectionIndex: detection.projectionIndex,
-    normalizedProjection: detection.normalizedProjection
+    normalizedProjection: detection.normalizedProjection,
+    confidence: resolveDetectionConfidence(detection)
   };
 }
 
@@ -285,6 +288,10 @@ function preprocessFrame(frame: Buffer): { tensor: ort.Tensor; meta: PreprocessM
 function probabilityToLogit(probability: number) {
   const clamped = clamp(probability, 1e-6, 1 - 1e-6);
   return Math.log(clamped / (1 - clamped));
+}
+
+function resolveDetectionConfidence(detection: YoloDetection) {
+  return clamp(detection.score, 0, 1);
 }
 
 function isMissingModelError(error: unknown) {

@@ -50,6 +50,8 @@ export type RecoverEventMeta = {
   maxDelayMs: number;
   baseDelayMs: number;
   appliedJitterMs: number;
+  minJitterMs: number;
+  maxJitterMs: number;
 };
 
 export type RecoverEvent = {
@@ -125,6 +127,22 @@ export class VideoSource extends EventEmitter {
     this.startCommand();
   }
 
+  isCircuitBroken() {
+    return this.circuitBroken;
+  }
+
+  resetCircuitBreaker(options: { restart?: boolean } = {}) {
+    const wasBroken = this.circuitBroken;
+    this.circuitBroken = false;
+    this.circuitBreakerFailures = 0;
+    this.lastCircuitCandidateReason = null;
+    this.shouldStop = false;
+    if (options.restart !== false && wasBroken) {
+      this.start();
+    }
+    return wasBroken;
+  }
+
   async stop(): Promise<void> {
     if (this.stopPromise) {
       await this.stopPromise;
@@ -158,7 +176,7 @@ export class VideoSource extends EventEmitter {
     this.cleanupStream();
     this.clearKillTimer();
 
-    const termination = this.terminateCommand(true) ?? Promise.resolve();
+    const termination = this.terminateCommand(true, { skipForceDelay: true }) ?? Promise.resolve();
 
     try {
       await termination;
@@ -452,7 +470,8 @@ export class VideoSource extends EventEmitter {
     this.clearStreamIdleTimer();
     this.cleanupStream();
 
-    const termination = this.terminateCommand(true, { skipForceDelay: shouldTripCircuit });
+    const shouldForceImmediateKill = shouldTripCircuit || reason === 'rtsp-timeout';
+    const termination = this.terminateCommand(true, { skipForceDelay: shouldForceImmediateKill });
     const waitForTermination = termination ?? Promise.resolve();
 
     if (shouldTripCircuit) {
@@ -494,6 +513,8 @@ export class VideoSource extends EventEmitter {
       minDelayMs: timing.meta.minDelayMs,
       maxDelayMs: timing.meta.maxDelayMs,
       jitterMs: timing.meta.appliedJitterMs,
+      minJitterMs: timing.meta.minJitterMs,
+      maxJitterMs: timing.meta.maxJitterMs,
       channel: channel ?? undefined,
       errorCode: errorCode ?? undefined,
       exitCode: exitCode ?? undefined,
@@ -734,6 +755,9 @@ export class VideoSource extends EventEmitter {
       appliedJitterMs = Math.round(centered * jitterRange);
     }
 
+    const jitterLowerBound = Math.max(minDelayMs, baseDelayMs - jitterRange) - baseDelayMs;
+    const jitterUpperBound = Math.min(maxDelayMs, baseDelayMs + jitterRange) - baseDelayMs;
+
     let delayMs = baseDelayMs + appliedJitterMs;
     if (delayMs > maxDelayMs) {
       delayMs = maxDelayMs;
@@ -749,7 +773,9 @@ export class VideoSource extends EventEmitter {
         minDelayMs,
         maxDelayMs,
         baseDelayMs,
-        appliedJitterMs
+        appliedJitterMs,
+        minJitterMs: jitterLowerBound,
+        maxJitterMs: jitterUpperBound
       }
     };
   }

@@ -111,4 +111,8 @@ export function onLogLevelChange(listener: (level: string, previous: string | nu
   };
 }
 
+export function getLogLevelMetrics() {
+  return metrics.exportLogLevelMetrics();
+}
+
 export default logger;

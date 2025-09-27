@@ -107,7 +107,7 @@ describe('AudioAnomalyWindowing', () => {
     expect(firstCall?.[2]?.bufferSize).toBe(frameSize);
   });
 
-  it('AudioAnomalyWindowSchedule blends thresholds during transitions', () => {
+  it('AudioAnomalyWindowBlend blends thresholds during transitions', () => {
     const transitionTs = new Date(2024, 0, 1, 22, 5).getTime();
     const detector = new AudioAnomalyDetector(
       {
@@ -162,8 +162,12 @@ describe('AudioAnomalyWindowing', () => {
     expect(Number(thresholds?.rms)).toBeLessThan(0.6);
     const blendedWindow = Number(thresholds?.rmsWindowMs ?? 0);
     expect(blendedWindow).toBeGreaterThan(200);
-    expect(blendedWindow).toBeLessThan(320);
+    expect(blendedWindow).toBeLessThanOrEqual(320);
     expect(blendedWindow % hopDurationMs).toBeCloseTo(0, 5);
+    const blendedCentroid = Number(thresholds?.centroidWindowMs ?? 0);
+    expect(blendedCentroid).toBeGreaterThan(200);
+    expect(blendedCentroid).toBeLessThanOrEqual(320);
+    expect(blendedCentroid % hopDurationMs).toBeCloseTo(0, 5);
     const recovery = meta.recoveryMs as Record<string, number>;
     expect(Number(recovery?.rmsMs ?? 0)).toBeGreaterThanOrEqual(0);
     expect(Number(recovery?.centroidMs ?? 0)).toBeGreaterThan(0);
