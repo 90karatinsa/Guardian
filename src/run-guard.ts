@@ -597,8 +597,13 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
           }
         });
         runtime.cleanup.length = 0;
-        runtime.source.stop();
+        const stopPromise = runtime.source.stop();
         logger.info({ camera: runtime.id }, 'Stopping guard pipeline');
+        try {
+          await stopPromise;
+        } catch (error) {
+          logger.warn({ err: error, camera: runtime.id }, 'Failed to stop guard pipeline');
+        }
       }
     }
 
@@ -624,8 +629,16 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
           }
         });
         existing.cleanup.length = 0;
-        existing.source.stop();
+        const stopPromise = existing.source.stop();
         logger.info({ camera: existing.id }, 'Restarting guard pipeline');
+        try {
+          await stopPromise;
+        } catch (error) {
+          logger.warn(
+            { err: error, camera: existing.id },
+            'Failed to stop guard pipeline before restart'
+          );
+        }
         await createPipeline(camera, config);
         continue;
       }

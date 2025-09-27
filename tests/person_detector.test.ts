@@ -164,6 +164,64 @@ describe('YoloParser utilities', () => {
     expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
   });
 
+  it('YoloBoundingBoxClamping clamps boxes to original frame dimensions', () => {
+    const classCount = 1;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 1;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    data[0 * detections + 0] = 1000;
+    data[1 * detections + 0] = 400;
+    data[2 * detections + 0] = 900;
+    data[3 * detections + 0] = 800;
+    data[OBJECTNESS_INDEX * detections + 0] = logit(0.95);
+    data[YOLO_CLASS_START_INDEX * detections + 0] = logit(0.92);
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 480,
+      scale: 1,
+      scaleX: 1,
+      scaleY: 1,
+      variants: [
+        {
+          padX: 0,
+          padY: 0,
+          originalWidth: 1280,
+          originalHeight: 720,
+          resizedWidth: 1280,
+          resizedHeight: 720,
+          scale: 1,
+          scaleX: 1,
+          scaleY: 1
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const [detection] = parseYoloDetections(tensor, meta, {
+      classIndices: [0],
+      scoreThreshold: 0.5
+    });
+
+    expect(detection).toBeDefined();
+    const bbox = detection.bbox;
+    expect(bbox.left).toBeGreaterThanOrEqual(0);
+    expect(bbox.top).toBeGreaterThanOrEqual(0);
+    expect(bbox.left + bbox.width).toBeLessThanOrEqual(meta.originalWidth);
+    expect(bbox.top + bbox.height).toBeLessThanOrEqual(meta.originalHeight);
+    expect(bbox.width).toBeLessThanOrEqual(meta.originalWidth);
+    expect(bbox.height).toBeLessThanOrEqual(meta.originalHeight);
+    expect(bbox.left).toBeCloseTo(550, 5);
+    expect(bbox.width).toBeCloseTo(90, 5);
+    expect(bbox.height).toBeCloseTo(meta.originalHeight, 5);
+  });
+
   it('YoloParserPersonConfidence prioritizes person detections across projections', () => {
     const classCount = 2;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

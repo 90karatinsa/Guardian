@@ -109,6 +109,7 @@ export class VideoSource extends EventEmitter {
   private hasReceivedFrame = false;
   private circuitBreakerFailures = 0;
   private circuitBroken = false;
+  private lastCircuitCandidateReason: RecoverEvent['reason'] | null = null;
   private readonly commandClassifications = new Set<string>();
   private readonly channel: string | null;
 
@@ -125,6 +126,7 @@ export class VideoSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
     this.commandClassifications.clear();
+    this.lastCircuitCandidateReason = null;
     this.clearAllTimers();
     this.startCommand();
   }
@@ -170,6 +172,7 @@ export class VideoSource extends EventEmitter {
     this.hasReceivedFrame = false;
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
+    this.lastCircuitCandidateReason = null;
     this.commandClassifications.clear();
     this.clearRestartTimer();
     this.clearStartTimer();
@@ -201,6 +204,7 @@ export class VideoSource extends EventEmitter {
       if (!this.hasReceivedFrame) {
         this.hasReceivedFrame = true;
         this.clearStartTimer();
+        this.restartCount = 0;
       }
 
       this.resetStreamIdleTimer();
@@ -468,11 +472,16 @@ export class VideoSource extends EventEmitter {
       reason === 'watchdog-timeout' ||
       reason === 'stream-idle' ||
       reason === 'rtsp-timeout' ||
-      reason === 'rtsp-connection-failure';
+      reason === 'rtsp-connection-failure' ||
+      reason === 'rtsp-auth-failure';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
+      this.lastCircuitCandidateReason = reason;
+    } else if (reason === 'ffmpeg-exit' && this.lastCircuitCandidateReason) {
+      this.lastCircuitCandidateReason = null;
     } else {
       this.circuitBreakerFailures = 0;
+      this.lastCircuitCandidateReason = null;
     }
 
     const threshold = this.options.circuitBreakerThreshold ?? DEFAULT_CIRCUIT_BREAKER_THRESHOLD;
@@ -495,6 +504,7 @@ export class VideoSource extends EventEmitter {
       this.shouldStop = true;
       this.recovering = false;
       this.circuitBroken = true;
+      this.lastCircuitCandidateReason = null;
       metrics.recordPipelineRestart('ffmpeg', 'circuit-breaker', {
         attempt,
         channel: channel ?? undefined,

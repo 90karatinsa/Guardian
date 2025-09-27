@@ -1382,6 +1382,106 @@ describe('VideoSource', () => {
       vi.useRealTimers();
     }
   });
+
+  it('VideoRestartCounterResetsAfterFrame resets restart attempts after healthy frames', async () => {
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:restart-reset',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length === 1, 200);
+      const first = commands[0];
+      first.emit('start');
+      first.pushFrame(SAMPLE_PNG);
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      first.emitClose(1);
+      await waitFor(() => recoverEvents.length >= 1, 200);
+      expect(recoverEvents[0].attempt).toBe(1);
+
+      await waitFor(() => commands.length === 2, 500);
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.attempt).toBe(1);
+    } finally {
+      await source.stop();
+    }
+  });
+
+  it('VideoRtspAuthCircuitBreaker trips after repeated authentication failures', async () => {
+    const commands: FakeCommand[] = [];
+    const fatalEvents: FatalEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-auth',
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 2,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        queueMicrotask(() => {
+          command.emit('start');
+          command.emit('stderr', 'RTSP/1.0 401 Unauthorized');
+          command.emitClose(1);
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('fatal', event => {
+      fatalEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length >= 2, 500);
+      await waitFor(() => fatalEvents.length === 1, 500);
+
+      expect(source.isCircuitBroken()).toBe(true);
+      const fatal = fatalEvents[0];
+      expect(fatal).toBeDefined();
+      expect(fatal.reason).toBe('circuit-breaker');
+      expect(fatal.channel).toBe('video:rtsp-auth');
+      expect(fatal.lastFailure.reason).toBe('rtsp-auth-failure');
+      expect(fatal.attempts).toBeGreaterThanOrEqual(2);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('circuit-breaker');
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.channel).toBe('video:rtsp-auth');
+    } finally {
+      await source.stop();
+    }
+  });
 });
 
 class FakeCommand extends EventEmitter {

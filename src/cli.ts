@@ -25,6 +25,7 @@ type CliIo = {
 
 type GuardRuntime = {
   stop: () => void | Promise<void>;
+  resetCircuitBreaker: (identifier: string) => boolean;
 };
 
 type ShutdownHookSummary = {
@@ -123,6 +124,7 @@ const USAGE_LINES = [
   '  guardian health       Print health JSON',
   '  guardian ready        Print readiness JSON',
   '  guardian daemon <command>  Run daemon lifecycle commands',
+  '  guardian audio <command>   Manage audio capture helpers',
   '  guardian log-level    Get or set the active log level',
   '  guardian retention run [--config path]  Run retention once with current config'
 ];
@@ -137,11 +139,23 @@ const DAEMON_USAGE = [
   '  guardian daemon health           Print health JSON',
   '  guardian daemon ready            Print readiness JSON',
   '  guardian daemon hooks [options]  Run shutdown hooks without stopping the daemon',
+  '  guardian daemon restart [--channel id]  Reset video circuit breakers for a channel',
   '',
   'Options for "hooks":',
   '  -r, --reason <reason>  Override shutdown reason (default: daemon-hooks)',
   '  -s, --signal <signal>  Report the originating signal when recording hooks',
   '  -h, --help             Show this help message'
+].join('\n');
+
+const DAEMON_RESTART_USAGE = [
+  'Guardian daemon restart command',
+  '',
+  'Usage:',
+  '  guardian daemon restart [--channel id]',
+  '',
+  'Options:',
+  '  -c, --channel <id>  Reset the video circuit breaker for the specified channel',
+  '  -h, --help          Show this help message'
 ].join('\n');
 
 const RETENTION_USAGE = [
@@ -153,6 +167,18 @@ const RETENTION_USAGE = [
   'Options:',
   '  -c, --config <path>   Use an alternate configuration file',
   '  -h, --help            Show this help message'
+].join('\n');
+
+const AUDIO_USAGE = [
+  'Guardian audio commands',
+  '',
+  'Usage:',
+  '  guardian audio devices [options]  List detected audio capture devices',
+  '',
+  'Options:',
+  '  -f, --format <format>  Force ffmpeg format (alsa, avfoundation, dshow, auto)',
+  '  -j, --json             Pretty-print JSON output',
+  '  -h, --help             Show this help message'
 ].join('\n');
 
 const LOG_LEVEL_USAGE = [
@@ -175,6 +201,21 @@ const VALID_SIGNALS: ReadonlySet<NodeJS.Signals> = new Set([
   'SIGUSR1',
   'SIGUSR2'
 ]);
+
+let audioSourceModule: typeof import('./audio/source.js') | null = null;
+
+type DaemonRestartArgs = {
+  channel?: string;
+  help?: boolean;
+  errors: string[];
+};
+
+type AudioDevicesArgs = {
+  format: 'alsa' | 'avfoundation' | 'dshow' | 'auto';
+  json: boolean;
+  help: boolean;
+  errors: string[];
+};
 
 const state: {
   status: ServiceStatus;
@@ -320,6 +361,10 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
     return runDaemonCommand(argv.slice(1), io);
   }
 
+  if (command === 'audio') {
+    return runAudioCommand(argv.slice(1), io);
+  }
+
   switch (command) {
     case 'start': {
       return startDaemon(io);
@@ -384,6 +429,10 @@ async function runDaemonCommand(args: string[], io: CliIo): Promise<number> {
     return runDaemonHooksCommand(rest, io);
   }
 
+  if (first === 'restart') {
+    return runDaemonRestartCommand(rest, io);
+  }
+
   if (first === 'help' || first === '--help' || first === '-h') {
     io.stdout.write(`${DAEMON_USAGE}\n`);
     return 0;
@@ -398,6 +447,191 @@ async function runDaemonCommand(args: string[], io: CliIo): Promise<number> {
   io.stderr.write(`Unknown daemon subcommand: ${first}\n`);
   io.stderr.write(`${DAEMON_USAGE}\n`);
   return 1;
+}
+
+async function runAudioCommand(args: string[], io: CliIo): Promise<number> {
+  const [first, ...rest] = args;
+
+  if (!first || first === 'devices') {
+    return runAudioDevicesCommand(rest, io);
+  }
+
+  if (first === 'help' || first === '--help' || first === '-h') {
+    io.stdout.write(`${AUDIO_USAGE}\n`);
+    return 0;
+  }
+
+  if (first.startsWith('-')) {
+    io.stderr.write(`Unknown option: ${first}\n`);
+    io.stderr.write(`${AUDIO_USAGE}\n`);
+    return 1;
+  }
+
+  io.stderr.write(`Unknown audio subcommand: ${first}\n`);
+  io.stderr.write(`${AUDIO_USAGE}\n`);
+  return 1;
+}
+
+function parseDaemonRestartArgs(args: string[]): DaemonRestartArgs {
+  const result: DaemonRestartArgs = { errors: [] };
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (!token) {
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      result.help = true;
+      continue;
+    }
+    if (token === '--channel' || token === '-c') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        result.errors.push('Missing value for --channel');
+      } else {
+        result.channel = value;
+        index += 1;
+      }
+      continue;
+    }
+    result.errors.push(`Unknown option: ${token}`);
+  }
+  return result;
+}
+
+function parseAudioDevicesArgs(args: string[]): AudioDevicesArgs {
+  const allowedFormats = new Set(['alsa', 'avfoundation', 'dshow', 'auto']);
+  const result: AudioDevicesArgs = {
+    format: 'auto',
+    json: false,
+    help: false,
+    errors: []
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (!token) {
+      continue;
+    }
+
+    if (token === '--help' || token === '-h') {
+      result.help = true;
+      continue;
+    }
+
+    if (token === '--format' || token === '-f') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        result.errors.push('Missing value for --format');
+      } else {
+        const normalized = value.toLowerCase();
+        if (!allowedFormats.has(normalized)) {
+          result.errors.push(
+            `Invalid format "${value}" (expected: ${Array.from(allowedFormats).join(', ')})`
+          );
+        } else {
+          result.format = normalized as AudioDevicesArgs['format'];
+        }
+        index += 1;
+      }
+      continue;
+    }
+
+    if (token === '--json' || token === '-j') {
+      result.json = true;
+      continue;
+    }
+
+    result.errors.push(`Unknown option: ${token}`);
+  }
+
+  return result;
+}
+
+async function runDaemonRestartCommand(args: string[], io: CliIo): Promise<number> {
+  const parsed = parseDaemonRestartArgs(args);
+  if (parsed.help) {
+    io.stdout.write(`${DAEMON_RESTART_USAGE}\n`);
+    return 0;
+  }
+
+  if (parsed.errors.length > 0) {
+    parsed.errors.forEach(error => {
+      io.stderr.write(`${error}\n`);
+    });
+    io.stderr.write(`${DAEMON_RESTART_USAGE}\n`);
+    return 1;
+  }
+
+  const channel = parsed.channel?.trim();
+  if (!channel) {
+    io.stderr.write('Missing required --channel option\n');
+    io.stderr.write(`${DAEMON_RESTART_USAGE}\n`);
+    return 1;
+  }
+
+  if (state.status !== 'running' || !state.runtime) {
+    io.stderr.write('Guardian daemon is not running\n');
+    return 1;
+  }
+
+  const reset = state.runtime.resetCircuitBreaker;
+  if (typeof reset !== 'function') {
+    io.stderr.write('Daemon runtime does not support circuit breaker resets\n');
+    return 1;
+  }
+
+  const triggered = reset(channel);
+  if (!triggered) {
+    io.stderr.write(`No circuit breaker reset performed for channel ${channel}\n`);
+    return 1;
+  }
+
+  io.stdout.write(`Requested circuit breaker reset for channel ${channel}\n`);
+  return 0;
+}
+
+async function runAudioDevicesCommand(args: string[], io: CliIo): Promise<number> {
+  const parsed = parseAudioDevicesArgs(args);
+
+  if (parsed.help) {
+    io.stdout.write(`${AUDIO_USAGE}\n`);
+    return 0;
+  }
+
+  if (parsed.errors.length > 0) {
+    parsed.errors.forEach(error => {
+      io.stderr.write(`${error}\n`);
+    });
+    io.stderr.write(`${AUDIO_USAGE}\n`);
+    return 1;
+  }
+
+  try {
+    if (!audioSourceModule) {
+      audioSourceModule = await import('./audio/source.js');
+    }
+
+    const AudioSource = audioSourceModule.default;
+
+    const devices = await AudioSource.listDevices(parsed.format, {
+      channel: 'cli:audio-devices'
+    });
+
+    const payload = {
+      format: parsed.format,
+      devices
+    };
+
+    const indent = parsed.json ? 2 : 0;
+    const json = JSON.stringify(payload, null, indent);
+    io.stdout.write(`${json}\n`);
+    return 0;
+  } catch (error) {
+    logger.error({ err: error }, 'Audio device discovery failed via CLI');
+    const message = error instanceof Error ? error.message : String(error);
+    io.stderr.write(`Failed to list audio devices: ${message}\n`);
+    return 1;
+  }
 }
 
 type DaemonHooksArgs = {

@@ -136,6 +136,33 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioAnalysisMetrics reports RMS and spectral centroid gauges', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 50
+    });
+
+    const samples = new Int16Array([0, 1000, -500, 200, -300, 50, -75, 0]);
+    (source as any).analyzeFrame(samples, 16000, 0.05);
+
+    const analysis = source.getAnalysisSnapshot();
+    expect(analysis.ffmpeg).toBeDefined();
+
+    const snapshot = metrics.snapshot();
+    const gauges = snapshot.detectors['audio-anomaly'].gauges;
+    expect(gauges['analysis.ffmpeg.rms']).toBeCloseTo(analysis.ffmpeg.rms, 6);
+    expect(gauges['analysis.ffmpeg.spectral-centroid']).toBeCloseTo(
+      analysis.ffmpeg.spectralCentroid,
+      6
+    );
+
+    source.stop();
+  });
+
   it('AudioDeviceFallbackDiscovery preserves discovered device ordering', async () => {
     vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');

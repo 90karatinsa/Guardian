@@ -1112,6 +1112,12 @@ export class AudioSource extends EventEmitter {
       state.spectralCentroid = spectral;
     }
     this.analysisByFormat.set(format, state);
+    metrics.setDetectorGauge('audio-anomaly', `analysis.${format}.rms`, state.rms);
+    metrics.setDetectorGauge(
+      'audio-anomaly',
+      `analysis.${format}.spectral-centroid`,
+      state.spectralCentroid
+    );
     this.emit('analysis', {
       format,
       rms: state.rms,
@@ -1374,6 +1380,9 @@ function buildFfprobeCandidates() {
   const candidates = new Set<string>();
   if (process.env.FFPROBE_PATH) {
     candidates.add(process.env.FFPROBE_PATH);
+  }
+  if (typeof ffmpegStatic === 'string' && ffmpegStatic.length > 0) {
+    candidates.add(ffmpegStatic);
   }
   candidates.add('ffprobe');
   candidates.add('ffmpeg');

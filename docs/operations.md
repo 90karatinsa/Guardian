@@ -17,8 +17,8 @@ nasıl yararlanacağınızı adım adım anlatır.
   kesicileri elle temizleyin.
 - `pnpm exec tsx src/tasks/retention.ts --run now` komutu ile retention görevini elle tetikleyebilir, ardından
   `scripts/db-maintenance.ts vacuum --mode full` yardımıyla SQLite arşivini sıkıştırabilirsiniz.
-- `guardian retention run --dry-run` çıktısı arşivde kaç fotoğrafın taşınacağını ve `maxArchivesPerCamera` sınırına ne kadar
-  yaklaşıldığını gösterir.
+- `guardian retention run --config config/production.json` ile farklı konfigürasyon dosyaları için bakım planlayabilirsiniz;
+  `pnpm tsx src/cli.ts retention --help` çıktısı güncel seçenekleri listeler.
 
 ## Log ve metrik inceleme
 - `guardian log-level get` ve `guardian log-level set warn` komutlarıyla log seviyesini değiştirirken, `guardian daemon health`
@@ -39,8 +39,8 @@ nasıl yararlanacağınızı adım adım anlatır.
   sağlar.
 - `guardian daemon restart --channel video:lobby` komutuyla yalnızca belirli bir RTSP akışını sıfırlayabilir, eş zamanlı olarak
   `guardian daemon status --json` ile watchdog sayaçlarının azaldığını doğrulayabilirsiniz.
-- Mikrofon fallback zincirleri için `pnpm exec tsx src/cli.ts audio devices --json` çıktısındaki `fallbacks` sıralamasını ve
-  `watchdogRestarts` değerini analiz ederek sessizlik devre kesicisinin tetiklendiği durumları yakalayın.
+- Mikrofon fallback zincirleri için `pnpm tsx src/cli.ts audio devices --json` çıktısındaki format/candidate sıralamasını
+  inceleyerek cihaz keşfi akışını doğrulayın; JSON çıktısı `AudioSource.listDevices` sonuçlarıyla birebir eşleşir.
 
 ## Ek kaynaklar
 - Daha fazla örnek, `README.md` içindeki Kurulum ve Sorun Giderme bölümlerinde yer alır.

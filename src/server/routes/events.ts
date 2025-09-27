@@ -933,10 +933,20 @@ function createMetricsDigest(
   }
 
   if (selection.pipelines.has('audio')) {
+    const audioChannels = Object.entries(snapshot.pipelines.audio.byChannel ?? {}).map(
+      ([channel, data]) => ({
+        channel,
+        restarts: data.restarts,
+        watchdogBackoffMs: data.watchdogBackoffMs,
+        lastRestartAt: data.lastRestartAt,
+        lastRestart: data.lastRestart
+      })
+    );
     pipelinePayload.audio = {
       restarts: snapshot.pipelines.audio.restarts,
       lastRestartAt: snapshot.pipelines.audio.lastRestartAt,
-      watchdogBackoffMs: snapshot.pipelines.audio.watchdogBackoffMs
+      watchdogBackoffMs: snapshot.pipelines.audio.watchdogBackoffMs,
+      channels: audioChannels
     };
   }
 

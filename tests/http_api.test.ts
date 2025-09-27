@@ -612,6 +612,36 @@ describe('RestApiEvents', () => {
     expect(payload.retention.totalsByCamera.lobby.archivedSnapshots).toBe(2);
   });
 
+  it('HttpApiAudioPipelineDigest surfaces audio channel restart metadata', async () => {
+    metrics.reset();
+    metrics.recordPipelineRestart('audio', 'watchdog-timeout', {
+      channel: 'audio:entrance',
+      delayMs: 1500,
+      attempt: 2
+    });
+    metrics.recordPipelineRestart('audio', 'spawn-error', { channel: 'audio:lobby' });
+
+    const { port } = await ensureServer();
+    const response = await fetch(`http://localhost:${port}/api/events`);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+
+    const audioDigest = payload.metrics?.pipelines?.audio;
+    expect(audioDigest.restarts).toBe(2);
+    expect(Array.isArray(audioDigest.channels)).toBe(true);
+    const entrance = audioDigest.channels.find((entry: { channel: string }) => entry.channel === 'audio:entrance');
+    const lobby = audioDigest.channels.find((entry: { channel: string }) => entry.channel === 'audio:lobby');
+    expect(entrance).toBeDefined();
+    expect(lobby).toBeDefined();
+    expect(entrance.restarts).toBe(1);
+    expect(entrance.watchdogBackoffMs).toBe(1500);
+    expect(entrance.lastRestart?.reason).toBe('watchdog-timeout');
+    expect(typeof entrance.lastRestartAt === 'string' || entrance.lastRestartAt === null).toBe(true);
+    expect(lobby.restarts).toBe(1);
+    expect(lobby.watchdogBackoffMs).toBe(0);
+    expect(lobby.lastRestart?.reason).toBe('spawn-error');
+  });
+
   it('HttpApiSnapshotDelivery handles snapshot errors and streams face registry results', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'snapshot.png');

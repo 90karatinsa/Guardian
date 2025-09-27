@@ -34,7 +34,7 @@ class MockVideoSource extends EventEmitter {
       MockVideoSource.startCounts[index] = (MockVideoSource.startCounts[index] ?? 0) + 1;
     }
   }
-  stop() {
+  async stop() {
     this.emit('stopped');
     this.circuitBroken = false;
   }
@@ -1847,6 +1847,96 @@ describe('run-guard multi camera orchestration', () => {
         expect.objectContaining({ deltaThreshold: 35, debounceFrames: 5, noiseMultiplier: 3 })
       );
     } finally {
+      runtime.stop();
+    }
+  });
+
+  it('GuardAwaitStopBeforeRestart waits for video stop before restarting pipeline', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    let resolveStop: (() => void) | null = null;
+    let stopSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+      expect(MockVideoSource.startCounts[0]).toBe(1);
+
+      const initialInstance = MockVideoSource.instances[0];
+      stopSpy = vi.spyOn(initialInstance, 'stop').mockImplementation(function (this: MockVideoSource) {
+        return new Promise<void>(resolve => {
+          resolveStop = () => {
+            this.emit('stopped');
+            this.circuitBroken = false;
+            resolve();
+            resolveStop = null;
+          };
+        });
+      });
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream-alt',
+              person: { score: 0.5 },
+              motion: { diffThreshold: 20, areaThreshold: 0.02 }
+            }
+          ]
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => (stopSpy?.mock.calls.length ?? 0) === 1);
+
+      expect(MockVideoSource.instances).toHaveLength(1);
+      expect(MockVideoSource.startCounts[0]).toBe(1);
+      expect(MockVideoSource.startCounts).toHaveLength(1);
+
+      expect(resolveStop).not.toBeNull();
+      resolveStop?.();
+
+      await waitFor(() => MockVideoSource.instances.length === 2);
+      await waitFor(() => MockVideoSource.startCounts[1] === 1);
+      expect(MockVideoSource.instances[1].options.file).toBe('rtsp://camera-1/stream-alt');
+      expect(MockVideoSource.startCounts.reduce((sum, value) => sum + value, 0)).toBe(2);
+    } finally {
+      resolveStop?.();
+      stopSpy?.mockRestore();
       runtime.stop();
     }
   });
