@@ -43,20 +43,30 @@ describe('ReadmeExamples', () => {
 
     expect(readme).toContain('"idleTimeoutMs": 5000');
     expect(readme).toContain('"restartJitterFactor": 0.2');
+    expect(readme).toContain('"run": "on-change"');
     expect(readme).toContain('Audio source recovering (reason=ffmpeg-missing|stream-idle)');
-    expect(readme).toContain('pipelines.ffmpeg.byChannel');
+    expect(readme).toContain('pipelines.ffmpeg.jitterHistogram');
     expect(readme).toContain('watchdogBackoffByChannel');
-    expect(readme).toContain('guardian status --json');
+    expect(readme).toContain('guardian daemon start');
+    expect(readme).toContain('guardian daemon status --json');
+    expect(readme).toContain('guardian daemon health');
+    expect(readme).toContain('guardian daemon ready');
+    expect(readme).toContain('guardian daemon hooks --reason');
     expect(readme).toContain('guardian health');
     expect(readme).toContain('guardian retention run');
     expect(readme).toContain('pnpm exec tsx src/cli.ts status --json');
     expect(readme).toContain('guardian log-level set debug');
     expect(readme).toContain('metrics.histograms.pipeline.ffmpeg.restarts');
+    expect(readme).toContain('pipelines.ffmpeg.restartHistogram.delay');
     expect(readme).toContain('metrics.suppression.histogram.historyCount');
     expect(readme).toContain('metrics.logs.byLevel.error');
     expect(readme).toContain('"maxArchivesPerCamera": 3');
+    expect(readme).toContain('vacuum=auto (run=on-change)');
+    expect(readme).toContain('pose.forecast');
+    expect(readme).toContain('threat.summary');
     expect(readme).toContain('Sorun giderme');
     expect(readme).toContain('pnpm tsx src/cli.ts --health');
+    expect(readme).toContain('status: ok');
 
     metrics.reset();
     const capture = createIo();

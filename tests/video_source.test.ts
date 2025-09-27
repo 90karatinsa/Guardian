@@ -3,7 +3,12 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import metrics from '../src/metrics/index.js';
-import { VideoSource, type RecoverEventMeta, type RecoverEvent } from '../src/video/source.js';
+import {
+  VideoSource,
+  type FatalEvent,
+  type RecoverEventMeta,
+  type RecoverEvent
+} from '../src/video/source.js';
 
 const SAMPLE_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAAZuX6kAAAAASUVORK5CYII=',
@@ -95,7 +100,7 @@ describe('VideoSource', () => {
       await new Promise(resolve => setTimeout(resolve, 25));
       await waitFor(() => recoverReasons.includes('watchdog-timeout'), 200);
     } finally {
-      source.stop();
+      await source.stop();
     }
 
     expect(recoverReasons[0]).toBe('start-timeout');
@@ -179,7 +184,7 @@ describe('VideoSource', () => {
       expect(channelStats.byReason['start-timeout']).toBeGreaterThanOrEqual(1);
       expect(channelStats.byReason['watchdog-timeout']).toBeGreaterThanOrEqual(1);
     } finally {
-      source.stop();
+      await source.stop();
     }
   });
 
@@ -238,7 +243,7 @@ describe('VideoSource', () => {
         channelStats?.historyLimit ?? 0
       );
     } finally {
-      source.stop();
+      await source.stop();
       vi.useRealTimers();
     }
   });
@@ -302,7 +307,7 @@ describe('VideoSource', () => {
       });
       expect(commands[1].framesPushed).toBeGreaterThanOrEqual(1);
     } finally {
-      source.stop();
+      await source.stop();
       vi.useRealTimers();
     }
   });
@@ -350,7 +355,7 @@ describe('VideoSource', () => {
       await vi.runOnlyPendingTimersAsync();
       await waitFor(() => commands.length >= 2, 500);
     } finally {
-      source.stop();
+      await source.stop();
       await vi.runOnlyPendingTimersAsync();
       vi.useRealTimers();
     }
@@ -409,7 +414,7 @@ describe('VideoSource', () => {
       const snapshot = metrics.snapshot();
       expect(snapshot.pipelines.ffmpeg.byReason['stream-idle']).toBeGreaterThanOrEqual(1);
     } finally {
-      source.stop();
+      await source.stop();
       vi.useRealTimers();
     }
   });
@@ -474,7 +479,7 @@ describe('VideoSource', () => {
         channel: 'video:exit-test'
       });
     } finally {
-      source.stop();
+      await source.stop();
       vi.useRealTimers();
     }
   });
@@ -508,7 +513,7 @@ describe('VideoSource', () => {
     await Promise.resolve();
     expect(commands[0].killedSignals).toContain('SIGTERM');
 
-    source.stop();
+    await source.stop();
 
     const internals = source as unknown as {
       startTimer: NodeJS.Timeout | null;
@@ -594,7 +599,7 @@ describe('VideoSource', () => {
       expect(channelStats.byReason['rtsp-timeout']).toBeGreaterThanOrEqual(1);
       expect(channelStats.byReason['circuit-breaker']).toBe(1);
     } finally {
-      source.stop();
+      await source.stop();
     }
   });
 
@@ -651,7 +656,7 @@ describe('VideoSource', () => {
       expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('corrupted-frame');
       expect(snapshot.pipelines.ffmpeg.byReason['corrupted-frame']).toBeGreaterThanOrEqual(1);
     } finally {
-      source.stop();
+      await source.stop();
       vi.useRealTimers();
     }
   });
@@ -672,7 +677,7 @@ describe('VideoSource', () => {
     expect(stream.listenerCount('error')).toBe(0);
     expect(stream.listenerCount('end')).toBe(0);
 
-    source.stop();
+    await source.stop();
 
     expect(commands.length).toBeGreaterThanOrEqual(3);
   });
@@ -840,7 +845,7 @@ describe('VideoSource', () => {
       '25-50': 1
     });
 
-    source.stop();
+    await source.stop();
     expect(commands.length).toBeGreaterThanOrEqual(3);
   });
 
@@ -873,7 +878,7 @@ describe('VideoSource', () => {
     await vi.advanceTimersByTimeAsync(6);
     expect(commands[0].killedSignals).toContain('SIGTERM');
 
-    source.stop();
+    await source.stop();
 
     await vi.advanceTimersByTimeAsync(100);
 
@@ -881,6 +886,212 @@ describe('VideoSource', () => {
     expect(commands[0].killedSignals).toContain('SIGKILL');
 
     vi.useRealTimers();
+  });
+
+  it('VideoFfmpegStopDrainsProcess waits for ffmpeg shutdown before resolving', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      restartDelayMs: 0,
+      restartMaxDelayMs: 0,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 50,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+    source.start();
+
+    try {
+      await waitFor(() => commands.length === 1, 200);
+      const command = commands[0];
+      command.emit('start');
+
+      let settled = false;
+      const stopPromise = source.stop();
+      stopPromise.then(() => {
+        settled = true;
+      });
+
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(40);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      command.emitClose(0, null);
+      await stopPromise;
+
+      expect(settled).toBe(true);
+      expect(command.listenerCount('close')).toBe(0);
+      expect(command.listenerCount('error')).toBe(0);
+      expect(command.listenerCount('end')).toBe(0);
+      expect(command.listenerCount('stderr')).toBe(0);
+      expect(command.stream.listenerCount('data')).toBe(0);
+      expect(command.stream.listenerCount('error')).toBe(0);
+      expect(command.stream.listenerCount('end')).toBe(0);
+      expect(command.stream.listenerCount('close')).toBe(0);
+      expect(command.stream.destroyed).toBe(true);
+
+      const internals = source as unknown as { killTimer: NodeJS.Timeout | null };
+      expect(internals.killTimer).toBeNull();
+    } finally {
+      await source.dispose();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoFfmpegStartStopNoLeak reuses the source without leaking listeners', async () => {
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      restartDelayMs: 0,
+      restartMaxDelayMs: 0,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 25,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const frames: Buffer[] = [];
+    source.on('frame', frame => {
+      frames.push(frame);
+    });
+    source.on('recover', () => {});
+    source.on('error', () => {});
+
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        source.start();
+        await waitFor(() => commands.length === i + 1, 500);
+        const command = commands[i];
+        command.emit('start');
+        command.pushFrame(SAMPLE_PNG);
+
+        const stopPromise = source.stop();
+        command.emitClose(0, null);
+        await stopPromise;
+
+        expect(command.listenerCount('close')).toBe(0);
+        expect(command.listenerCount('stderr')).toBe(0);
+        expect(command.listenerCount('error')).toBe(0);
+        expect(command.stream.listenerCount('data')).toBe(0);
+        expect(command.stream.listenerCount('end')).toBe(0);
+        expect(command.stream.listenerCount('close')).toBe(0);
+        expect(command.stream.destroyed).toBe(true);
+      }
+
+      expect(frames.length).toBeGreaterThan(0);
+    } finally {
+      await source.dispose();
+    }
+
+    expect(source.listenerCount('frame')).toBe(0);
+    expect(source.listenerCount('recover')).toBe(0);
+    expect(source.listenerCount('error')).toBe(0);
+  });
+
+  it('VideoRtspAdaptiveBackoff escalates delays and updates metrics before tripping circuit breaker', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+    const fatalEvents: FatalEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-backoff',
+      restartDelayMs: 25,
+      restartMaxDelayMs: 200,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 5,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      circuitBreakerThreshold: 4,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverEvents.push(event);
+    });
+    source.on('fatal', event => {
+      fatalEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    try {
+      await waitFor(() => commands.length === 1, 500);
+      const first = commands[0];
+      first.emit('start');
+      first.emit('stderr', 'method DESCRIBE failed: Connection timed out');
+      first.emitClose(1);
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      await waitFor(() => commands.length === 2, 500);
+      const second = commands[1];
+      second.emit('start');
+      second.emit('stderr', 'Read timeout after 100 ms');
+      second.emitClose(1);
+      await vi.advanceTimersByTimeAsync(50);
+      await Promise.resolve();
+
+      await waitFor(() => commands.length === 3, 500);
+      const third = commands[2];
+      third.emit('start');
+      third.emit('stderr', 'connection refused');
+      third.emitClose(1);
+      await vi.advanceTimersByTimeAsync(100);
+      await Promise.resolve();
+
+      await waitFor(() => commands.length === 4, 500);
+      const fourth = commands[3];
+      fourth.emit('start');
+      fourth.emit('stderr', 'network is unreachable');
+      fourth.emitClose(1);
+
+      await vi.runOnlyPendingTimersAsync();
+      await waitFor(() => fatalEvents.length === 1, 500);
+
+      expect(recoverEvents.map(event => event.delayMs)).toEqual([25, 50, 100]);
+      expect(recoverEvents.map(event => event.attempt)).toEqual([1, 2, 3]);
+      expect(fatalEvents).toHaveLength(1);
+      expect(fatalEvents[0].reason).toBe('circuit-breaker');
+      expect(fatalEvents[0].lastFailure.reason).toBe('rtsp-connection-failure');
+
+      const snapshot = metrics.snapshot();
+      const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:rtsp-backoff'];
+      expect(channelStats.delayHistogram['25-50']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.delayHistogram['50-100']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.delayHistogram['100-250']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.attemptHistogram['1']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.attemptHistogram['2']).toBeGreaterThanOrEqual(1);
+      expect(channelStats.attemptHistogram['3']).toBeGreaterThanOrEqual(1);
+    } finally {
+      await source.dispose();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
   });
 });
 

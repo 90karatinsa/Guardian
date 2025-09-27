@@ -21,6 +21,8 @@ export type EventsConfig = {
 
 export type RetentionVacuumMode = 'auto' | 'full';
 
+export type RetentionVacuumRunMode = 'always' | 'on-change';
+
 export type RetentionVacuumConfig = {
   mode?: RetentionVacuumMode;
   target?: string;
@@ -28,6 +30,7 @@ export type RetentionVacuumConfig = {
   reindex?: boolean;
   optimize?: boolean;
   pragmas?: string[];
+  run?: RetentionVacuumRunMode;
 };
 
 export type RetentionSnapshotMode = 'archive' | 'delete' | 'ignore';
@@ -98,6 +101,8 @@ export type VideoChannelConfig = {
   motion?: CameraMotionConfig;
   person?: CameraPersonConfig;
   light?: CameraLightConfig;
+  pose?: PoseOverrideConfig;
+  objects?: ObjectsOverrideConfig;
 };
 
 export type CameraFfmpegConfig = {
@@ -122,6 +127,8 @@ export type CameraConfig = {
   motion?: CameraMotionConfig;
   ffmpeg?: CameraFfmpegConfig;
   light?: CameraLightConfig;
+  pose?: PoseOverrideConfig;
+  objects?: ObjectsOverrideConfig;
 };
 
 export type VideoConfig = {
@@ -157,6 +164,8 @@ export type PoseConfig = {
   historySize?: number;
 };
 
+export type PoseOverrideConfig = Partial<Omit<PoseConfig, 'modelPath'>> & { modelPath?: string };
+
 export type FaceConfig = {
   modelPath: string;
   embeddingSize?: number;
@@ -168,6 +177,13 @@ export type ObjectsConfig = {
   threatLabels?: string[];
   threatThreshold?: number;
   classIndices?: number[];
+};
+
+export type ObjectsOverrideConfig = Partial<
+  Omit<ObjectsConfig, 'modelPath' | 'labels'>
+> & {
+  modelPath?: string;
+  labels?: string[];
 };
 
 export type LightTuningConfig = {
@@ -296,6 +312,39 @@ const lightNormalHoursSchema: JsonSchema = {
   }
 };
 
+const cameraPoseOverrideSchema: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    modelPath: { type: 'string' },
+    forecastHorizonMs: { type: 'number', minimum: 0 },
+    smoothingWindow: { type: 'number', minimum: 1 },
+    minMovement: { type: 'number', minimum: 0 },
+    historySize: { type: 'number', minimum: 1 }
+  }
+};
+
+const cameraObjectsConfigSchema: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    modelPath: { type: 'string' },
+    labels: {
+      type: 'array',
+      items: { type: 'string' }
+    },
+    threatLabels: {
+      type: 'array',
+      items: { type: 'string' }
+    },
+    threatThreshold: { type: 'number', minimum: 0 },
+    classIndices: {
+      type: 'array',
+      items: { type: 'number', minimum: 0 }
+    }
+  }
+};
+
 const cameraLightConfigSchema: JsonSchema = {
   type: 'object',
   additionalProperties: false,
@@ -376,7 +425,8 @@ const guardianConfigSchema: JsonSchema = {
                 pragmas: {
                   type: 'array',
                   items: { type: 'string' }
-                }
+                },
+                run: { type: 'string', enum: ['always', 'on-change'] }
               }
             },
             archiveDir: { type: 'string' },
@@ -524,6 +574,7 @@ const guardianConfigSchema: JsonSchema = {
                 }
               },
               light: cameraLightConfigSchema,
+              pose: cameraPoseOverrideSchema,
               person: {
                 type: 'object',
                 additionalProperties: false,
@@ -539,7 +590,8 @@ const guardianConfigSchema: JsonSchema = {
                   },
                   classScoreThresholds: classScoreThresholdSchema
                 }
-              }
+              },
+              objects: cameraObjectsConfigSchema
             }
           }
         },
@@ -587,6 +639,7 @@ const guardianConfigSchema: JsonSchema = {
                 }
               },
               light: cameraLightConfigSchema,
+              pose: cameraPoseOverrideSchema,
               ffmpeg: {
                 type: 'object',
                 additionalProperties: false,
@@ -605,7 +658,8 @@ const guardianConfigSchema: JsonSchema = {
                   restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
                   circuitBreakerThreshold: { type: 'number', minimum: 1 }
                 }
-              }
+              },
+              objects: cameraObjectsConfigSchema
             }
           }
         }

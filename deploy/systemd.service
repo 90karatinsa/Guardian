@@ -8,10 +8,11 @@ Type=simple
 WorkingDirectory=/opt/guardian
 Environment=NODE_ENV=production
 EnvironmentFile=-/etc/default/guardian
-ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts --health
-ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts start
-ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop
-ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts status --json
+ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health
+ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start
+ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop
+ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM
+ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts daemon status --json
 ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts
 Restart=on-failure
 RestartSec=5

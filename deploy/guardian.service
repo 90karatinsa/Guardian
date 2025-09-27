@@ -9,10 +9,11 @@ Environment=GUARDIAN_CONFIG=/etc/guardian/config.json
 Environment=GUARDIAN_DATA_DIR=/var/lib/guardian
 Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
-ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts --health
-ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts start
-ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts status --json
-ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts stop
+ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health
+ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start
+ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts daemon status --json
+ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop
+ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM
 ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts
 KillSignal=SIGTERM
 Restart=on-failure

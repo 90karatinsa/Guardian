@@ -9,6 +9,9 @@ const streamState = document.getElementById('stream-state');
 const streamHeartbeats = document.getElementById('stream-heartbeats');
 const streamEvents = document.getElementById('stream-events');
 const streamUpdated = document.getElementById('stream-updated');
+const poseConfidence = document.getElementById('pose-confidence');
+const poseMovement = document.getElementById('pose-movement');
+const poseThreatIndicator = document.getElementById('pose-threat');
 const channelFilter = document.getElementById('channel-filter');
 const channelFilterOptions = document.getElementById('channel-filter-options');
 const channelFilterEmpty = document.getElementById('channel-filter-empty');
@@ -58,7 +61,12 @@ const state = {
     data: null
   },
   summary: null,
-  digest: null
+  digest: null,
+  pose: {
+    lastForecast: null,
+    lastThreat: null,
+    lastUpdated: null
+  }
 };
 
 function getSelectedChannels() {
@@ -350,6 +358,39 @@ function updateStreamWidget() {
   }
 }
 
+function updatePoseWidget() {
+  if (poseConfidence) {
+    const text = formatPercent(state.pose.lastForecast?.confidence ?? null);
+    poseConfidence.textContent = text ?? '—';
+  }
+
+  if (poseMovement) {
+    const count = state.pose.lastForecast?.movingJointCount;
+    const ratioText = formatPercent(state.pose.lastForecast?.movingJointRatio ?? null);
+    if (typeof count === 'number' && Number.isFinite(count)) {
+      poseMovement.textContent = ratioText ? `${count} joints (${ratioText})` : `${count} joints`;
+    } else if (ratioText) {
+      poseMovement.textContent = ratioText;
+    } else {
+      poseMovement.textContent = '—';
+    }
+  }
+
+  if (poseThreatIndicator) {
+    const threat = state.pose.lastThreat;
+    const hasPoseData = Boolean(state.pose.lastForecast || threat || state.pose.lastUpdated);
+    if (threat) {
+      const label = threat.label && typeof threat.label === 'string' ? threat.label : 'Threat';
+      const scoreText = formatPercent(threat.threatScore ?? null);
+      poseThreatIndicator.textContent = scoreText ? `${label} (${scoreText})` : label;
+    } else if (hasPoseData) {
+      poseThreatIndicator.textContent = 'No threat';
+    } else {
+      poseThreatIndicator.textContent = '—';
+    }
+  }
+}
+
 function setConnectionState(status) {
   state.stream.status = status;
   updateStreamWidget();
@@ -470,6 +511,64 @@ function renderThreatSummary(summary) {
   }
   if (threatSummaryEmpty) {
     threatSummaryEmpty.hidden = true;
+  }
+
+  const poseSummary = summary.pose && typeof summary.pose === 'object' ? summary.pose : null;
+  if (poseSummary) {
+    const poseSection = document.createElement('section');
+    poseSection.className = 'metrics-section';
+    const poseHeading = document.createElement('h3');
+    poseHeading.textContent = 'Pose indicators';
+    poseSection.appendChild(poseHeading);
+    const list = document.createElement('div');
+    list.className = 'metrics-channels';
+    const forecastCount = typeof poseSummary.forecasts === 'number' ? poseSummary.forecasts : 0;
+    list.appendChild(createMetricsRow('Forecasts', `${forecastCount}`));
+    const avgConfidence = formatPercent(poseSummary.averageConfidence ?? null);
+    if (avgConfidence) {
+      list.appendChild(createMetricsRow('Avg confidence', avgConfidence));
+    }
+    const latest = poseSummary.lastForecast && typeof poseSummary.lastForecast === 'object' ? poseSummary.lastForecast : null;
+    if (latest) {
+      const parts = [];
+      if (typeof latest.movingJointCount === 'number' && Number.isFinite(latest.movingJointCount)) {
+        parts.push(`${latest.movingJointCount} joints`);
+      }
+      const latestRatio = formatPercent(latest.movingJointRatio ?? null);
+      if (latestRatio) {
+        parts.push(latestRatio);
+      }
+      if (parts.length > 0) {
+        list.appendChild(createMetricsRow('Latest movement', parts.join(' · ')));
+      }
+    }
+    const threats = poseSummary.threats && typeof poseSummary.threats === 'object' ? poseSummary.threats : null;
+    if (threats) {
+      const maxThreat = threats.maxThreat && typeof threats.maxThreat === 'object' ? threats.maxThreat : null;
+      const peak = maxThreat
+        ? (() => {
+            const label = maxThreat.label && typeof maxThreat.label === 'string' ? maxThreat.label : 'Threat';
+            const score = formatPercent(maxThreat.threatScore ?? null);
+            return score ? `${label} (${score})` : label;
+          })()
+        : 'No threat spikes';
+      list.appendChild(createMetricsRow('Peak threat', peak));
+      if (typeof threats.events === 'number' && threats.events > 0) {
+        const averageThreat = formatPercent(threats.averageMaxThreatScore ?? null);
+        const pieces = [];
+        if (averageThreat) {
+          pieces.push(`avg ${averageThreat}`);
+        }
+        if (typeof threats.totalDetections === 'number' && Number.isFinite(threats.totalDetections)) {
+          pieces.push(`${threats.totalDetections} detections`);
+        }
+        if (pieces.length > 0) {
+          list.appendChild(createMetricsRow('Threat activity', pieces.join(' · ')));
+        }
+      }
+    }
+    poseSection.appendChild(list);
+    threatSummaryContainer.appendChild(poseSection);
   }
 
   const severityEntries = Object.entries(summary.totals?.bySeverity ?? {});
@@ -863,10 +962,187 @@ function rebuildChannelsFromEvents() {
   updateChannelFilterControls();
 }
 
+function createPoseSummaryAccumulator() {
+  return {
+    forecasts: 0,
+    confidenceTotal: 0,
+    confidenceCount: 0,
+    lastForecast: null,
+    threatEvents: 0,
+    threatScoreTotal: 0,
+    threatDetections: 0,
+    highestThreat: null
+  };
+}
+
+function accumulatePoseSummaryFromEvent(accumulator, event) {
+  const meta = (event && event.meta && typeof event.meta === 'object') ? event.meta : {};
+  const ts = normalizeTimestamp(event?.ts);
+  const forecast = extractPoseForecast(meta);
+  if (forecast) {
+    accumulator.forecasts += 1;
+    if (typeof forecast.confidence === 'number') {
+      accumulator.confidenceTotal += forecast.confidence;
+      accumulator.confidenceCount += 1;
+    }
+    const shouldReplace = !accumulator.lastForecast ||
+      (typeof ts === 'number' && (accumulator.lastForecast.ts ?? -Infinity) <= ts);
+    if (shouldReplace) {
+      accumulator.lastForecast = {
+        ts: typeof ts === 'number' ? ts : null,
+        eventId: typeof event?.id === 'number' ? event.id : null,
+        confidence: typeof forecast.confidence === 'number' ? forecast.confidence : null,
+        movingJointCount:
+          typeof forecast.movingJointCount === 'number' && Number.isFinite(forecast.movingJointCount)
+            ? forecast.movingJointCount
+            : null,
+        movingJointRatio:
+          typeof forecast.movingJointRatio === 'number' && Number.isFinite(forecast.movingJointRatio)
+            ? forecast.movingJointRatio
+            : null,
+        detector: typeof event?.detector === 'string' ? event.detector : null,
+        severity: typeof event?.severity === 'string' ? event.severity : null
+      };
+    }
+  }
+
+  const threat = extractPoseThreatSummary(meta);
+  if (threat) {
+    accumulator.threatEvents += 1;
+    if (typeof threat.maxThreatScore === 'number') {
+      accumulator.threatScoreTotal += threat.maxThreatScore;
+      const current = accumulator.highestThreat;
+      if (!current || current.threatScore < threat.maxThreatScore) {
+        accumulator.highestThreat = {
+          threatScore: threat.maxThreatScore,
+          label: typeof threat.maxThreatLabel === 'string' ? threat.maxThreatLabel : null,
+          eventId: typeof event?.id === 'number' ? event.id : null,
+          ts: typeof ts === 'number' ? ts : null,
+          detector: typeof event?.detector === 'string' ? event.detector : null,
+          severity: typeof event?.severity === 'string' ? event.severity : null
+        };
+      }
+    }
+    if (typeof threat.totalDetections === 'number') {
+      accumulator.threatDetections += threat.totalDetections;
+    }
+  }
+}
+
+function finalizePoseSummaryFromAccumulator(accumulator) {
+  if (
+    accumulator.forecasts === 0 &&
+    accumulator.confidenceCount === 0 &&
+    accumulator.threatEvents === 0 &&
+    !accumulator.highestThreat
+  ) {
+    return null;
+  }
+
+  const summary = {
+    forecasts: accumulator.forecasts
+  };
+
+  if (accumulator.confidenceCount > 0) {
+    summary.averageConfidence = accumulator.confidenceTotal / accumulator.confidenceCount;
+  }
+
+  if (accumulator.lastForecast) {
+    summary.lastForecast = {
+      ts: accumulator.lastForecast.ts,
+      eventId: accumulator.lastForecast.eventId,
+      confidence: accumulator.lastForecast.confidence,
+      movingJointCount: accumulator.lastForecast.movingJointCount,
+      movingJointRatio: accumulator.lastForecast.movingJointRatio,
+      detector: accumulator.lastForecast.detector,
+      severity: accumulator.lastForecast.severity
+    };
+  }
+
+  if (accumulator.threatEvents > 0 || accumulator.highestThreat) {
+    summary.threats = {
+      events: accumulator.threatEvents,
+      averageMaxThreatScore:
+        accumulator.threatEvents > 0 ? accumulator.threatScoreTotal / accumulator.threatEvents : null,
+      totalDetections: accumulator.threatDetections,
+      maxThreat: accumulator.highestThreat
+        ? {
+            label: accumulator.highestThreat.label,
+            threatScore: accumulator.highestThreat.threatScore,
+            eventId: accumulator.highestThreat.eventId,
+            ts: accumulator.highestThreat.ts,
+            detector: accumulator.highestThreat.detector,
+            severity: accumulator.highestThreat.severity
+          }
+        : null
+    };
+  }
+
+  return summary;
+}
+
+function extractPoseForecast(meta) {
+  if (!meta || typeof meta !== 'object') {
+    return null;
+  }
+  const forecast = meta.poseForecast;
+  if (!forecast || typeof forecast !== 'object') {
+    return null;
+  }
+  return {
+    confidence: typeof forecast.confidence === 'number' ? forecast.confidence : null,
+    movingJointCount: typeof forecast.movingJointCount === 'number' ? forecast.movingJointCount : null,
+    movingJointRatio: typeof forecast.movingJointRatio === 'number' ? forecast.movingJointRatio : null
+  };
+}
+
+function extractPoseThreatSummary(meta) {
+  if (!meta || typeof meta !== 'object') {
+    return null;
+  }
+  const summary = meta.poseThreatSummary || meta.threats;
+  if (!summary || typeof summary !== 'object') {
+    return null;
+  }
+  return {
+    maxThreatScore: typeof summary.maxThreatScore === 'number' ? summary.maxThreatScore : null,
+    maxThreatLabel:
+      typeof summary.maxThreatLabel === 'string'
+        ? summary.maxThreatLabel
+        : summary.maxThreatLabel === null
+        ? null
+        : undefined,
+    totalDetections:
+      typeof summary.totalDetections === 'number' ? summary.totalDetections : undefined
+  };
+}
+
+function normalizeTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function formatPercent(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const clamped = Math.min(Math.max(value, 0), 1);
+  return `${Math.round(clamped * 100)}%`;
+}
+
 function computeSummaryFromEvents(events) {
   const totalsByDetector = {};
   const totalsBySeverity = {};
   const channelMap = new Map();
+  const poseAccumulator = createPoseSummaryAccumulator();
 
   events.forEach(event => {
     const detector = event.detector ?? 'unknown';
@@ -874,6 +1150,7 @@ function computeSummaryFromEvents(events) {
     totalsByDetector[detector] = (totalsByDetector[detector] ?? 0) + 1;
     totalsBySeverity[severity] = (totalsBySeverity[severity] ?? 0) + 1;
     const meta = event.meta ?? {};
+    accumulatePoseSummaryFromEvent(poseAccumulator, event);
     const resolvedChannels = Array.isArray(meta.resolvedChannels)
       ? meta.resolvedChannels.filter(channel => typeof channel === 'string')
       : [getEventChannel(event)].filter(Boolean);
@@ -901,13 +1178,20 @@ function computeSummaryFromEvents(events) {
     });
   });
 
-  return {
+  const summary = {
     totals: {
       byDetector: totalsByDetector,
       bySeverity: totalsBySeverity
     },
     channels: Array.from(channelMap.values())
   };
+
+  const poseSummary = finalizePoseSummaryFromAccumulator(poseAccumulator);
+  if (poseSummary) {
+    summary.pose = poseSummary;
+  }
+
+  return summary;
 }
 
 function updateSummaries(serverSummary) {
@@ -916,8 +1200,64 @@ function updateSummaries(serverSummary) {
   } else {
     state.summary = computeSummaryFromEvents(state.events);
   }
+  applyPoseSummary(state.summary);
   renderThreatSummary(state.summary);
   renderChannelStatus();
+}
+
+function applyPoseSummary(summary) {
+  const pose = summary && typeof summary === 'object' ? summary.pose : null;
+  if (!pose || typeof pose !== 'object') {
+    state.pose.lastForecast = null;
+    state.pose.lastThreat = null;
+    state.pose.lastUpdated = null;
+    updatePoseWidget();
+    return;
+  }
+
+  const forecast = pose.lastForecast && typeof pose.lastForecast === 'object' ? pose.lastForecast : null;
+  state.pose.lastForecast = forecast
+    ? {
+        confidence:
+          typeof forecast.confidence === 'number' && Number.isFinite(forecast.confidence)
+            ? forecast.confidence
+            : null,
+        movingJointCount:
+          typeof forecast.movingJointCount === 'number' && Number.isFinite(forecast.movingJointCount)
+            ? forecast.movingJointCount
+            : null,
+        movingJointRatio:
+          typeof forecast.movingJointRatio === 'number' && Number.isFinite(forecast.movingJointRatio)
+            ? forecast.movingJointRatio
+            : null,
+        eventId: typeof forecast.eventId === 'number' ? forecast.eventId : null,
+        ts: normalizeTimestamp(forecast.ts)
+      }
+    : null;
+
+  const threats = pose.threats && typeof pose.threats === 'object' ? pose.threats : null;
+  const maxThreat = threats && typeof threats.maxThreat === 'object' ? threats.maxThreat : null;
+  state.pose.lastThreat = maxThreat
+    ? {
+        label: typeof maxThreat.label === 'string' ? maxThreat.label : null,
+        threatScore:
+          typeof maxThreat.threatScore === 'number' && Number.isFinite(maxThreat.threatScore)
+            ? maxThreat.threatScore
+            : null,
+        eventId: typeof maxThreat.eventId === 'number' ? maxThreat.eventId : null,
+        ts: normalizeTimestamp(maxThreat.ts)
+      }
+    : null;
+
+  const forecastTs = state.pose.lastForecast?.ts;
+  const threatTs = state.pose.lastThreat?.ts;
+  state.pose.lastUpdated = typeof forecastTs === 'number' && Number.isFinite(forecastTs)
+    ? forecastTs
+    : typeof threatTs === 'number' && Number.isFinite(threatTs)
+    ? threatTs
+    : null;
+
+  updatePoseWidget();
 }
 
 function setMetricsDigest(digest) {

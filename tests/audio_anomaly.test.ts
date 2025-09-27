@@ -172,6 +172,114 @@ describe('AudioAnomalyWindowing', () => {
     expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(blendedWindow, 5);
   });
 
+  it('AudioAnomalyWindowSustain requires consecutive frames to trigger', () => {
+    const detector = new AudioAnomalyDetector(
+      {
+        source: 'audio:test',
+        sampleRate,
+        frameDurationMs,
+        hopDurationMs,
+        minIntervalMs: 0,
+        thresholds: {
+          day: {
+            rms: 0.18,
+            rmsWindowMs: hopDurationMs * 4,
+            minTriggerDurationMs: hopDurationMs * 3
+          }
+        },
+        centroidJumpThreshold: 4000
+      },
+      bus
+    );
+
+    const quietFrame = createConstantFrame(frameSize, 0.05);
+    const loudFrame = createConstantFrame(frameSize, 0.45);
+    let ts = dayTs;
+
+    detector.handleChunk(quietFrame, ts);
+    ts += hopDurationMs;
+    detector.handleChunk(loudFrame, ts);
+    ts += hopDurationMs;
+    detector.handleChunk(loudFrame, ts);
+    ts += hopDurationMs;
+    detector.handleChunk(quietFrame, ts);
+    ts += hopDurationMs;
+    detector.handleChunk(loudFrame, ts);
+    ts += hopDurationMs;
+    detector.handleChunk(loudFrame, ts);
+    ts += hopDurationMs;
+    detector.handleChunk(loudFrame, ts);
+
+    expect(events).toHaveLength(1);
+    const meta = events[0].meta as Record<string, any>;
+    expect(meta.durationAboveThresholdMs).toBeCloseTo(3 * hopDurationMs, 5);
+    const accumulation = meta.accumulationMs as Record<string, number>;
+    expect(accumulation.rmsFrames).toBeGreaterThanOrEqual(3);
+    expect(accumulation.rmsFrames).toBeLessThanOrEqual(4);
+    const state = meta.state as Record<string, any>;
+    expect(state.rms.sustainFrames).toBeGreaterThanOrEqual(3);
+    expect(state.rms.recoveryFrames).toBe(0);
+  });
+
+  it('AudioAnomalyNightProfile smooths blend around night boundary', () => {
+    const detector = new AudioAnomalyDetector(
+      {
+        source: 'audio:test',
+        sampleRate,
+        frameDurationMs,
+        hopDurationMs,
+        minIntervalMs: 0,
+        thresholds: {
+          day: {
+            rms: 0.4,
+            rmsWindowMs: hopDurationMs * 4,
+            minTriggerDurationMs: hopDurationMs * 2
+          },
+          night: {
+            rms: 0.16,
+            rmsWindowMs: hopDurationMs * 5,
+            minTriggerDurationMs: hopDurationMs * 2
+          },
+          blendMinutes: 60
+        },
+        nightHours: { start: 22, end: 6 }
+      },
+      bus
+    );
+
+    const warmFrame = createConstantFrame(frameSize, 0.08);
+    const loudFrame = createConstantFrame(frameSize, 0.5);
+
+    const firstTs = new Date(2024, 0, 1, 21, 45).getTime();
+    const warmStart = firstTs - hopDurationMs * 4;
+    for (let i = 0; i < 4; i += 1) {
+      detector.handleChunk(warmFrame, warmStart + i * hopDurationMs);
+    }
+    for (let i = 0; i < 5; i += 1) {
+      detector.handleChunk(loudFrame, firstTs + i * hopDurationMs);
+    }
+
+    expect(events).toHaveLength(1);
+    const firstMeta = events.pop()?.meta as Record<string, any>;
+    const firstWeights = firstMeta.thresholds?.weights as Record<string, number>;
+    expect(firstWeights.day ?? 0).toBeGreaterThan(firstWeights.night ?? 0);
+
+    const secondTs = new Date(2024, 0, 1, 22, 15).getTime();
+    const nightWarmStart = secondTs - hopDurationMs * 3;
+    for (let i = 0; i < 3; i += 1) {
+      detector.handleChunk(warmFrame, nightWarmStart + i * hopDurationMs);
+    }
+    for (let i = 0; i < 5; i += 1) {
+      detector.handleChunk(loudFrame, secondTs + i * hopDurationMs);
+    }
+
+    expect(events).toHaveLength(1);
+    const secondMeta = events[0].meta as Record<string, any>;
+    const secondWeights = secondMeta.thresholds?.weights as Record<string, number>;
+    expect(secondWeights.night ?? 0).toBeGreaterThan(secondWeights.day ?? 0);
+    expect(secondMeta.thresholds?.profile).toBe('transition');
+  });
+
   it('AudioAnomalyHotReload resets buffers and applies new window lengths', () => {
     const detector = new AudioAnomalyDetector(
       {

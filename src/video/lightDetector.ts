@@ -31,6 +31,9 @@ const DEFAULT_BACKOFF_FRAMES = 3;
 const DEFAULT_NOISE_MULTIPLIER = 2.5;
 const DEFAULT_NOISE_SMOOTHING = 0.1;
 const DEFAULT_IDLE_REBASELINE_MS = 120_000;
+const NOISE_WINDOW_SIZE = 40;
+const DELTA_WINDOW_SIZE = 24;
+const SUSTAINED_NOISE_THRESHOLD = 1.1;
 
 export class LightDetector {
   private options: LightDetectorOptions;
@@ -43,6 +46,10 @@ export class LightDetector {
   private deltaTrend = 0;
   private pendingSuppressedFramesBeforeTrigger = 0;
   private lastFrameTs: number | null = null;
+  private readonly noiseWindow: number[] = [];
+  private readonly deltaWindow: number[] = [];
+  private sustainedNoiseBoost = 1;
+  private lastDenoiseStrategy = 'gaussian-median';
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
@@ -184,7 +191,10 @@ export class LightDetector {
         this.deltaTrend === 0
           ? delta
           : this.deltaTrend * (1 - deltaTrendSmoothing) + delta * deltaTrendSmoothing;
-      const stabilizedDelta = Math.max(delta, this.deltaTrend);
+      recordWindowSample(this.deltaWindow, delta, DELTA_WINDOW_SIZE);
+      const deltaWindowMedian = median(this.deltaWindow);
+      const stabilizedDelta = Math.max(delta, this.deltaTrend, deltaWindowMedian ?? delta);
+      metrics.setDetectorGauge('light', 'deltaWindowMedian', deltaWindowMedian ?? delta);
 
       const effectiveNoiseSmoothing = clamp(
         baseNoiseSmoothing * (noiseRatio > 1 ? 1 + Math.min(noiseRatio - 1, 1) * 0.6 : 0.65),
@@ -206,6 +216,24 @@ export class LightDetector {
       const adaptiveThreshold = baseAdaptiveThreshold * noiseSuppressionFactor;
       const intensityRatio = adaptiveThreshold === 0 ? 0 : stabilizedDelta / adaptiveThreshold;
 
+      recordWindowSample(this.noiseWindow, noiseRatio, NOISE_WINDOW_SIZE);
+      const noiseWindowMedian = median(this.noiseWindow);
+      const noiseWindowPressure = computePressure(this.noiseWindow, SUSTAINED_NOISE_THRESHOLD);
+      const targetBoost = clamp(
+        1 + Math.max((noiseWindowMedian ?? noiseRatio) - 1, 0) * 0.8 + noiseWindowPressure * 1.6,
+        1,
+        4
+      );
+      const boostSmoothing = noiseWindowPressure > 0.2 ? 0.35 : 0.2;
+      this.sustainedNoiseBoost = clamp(
+        this.sustainedNoiseBoost * (1 - boostSmoothing) + targetBoost * boostSmoothing,
+        1,
+        4
+      );
+      metrics.setDetectorGauge('light', 'noiseWindowMedian', noiseWindowMedian ?? noiseRatio);
+      metrics.setDetectorGauge('light', 'noiseWindowPressure', noiseWindowPressure);
+      metrics.setDetectorGauge('light', 'noiseWindowBoost', this.sustainedNoiseBoost);
+
       this.lastDenoiseStrategy = denoiseStrategy;
 
       const effectiveSmoothing = clamp(
@@ -217,9 +245,10 @@ export class LightDetector {
       );
 
       const debounceMultiplier = clamp(noiseSuppressionFactor, 1, 1.5);
+      const sustainedDebounceMultiplier = Math.max(1, this.sustainedNoiseBoost);
       const effectiveDebounce = Math.max(
         baseDebounce,
-        Math.round(baseDebounce * debounceMultiplier)
+        Math.round(baseDebounce * debounceMultiplier * sustainedDebounceMultiplier)
       );
       const backoffMultiplier = clamp(
         noiseSuppressionFactor > 1 ? 1 + (noiseSuppressionFactor - 1) * 0.5 : 1.2,
@@ -228,8 +257,11 @@ export class LightDetector {
       );
       const effectiveBackoff = Math.max(
         baseBackoff,
-        Math.round(baseBackoff * backoffMultiplier)
+        Math.round(baseBackoff * backoffMultiplier * Math.max(1, this.sustainedNoiseBoost * 1.05))
       );
+
+      metrics.setDetectorGauge('light', 'effectiveDebounceFrames', effectiveDebounce);
+      metrics.setDetectorGauge('light', 'effectiveBackoffFrames', effectiveBackoff);
 
       if (this.isWithinNormalHours(ts)) {
         this.updateBaseline(luminance, effectiveSmoothing);
@@ -325,11 +357,15 @@ export class LightDetector {
           noiseFloor: updatedNoiseFloor,
           noiseRatio,
           noiseSuppressionFactor,
+          noiseWindowMedian: noiseWindowMedian ?? noiseRatio,
+          noiseWindowPressure,
+          sustainedNoiseBoost: this.sustainedNoiseBoost,
           effectiveDebounceFrames: effectiveDebounce,
           effectiveBackoffFrames: effectiveBackoff,
           noiseSmoothing: effectiveNoiseSmoothing,
           smoothingFactor: effectiveSmoothing,
           noiseMultiplier,
+          deltaWindowMedian: deltaWindowMedian ?? stabilizedDelta,
           debounceMultiplier,
           backoffMultiplier,
           suppressedFramesBeforeTrigger,
@@ -359,6 +395,9 @@ export class LightDetector {
     this.noiseLevel = 0;
     this.pendingFrames = 0;
     this.backoffFrames = 0;
+    this.noiseWindow.length = 0;
+    this.deltaWindow.length = 0;
+    this.sustainedNoiseBoost = 1;
     if (!preserveSuppression) {
       this.suppressedFrames = 0;
       this.pendingSuppressedFramesBeforeTrigger = 0;
@@ -394,6 +433,36 @@ function isHourWithinRange(hour: number, start: number, end: number): boolean {
 
 function normalizeHour(hour: number) {
   return ((Math.floor(hour) % 24) + 24) % 24;
+}
+
+function recordWindowSample(buffer: number[], sample: number, size: number) {
+  if (!Number.isFinite(sample)) {
+    return;
+  }
+  buffer.push(sample);
+  if (buffer.length > size) {
+    buffer.splice(0, buffer.length - size);
+  }
+}
+
+function median(buffer: number[]): number | null {
+  if (buffer.length === 0) {
+    return null;
+  }
+  const sorted = [...buffer].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1]! + sorted[mid]!) / 2;
+  }
+  return sorted[mid]!;
+}
+
+function computePressure(buffer: number[], threshold: number) {
+  if (buffer.length === 0) {
+    return 0;
+  }
+  const hits = buffer.filter(value => value >= threshold).length;
+  return hits / buffer.length;
 }
 
 function clamp(value: number, min: number, max: number) {

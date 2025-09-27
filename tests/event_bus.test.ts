@@ -177,6 +177,82 @@ describe('EventSuppressionRateLimit', () => {
     expect(Number(snapshot.suppression.lastEvent?.cooldownRemainingMs ?? 0)).toBeGreaterThanOrEqual(0);
   });
 
+  it('EventSuppressionChannelRateLimit exposes per-channel window metadata', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'per-channel',
+        detector: 'test-detector',
+        rateLimit: { count: 1, perMs: 800, cooldownMs: 500 },
+        suppressForMs: 600,
+        reason: 'per-channel limit'
+      }
+    ]);
+
+    metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 400, meta: { channel: 'cam:b' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 500, meta: { channel: 'cam:b' } });
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressedMeta).toHaveLength(2);
+    const firstState = suppressedMeta[0].suppressionChannelStates as Record<string, any>;
+    expect(firstState).toBeDefined();
+    expect(firstState['cam:a']).toMatchObject({
+      hits: 1,
+      cooldownRemainingMs: 500,
+      windowRemainingMs: 600
+    });
+    expect(firstState['cam:a'].reasons).toContain('per-channel limit');
+    const secondState = suppressedMeta[1].suppressionChannelStates as Record<string, any>;
+    expect(secondState['cam:b'].hits).toBeGreaterThanOrEqual(1);
+  });
+
+  it('EventSuppressionMetricsHistogram tracks channel-specific counts', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'histogram-channel',
+        detector: 'test-detector',
+        rateLimit: { count: 1, perMs: 1000, cooldownMs: 400 },
+        suppressForMs: 700,
+        reason: 'histogram limit'
+      }
+    ]);
+
+    metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 100, meta: { channel: 'cam:a' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 500, meta: { channel: 'cam:b' } });
+    metricsBus.emitEvent({ ...basePayload, ts: 600, meta: { channel: 'cam:b' } });
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.byChannel['cam:a']).toBe(1);
+    expect(snapshot.suppression.byChannel['cam:b']).toBe(1);
+    expect(snapshot.suppression.rules['histogram-channel'].byChannel['cam:a']).toBe(1);
+    expect(snapshot.suppression.rules['histogram-channel'].byChannel['cam:b']).toBe(1);
+    const channelHist = snapshot.suppression.histogram.channel;
+    expect(channelHist.cooldownMs['cam:a']).toBeDefined();
+    expect(Object.values(channelHist.cooldownMs['cam:a'])).not.toHaveLength(0);
+    expect(channelHist.windowRemainingMs['cam:b']).toBeDefined();
+    expect(Object.values(channelHist.windowRemainingMs['cam:b'])).not.toHaveLength(0);
+  });
+
   it('EventSuppressionMaxEvents enforces burst limits with history metadata', () => {
     bus.configureSuppression([
       {

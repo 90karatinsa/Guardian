@@ -42,7 +42,7 @@ type InferenceSessionLike = {
 export class PersonDetector {
   private session: InferenceSessionLike | null = null;
   private inputName: string | null = null;
-  private outputName: string | null = null;
+  private outputNames: string[] = [];
   private lastEventTs = 0;
   private readonly classIndices: number[];
   private readonly objectClassifier?: ObjectClassifier;
@@ -72,7 +72,7 @@ export class PersonDetector {
     try {
       await this.ensureSession();
 
-      if (!this.session || !this.inputName || !this.outputName) {
+      if (!this.session || !this.inputName) {
         return;
       }
 
@@ -86,13 +86,21 @@ export class PersonDetector {
       };
 
       const results = await this.session.run(feeds);
-      const output = results[this.outputName];
 
-      if (!output) {
+      const outputTensors: ort.Tensor[] = [];
+      const names = this.outputNames.length > 0 ? this.outputNames : Object.keys(results);
+      for (const name of names) {
+        const candidate = results[name];
+        if (candidate) {
+          outputTensors.push(candidate);
+        }
+      }
+
+      if (outputTensors.length === 0) {
         return;
       }
 
-      const detections = parseYoloDetections(output, meta, {
+      const detections = parseYoloDetections(outputTensors, meta, {
         classIndex: PERSON_CLASS_INDEX,
         classIndices: this.classIndices,
         scoreThreshold: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
@@ -201,7 +209,9 @@ export class PersonDetector {
     }
 
     this.inputName = this.session.inputNames[0] ?? null;
-    this.outputName = this.session.outputNames[0] ?? null;
+    this.outputNames = Array.isArray(this.session.outputNames)
+      ? [...this.session.outputNames]
+      : [];
   }
 }
 

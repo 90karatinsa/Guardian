@@ -89,14 +89,32 @@ const USAGE_LINES = [
   'Guardian CLI',
   '',
   'Usage:',
-  '  guardian start        Start the detector daemon',
-  '  guardian stop         Stop the running daemon',
+  '  guardian start        Start the detector daemon (alias of "guardian daemon start")',
+  '  guardian stop         Stop the running daemon (alias of "guardian daemon stop")',
   '  guardian status       Print service status summary',
   '  guardian health       Print health JSON',
   '  guardian ready        Print readiness JSON',
+  '  guardian daemon <command>  Run daemon lifecycle commands',
   '  guardian log-level    Get or set the active log level',
   '  guardian retention run [--config path]  Run retention once with current config'
 ];
+
+const DAEMON_USAGE = [
+  'Guardian daemon commands',
+  '',
+  'Usage:',
+  '  guardian daemon start            Start the detector daemon',
+  '  guardian daemon stop             Stop the running daemon',
+  '  guardian daemon status [--json]  Print service status summary',
+  '  guardian daemon health           Print health JSON',
+  '  guardian daemon ready            Print readiness JSON',
+  '  guardian daemon hooks [options]  Run shutdown hooks without stopping the daemon',
+  '',
+  'Options for "hooks":',
+  '  -r, --reason <reason>  Override shutdown reason (default: daemon-hooks)',
+  '  -s, --signal <signal>  Report the originating signal when recording hooks',
+  '  -h, --help             Show this help message'
+].join('\n');
 
 const RETENTION_USAGE = [
   'Guardian retention commands',
@@ -120,6 +138,15 @@ const LOG_LEVEL_USAGE = [
   '',
   `Available levels: ${getAvailableLogLevels().join(', ')}`
 ].join('\n');
+
+const VALID_SIGNALS: ReadonlySet<NodeJS.Signals> = new Set([
+  'SIGTERM',
+  'SIGINT',
+  'SIGQUIT',
+  'SIGHUP',
+  'SIGUSR1',
+  'SIGUSR2'
+]);
 
 const state: {
   status: ServiceStatus;
@@ -240,6 +267,10 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
 
   const command = argv[0] ?? 'start';
 
+  if (command === 'daemon') {
+    return runDaemonCommand(argv.slice(1), io);
+  }
+
   switch (command) {
     case 'start': {
       return startDaemon(io);
@@ -273,6 +304,188 @@ export async function runCli(argv = process.argv.slice(2), io: CliIo = DEFAULT_I
       io.stderr.write(`Unknown command: ${command}\n`);
       return 1;
     }
+  }
+}
+
+async function runDaemonCommand(args: string[], io: CliIo): Promise<number> {
+  const [first, ...rest] = args;
+
+  if (!first || first === 'start') {
+    return startDaemon(io);
+  }
+
+  if (first === 'stop') {
+    return stopDaemon(io);
+  }
+
+  if (first === 'status') {
+    const json = rest.includes('--json') || rest.includes('-j');
+    return printStatus(io, { json });
+  }
+
+  if (first === 'health') {
+    return outputHealth(io);
+  }
+
+  if (first === 'ready') {
+    return outputReadiness(io);
+  }
+
+  if (first === 'hooks') {
+    return runDaemonHooksCommand(rest, io);
+  }
+
+  if (first === 'help' || first === '--help' || first === '-h') {
+    io.stdout.write(`${DAEMON_USAGE}\n`);
+    return 0;
+  }
+
+  if (first.startsWith('-')) {
+    io.stderr.write(`Unknown option: ${first}\n`);
+    io.stderr.write(`${DAEMON_USAGE}\n`);
+    return 1;
+  }
+
+  io.stderr.write(`Unknown daemon subcommand: ${first}\n`);
+  io.stderr.write(`${DAEMON_USAGE}\n`);
+  return 1;
+}
+
+type DaemonHooksArgs = {
+  help: boolean;
+  errors: string[];
+  reason: string;
+  signal?: NodeJS.Signals;
+};
+
+function parseDaemonHooksArgs(args: string[]): DaemonHooksArgs {
+  const result: DaemonHooksArgs = {
+    help: false,
+    errors: [],
+    reason: 'daemon-hooks'
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (!token) {
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      result.help = true;
+      continue;
+    }
+    if (token === '--reason' || token === '-r') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        result.errors.push('Missing value for --reason');
+      } else {
+        result.reason = value;
+        index += 1;
+      }
+      continue;
+    }
+    if (token === '--signal' || token === '-s') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        result.errors.push('Missing value for --signal');
+      } else {
+        const upper = value.toUpperCase();
+        if (VALID_SIGNALS.has(upper as NodeJS.Signals)) {
+          result.signal = upper as NodeJS.Signals;
+        } else {
+          result.errors.push(`Unknown signal: ${value}`);
+        }
+        index += 1;
+      }
+      continue;
+    }
+    result.errors.push(`Unknown option: ${token}`);
+  }
+
+  return result;
+}
+
+type ShutdownHookExecution = {
+  summaries: ShutdownHookSummary[];
+  summary: { ok: number; failed: number };
+  error: Error | null;
+};
+
+async function executeShutdownHooks(context: { reason: string; signal?: NodeJS.Signals }): Promise<ShutdownHookExecution> {
+  const results = await runShutdownHooks(context);
+  const summaries: ShutdownHookSummary[] = [];
+  let ok = 0;
+  let failed = 0;
+  let firstError: Error | null = null;
+
+  for (const result of results) {
+    if (result.status === 'error') {
+      const error = result.error ?? new Error('shutdown hook failed');
+      if (!firstError) {
+        firstError = error;
+      }
+      failed += 1;
+      summaries.push({
+        name: result.name,
+        status: 'error',
+        error: error.message ?? String(error)
+      });
+      logger.error({ err: error, hook: result.name }, 'Shutdown hook failed');
+    } else {
+      ok += 1;
+      summaries.push({ name: result.name, status: 'ok' });
+      logger.debug({ hook: result.name }, 'Shutdown hook executed');
+    }
+  }
+
+  const summary = { ok, failed };
+  logger.info({ hooks: summaries, summary }, 'Shutdown hooks completed');
+
+  return { summaries, summary, error: firstError };
+}
+
+async function runDaemonHooksCommand(args: string[], io: CliIo): Promise<number> {
+  const parsed = parseDaemonHooksArgs(args);
+
+  if (parsed.help) {
+    io.stdout.write(`${DAEMON_USAGE}\n`);
+    return 0;
+  }
+
+  if (parsed.errors.length > 0) {
+    for (const message of parsed.errors) {
+      io.stderr.write(`${message}\n`);
+    }
+    return 1;
+  }
+
+  try {
+    const { summaries, summary, error } = await executeShutdownHooks({
+      reason: parsed.reason,
+      signal: parsed.signal
+    });
+    state.lastShutdownHooks = summaries;
+    state.lastShutdownAt = Date.now();
+    state.lastShutdownReason = parsed.reason;
+    state.lastShutdownSignal = parsed.signal ?? null;
+    state.lastShutdownError = error;
+
+    io.stdout.write(`Shutdown hooks executed: ${summary.ok} ok, ${summary.failed} failed\n`);
+    if (summary.failed > 0) {
+      for (const hook of summaries) {
+        if (hook.status === 'error') {
+          const message = hook.error ?? 'unknown error';
+          io.stderr.write(`Hook ${hook.name} failed: ${message}\n`);
+        }
+      }
+    }
+
+    return summary.failed > 0 ? 1 : 0;
+  } catch (error) {
+    const err = error as Error;
+    const message = err.message ?? String(err);
+    io.stderr.write(`Failed to execute shutdown hooks: ${message}\n`);
+    return 1;
   }
 }
 
@@ -620,39 +833,11 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
       logger.error({ err }, 'Error during shutdown');
     } finally {
       try {
-        const results = await runShutdownHooks({ reason, signal });
-        const hookSummaries: ShutdownHookSummary[] = [];
-        for (const result of results) {
-          if (result.status === 'error' && result.error) {
-            logger.error({ err: result.error, hook: result.name }, 'Shutdown hook failed');
-            if (!state.lastShutdownError) {
-              state.lastShutdownError = result.error;
-            }
-          } else {
-            logger.debug({ hook: result.name }, 'Shutdown hook executed');
-          }
-          hookSummaries.push({
-            name: result.name,
-            status: result.status === 'error' ? 'error' : 'ok',
-            error:
-              result.status === 'error' && result.error
-                ? result.error.message ?? String(result.error)
-                : undefined
-          });
+        const { summaries, error: hookError } = await executeShutdownHooks({ reason, signal });
+        state.lastShutdownHooks = summaries;
+        if (hookError && !state.lastShutdownError) {
+          state.lastShutdownError = hookError;
         }
-        state.lastShutdownHooks = hookSummaries;
-        const summary = hookSummaries.reduce(
-          (acc, hook) => {
-            if (hook.status === 'error') {
-              acc.failed += 1;
-            } else {
-              acc.ok += 1;
-            }
-            return acc;
-          },
-          { ok: 0, failed: 0 }
-        );
-        logger.info({ hooks: hookSummaries, summary }, 'Shutdown hooks completed');
       } catch (hookError) {
         const err = hookError as Error;
         logger.error({ err }, 'Shutdown hooks threw unexpectedly');

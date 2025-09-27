@@ -281,7 +281,7 @@ export class AudioSource extends EventEmitter {
     format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto',
     options: { timeoutMs?: number; channel?: string } = {}
   ): Promise<MicCandidate[]> {
-    const cacheKey = `${process.platform}:${format}`;
+    const cacheKey = buildDeviceCacheKey(process.platform, format);
     const cached = DEVICE_DISCOVERY_CACHE.get(cacheKey);
     if (cached) {
       const devices = await cached;
@@ -343,8 +343,13 @@ export class AudioSource extends EventEmitter {
     }
   }
 
-  static clearDeviceCache() {
-    DEVICE_DISCOVERY_CACHE.clear();
+  static clearDeviceCache(format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' | undefined = undefined) {
+    if (!format || format === 'auto') {
+      DEVICE_DISCOVERY_CACHE.clear();
+      return;
+    }
+
+    DEVICE_DISCOVERY_CACHE.delete(buildDeviceCacheKey(process.platform, format));
   }
 
   private async prepareMicCandidates(): Promise<boolean> {
@@ -405,6 +410,18 @@ export class AudioSource extends EventEmitter {
       }
 
       this.emit('error', error as Error);
+      AudioSource.clearDeviceCache(format);
+
+      if (this.options.type === 'mic') {
+        this.micInputArgs = buildMicInputArgs(
+          process.platform,
+          this.options,
+          this.options.micFallbacks
+        );
+        this.micCandidateIndex = 0;
+        this.activeMicCandidateIndex = null;
+        this.lastSuccessfulMicIndex = null;
+      }
     }
 
     if (this.shouldStop || this.circuitBroken) {
@@ -1335,6 +1352,10 @@ function resolveDeviceFormats(
     default:
       return ['alsa', 'dshow', 'avfoundation'];
   }
+}
+
+function buildDeviceCacheKey(platform: NodeJS.Platform, format: string) {
+  return `${platform}:${format}`;
 }
 
 export default AudioSource;

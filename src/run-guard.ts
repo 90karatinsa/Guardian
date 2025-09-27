@@ -16,8 +16,10 @@ import configManager, {
   VideoChannelConfig,
   RetentionConfig,
   PoseConfig,
+  PoseOverrideConfig,
   FaceConfig,
   ObjectsConfig,
+  ObjectsOverrideConfig,
   LightConfig,
   CameraLightConfig,
   AudioConfig
@@ -60,8 +62,8 @@ type CameraPipelineState = {
     classIndices?: number[];
     classScoreThresholds?: Record<number, number>;
   };
-  pose?: PoseConfig;
-  objects?: ObjectsConfig;
+  pose: PoseConfig | null;
+  objects: ObjectsConfig | null;
   light?: LightConfig | null;
 };
 
@@ -681,7 +683,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     return syncPromise;
   };
 
-  const handleReload = ({ next }: ConfigReloadEvent) => {
+  const handleReload = ({ previous, next }: ConfigReloadEvent) => {
+    const overrideDiff = diffGuardOverrides(previous, next);
     activeConfig = pickGuardConfig(next);
     runSync(activeConfig);
 
@@ -695,22 +698,29 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
     applyConfiguredLogLevel(next.logging?.level);
 
-    logger.info(
-      {
-        diffThreshold: activeConfig.motion?.diffThreshold,
-        areaThreshold: activeConfig.motion?.areaThreshold,
-        minIntervalMs: activeConfig.motion?.minIntervalMs,
-        suppressionRules: activeConfig.events?.suppression?.rules?.length ?? 0,
-        cameras: Array.isArray(next.video.cameras) ? next.video.cameras.length : 0,
-        channels: next.video.channels ? Object.keys(next.video.channels).length : 0,
-        audioFallbacks: next.audio?.micFallbacks
-          ? Object.values(next.audio.micFallbacks).reduce((total, devices) => {
-              return total + (Array.isArray(devices) ? devices.length : 0);
-            }, 0)
-          : 0
-      },
-      'configuration reloaded'
-    );
+    if (overrideDiff) {
+      logger.info(overrideDiff, 'configuration overrides diff');
+    }
+
+    const reloadMeta: Record<string, unknown> = {
+      diffThreshold: activeConfig.motion?.diffThreshold,
+      areaThreshold: activeConfig.motion?.areaThreshold,
+      minIntervalMs: activeConfig.motion?.minIntervalMs,
+      suppressionRules: activeConfig.events?.suppression?.rules?.length ?? 0,
+      cameras: Array.isArray(next.video.cameras) ? next.video.cameras.length : 0,
+      channels: next.video.channels ? Object.keys(next.video.channels).length : 0,
+      audioFallbacks: next.audio?.micFallbacks
+        ? Object.values(next.audio.micFallbacks).reduce((total, devices) => {
+            return total + (Array.isArray(devices) ? devices.length : 0);
+          }, 0)
+        : 0
+    };
+
+    if (overrideDiff) {
+      reloadMeta.overrides = overrideDiff;
+    }
+
+    logger.info(reloadMeta, 'configuration reloaded');
   };
 
   if (!injectedConfig) {
@@ -929,6 +939,54 @@ function resolveLightConfig(
   };
 }
 
+function resolvePoseConfig(
+  globalPose: PoseConfig | undefined,
+  channelPose: PoseOverrideConfig | undefined,
+  cameraPose: PoseOverrideConfig | undefined
+): PoseConfig | null {
+  const modelPath = cameraPose?.modelPath ?? channelPose?.modelPath ?? globalPose?.modelPath;
+  if (!modelPath) {
+    return null;
+  }
+
+  return {
+    modelPath,
+    forecastHorizonMs:
+      cameraPose?.forecastHorizonMs ??
+      channelPose?.forecastHorizonMs ??
+      globalPose?.forecastHorizonMs,
+    smoothingWindow:
+      cameraPose?.smoothingWindow ?? channelPose?.smoothingWindow ?? globalPose?.smoothingWindow,
+    minMovement: cameraPose?.minMovement ?? channelPose?.minMovement ?? globalPose?.minMovement,
+    historySize: cameraPose?.historySize ?? channelPose?.historySize ?? globalPose?.historySize
+  };
+}
+
+function resolveObjectsConfig(
+  globalObjects: ObjectsConfig | undefined,
+  channelObjects: ObjectsOverrideConfig | undefined,
+  cameraObjects: ObjectsOverrideConfig | undefined
+): ObjectsConfig | null {
+  const modelPath = cameraObjects?.modelPath ?? channelObjects?.modelPath ?? globalObjects?.modelPath;
+  const labels = cameraObjects?.labels ?? channelObjects?.labels ?? globalObjects?.labels;
+
+  if (!modelPath || !labels || labels.length === 0) {
+    return null;
+  }
+
+  const threatLabels = cameraObjects?.threatLabels ?? channelObjects?.threatLabels ?? globalObjects?.threatLabels;
+  const classIndices = cameraObjects?.classIndices ?? channelObjects?.classIndices ?? globalObjects?.classIndices;
+
+  return {
+    modelPath,
+    labels: [...labels],
+    threatLabels: threatLabels ? [...threatLabels] : undefined,
+    threatThreshold:
+      cameraObjects?.threatThreshold ?? channelObjects?.threatThreshold ?? globalObjects?.threatThreshold,
+    classIndices: classIndices ? [...classIndices] : undefined
+  };
+}
+
 function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   if (!config.motion) {
     throw new Error('Motion configuration is required');
@@ -957,6 +1015,8 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
     )
   );
   const light = resolveLightConfig(config.light, channelConfig?.light, camera.light);
+  const pose = resolvePoseConfig(config.pose, channelConfig?.pose, camera.pose);
+  const objects = resolveObjectsConfig(config.objects, channelConfig?.objects, camera.objects);
 
   const motionDefaults = channelConfig?.motion
     ? resolveCameraMotion(channelConfig.motion, config.motion)
@@ -994,8 +1054,24 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
         config.person.classIndices,
       classScoreThresholds
     },
-    pose: config.pose,
-    objects: config.objects,
+    pose: pose
+      ? {
+          modelPath: pose.modelPath,
+          forecastHorizonMs: pose.forecastHorizonMs,
+          smoothingWindow: pose.smoothingWindow,
+          minMovement: pose.minMovement,
+          historySize: pose.historySize
+        }
+      : null,
+    objects: objects
+      ? {
+          modelPath: objects.modelPath,
+          labels: [...objects.labels],
+          threatLabels: objects.threatLabels ? [...objects.threatLabels] : undefined,
+          threatThreshold: objects.threatThreshold,
+          classIndices: objects.classIndices ? [...objects.classIndices] : undefined
+        }
+      : null,
     light
   };
 
@@ -1141,7 +1217,7 @@ function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
   );
 }
 
-function poseConfigsEqual(a?: PoseConfig, b?: PoseConfig) {
+function poseConfigsEqual(a?: PoseConfig | null, b?: PoseConfig | null) {
   if (!a && !b) {
     return true;
   }
@@ -1157,7 +1233,7 @@ function poseConfigsEqual(a?: PoseConfig, b?: PoseConfig) {
   );
 }
 
-function objectConfigsEqual(a?: ObjectsConfig, b?: ObjectsConfig) {
+function objectConfigsEqual(a?: ObjectsConfig | null, b?: ObjectsConfig | null) {
   if (!a && !b) {
     return true;
   }
@@ -1235,6 +1311,179 @@ function mergeGuardConfig(injected: GuardConfig, fallback: GuardianConfig): Guar
     light: injected.light ?? fallback.light,
     audio: injected.audio ?? fallback.audio
   };
+}
+
+type OverrideSummary = Record<string, unknown>;
+
+type OverrideDiff<T> = {
+  added?: Record<string, T>;
+  removed?: string[];
+  changed?: Record<string, { previous: T; next: T }>;
+};
+
+type OverridesDiffSummary = {
+  channels?: OverrideDiff<OverrideSummary>;
+  cameras?: OverrideDiff<OverrideSummary>;
+};
+
+function diffGuardOverrides(previous: GuardianConfig, next: GuardianConfig): OverridesDiffSummary | null {
+  const previousChannels = summarizeChannelOverrides(previous);
+  const nextChannels = summarizeChannelOverrides(next);
+  const previousCameras = summarizeCameraOverrides(previous);
+  const nextCameras = summarizeCameraOverrides(next);
+
+  const channelDiff = diffOverrideMap(previousChannels, nextChannels);
+  const cameraDiff = diffOverrideMap(previousCameras, nextCameras);
+
+  if (!channelDiff && !cameraDiff) {
+    return null;
+  }
+
+  const summary: OverridesDiffSummary = {};
+  if (channelDiff) {
+    summary.channels = channelDiff;
+  }
+  if (cameraDiff) {
+    summary.cameras = cameraDiff;
+  }
+
+  return summary;
+}
+
+function diffOverrideMap<T>(previous: Record<string, T>, next: Record<string, T>): OverrideDiff<T> | null {
+  const added: Record<string, T> = {};
+  const removed: string[] = [];
+  const changed: Record<string, { previous: T; next: T }> = {};
+
+  const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+  for (const key of keys) {
+    if (!(key in next)) {
+      removed.push(key);
+      continue;
+    }
+    if (!(key in previous)) {
+      added[key] = next[key];
+      continue;
+    }
+    if (!isDeepEqual(previous[key], next[key])) {
+      changed[key] = { previous: previous[key], next: next[key] };
+    }
+  }
+
+  const diff: OverrideDiff<T> = {};
+  if (Object.keys(added).length > 0) {
+    diff.added = added;
+  }
+  if (removed.length > 0) {
+    diff.removed = removed;
+  }
+  if (Object.keys(changed).length > 0) {
+    diff.changed = changed;
+  }
+
+  return Object.keys(diff).length > 0 ? diff : null;
+}
+
+function summarizeChannelOverrides(config: GuardianConfig): Record<string, OverrideSummary> {
+  const summaries: Record<string, OverrideSummary> = {};
+  const channels = config.video.channels ?? {};
+  for (const [channelId, channel] of Object.entries(channels)) {
+    const summary = buildOverrideSummary({
+      framesPerSecond: channel.framesPerSecond,
+      ffmpeg: channel.ffmpeg,
+      motion: channel.motion,
+      person: channel.person,
+      pose: channel.pose,
+      objects: channel.objects,
+      light: channel.light
+    });
+    if (summary) {
+      summaries[channelId] = summary;
+    }
+  }
+  return summaries;
+}
+
+function summarizeCameraOverrides(config: GuardianConfig): Record<string, OverrideSummary> {
+  const summaries: Record<string, OverrideSummary> = {};
+  const cameras = config.video.cameras ?? [];
+  cameras.forEach((camera, index) => {
+    const summary = buildOverrideSummary({
+      channel: camera.channel,
+      input: camera.input,
+      framesPerSecond: camera.framesPerSecond,
+      ffmpeg: camera.ffmpeg,
+      motion: camera.motion,
+      person: camera.person,
+      pose: camera.pose,
+      objects: camera.objects,
+      light: camera.light
+    });
+    if (summary) {
+      const key = camera.id ?? `#${index}`;
+      summaries[key] = summary;
+    }
+  });
+  return summaries;
+}
+
+function buildOverrideSummary(candidate: Record<string, unknown> | undefined): OverrideSummary | undefined {
+  if (!candidate) {
+    return undefined;
+  }
+  const normalized = pruneSerializable(candidate);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) {
+    return undefined;
+  }
+  return normalized as OverrideSummary;
+}
+
+function pruneSerializable(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map(entry => pruneSerializable(entry))
+      .filter(entry => typeof entry !== 'undefined');
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, child]) => [key, pruneSerializable(child)] as const)
+      .filter(([, child]) => typeof child !== 'undefined');
+    if (entries.length === 0) {
+      return undefined;
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, child] of entries) {
+      result[key] = child;
+    }
+    return result;
+  }
+
+  if (typeof value === 'undefined') {
+    return undefined;
+  }
+
+  return value;
+}
+
+function isDeepEqual(a: unknown, b: unknown): boolean {
+  return stableStringify(a) === stableStringify(b);
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(entry => stableStringify(entry)).join(',')}]`;
+  }
+
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
+    return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`).join(',')}}`;
+  }
+
+  return JSON.stringify(value);
 }
 
 function hasScheme(input: string) {

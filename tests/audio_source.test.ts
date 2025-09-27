@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { ChildProcess, ExecFileCallback, ExecFileException } from 'node:child_process';
+import type {
+  ChildProcess,
+  ChildProcessWithoutNullStreams,
+  ExecFileCallback,
+  ExecFileException
+} from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import metrics from '../src/metrics/index.js';
@@ -239,6 +244,93 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioMicFallbackRetryCycle rotates fallbacks and records jitter metrics', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    execFileMock.mockImplementation((_cmd: string, _args: string[], cb: ExecFileCallback) => {
+      const child = createExecFileChild();
+      const error = new Error('ffprobe missing') as ExecFileException;
+      (error as NodeJS.ErrnoException).code = 'ENOENT';
+      cb(error, '', '');
+      return child;
+    });
+
+    const jitterValues = [0.9, 0.2, 0.6];
+    let jitterIndex = 0;
+    const random = () => {
+      const value = jitterValues[jitterIndex % jitterValues.length];
+      jitterIndex += 1;
+      return value;
+    };
+
+    const devices: string[] = [];
+    let activeProcess: ReturnType<typeof createFakeProcess> | null = null;
+    spawnMock.mockImplementation((_command: string, args: string[]) => {
+      const deviceIndex = args.indexOf('-i');
+      devices.push(deviceIndex >= 0 ? args[deviceIndex + 1] : 'unknown');
+      if (devices.length < 3) {
+        const err = new Error('missing') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      activeProcess = createFakeProcess();
+      const frameBytes = Math.round((16000 * 50) / 1000) * 2;
+      setTimeout(() => {
+        activeProcess?.stdout.emit('data', Buffer.alloc(frameBytes));
+      }, 0);
+      return activeProcess as unknown as ChildProcessWithoutNullStreams;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:mic',
+      device: 'default',
+      sampleRate: 16000,
+      frameDurationMs: 50,
+      restartDelayMs: 40,
+      restartMaxDelayMs: 120,
+      restartJitterFactor: 0.5,
+      silenceDurationMs: 200,
+      random
+    });
+
+    source.on('error', () => {});
+    source.start();
+
+    await flushTimers();
+    await vi.runOnlyPendingTimersAsync();
+    await flushTimers();
+
+    vi.advanceTimersByTime(80);
+    await vi.runOnlyPendingTimersAsync();
+    await flushTimers();
+
+    vi.advanceTimersByTime(80);
+    await vi.runOnlyPendingTimersAsync();
+    await flushTimers();
+
+    expect(devices[0]).toBe('default');
+    expect(new Set(devices.slice(0, 3))).toEqual(new Set(['default', 'hw:0']));
+    expect(activeProcess).not.toBeNull();
+
+    await flushTimers();
+
+    expect((source as any).idleTimer).not.toBeNull();
+    expect((source as any).watchdogTimer).not.toBeNull();
+
+    const snapshot = metrics.snapshot();
+    const channelSnapshot = snapshot.pipelines.audio.byChannel['audio:mic'];
+    expect(channelSnapshot).toBeDefined();
+    expect(Object.keys(channelSnapshot.jitterHistogram)).not.toHaveLength(0);
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+    platformSpy.mockRestore();
+  });
+
   it('AudioWatchdogSilenceReset recovers from silence and restarts on watchdog timeout', async () => {
     vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
@@ -328,6 +420,7 @@ describe('AudioSource resilience', () => {
       restartJitterFactor: 0,
       watchdogTimeoutMs: 60,
       silenceCircuitBreakerThreshold: 3,
+      deviceDiscoveryTimeoutMs: 0,
       micFallbacks: {
         linux: [
           { format: 'alsa', device: 'hw:1' },
@@ -343,6 +436,7 @@ describe('AudioSource resilience', () => {
     try {
       expect((source as any).options.silenceCircuitBreakerThreshold).toBe(3);
       source.start();
+      await flushTimers();
       expect(spawnMock).toHaveBeenCalledTimes(1);
       const firstArgs = spawnMock.mock.calls[0][1];
       const firstDevice = firstArgs[firstArgs.indexOf('-i') + 1];

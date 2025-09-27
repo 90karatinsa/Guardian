@@ -185,6 +185,51 @@ describe('GuardianCliHealthcheck', () => {
 
     await expect(startPromise).resolves.toBe(0);
   });
+
+  it('CliDaemonHealthcheck exposes daemon subcommands and exit codes', async () => {
+    const healthIo = createTestIo();
+    const healthCode = await runCli(['daemon', 'health'], healthIo.io);
+    const healthPayload = JSON.parse(healthIo.stdout().trim());
+
+    expect(healthCode).toBe(0);
+    expect(healthPayload.status).toBe('ok');
+
+    const readyIo = createTestIo();
+    const readyCode = await runCli(['daemon', 'ready'], readyIo.io);
+    const readyPayload = JSON.parse(readyIo.stdout().trim());
+
+    expect(readyCode).toBe(1);
+    expect(readyPayload.ready).toBe(false);
+    expect(readyPayload.reason).toBe('service-idle');
+
+    const stopIo = createTestIo();
+    const stopCode = await runCli(['daemon', 'stop'], stopIo.io);
+
+    expect(stopCode).toBe(0);
+    expect(stopIo.stdout()).toContain('Guardian daemon is not running');
+  });
+
+  it('SystemdShutdownHook unit definitions call daemon commands and shutdown hooks', () => {
+    const guardianService = fs.readFileSync(path.join('deploy', 'guardian.service'), 'utf8');
+    expect(guardianService).toContain('ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start');
+    expect(guardianService).toContain('ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop');
+    expect(guardianService).toContain(
+      'ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM'
+    );
+    expect(guardianService).toContain('ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts');
+
+    const systemdService = fs.readFileSync(path.join('deploy', 'systemd.service'), 'utf8');
+    expect(systemdService).toContain('ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start');
+    expect(systemdService).toContain('ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop');
+    expect(systemdService).toContain(
+      'ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM'
+    );
+    expect(systemdService).toContain('ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts');
+
+    const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
+    expect(dockerfile).toContain('cli.ts daemon health');
+    expect(dockerfile).toContain('"daemon", "start"');
+  });
 });
 
 describe('GuardianCliRetention', () => {

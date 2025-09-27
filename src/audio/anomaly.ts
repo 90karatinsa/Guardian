@@ -77,6 +77,12 @@ export class AudioAnomalyDetector {
   private centroidDurationMs = 0;
   private rmsRecoveryMs = 0;
   private centroidRecoveryMs = 0;
+  private rmsSustainFrames = 0;
+  private centroidSustainFrames = 0;
+  private rmsRecoveryFrames = 0;
+  private centroidRecoveryFrames = 0;
+  private rmsRecoveredSinceEvent = true;
+  private centroidRecoveredSinceEvent = true;
   private rmsWindowFrames: number;
   private centroidWindowFrames: number;
   private readonly rmsValues: number[] = [];
@@ -175,18 +181,19 @@ export class AudioAnomalyDetector {
 
     if (geometryChanged) {
       this.updateWindowGeometry(next);
+      this.resetWindows();
     } else {
-      this.rmsWindowFrames = Math.max(
+      const nextRmsFrames = Math.max(
         1,
         Math.round(this.defaultRmsWindowMs / this.hopDurationMs)
       );
-      this.centroidWindowFrames = Math.max(
+      const nextCentroidFrames = Math.max(
         1,
         Math.round(this.defaultCentroidWindowMs / this.hopDurationMs)
       );
+      this.resampleWindows(nextRmsFrames, nextCentroidFrames, false);
     }
 
-    this.resetWindows();
     this.currentThresholds = null;
   }
 
@@ -202,7 +209,9 @@ export class AudioAnomalyDetector {
     const hopDurationMs = this.hopDurationMs;
 
     while (this.buffer.length >= this.frameSize) {
-      const frame = this.buffer.slice(0, this.frameSize);
+      const frameStart = Math.max(0, this.buffer.length - this.frameSize);
+      const frame = this.buffer.slice(frameStart, frameStart + this.frameSize);
+      const frameRms = computeRms(frame);
       const windowed = applyWindow(frame, this.window);
       const features = Meyda.extract(['rms', 'spectralCentroid'], windowed, {
         sampleRate,
@@ -214,13 +223,17 @@ export class AudioAnomalyDetector {
         continue;
       }
 
-      const rms = features.rms ?? 0;
+      const rms = frameRms;
       const centroid = features.spectralCentroid ?? 0;
 
       this.processedFrames += 1;
 
       const thresholds = this.resolveThresholds(ts);
       const minTriggerDuration = thresholds.minTriggerDurationMs;
+      const minTriggerFrames = Math.max(
+        1,
+        Math.round(minTriggerDuration / this.hopDurationMs)
+      );
       const baselineRms = computeAverage(this.rmsValues);
       const baselineCentroid = computeAverage(this.centroidValues);
       const rmsDelta = Math.max(0, rms - baselineRms);
@@ -229,20 +242,31 @@ export class AudioAnomalyDetector {
       const triggeredByCentroid = centroidDelta >= thresholds.centroidJump;
 
       if (triggeredByRms) {
-        this.rmsDurationMs += hopDurationMs;
-        this.rmsRecoveryMs = 0;
+        this.rmsSustainFrames += 1;
+        this.rmsRecoveryFrames = 0;
       } else {
-        this.rmsDurationMs = Math.max(0, this.rmsDurationMs - hopDurationMs);
-        this.rmsRecoveryMs += hopDurationMs;
+        this.rmsSustainFrames = 0;
+        this.rmsRecoveryFrames += 1;
+        if (this.rmsRecoveryFrames >= minTriggerFrames) {
+          this.rmsRecoveredSinceEvent = true;
+        }
       }
 
       if (triggeredByCentroid) {
-        this.centroidDurationMs += hopDurationMs;
-        this.centroidRecoveryMs = 0;
+        this.centroidSustainFrames += 1;
+        this.centroidRecoveryFrames = 0;
       } else {
-        this.centroidDurationMs = Math.max(0, this.centroidDurationMs - hopDurationMs);
-        this.centroidRecoveryMs += hopDurationMs;
+        this.centroidSustainFrames = 0;
+        this.centroidRecoveryFrames += 1;
+        if (this.centroidRecoveryFrames >= minTriggerFrames) {
+          this.centroidRecoveredSinceEvent = true;
+        }
       }
+
+      this.rmsDurationMs = this.rmsSustainFrames * hopDurationMs;
+      this.centroidDurationMs = this.centroidSustainFrames * hopDurationMs;
+      this.rmsRecoveryMs = this.rmsRecoveryFrames * hopDurationMs;
+      this.centroidRecoveryMs = this.centroidRecoveryFrames * hopDurationMs;
 
       this.buffer.splice(0, this.hopSize);
       const rmsBaselineUpdate = triggeredByRms
@@ -254,46 +278,74 @@ export class AudioAnomalyDetector {
       this.pushValue(this.rmsValues, rmsBaselineUpdate, this.rmsWindowFrames);
       this.pushValue(this.centroidValues, centroidBaselineUpdate, this.centroidWindowFrames);
 
-      const rmsExceeded = this.rmsDurationMs >= minTriggerDuration;
-      const centroidExceeded = this.centroidDurationMs >= minTriggerDuration;
+      const rmsExceeded = this.rmsSustainFrames >= minTriggerFrames;
+      const centroidExceeded = this.centroidSustainFrames >= minTriggerFrames;
 
       if (!rmsExceeded && !centroidExceeded) {
-        continue;
+        break;
+      }
+
+      const recoveryBlocked =
+        this.lastEventTs !== 0 &&
+        ((rmsExceeded && !this.rmsRecoveredSinceEvent) ||
+          (centroidExceeded && !this.centroidRecoveredSinceEvent));
+
+      if (recoveryBlocked) {
+        break;
       }
 
       if (ts - this.lastEventTs < minInterval) {
-        continue;
+        break;
       }
 
       const triggeredBy = rmsExceeded ? 'rms' : 'centroid';
       const triggeredDurationMs = rmsExceeded ? this.rmsDurationMs : this.centroidDurationMs;
       const accumulationSnapshot = {
         rmsMs: this.rmsDurationMs,
-        centroidMs: this.centroidDurationMs
+        rmsFrames: this.rmsSustainFrames,
+        centroidMs: this.centroidDurationMs,
+        centroidFrames: this.centroidSustainFrames
       };
       const recoverySnapshot = {
         rmsMs: this.rmsRecoveryMs,
-        centroidMs: this.centroidRecoveryMs
+        rmsFrames: this.rmsRecoveryFrames,
+        centroidMs: this.centroidRecoveryMs,
+        centroidFrames: this.centroidRecoveryFrames
       };
 
       const stateSnapshot = {
         rms: {
           durationMs: this.rmsDurationMs,
           recoveryMs: this.rmsRecoveryMs,
+          sustainFrames: this.rmsSustainFrames,
+          recoveryFrames: this.rmsRecoveryFrames,
           windowMs: this.rmsWindowFrames * this.hopDurationMs
         },
         centroid: {
           durationMs: this.centroidDurationMs,
           recoveryMs: this.centroidRecoveryMs,
+          sustainFrames: this.centroidSustainFrames,
+          recoveryFrames: this.centroidRecoveryFrames,
           windowMs: this.centroidWindowFrames * this.hopDurationMs
         }
       };
 
       this.lastEventTs = ts;
+      if (rmsExceeded) {
+        this.rmsRecoveredSinceEvent = false;
+      }
+      if (centroidExceeded) {
+        this.centroidRecoveredSinceEvent = false;
+      }
+
       this.rmsDurationMs = 0;
       this.centroidDurationMs = 0;
       this.rmsRecoveryMs = 0;
       this.centroidRecoveryMs = 0;
+      this.rmsSustainFrames = 0;
+      this.centroidSustainFrames = 0;
+      this.rmsRecoveryFrames = 0;
+      this.centroidRecoveryFrames = 0;
 
       const payload: EventPayload = {
         ts,
@@ -369,6 +421,7 @@ export class AudioAnomalyDetector {
       1,
       Math.round(this.defaultCentroidWindowMs / this.hopDurationMs)
     );
+    this.resetAccumulation();
     this.processedFrames = 0;
   }
 
@@ -376,12 +429,85 @@ export class AudioAnomalyDetector {
     this.buffer.length = 0;
     this.rmsValues.length = 0;
     this.centroidValues.length = 0;
+    this.resetAccumulation();
+    this.lastEventTs = 0;
+    this.processedFrames = 0;
+  }
+
+  private resetAccumulation() {
     this.rmsDurationMs = 0;
     this.centroidDurationMs = 0;
     this.rmsRecoveryMs = 0;
     this.centroidRecoveryMs = 0;
-    this.lastEventTs = 0;
-    this.processedFrames = 0;
+    this.rmsSustainFrames = 0;
+    this.centroidSustainFrames = 0;
+    this.rmsRecoveryFrames = 0;
+    this.centroidRecoveryFrames = 0;
+    this.rmsRecoveredSinceEvent = true;
+    this.centroidRecoveredSinceEvent = true;
+  }
+
+  private resampleWindows(rmsFrames: number, centroidFrames: number, resetHistory: boolean) {
+    const nextRmsFrames = Math.max(1, Math.floor(rmsFrames));
+    const nextCentroidFrames = Math.max(1, Math.floor(centroidFrames));
+
+    if (resetHistory) {
+      this.resizeWindowStore(this.rmsValues, nextRmsFrames);
+      this.resizeWindowStore(this.centroidValues, nextCentroidFrames);
+      this.rmsWindowFrames = nextRmsFrames;
+      this.centroidWindowFrames = nextCentroidFrames;
+      this.resetAccumulation();
+      return;
+    }
+
+    const rmsChanged = nextRmsFrames !== this.rmsWindowFrames;
+    const centroidChanged = nextCentroidFrames !== this.centroidWindowFrames;
+
+    if (rmsChanged) {
+      this.resizeWindowStore(this.rmsValues, nextRmsFrames);
+    }
+    if (centroidChanged) {
+      this.resizeWindowStore(this.centroidValues, nextCentroidFrames);
+    }
+
+    this.rmsWindowFrames = nextRmsFrames;
+    this.centroidWindowFrames = nextCentroidFrames;
+
+    if (rmsChanged || centroidChanged) {
+      this.rmsSustainFrames = Math.min(this.rmsSustainFrames, nextRmsFrames);
+      this.centroidSustainFrames = Math.min(this.centroidSustainFrames, nextCentroidFrames);
+      this.rmsRecoveryFrames = Math.min(this.rmsRecoveryFrames, nextRmsFrames);
+      this.centroidRecoveryFrames = Math.min(this.centroidRecoveryFrames, nextCentroidFrames);
+      this.rmsDurationMs = Math.min(this.rmsDurationMs, nextRmsFrames * this.hopDurationMs);
+      this.centroidDurationMs = Math.min(
+        this.centroidDurationMs,
+        nextCentroidFrames * this.hopDurationMs
+      );
+      this.rmsRecoveryMs = this.rmsRecoveryFrames * this.hopDurationMs;
+      this.centroidRecoveryMs = this.centroidRecoveryFrames * this.hopDurationMs;
+    }
+  }
+
+  private resizeWindowStore(store: number[], length: number) {
+    const target = Math.max(0, Math.floor(length));
+    if (target <= 0) {
+      store.length = 0;
+      return;
+    }
+
+    if (store.length > target) {
+      store.splice(0, store.length - target);
+      return;
+    }
+
+    if (store.length === target) {
+      return;
+    }
+
+    const fillValue = store.length > 0 ? computeAverage(store) : 0;
+    while (store.length < target) {
+      store.unshift(fillValue);
+    }
   }
 
   private resolveThresholds(ts: number): ResolvedThresholds {
@@ -603,14 +729,11 @@ export class AudioAnomalyDetector {
       rmsWindowFrames !== this.rmsWindowFrames || centroidWindowFrames !== this.centroidWindowFrames;
 
     if (windowChanged) {
-      this.rmsWindowFrames = rmsWindowFrames;
-      this.centroidWindowFrames = centroidWindowFrames;
-      this.resetWindows();
+      this.resampleWindows(rmsWindowFrames, centroidWindowFrames, profileChanged);
     } else {
-      this.rmsWindowFrames = rmsWindowFrames;
-      this.centroidWindowFrames = centroidWindowFrames;
+      this.resampleWindows(rmsWindowFrames, centroidWindowFrames, false);
       if (profileChanged) {
-        this.resetWindows();
+        this.resetAccumulation();
       }
     }
     const applied = {
@@ -734,6 +857,19 @@ function computeAverage(values: number[]): number {
   }
 
   return sum / values.length;
+}
+
+function computeRms(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  let sumSquares = 0;
+  for (const value of values) {
+    sumSquares += value * value;
+  }
+
+  return Math.sqrt(sumSquares / values.length);
 }
 
 function clamp(value: number, min: number, max: number) {

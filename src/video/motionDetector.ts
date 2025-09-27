@@ -54,6 +54,9 @@ const DEFAULT_AREA_INFLATION = 1.5;
 const DEFAULT_AREA_DELTA_THRESHOLD = 0.02;
 const DEFAULT_IDLE_REBASELINE_MS = 30_000;
 const MAX_HISTORY_SIZE = 120;
+const NOISE_WINDOW_SIZE = 30;
+const AREA_WINDOW_SIZE = 20;
+const SUSTAINED_NOISE_THRESHOLD = 1.15;
 
 export class MotionDetector {
   private previousFrame: GrayscaleFrame | null = null;
@@ -69,6 +72,9 @@ export class MotionDetector {
   private lastFrameTs: number | null = null;
   private lastDenoiseStrategy = 'gaussian-median';
   private readonly motionHistory: MotionHistoryEntry[] = [];
+  private readonly noiseWindow: number[] = [];
+  private readonly areaWindow: number[] = [];
+  private sustainedNoiseBoost = 1;
 
   constructor(
     private options: MotionDetectorOptions,
@@ -215,6 +221,25 @@ export class MotionDetector {
         3
       );
 
+      recordWindowSample(this.noiseWindow, noiseRatio, NOISE_WINDOW_SIZE);
+      const noiseWindowMedian = median(this.noiseWindow);
+      const noiseWindowPressure = computePressure(this.noiseWindow, SUSTAINED_NOISE_THRESHOLD);
+      const targetNoiseBoost = clamp(
+        1 + Math.max((noiseWindowMedian ?? noiseRatio) - 1, 0) * 0.9 + noiseWindowPressure * 1.4,
+        1,
+        4
+      );
+      const boostSmoothing = noiseWindowPressure > 0.25 ? 0.4 : 0.25;
+      this.sustainedNoiseBoost = clamp(
+        this.sustainedNoiseBoost * (1 - boostSmoothing) + targetNoiseBoost * boostSmoothing,
+        1,
+        4
+      );
+
+      metrics.setDetectorGauge('motion', 'noiseWindowMedian', noiseWindowMedian ?? noiseRatio);
+      metrics.setDetectorGauge('motion', 'noiseWindowPressure', noiseWindowPressure);
+      metrics.setDetectorGauge('motion', 'noiseWindowBoost', this.sustainedNoiseBoost);
+
       const dynamicDiffThreshold = Math.max(diffThreshold, updatedNoiseFloor * noiseMultiplier);
       const adaptiveDiffThreshold = clamp(
         dynamicDiffThreshold * noiseSuppressionFactor,
@@ -241,7 +266,17 @@ export class MotionDetector {
         previousBaseline === 0
           ? areaTrend
           : this.areaTrendMomentum * (1 - trendSmoothing) + areaTrend * trendSmoothing;
-      const stabilizedAreaTrend = previousBaseline === 0 ? areaTrend : this.areaTrendMomentum;
+
+      recordWindowSample(this.areaWindow, areaPct, AREA_WINDOW_SIZE);
+      const areaWindowMedian = median(this.areaWindow);
+      const windowTrend =
+        areaWindowMedian === null ? areaTrend : clamp(areaPct - areaWindowMedian, -1, 1);
+      const stabilizedAreaTrend =
+        previousBaseline === 0
+          ? areaTrend
+          : this.areaTrendMomentum * 0.6 + windowTrend * 0.4;
+      metrics.setDetectorGauge('motion', 'areaWindowMedian', areaWindowMedian ?? areaPct);
+      metrics.setDetectorGauge('motion', 'areaWindowTrend', stabilizedAreaTrend);
       const normalizedAreaTrend = clamp(
         previousBaseline === 0
           ? areaPct / Math.max(areaThreshold, 0.01)
@@ -277,9 +312,12 @@ export class MotionDetector {
         3
       );
       const relaxationMultiplier = normalizedAreaTrend < 0 ? 1.15 : 1;
+      const sustainedDebounceMultiplier = Math.max(1, this.sustainedNoiseBoost);
       const effectiveDebounceFrames = Math.max(
         baseDebounce,
-        Math.round(baseDebounce * debounceMultiplier * relaxationMultiplier)
+        Math.round(
+          baseDebounce * debounceMultiplier * relaxationMultiplier * sustainedDebounceMultiplier
+        )
       );
 
       const backoffMultiplier = clamp(
@@ -289,10 +327,14 @@ export class MotionDetector {
         1,
         4
       );
+      const sustainedBackoffMultiplier = Math.max(1, Math.min(this.sustainedNoiseBoost * 1.1, 5));
       const effectiveBackoffFrames = Math.max(
         baseBackoff,
-        Math.round(baseBackoff * backoffMultiplier)
+        Math.round(baseBackoff * backoffMultiplier * sustainedBackoffMultiplier)
       );
+
+      metrics.setDetectorGauge('motion', 'effectiveDebounceFrames', effectiveDebounceFrames);
+      metrics.setDetectorGauge('motion', 'effectiveBackoffFrames', effectiveBackoffFrames);
 
       this.areaBaseline = nextBaseline;
       this.baselineFrame = smoothed;
@@ -410,8 +452,12 @@ export class MotionDetector {
           noiseFloor: updatedNoiseFloor,
           noiseRatio,
           noiseSuppressionFactor,
+          noiseWindowMedian: noiseWindowMedian ?? noiseRatio,
+          noiseWindowPressure,
+          sustainedNoiseBoost: this.sustainedNoiseBoost,
           areaTrend,
           stabilizedAreaTrend,
+          areaWindowMedian: areaWindowMedian ?? areaPct,
           areaDeltaThreshold: adjustedAreaDeltaThreshold,
           normalizedAreaTrend,
           effectiveDebounceFrames,
@@ -451,6 +497,9 @@ export class MotionDetector {
     this.areaTrendMomentum = 0;
     this.activationFrames = 0;
     this.backoffFrames = 0;
+    this.noiseWindow.length = 0;
+    this.areaWindow.length = 0;
+    this.sustainedNoiseBoost = 1;
     if (!preserveSuppression) {
       this.suppressedFrames = 0;
       this.pendingSuppressedFramesBeforeTrigger = 0;
@@ -470,6 +519,36 @@ export class MotionDetector {
     const entries = this.motionHistory.slice(-count);
     return entries.map(entry => ({ ...entry }));
   }
+}
+
+function recordWindowSample(buffer: number[], sample: number, size: number) {
+  if (!Number.isFinite(sample)) {
+    return;
+  }
+  buffer.push(sample);
+  if (buffer.length > size) {
+    buffer.splice(0, buffer.length - size);
+  }
+}
+
+function median(buffer: number[]): number | null {
+  if (buffer.length === 0) {
+    return null;
+  }
+  const sorted = [...buffer].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1]! + sorted[mid]!) / 2;
+  }
+  return sorted[mid]!;
+}
+
+function computePressure(buffer: number[], threshold: number): number {
+  if (buffer.length === 0) {
+    return 0;
+  }
+  const hits = buffer.filter(value => value >= threshold).length;
+  return hits / buffer.length;
 }
 
 function clamp(value: number, min: number, max: number) {
