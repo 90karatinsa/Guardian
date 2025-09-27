@@ -83,6 +83,9 @@ describe('GuardianCliHealthcheck', () => {
     const initialPayload = JSON.parse(initialReady.stdout().trim());
     expect(initialPayload.ready).toBe(false);
     expect(initialPayload.reason).toBe('service-idle');
+    expect(initialPayload.metrics.channels.video).toBe(0);
+    expect(initialPayload.metrics.channels.audio).toBe(0);
+    expect(typeof initialPayload.metrics.snapshotCapturedAt).toBe('string');
 
     const stopSpy = vi.fn();
     startGuardMock.mockResolvedValue({ stop: stopSpy });
@@ -98,6 +101,8 @@ describe('GuardianCliHealthcheck', () => {
     const readyPayload = JSON.parse(readyIo.stdout().trim());
     expect(readyPayload.ready).toBe(true);
     expect(readyPayload.reason).toBeNull();
+    expect(readyPayload.metrics.channels.video).toBe(0);
+    expect(readyPayload.metrics.channels.audio).toBe(0);
 
     metrics.incrementLogLevel('error', { message: 'detector error' });
     const degradedIo = createTestIo();
@@ -106,6 +111,7 @@ describe('GuardianCliHealthcheck', () => {
     const degradedPayload = JSON.parse(degradedIo.stdout().trim());
     expect(degradedPayload.ready).toBe(false);
     expect(degradedPayload.reason).toBe('health-degraded');
+    expect(typeof degradedPayload.metrics.snapshotCapturedAt).toBe('string');
 
     await runCli(['stop'], createTestIo().io);
     await expect(startPromise).resolves.toBe(0);
@@ -126,6 +132,11 @@ describe('GuardianCliHealthcheck', () => {
     expect(flagPayload.runtime.pipelines.audioChannels).toBeTypeOf('number');
     expect(flagPayload.runtime.pipelines.videoRestarts).toBe(0);
     expect(flagPayload.runtime.pipelines.audioRestarts).toBe(0);
+    expect(typeof flagPayload.metricsCapturedAt).toBe('string');
+    expect(flagPayload.metricsSummary.pipelines.channels.video).toBe(0);
+    expect(flagPayload.metricsSummary.pipelines.channels.audio).toBe(0);
+    expect(flagPayload.metricsSummary.pipelines.lastRestartAt.video).toBeNull();
+    expect(flagPayload.metricsSummary.pipelines.lastRestartAt.audio).toBeNull();
 
     metrics.reset();
     metrics.incrementLogLevel('error', { message: 'detector failure' });
@@ -212,6 +223,7 @@ describe('GuardianCliHealthcheck', () => {
   it('SystemdShutdownHook unit definitions call daemon commands and shutdown hooks', () => {
     const guardianService = fs.readFileSync(path.join('deploy', 'guardian.service'), 'utf8');
     expect(guardianService).toContain('ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start');
+    expect(guardianService).toContain('ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health');
     expect(guardianService).toContain('ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop');
     expect(guardianService).toContain(
       'ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM'
@@ -220,13 +232,18 @@ describe('GuardianCliHealthcheck', () => {
 
     const systemdService = fs.readFileSync(path.join('deploy', 'systemd.service'), 'utf8');
     expect(systemdService).toContain('ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start');
+    expect(systemdService).toContain('ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health');
     expect(systemdService).toContain('ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop');
     expect(systemdService).toContain(
       'ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM'
     );
     expect(systemdService).toContain('ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts');
+  });
 
+  it('DockerHealthProbeConfig wires CLI health command and entrypoint', () => {
     const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
+    expect(dockerfile).toContain('STOPSIGNAL SIGTERM');
+    expect(dockerfile).toContain('HEALTHCHECK');
     expect(dockerfile).toContain('cli.ts daemon health');
     expect(dockerfile).toContain('"daemon", "start"');
   });

@@ -26,12 +26,20 @@ type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
 
 type StreamFilters = Omit<ListEventsOptions, 'limit' | 'offset'>;
 
+type MetricsSelection = {
+  enabled: boolean;
+  includeEvents: boolean;
+  includeRetention: boolean;
+  pipelines: Set<'ffmpeg' | 'audio'>;
+};
+
 type ClientState = {
   heartbeat: NodeJS.Timeout;
   filters: StreamFilters;
   retryMs: number;
   includeFaces: boolean;
   facesQuery: string | null;
+  metricsFilter: MetricsSelection;
 };
 
 const DEFAULT_FACE_THRESHOLD = 0.5;
@@ -51,6 +59,7 @@ export class EventsRouter {
     this.heartbeatMs = 15000;
     this.handlers = [
       (req, res, url) => this.handleList(req, res, url),
+      (req, res, url) => this.handleSnapshotList(req, res, url),
       (req, res, url) => this.handleMetrics(req, res, url),
       (req, res, url) => this.handleStream(req, res, url),
       (req, res, url) => this.handleSnapshot(req, res, url),
@@ -88,8 +97,9 @@ export class EventsRouter {
   }
 
   private readonly handleBusEvent = (event: EventRecord) => {
-    const payload = JSON.stringify(formatEventForClient(event));
-    const digest = createMetricsDigest(this.metrics.snapshot());
+    const formatted = formatEventForClient(event);
+    const payload = JSON.stringify(formatted);
+    const metricsSnapshot = this.metrics.snapshot();
     for (const [client, state] of this.clients) {
       if (client.writableEnded) {
         clearInterval(state.heartbeat);
@@ -103,8 +113,11 @@ export class EventsRouter {
 
       try {
         client.write(`data: ${payload}\n\n`);
-        client.write(`event: metrics\n`);
-        client.write(`data: ${JSON.stringify(digest)}\n\n`);
+        const digest = createMetricsDigest(metricsSnapshot, state.metricsFilter);
+        if (digest) {
+          client.write(`event: metrics\n`);
+          client.write(`data: ${JSON.stringify(digest)}\n\n`);
+        }
       } catch (error) {
         clearInterval(state.heartbeat);
         client.end();
@@ -119,6 +132,37 @@ export class EventsRouter {
     }
 
     const options = parseListOptions(url);
+    const result = listEvents(options);
+    const items = result.items.map(formatEventForClient);
+    const summary = summarizeEvents(items);
+    const digest = createMetricsDigest(this.metrics.snapshot());
+
+    sendJson(res, 200, {
+      items,
+      total: result.total,
+      limit: options.limit ?? undefined,
+      offset: options.offset ?? undefined,
+      summary,
+      metrics: digest
+    });
+
+    return true;
+  }
+
+  private handleSnapshotList(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+    if (req.method !== 'GET' || url.pathname !== '/api/events/snapshots') {
+      return false;
+    }
+
+    const options = parseListOptions(url);
+    if (!options.snapshot) {
+      options.snapshot = 'with';
+    }
+    const faceFilter = resolveFaceSnapshotFilter(url.searchParams);
+    if (faceFilter) {
+      options.faceSnapshot = faceFilter;
+    }
+
     const result = listEvents(options);
     const items = result.items.map(formatEventForClient);
     const summary = summarizeEvents(items);
@@ -159,6 +203,7 @@ export class EventsRouter {
     const filters = extractStreamFilters(url);
     const retryMs = resolveRetryInterval(url.searchParams);
     const facesRequest = resolveFacesRequest(url.searchParams);
+    const metricsFilter = resolveMetricsSelection(url.searchParams);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -168,10 +213,26 @@ export class EventsRouter {
     res.write(': connected\n');
     res.write(`retry: ${retryMs}\n`);
     res.write(`event: stream-status\n`);
-    res.write(`data: ${JSON.stringify({ status: 'connected', retryMs, filters })}\n\n`);
-    const initialDigest = createMetricsDigest(this.metrics.snapshot());
-    res.write(`event: metrics\n`);
-    res.write(`data: ${JSON.stringify(initialDigest)}\n\n`);
+    const statusPayload = {
+      status: 'connected',
+      retryMs,
+      filters,
+      metrics: metricsFilter.enabled
+        ? {
+            enabled: true,
+            events: metricsFilter.includeEvents,
+            retention: metricsFilter.includeRetention,
+            pipelines: Array.from(metricsFilter.pipelines)
+          }
+        : { enabled: false }
+    };
+    res.write(`data: ${JSON.stringify(statusPayload)}\n\n`);
+    const metricsSnapshot = this.metrics.snapshot();
+    const initialDigest = createMetricsDigest(metricsSnapshot, metricsFilter);
+    if (initialDigest) {
+      res.write(`event: metrics\n`);
+      res.write(`data: ${JSON.stringify(initialDigest)}\n\n`);
+    }
 
     const heartbeat = setInterval(() => {
       if (res.writableEnded) {
@@ -194,7 +255,8 @@ export class EventsRouter {
       filters,
       retryMs,
       includeFaces: facesRequest.includeFaces,
-      facesQuery: facesRequest.query
+      facesQuery: facesRequest.query,
+      metricsFilter
     });
 
     if (facesRequest.includeFaces) {
@@ -253,7 +315,8 @@ export class EventsRouter {
 
     if (req.method === 'GET' && url.pathname === '/api/faces') {
       const search = (url.searchParams.get('search') ?? url.searchParams.get('q')) || null;
-      void this.handleFaceList(res, search);
+      const channelFilters = parseChannelParams(url.searchParams);
+      void this.handleFaceList(res, search, channelFilters);
       return true;
     }
 
@@ -283,14 +346,14 @@ export class EventsRouter {
     return false;
   }
 
-  private async handleFaceList(res: ServerResponse, search: string | null) {
+  private async handleFaceList(res: ServerResponse, search: string | null, channels: string[]) {
     const registry = await this.ensureFaceRegistry();
     if (!registry) {
       this.respondFaceUnavailable(res);
       return;
     }
 
-    const faces = filterFaces(registry.list(), search);
+    const faces = filterFaces(registry.list(), search, channels);
     sendJson(res, 200, { faces, threshold: DEFAULT_FACE_THRESHOLD });
   }
 
@@ -593,6 +656,26 @@ function parseListOptions(url: URL): ListEventsOptions {
     }
   }
 
+  const faceSnapshotParam = params.get('faceSnapshot');
+  if (faceSnapshotParam) {
+    const normalized = faceSnapshotParam.toLowerCase();
+    if (normalized === 'with' || normalized === 'only' || normalized === 'true') {
+      options.faceSnapshot = 'with';
+    } else if (normalized === 'without' || normalized === 'false') {
+      options.faceSnapshot = 'without';
+    }
+  } else {
+    const facesFilter = params.get('faces');
+    if (facesFilter) {
+      const normalized = facesFilter.trim().toLowerCase();
+      if (normalized === 'with' || normalized === 'only') {
+        options.faceSnapshot = 'with';
+      } else if (normalized === 'without') {
+        options.faceSnapshot = 'without';
+      }
+    }
+  }
+
   return options;
 }
 
@@ -807,48 +890,73 @@ function summarizeEvents(events: SummarizedEvent[]) {
   return summary;
 }
 
-function createMetricsDigest(snapshot: ReturnType<MetricsRegistry['snapshot']>) {
-  const ffmpegChannels = Object.entries(snapshot.pipelines.ffmpeg.byChannel ?? {}).map(
-    ([channel, data]) => ({
-      channel,
-      restarts: data.restarts,
-      lastRestartAt: data.lastRestartAt,
-      watchdogBackoffMs: data.watchdogBackoffMs,
-      totalWatchdogBackoffMs: data.totalWatchdogBackoffMs,
-      totalDelayMs: data.totalRestartDelayMs,
-      lastRestart: data.lastRestart
-    })
-  );
+function createMetricsDigest(
+  snapshot: ReturnType<MetricsRegistry['snapshot']>,
+  selection: MetricsSelection = {
+    enabled: true,
+    includeEvents: true,
+    includeRetention: true,
+    pipelines: new Set(['ffmpeg', 'audio'])
+  }
+) {
+  if (!selection.enabled) {
+    return null;
+  }
 
-  const retention = snapshot.retention
-    ? {
-        runs: snapshot.retention.runs,
-        lastRunAt: snapshot.retention.lastRunAt,
-        warnings: snapshot.retention.warnings,
-        warningsByCamera: snapshot.retention.warningsByCamera,
-        lastWarning: snapshot.retention.lastWarning,
-        totals: snapshot.retention.totals,
-        totalsByCamera: snapshot.retention.totalsByCamera
-      }
-    : undefined;
-
-  return {
-    fetchedAt: snapshot.createdAt,
-    events: snapshot.events,
-    pipelines: {
-      ffmpeg: {
-        restarts: snapshot.pipelines.ffmpeg.restarts,
-        lastRestartAt: snapshot.pipelines.ffmpeg.lastRestartAt,
-        channels: ffmpegChannels
-      },
-      audio: {
-        restarts: snapshot.pipelines.audio.restarts,
-        lastRestartAt: snapshot.pipelines.audio.lastRestartAt,
-        watchdogBackoffMs: snapshot.pipelines.audio.watchdogBackoffMs
-      }
-    },
-    retention
+  const digest: Record<string, unknown> = {
+    fetchedAt: snapshot.createdAt
   };
+
+  if (selection.includeEvents) {
+    digest.events = snapshot.events;
+  }
+
+  const pipelinePayload: Record<string, unknown> = {};
+
+  if (selection.pipelines.has('ffmpeg')) {
+    const ffmpegChannels = Object.entries(snapshot.pipelines.ffmpeg.byChannel ?? {}).map(
+      ([channel, data]) => ({
+        channel,
+        restarts: data.restarts,
+        lastRestartAt: data.lastRestartAt,
+        watchdogBackoffMs: data.watchdogBackoffMs,
+        totalWatchdogBackoffMs: data.totalWatchdogBackoffMs,
+        totalDelayMs: data.totalRestartDelayMs,
+        lastRestart: data.lastRestart
+      })
+    );
+    pipelinePayload.ffmpeg = {
+      restarts: snapshot.pipelines.ffmpeg.restarts,
+      lastRestartAt: snapshot.pipelines.ffmpeg.lastRestartAt,
+      channels: ffmpegChannels
+    };
+  }
+
+  if (selection.pipelines.has('audio')) {
+    pipelinePayload.audio = {
+      restarts: snapshot.pipelines.audio.restarts,
+      lastRestartAt: snapshot.pipelines.audio.lastRestartAt,
+      watchdogBackoffMs: snapshot.pipelines.audio.watchdogBackoffMs
+    };
+  }
+
+  if (Object.keys(pipelinePayload).length > 0) {
+    digest.pipelines = pipelinePayload;
+  }
+
+  if (selection.includeRetention && snapshot.retention) {
+    digest.retention = {
+      runs: snapshot.retention.runs,
+      lastRunAt: snapshot.retention.lastRunAt,
+      warnings: snapshot.retention.warnings,
+      warningsByCamera: snapshot.retention.warningsByCamera,
+      lastWarning: snapshot.retention.lastWarning,
+      totals: snapshot.retention.totals,
+      totalsByCamera: snapshot.retention.totalsByCamera
+    };
+  }
+
+  return digest;
 }
 
 function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boolean {
@@ -957,6 +1065,68 @@ function parseChannelParams(params: URLSearchParams): string[] {
     .flatMap(value => value.split(','))
     .map(value => value.trim())
     .filter(value => value.length > 0);
+}
+
+function resolveMetricsSelection(params: URLSearchParams): MetricsSelection {
+  const rawTokens = params
+    .getAll('metrics')
+    .flatMap(value => value.split(','))
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (rawTokens.length === 0) {
+    return {
+      enabled: true,
+      includeEvents: true,
+      includeRetention: true,
+      pipelines: new Set(['ffmpeg', 'audio'])
+    };
+  }
+
+  const recognized = rawTokens.filter(token =>
+    ['none', 'all', 'events', 'retention', 'ffmpeg', 'audio'].includes(token)
+  );
+
+  if (recognized.includes('none')) {
+    return { enabled: false, includeEvents: false, includeRetention: false, pipelines: new Set() };
+  }
+
+  if (recognized.length === 0) {
+    return {
+      enabled: true,
+      includeEvents: true,
+      includeRetention: true,
+      pipelines: new Set(['ffmpeg', 'audio'])
+    };
+  }
+
+  const includeAll = recognized.includes('all');
+  const includeRetention = includeAll || recognized.includes('retention');
+  const pipelineTokens = includeAll
+    ? ['ffmpeg', 'audio']
+    : recognized.filter(token => token === 'ffmpeg' || token === 'audio');
+  const pipelines = pipelineTokens.length > 0
+    ? new Set(pipelineTokens as Array<'ffmpeg' | 'audio'>)
+    : new Set<'ffmpeg' | 'audio'>();
+
+  const includeEvents = includeAll || recognized.includes('events') || pipelineTokens.length > 0;
+
+  return { enabled: true, includeEvents, includeRetention, pipelines };
+}
+
+function resolveFaceSnapshotFilter(params: URLSearchParams): 'with' | 'without' | undefined {
+  const candidate = params.get('faceSnapshot') ?? params.get('faces');
+  if (!candidate) {
+    return undefined;
+  }
+  const normalized = candidate.trim().toLowerCase();
+  if (normalized === 'with' || normalized === 'only' || normalized === 'true') {
+    return 'with';
+  }
+  if (normalized === 'without' || normalized === 'false') {
+    return 'without';
+  }
+  return undefined;
 }
 
 function collectChannelFilters(source: { channel?: string; channels?: string[] | undefined }): string[] {

@@ -181,6 +181,130 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
   });
 
+  it('HttpApiSnapshotFaces filters snapshot listings, faces, and SSE metrics selections', async () => {
+    const now = Date.now();
+    const snapshotA = path.join(snapshotDir, 'snap-a.png');
+    const snapshotB = path.join(snapshotDir, 'snap-b.png');
+    const faceSnap = path.join(snapshotDir, 'face-a.png');
+    fs.writeFileSync(snapshotA, Buffer.from([1, 2, 3]));
+    fs.writeFileSync(snapshotB, Buffer.from([4, 5, 6]));
+    fs.writeFileSync(faceSnap, Buffer.from([7, 8, 9]));
+
+    storeEvent({
+      ts: now - 400,
+      source: 'video:alpha',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'alpha motion',
+      meta: { channel: 'video:alpha', snapshot: snapshotA, faceSnapshot: faceSnap }
+    });
+    storeEvent({
+      ts: now - 200,
+      source: 'video:beta',
+      detector: 'motion',
+      severity: 'info',
+      message: 'beta motion',
+      meta: { channel: 'video:beta', snapshot: snapshotB }
+    });
+
+    const { port } = await ensureServer();
+
+    const listingResponse = await fetch(`http://localhost:${port}/api/events/snapshots?limit=5`);
+    expect(listingResponse.status).toBe(200);
+    const listingPayload = await listingResponse.json();
+    expect(listingPayload.items.length).toBeGreaterThanOrEqual(2);
+    const firstItem = listingPayload.items.find((item: any) => item.meta?.channel === 'video:alpha');
+    expect(firstItem?.meta?.faceSnapshotUrl).toBe(`/api/events/${firstItem?.id}/face-snapshot`);
+
+    const faceFiltered = await fetch(`http://localhost:${port}/api/events/snapshots?faceSnapshot=with`);
+    const faceFilteredPayload = await faceFiltered.json();
+    expect(faceFilteredPayload.items).toHaveLength(1);
+    expect(faceFilteredPayload.items[0]?.meta?.channel).toBe('video:alpha');
+
+    const facesResponse = await fetch(
+      `http://localhost:${port}/api/faces?channel=${encodeURIComponent('video:alpha')}`
+    );
+    expect(facesResponse.status).toBe(200);
+    const facesPayload = await facesResponse.json();
+    expect(Array.isArray(facesPayload.faces)).toBe(true);
+    expect(facesPayload.faces.every((face: { metadata?: { channel?: string } }) => face.metadata?.channel === 'video:alpha')).toBe(
+      true
+    );
+
+    const controller = new AbortController();
+    const streamResponse = await fetch(
+      `http://localhost:${port}/api/events/stream?metrics=audio&faces=0`,
+      { signal: controller.signal }
+    );
+    expect(streamResponse.status).toBe(200);
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const metricsEvents: any[] = [];
+    const readMetrics = new Promise<void>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              resolve();
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (eventName === 'metrics' && dataLines.length > 0) {
+                metricsEvents.push(JSON.parse(dataLines.join('')));
+                resolve();
+                return;
+              }
+            }
+            readNext();
+          })
+          .catch(reject);
+      };
+      readNext();
+    });
+
+    await readMetrics;
+    controller.abort();
+    expect(metricsEvents).toHaveLength(1);
+    const firstMetrics = metricsEvents[0];
+    expect(firstMetrics.pipelines?.audio?.restarts).toBeDefined();
+    expect(firstMetrics.pipelines?.ffmpeg).toBeUndefined();
+    expect(firstMetrics.events).toBeDefined();
+
+    const noneController = new AbortController();
+    const noneResponse = await fetch(`http://localhost:${port}/api/events/stream?metrics=none`, {
+      signal: noneController.signal
+    });
+    const noneReader = noneResponse.body?.getReader();
+    expect(noneReader).toBeDefined();
+    const firstChunk = await noneReader!.read();
+    const chunkText = decoder.decode(firstChunk.value ?? new Uint8Array());
+    expect(chunkText.includes('event: metrics')).toBe(false);
+    noneController.abort();
+  });
+
   it('HttpApiPoseThreatPayload surfaces pose metadata and caches snapshots', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'pose.png');
@@ -921,6 +1045,199 @@ describe('RestApiEvents', () => {
       globalThis.navigator = originalNavigator;
     } else {
       // @ts-expect-error cleanup for navigator in node environment
+      delete globalThis.navigator;
+    }
+  });
+
+  it('DashboardRenderEvents renders face previews and snapshots', async () => {
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
+
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
+
+    const metricsSnapshot = {
+      fetchedAt: new Date(1700002000000).toISOString(),
+      pipelines: {
+        ffmpeg: {
+          restarts: 0,
+          lastRestartAt: null,
+          channels: []
+        },
+        audio: {
+          restarts: 0,
+          lastRestartAt: null,
+          watchdogBackoffMs: 0
+        }
+      },
+      retention: {
+        runs: 0,
+        lastRunAt: null,
+        warnings: 0,
+        warningsByCamera: {},
+        lastWarning: null,
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 },
+        totalsByCamera: {}
+      }
+    };
+
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events?')) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 101,
+                ts: 1700002000100,
+                source: 'video:alpha',
+                detector: 'motion',
+                severity: 'warning',
+                message: 'alpha event',
+                meta: {
+                  channel: 'video:alpha',
+                  snapshotUrl: '/api/events/101/snapshot',
+                  faceSnapshotUrl: '/api/events/101/face-snapshot'
+                }
+              }
+            ],
+            total: 1
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(JSON.stringify(metricsSnapshot), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    type Listener = (event: MessageEvent) => void;
+    class MinimalEventSource {
+      static instances: MinimalEventSource[] = [];
+      public readyState = 0;
+      public url: string;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
+
+      constructor(url: string) {
+        this.url = url;
+        MinimalEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const payload = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(payload));
+      }
+
+      emitMessage(data: string) {
+        this.onmessage?.(new window.MessageEvent('message', { data }));
+      }
+
+      open() {
+        this.onopen?.(new window.Event('open'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.stubGlobal('EventSource', MinimalEventSource as unknown as typeof EventSource);
+
+    await import('../public/dashboard.js');
+    await Promise.resolve();
+    await vi.waitFor(() => {
+      const events = (window as any).__guardianDashboardState?.events ?? [];
+      if (events.length === 0) {
+        throw new Error('events not loaded');
+      }
+    });
+
+    const firstEvent = window.document.querySelector('#events .event');
+    expect(firstEvent).not.toBeNull();
+    firstEvent?.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const previewImg = window.document.getElementById('preview-image') as HTMLImageElement;
+    const faceImg = window.document.getElementById('preview-face-image') as HTMLImageElement;
+    const faceCaption = window.document.getElementById('preview-face-caption');
+    expect(previewImg.hidden).toBe(false);
+    expect(previewImg.src).toContain('/api/events/101/snapshot');
+    expect(faceImg.hidden).toBe(false);
+    expect(faceImg.src).toContain('/api/events/101/face-snapshot');
+    expect(faceCaption?.textContent).toBe('Face snapshot available');
+
+    dom.window.close();
+    vi.unstubAllGlobals();
+
+    if (originalWindow) {
+      globalThis.window = originalWindow;
+    } else {
+      // @ts-expect-error cleanup
+      delete globalThis.window;
+    }
+    if (originalDocument) {
+      globalThis.document = originalDocument;
+    } else {
+      // @ts-expect-error cleanup
+      delete globalThis.document;
+    }
+    if (originalEventSource) {
+      globalThis.EventSource = originalEventSource;
+    }
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    }
+    if (originalHTMLElement) {
+      globalThis.HTMLElement = originalHTMLElement;
+    }
+    if (originalMessageEvent) {
+      globalThis.MessageEvent = originalMessageEvent;
+    }
+    if (originalNavigator) {
+      globalThis.navigator = originalNavigator;
+    } else {
+      // @ts-expect-error cleanup for navigator
       delete globalThis.navigator;
     }
   });

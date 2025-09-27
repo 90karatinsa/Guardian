@@ -1093,6 +1093,140 @@ describe('VideoSource', () => {
       vi.useRealTimers();
     }
   });
+
+  it('VideoFfmpegStopCancelsRecovery clears pending timers when stopped mid-recovery', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 10,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    try {
+      await waitFor(() => commands.length === 1, 200);
+      const command = commands[0];
+      command.emit('start');
+      command.emit('stderr', 'Read timeout after 100 ms');
+      await Promise.resolve();
+      expect(recoverEvents).toHaveLength(1);
+
+      const stopPromise = source.stop();
+      command.emitClose(1);
+      await stopPromise;
+
+      await vi.runOnlyPendingTimersAsync();
+
+      const internals = source as unknown as {
+        restartTimer: NodeJS.Timeout | null;
+        killTimer: NodeJS.Timeout | null;
+        restartCount: number;
+        recovering: boolean;
+      };
+
+      expect(internals.restartTimer).toBeNull();
+      expect(internals.killTimer).toBeNull();
+      expect(internals.restartCount).toBe(0);
+      expect(internals.recovering).toBe(false);
+      expect(command.killedSignals).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(commands).toHaveLength(1);
+    } finally {
+      await source.dispose();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoFfmpegRestartJitterBounds records jitter limits and applied jitter in metrics', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+    const randomValues = [0, 1, 0.5];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:jitter',
+      restartDelayMs: 30,
+      restartMaxDelayMs: 90,
+      restartJitterFactor: 0.5,
+      forceKillTimeoutMs: 5,
+      random: () => (randomValues.length > 0 ? randomValues.shift()! : 0.5),
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      recoverEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    source.start();
+
+    try {
+      await waitFor(() => commands.length === 1, 500);
+      const first = commands[0];
+      first.emit('start');
+      first.emit('stderr', 'Read timeout after 100 ms');
+      first.emitClose(1);
+      await Promise.resolve();
+
+      expect(recoverEvents).toHaveLength(1);
+      const firstEvent = recoverEvents[0];
+      expect(firstEvent.meta.minJitterMs).toBe(0);
+      expect(firstEvent.meta.maxJitterMs).toBe(15);
+      expect(firstEvent.meta.appliedJitterMs).toBeGreaterThanOrEqual(firstEvent.meta.minJitterMs);
+      expect(firstEvent.meta.appliedJitterMs).toBeLessThanOrEqual(firstEvent.meta.maxJitterMs);
+
+      await vi.advanceTimersByTimeAsync(firstEvent.delayMs);
+      await Promise.resolve();
+
+      await waitFor(() => commands.length === 2, 500);
+      const second = commands[1];
+      second.emit('start');
+      second.emit('stderr', 'Read timeout after 100 ms');
+      second.emitClose(1);
+      await Promise.resolve();
+
+      expect(recoverEvents).toHaveLength(2);
+      const secondEvent = recoverEvents[1];
+      expect(secondEvent.meta.minJitterMs).toBe(-30);
+      expect(secondEvent.meta.maxJitterMs).toBe(30);
+      expect(secondEvent.meta.appliedJitterMs).toBeLessThanOrEqual(secondEvent.meta.maxJitterMs);
+      expect(secondEvent.meta.appliedJitterMs).toBeGreaterThanOrEqual(secondEvent.meta.minJitterMs);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.minJitterMs).toBe(secondEvent.meta.minJitterMs);
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.maxJitterMs).toBe(secondEvent.meta.maxJitterMs);
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.jitterMs).toBe(secondEvent.meta.appliedJitterMs);
+    } finally {
+      await source.dispose();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
 });
 
 class FakeCommand extends EventEmitter {

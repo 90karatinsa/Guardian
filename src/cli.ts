@@ -40,6 +40,23 @@ type HealthPayload = {
     details?: Record<string, unknown>;
   }>;
   metrics: MetricsSnapshot;
+  metricsCapturedAt: string;
+  metricsSummary: {
+    pipelines: {
+      restarts: {
+        video: number;
+        audio: number;
+      };
+      channels: {
+        video: number;
+        audio: number;
+      };
+      lastRestartAt: {
+        video: string | null;
+        audio: string | null;
+      };
+    };
+  };
   runtime: {
     pipelines: {
       videoChannels: number;
@@ -73,6 +90,11 @@ type ReadinessPayload = {
       video: number;
       audio: number;
     };
+    channels: {
+      video: number;
+      audio: number;
+    };
+    snapshotCapturedAt: string;
   };
 };
 
@@ -188,6 +210,7 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const audioChannels = Object.keys(snapshot.pipelines.audio.byChannel ?? {}).length;
   const videoRestarts = snapshot.pipelines.ffmpeg.restarts;
   const audioRestarts = snapshot.pipelines.audio.restarts;
+  const metricsCapturedAt = snapshot.createdAt;
 
   let status: HealthStatus = 'ok';
   if (state.status === 'starting') {
@@ -221,6 +244,23 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
     uptimeSeconds,
     startedAt: state.startedAt ? new Date(state.startedAt).toISOString() : null,
     timestamp: new Date().toISOString(),
+    metricsCapturedAt,
+    metricsSummary: {
+      pipelines: {
+        restarts: {
+          video: videoRestarts,
+          audio: audioRestarts
+        },
+        channels: {
+          video: videoChannels,
+          audio: audioChannels
+        },
+        lastRestartAt: {
+          video: snapshot.pipelines.ffmpeg.lastRestartAt,
+          audio: snapshot.pipelines.audio.lastRestartAt
+        }
+      }
+    },
     application: {
       name: packageJson.name ?? 'guardian',
       version: packageJson.version ?? '0.0.0',
@@ -915,7 +955,12 @@ function buildReadinessPayload(health: HealthPayload): ReadinessPayload {
       restarts: {
         video: health.runtime.pipelines.videoRestarts,
         audio: health.runtime.pipelines.audioRestarts
-      }
+      },
+      channels: {
+        video: health.runtime.pipelines.videoChannels,
+        audio: health.runtime.pipelines.audioChannels
+      },
+      snapshotCapturedAt: health.metricsCapturedAt
     }
   } satisfies ReadinessPayload;
 }

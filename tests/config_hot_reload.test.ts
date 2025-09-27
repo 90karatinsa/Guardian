@@ -560,6 +560,47 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigHotReloadPipelineUpdates logs motion warmup adjustments without restart', async () => {
+    const baseConfig = createConfig({ diffThreshold: 30 });
+    baseConfig.video.channels = { 'video:cam-1': {} };
+    baseConfig.motion.noiseWarmupFrames = 0;
+    baseConfig.motion.noiseBackoffPadding = 0;
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({ logger, configManager: manager });
+
+    try {
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      logger.info.mockClear();
+
+      const updated = JSON.parse(JSON.stringify(baseConfig)) as GuardianConfig;
+      updated.motion.noiseWarmupFrames = 4;
+      updated.motion.noiseBackoffPadding = 2;
+
+      fs.writeFileSync(configPath, JSON.stringify(updated, null, 2));
+
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'Updated guard pipeline configuration')
+      );
+
+      const updateCall = logger.info.mock.calls.find(([, message]) => message === 'Updated guard pipeline configuration');
+      expect(updateCall?.[0]?.updates?.motion?.noiseWarmupFrames).toEqual({ previous: 0, next: 4 });
+      expect(updateCall?.[0]?.updates?.motion?.noiseBackoffPadding).toEqual({ previous: 0, next: 2 });
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigHotReloadChannelOverrides logs layered diff summaries for overrides', async () => {
     const baseConfig = createConfig({ diffThreshold: 30 });
     baseConfig.video.channels = {

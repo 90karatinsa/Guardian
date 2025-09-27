@@ -24,6 +24,8 @@ export interface MotionDetectorOptions {
   areaInflation?: number;
   areaDeltaThreshold?: number;
   idleRebaselineMs?: number;
+  noiseWarmupFrames?: number;
+  noiseBackoffPadding?: number;
 }
 
 type MotionHistoryEntry = {
@@ -75,11 +77,16 @@ export class MotionDetector {
   private readonly noiseWindow: number[] = [];
   private readonly areaWindow: number[] = [];
   private sustainedNoiseBoost = 1;
+  private noiseWarmupRemaining: number;
+  private noiseBackoffPadding: number;
 
   constructor(
     private options: MotionDetectorOptions,
     private readonly bus: EventEmitter = eventBus
-  ) {}
+  ) {
+    this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
+    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+  }
 
   updateOptions(options: Partial<Omit<MotionDetectorOptions, 'source'>>) {
     const previous = this.options;
@@ -101,17 +108,37 @@ export class MotionDetector {
       hasOptionChanged('areaInflation') ||
       hasOptionChanged('areaDeltaThreshold');
 
+    const warmupChanged = hasOptionChanged('noiseWarmupFrames');
+    const backoffPaddingChanged = hasOptionChanged('noiseBackoffPadding');
+
     const countersResetNeeded =
       referenceResetNeeded ||
       hasOptionChanged('debounceFrames') ||
-      hasOptionChanged('backoffFrames');
+      hasOptionChanged('backoffFrames') ||
+      warmupChanged ||
+      backoffPaddingChanged;
 
     this.options = next;
 
+    if (warmupChanged) {
+      this.noiseWarmupRemaining = Math.max(0, next.noiseWarmupFrames ?? 0);
+    }
+
+    if (backoffPaddingChanged) {
+      this.noiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
+      const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
+      const paddedBackoff = baseBackoff + this.noiseBackoffPadding;
+      this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
+    }
+
     if (referenceResetNeeded) {
-      this.resetAdaptiveState();
+      this.resetAdaptiveState({ preserveWarmup: !warmupChanged });
     } else if (countersResetNeeded) {
-      this.resetAdaptiveState({ preserveReference: true, preserveSuppressionCounters: true });
+      this.resetAdaptiveState({
+        preserveReference: true,
+        preserveSuppressionCounters: true,
+        preserveWarmup: !warmupChanged
+      });
     }
   }
 
@@ -328,13 +355,15 @@ export class MotionDetector {
         4
       );
       const sustainedBackoffMultiplier = Math.max(1, Math.min(this.sustainedNoiseBoost * 1.1, 5));
-      const effectiveBackoffFrames = Math.max(
+      const dynamicBackoffFrames = Math.max(
         baseBackoff,
         Math.round(baseBackoff * backoffMultiplier * sustainedBackoffMultiplier)
       );
+      const effectiveBackoffFrames = dynamicBackoffFrames + this.noiseBackoffPadding;
 
       metrics.setDetectorGauge('motion', 'effectiveDebounceFrames', effectiveDebounceFrames);
       metrics.setDetectorGauge('motion', 'effectiveBackoffFrames', effectiveBackoffFrames);
+      metrics.setDetectorGauge('motion', 'noiseBackoffPadding', this.noiseBackoffPadding);
 
       this.areaBaseline = nextBaseline;
       this.baselineFrame = smoothed;
@@ -354,6 +383,24 @@ export class MotionDetector {
         denoiseStrategy,
         reason: hasSignificantArea ? 'candidate' : 'suppressed'
       };
+
+      if (this.noiseWarmupRemaining > 0) {
+        this.noiseWarmupRemaining -= 1;
+        metrics.setDetectorGauge('motion', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+        this.activationFrames = 0;
+        if (this.backoffFrames > 0) {
+          this.backoffFrames = Math.max(0, this.backoffFrames - 1);
+        }
+        this.suppressedFrames += 1;
+        metrics.incrementDetectorCounter('motion', 'suppressedFrames', 1);
+        historyEntry.suppressed = true;
+        historyEntry.reason = 'warmup';
+        historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+        this.recordHistory(historyEntry);
+        return;
+      }
+
+      metrics.setDetectorGauge('motion', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
 
       if (!hasSignificantArea) {
         this.activationFrames = 0;
@@ -470,6 +517,8 @@ export class MotionDetector {
           backoffMultiplier,
           suppressedFramesBeforeTrigger,
           denoiseStrategy,
+          noiseWarmupRemaining: this.noiseWarmupRemaining,
+          noiseBackoffPadding: this.noiseBackoffPadding,
           history: historySnapshot,
           historyWindowMs
         }
@@ -481,9 +530,16 @@ export class MotionDetector {
     }
   }
 
-  private resetAdaptiveState(options: { preserveReference?: boolean; preserveSuppressionCounters?: boolean } = {}) {
+  private resetAdaptiveState(
+    options: {
+      preserveReference?: boolean;
+      preserveSuppressionCounters?: boolean;
+      preserveWarmup?: boolean;
+    } = {}
+  ) {
     const preserveReference = options.preserveReference ?? false;
     const preserveSuppression = options.preserveSuppressionCounters ?? false;
+    const preserveWarmup = options.preserveWarmup ?? false;
 
     if (!preserveReference) {
       this.previousFrame = null;
@@ -504,6 +560,10 @@ export class MotionDetector {
       this.suppressedFrames = 0;
       this.pendingSuppressedFramesBeforeTrigger = 0;
     }
+    if (!preserveWarmup) {
+      this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
+    }
+    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
     this.lastDenoiseStrategy = 'gaussian-median';
   }
 

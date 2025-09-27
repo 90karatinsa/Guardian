@@ -232,6 +232,9 @@ describe('RetentionMaintenance', () => {
     const indexes = db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }>;
     const indexNames = indexes.map(entry => entry.name);
     expect(indexNames).toContain('idx_events_channel');
+    expect(indexNames).toContain('idx_events_camera');
+    expect(indexNames).toContain('idx_events_snapshot_path');
+    expect(indexNames).toContain('idx_events_face_snapshot');
 
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 7, 1);
@@ -373,6 +376,57 @@ describe('RetentionMaintenance', () => {
       const completionCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
       expect(completionCall?.[0]).toMatchObject({ vacuumRunMode: 'always', vacuumMode: 'full' });
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('RetentionArchiveRotation surfaces rotation warnings in results', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 2, 12);
+    vi.setSystemTime(now);
+
+    const staleFile = path.join(cameraOneDir, 'stale.jpg');
+    fs.writeFileSync(staleFile, staleFile);
+    fs.utimesSync(staleFile, (now - 45 * dayMs) / 1000, (now - 45 * dayMs) / 1000);
+
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('rotation failed');
+    });
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        snapshot: { mode: 'archive', retentionDays: 10 },
+        vacuum: { mode: 'auto', run: 'on-change' },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.warnings.length).toBeGreaterThan(0);
+      const warning = result.warnings[0];
+      expect(warning?.reason).toBe('rotation failed');
+      expect(warning?.path).toContain(path.basename(staleFile));
+      expect(metrics.recordRetentionWarning).toHaveBeenCalledWith({
+        camera: path.basename(cameraOneDir),
+        path: expect.stringContaining('stale.jpg'),
+        reason: 'rotation failed'
+      });
+    } finally {
+      renameSpy.mockRestore();
       vi.useRealTimers();
     }
   });

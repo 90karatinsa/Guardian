@@ -82,6 +82,8 @@ export type MotionTuningConfig = {
   areaInflation?: number;
   areaDeltaThreshold?: number;
   idleRebaselineMs?: number;
+  noiseWarmupFrames?: number;
+  noiseBackoffPadding?: number;
 };
 
 export type CameraMotionConfig = MotionTuningConfig & {
@@ -194,6 +196,8 @@ export type LightTuningConfig = {
   noiseMultiplier?: number;
   noiseSmoothing?: number;
   idleRebaselineMs?: number;
+  noiseWarmupFrames?: number;
+  noiseBackoffPadding?: number;
 };
 
 export type LightConfig = LightTuningConfig & {
@@ -356,7 +360,9 @@ const cameraLightConfigSchema: JsonSchema = {
     debounceFrames: { type: 'number', minimum: 0 },
     backoffFrames: { type: 'number', minimum: 0 },
     noiseMultiplier: { type: 'number', minimum: 0 },
-    noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 }
+    noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+    noiseWarmupFrames: { type: 'number', minimum: 0 },
+    noiseBackoffPadding: { type: 'number', minimum: 0 }
   }
 };
 
@@ -570,7 +576,9 @@ const guardianConfigSchema: JsonSchema = {
                   noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
                   areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
                   areaInflation: { type: 'number', minimum: 0 },
-                  areaDeltaThreshold: { type: 'number', minimum: 0 }
+                  areaDeltaThreshold: { type: 'number', minimum: 0 },
+                  noiseWarmupFrames: { type: 'number', minimum: 0 },
+                  noiseBackoffPadding: { type: 'number', minimum: 0 }
                 }
               },
               light: cameraLightConfigSchema,
@@ -635,7 +643,9 @@ const guardianConfigSchema: JsonSchema = {
                   noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
                   areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
                   areaInflation: { type: 'number', minimum: 0 },
-                  areaDeltaThreshold: { type: 'number', minimum: 0 }
+                  areaDeltaThreshold: { type: 'number', minimum: 0 },
+                  noiseWarmupFrames: { type: 'number', minimum: 0 },
+                  noiseBackoffPadding: { type: 'number', minimum: 0 }
                 }
               },
               light: cameraLightConfigSchema,
@@ -697,7 +707,9 @@ const guardianConfigSchema: JsonSchema = {
         noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
         areaSmoothing: { type: 'number', minimum: 0, maximum: 1 },
         areaInflation: { type: 'number', minimum: 0 },
-        areaDeltaThreshold: { type: 'number', minimum: 0 }
+        areaDeltaThreshold: { type: 'number', minimum: 0 },
+        noiseWarmupFrames: { type: 'number', minimum: 0 },
+        noiseBackoffPadding: { type: 'number', minimum: 0 }
       }
     },
     pose: {
@@ -747,14 +759,16 @@ const guardianConfigSchema: JsonSchema = {
       required: ['deltaThreshold'],
       additionalProperties: false,
       properties: {
-    deltaThreshold: { type: 'number', minimum: 0 },
+        deltaThreshold: { type: 'number', minimum: 0 },
         normalHours: lightNormalHoursSchema,
         smoothingFactor: { type: 'number', minimum: 0, maximum: 1 },
         minIntervalMs: { type: 'number', minimum: 0 },
         debounceFrames: { type: 'number', minimum: 0 },
         backoffFrames: { type: 'number', minimum: 0 },
         noiseMultiplier: { type: 'number', minimum: 0 },
-        noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 }
+        noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
+        noiseWarmupFrames: { type: 'number', minimum: 0 },
+        noiseBackoffPadding: { type: 'number', minimum: 0 }
       }
     },
     audio: {
@@ -769,6 +783,7 @@ const guardianConfigSchema: JsonSchema = {
         restartMaxDelayMs: { type: 'number', minimum: 0 },
         restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
         forceKillTimeoutMs: { type: 'number', minimum: 0 },
+        deviceDiscoveryTimeoutMs: { type: 'number', minimum: 0 },
         micFallbacks: {
           type: 'object',
           additionalProperties: {

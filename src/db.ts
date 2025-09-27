@@ -34,6 +34,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
   CREATE INDEX IF NOT EXISTS idx_events_source_detector ON events (source, detector);
   CREATE INDEX IF NOT EXISTS idx_events_channel ON events (json_extract(meta, '$.channel'));
+  CREATE INDEX IF NOT EXISTS idx_events_camera ON events (json_extract(meta, '$.camera'));
+  CREATE INDEX IF NOT EXISTS idx_events_snapshot_path ON events (json_extract(meta, '$.snapshot'));
+  CREATE INDEX IF NOT EXISTS idx_events_face_snapshot ON events (
+    COALESCE(json_extract(meta, '$.faceSnapshot'), json_extract(meta, '$.face.snapshot'))
+  );
   CREATE INDEX IF NOT EXISTS idx_faces_label ON faces (label);
 `);
 
@@ -94,6 +99,7 @@ export interface ListEventsOptions {
   until?: number;
   search?: string;
   snapshot?: 'with' | 'without';
+  faceSnapshot?: 'with' | 'without';
 }
 
 export interface PaginatedEvents {
@@ -237,6 +243,16 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
     filters.push("COALESCE(json_extract(meta, '$.snapshot'), '') <> ''");
   } else if (options.snapshot === 'without') {
     filters.push("COALESCE(json_extract(meta, '$.snapshot'), '') = ''");
+  }
+
+  if (options.faceSnapshot === 'with') {
+    filters.push(
+      "COALESCE(json_extract(meta, '$.faceSnapshot'), json_extract(meta, '$.face.snapshot'), '') <> ''"
+    );
+  } else if (options.faceSnapshot === 'without') {
+    filters.push(
+      "COALESCE(json_extract(meta, '$.faceSnapshot'), json_extract(meta, '$.face.snapshot'), '') = ''"
+    );
   }
 
   const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';

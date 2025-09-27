@@ -202,6 +202,74 @@ describe('AudioSource resilience', () => {
     platformSpy.mockRestore();
   });
 
+  it('AudioDeviceCircuitBreakerReset rotates ffmpeg candidates after silence', async () => {
+    vi.useFakeTimers();
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    let activeProcess: (ChildProcessWithoutNullStreams & EventEmitter) | null = null;
+    const createProcess = () => {
+      const proc = new EventEmitter() as ChildProcessWithoutNullStreams & EventEmitter;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(proc, {
+        stdout,
+        stderr,
+        stdin: new PassThrough(),
+        kill: vi.fn(() => true)
+      });
+      return proc;
+    };
+
+    spawnMock.mockImplementation(() => {
+      activeProcess = createProcess();
+      return activeProcess as ChildProcessWithoutNullStreams;
+    });
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      channel: 'audio:test',
+      sampleRate: 8000,
+      channels: 1,
+      frameDurationMs: 50,
+      silenceDurationMs: 50,
+      silenceCircuitBreakerThreshold: 1,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      random: () => 0.5
+    });
+
+    const fatalSpy = vi.fn();
+    source.on('fatal', fatalSpy);
+    source.on('error', () => {});
+    source.on('recover', () => {});
+
+    source.start();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(activeProcess).not.toBeNull();
+
+    const frameBytes = (8000 * 50) / 1000 * 2;
+    activeProcess!.stdout.emit('data', Buffer.alloc(frameBytes));
+
+    await Promise.resolve();
+    expect(fatalSpy).toHaveBeenCalledTimes(1);
+    expect(source.isCircuitBroken()).toBe(true);
+
+    const snapshotAfterSilence = metrics.snapshot();
+    const audioChannel = snapshotAfterSilence.pipelines.audio.byChannel['audio:test'];
+    expect(audioChannel.byReason['stream-silence']).toBe(1);
+
+    const resetResult = source.resetCircuitBreaker();
+    expect(resetResult).toBe(true);
+    expect(source.isCircuitBroken()).toBe(false);
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+    vi.useRealTimers();
+  });
+
   it('AudioPipeMisalignTriggersRecovery restarts pipe streams on misaligned chunks', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 

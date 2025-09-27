@@ -198,6 +198,106 @@ describe('MotionDetector', () => {
     expect(meta.areaWindowMedian ?? 0).toBeGreaterThan(0);
   });
 
+  it('MotionNoiseAdaptiveBackoff applies warmup padding and reload updates counters', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'warmup-motion',
+        diffThreshold: 4,
+        areaThreshold: 0.025,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.3,
+        noiseSmoothing: 0.18,
+        areaSmoothing: 0.2,
+        areaInflation: 1.05,
+        noiseWarmupFrames: 3,
+        noiseBackoffPadding: 2
+      },
+      bus
+    );
+
+    const base = createUniformFrame(16, 16, 8);
+    detector.handleFrame(base, 0);
+
+    const noiseFrames = [
+      createFrame(16, 16, (x, y) => 8 + ((x + y) % 3 === 0 ? 6 : -5)),
+      createFrame(16, 16, (x, y) => 8 + ((x * y) % 4 === 0 ? 7 : -6)),
+      createFrame(16, 16, (x, y) => 8 + ((2 * x + y) % 5 === 0 ? 8 : -6))
+    ];
+
+    noiseFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, 1 + idx);
+    });
+
+    expect(events).toHaveLength(0);
+
+    let snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.gauges?.noiseWarmupRemaining ?? 0).toBe(0);
+
+    const motionBurst = [
+      createFrame(16, 16, (x, y) => (x < 8 ? 220 : 5)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 235 : 6)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 245 : 7)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 250 : 8)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 9)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 10)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 11)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 12))
+    ];
+
+    let ts = 100;
+    for (const frame of motionBurst) {
+      detector.handleFrame(frame, ts);
+      ts += 1;
+    }
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.gauges?.noiseWarmupRemaining ?? 0).toBe(0);
+    expect(snapshot.detectors.motion?.gauges?.noiseBackoffPadding ?? 0).toBe(2);
+    expect(snapshot.detectors.motion?.gauges?.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(4);
+
+    detector.updateOptions({
+      debounceFrames: 3,
+      backoffFrames: 2,
+      noiseWarmupFrames: 2,
+      noiseBackoffPadding: 3
+    });
+
+    const recalibration = createUniformFrame(16, 16, 9);
+    detector.handleFrame(recalibration, 200);
+
+    const warmupNoise = createFrame(16, 16, (x, y) => 9 + ((x + 2 * y) % 4 === 0 ? 4 : -3));
+    detector.handleFrame(warmupNoise, 201);
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.gauges?.noiseWarmupRemaining ?? 0).toBe(0);
+
+    detector.handleFrame(warmupNoise, 202);
+
+    const secondBurst = [
+      createFrame(16, 16, (x, y) => (x < 8 ? 225 : 6)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 235 : 7)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 245 : 8)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 9)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 10)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 11)),
+      createFrame(16, 16, (x, y) => (x < 8 ? 255 : 12))
+    ];
+
+    let secondTs = 300;
+    for (const frame of secondBurst) {
+      detector.handleFrame(frame, secondTs);
+      secondTs += 1;
+    }
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.gauges?.noiseWarmupRemaining ?? 0).toBe(0);
+    expect(snapshot.detectors.motion?.gauges?.noiseBackoffPadding ?? 0).toBe(3);
+    expect(snapshot.detectors.motion?.gauges?.effectiveDebounceFrames ?? 0).toBeGreaterThanOrEqual(3);
+    expect(snapshot.detectors.motion?.gauges?.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(5);
+  });
+
   it('MotionLightAdaptiveBackoff suppresses noise bursts and tracks suppression metrics', () => {
     const detector = new MotionDetector(
       {
@@ -697,6 +797,94 @@ describe('LightDetector', () => {
 
     detector.handleFrame(createUniformFrame(8, 8, 62), 2100);
     expect(events).toHaveLength(0);
+  });
+
+  it('LightDetectorNoiseWindow enforces warmup and noise padding tuning', () => {
+    const detector = new LightDetector(
+      {
+        source: 'warmup-light',
+        deltaThreshold: 18,
+        smoothingFactor: 0.07,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 2.2,
+        noiseSmoothing: 0.16,
+        noiseWarmupFrames: 2,
+        noiseBackoffPadding: 1
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(12, 12, 30);
+    detector.handleFrame(baseline, 0);
+
+    const noiseFrames = [
+      createUniformFrame(12, 12, 33),
+      createUniformFrame(12, 12, 35)
+    ];
+
+    noiseFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, 1 + idx);
+    });
+
+    expect(events).toHaveLength(0);
+    let snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.noiseWarmupRemaining ?? 0).toBe(0);
+    const initialDebounce = Math.max(
+      1,
+      snapshot.detectors.light?.gauges?.effectiveDebounceFrames ?? 0
+    );
+
+    const triggerIterations = Math.max(initialDebounce + 10, 12);
+    for (let idx = 0; idx < triggerIterations && events.length === 0; idx += 1) {
+      const frame = createUniformFrame(12, 12, 160 + idx * 15);
+      detector.handleFrame(frame, 200 + idx * 2);
+    }
+
+    expect(events).toHaveLength(1);
+    const firstMeta = events[0].meta as Record<string, number>;
+    expect(firstMeta.noiseWarmupRemaining).toBe(0);
+    expect(firstMeta.noiseBackoffPadding).toBe(1);
+    expect(firstMeta.effectiveBackoffFrames).toBeGreaterThanOrEqual(3);
+    expect(firstMeta.sustainedNoiseBoost).toBeGreaterThanOrEqual(1);
+    expect(firstMeta.sustainedNoiseBoost).toBeLessThanOrEqual(4);
+
+    detector.updateOptions({
+      debounceFrames: 3,
+      backoffFrames: 2,
+      noiseWarmupFrames: 1,
+      noiseBackoffPadding: 2
+    });
+
+    const recalibration = createUniformFrame(12, 12, 40);
+    detector.handleFrame(recalibration, 400);
+    detector.handleFrame(createUniformFrame(12, 12, 42), 401);
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.noiseWarmupRemaining ?? 0).toBe(0);
+    const updatedDebounce = Math.max(
+      1,
+      snapshot.detectors.light?.gauges?.effectiveDebounceFrames ?? 0
+    );
+
+    const followUpIterations = Math.max(updatedDebounce + 20, 24);
+    for (let idx = 0; idx < followUpIterations; idx += 1) {
+      const frame = createUniformFrame(12, 12, 200 + idx * 15);
+      detector.handleFrame(frame, 500 + idx * 3);
+      if (events.filter(event => event.detector === 'light').length >= 2) {
+        break;
+      }
+    }
+
+    expect(events.filter(event => event.detector === 'light')).toHaveLength(2);
+    const secondLightEvent = events.filter(event => event.detector === 'light').at(-1);
+    const secondMeta = secondLightEvent?.meta as Record<string, number>;
+    expect(secondMeta.noiseWarmupRemaining).toBe(0);
+    expect(secondMeta.noiseBackoffPadding).toBe(2);
+    expect(secondMeta.effectiveBackoffFrames).toBeGreaterThanOrEqual(4);
+    expect(secondMeta.sustainedNoiseBoost).toBeGreaterThanOrEqual(1);
+    expect(secondMeta.sustainedNoiseBoost).toBeLessThanOrEqual(4);
   });
 });
 

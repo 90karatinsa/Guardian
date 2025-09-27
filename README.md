@@ -15,6 +15,7 @@ Guardian, ağ kameraları ve ses girişleri üzerinden gelen olayları normalize
 - [Video ve ses boru hatları](#video-ve-ses-boru-hatları)
 - [Docker ile çalışma](#docker-ile-çalışma)
 - [systemd servisi](#systemd-servisi)
+- [Operasyon kılavuzu](#operasyon-kılavuzu)
 - [Sorun giderme](#sorun-giderme)
 
 ## Gereksinimler
@@ -51,6 +52,18 @@ pnpm tsx src/cli.ts --health
 ```
 
 `pnpm tsx src/cli.ts --health` çıktısı `"status":"ok"` satırını ve `metrics.histograms.pipeline.ffmpeg.restarts`, `metrics.histograms.pipeline.audio.restarts` gibi anahtarları içerir; histogramlar sıfır değerlerle bile görünür. Aynı çıktı içinde `metrics.suppression.histogram.historyCount` ve `metrics.logs.byLevel.error` alanlarını da görebilirsiniz.
+
+Kurulum sonrası hızlı doğrulama için aşağıdaki adımları takip edin:
+
+1. `guardian daemon start` komutuyla süreci arka planda başlatın ve `guardian daemon status --json` çıktısındaki
+   `pipelines.ffmpeg.watchdogRestarts` alanının 0 kaldığını doğrulayın.
+2. `guardian daemon health --json` çıktısında `metrics.logs.histogram.error` ve `pipelines.ffmpeg.watchdogRestartsByChannel`
+   anahtarlarını kontrol ederek log seviyelerinin doğru sayıldığından emin olun.
+3. `guardian log-level set debug` ile seviyeyi yükseltip `guardian log-level get` komutuyla geri okuma yapın; metrikler
+   `metrics.logs.byLevel.debug` alanına yeni bir artış yazacaktır.
+4. Dedektör gecikme dağılımını gözlemlemek için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
+   console.log(metrics.exportDetectorLatencyHistogram('motion'))"` örneğini çalıştırarak Prometheus uyumlu histogram çıktısını
+   inceleyin.
 
 ## Konfigürasyon
 Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve retention politikalarını yapılandırır. Hot reload mekanizması, dosya değişikliklerini izler ve geçersiz JSON bulunduğunda son bilinen iyi yapılandırmaya geri döner.
@@ -242,7 +255,12 @@ guardian stop
 guardian status
 ```
 
-`guardian daemon status --json` çıktısı `"status":"ok"`, `metrics.logs.byLevel.error`, `metrics.suppression.histogram.cooldownMs` ve `pipelines.ffmpeg.byChannel` gibi alanları içerir. Komut çalıştırıldıktan sonra isterseniz `guardian log-level set info` ile varsayılan seviyeye geri dönebilirsiniz. Geliştirme sırasında `pnpm start` komutu HTTP sunucusunu ve guardian daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
+`guardian daemon status --json` çıktısı `"status":"ok"`, `metrics.logs.byLevel.error`, `metrics.logs.histogram.error`,
+`pipelines.ffmpeg.watchdogRestartsByChannel` ve `pipelines.ffmpeg.byChannel` gibi alanları içerir. Watchdog sayaçları tek tek
+kanallar için kaç yeniden deneme yaşandığını, `watchdogBackoffByChannel` ise toplam gecikme süresini gösterir. Komut
+çalıştırıldıktan sonra isterseniz `guardian log-level set info` ile varsayılan seviyeye geri dönebilir, `guardian log-level get`
+çıkışını `metrics.logs.byLevel` ile karşılaştırabilirsiniz. Geliştirme sırasında `pnpm start` komutu HTTP sunucusunu ve guardian
+daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
 
 ## Dashboard
 `pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir.
@@ -276,10 +294,19 @@ Docker healthcheck'i `guardian daemon health` ve `guardian daemon status --json`
 ## systemd servisi
 `deploy/guardian.service` ve `deploy/systemd.service` dosyaları, CLI'nin `start`, `stop` ve `health` komutlarını kullanan örnek unit tanımları içerir. `journalctl -u guardian` çıktısında `metrics.logs.byLevel.error` artışını veya `pipelines.audio.watchdogBackoffByChannel` değişikliklerini izleyebilirsiniz.
 
+## Operasyon kılavuzu
+Guardian'ı 7/24 çalıştırırken yapılması gereken rutin kontroller ve bakım adımları için [Operasyon kılavuzu](docs/operations.md)
+dokümanını takip edin. Bu kılavuzda `guardian daemon health --json` çıktısındaki `watchdogRestarts` sayaçlarını nasıl yorumlayacağı,
+`pnpm exec tsx src/tasks/retention.ts --run now` komutuyla bakım tetiklemenin yolları ve dedektör gecikme histogramlarının Prometheus
+üzerinden nasıl dışa aktarılacağı gibi örnekler yer alır. README'deki Kurulum, Guardian'ı Çalıştırma ve Sorun giderme bölümleri bu
+operasyonel rehber ile birlikte okunmalıdır.
+
 ## Sorun giderme
 - `guardian daemon status --json` veya `pnpm exec tsx src/cli.ts --health` çıktısında `metrics.logs.byLevel.error` hızla artıyorsa log seviyesini `guardian log-level set debug` ile yükseltip detaylı inceleme yapın.
 - `pipelines.ffmpeg.watchdogBackoffByChannel` veya `pipelines.ffmpeg.restartHistogram.delay` değerleri sürekli yükseliyorsa RTSP bağlantılarını kontrol edin; `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` parametrelerini düşürmek backoff süresini azaltır.
 - `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırları kesintisiz devam ediyorsa `audio.micFallbacks` listesinde çalışan bir cihaz kalmamış olabilir.
 - `metrics.suppression.histogram.cooldownRemainingMs` ve `metrics.suppression.histogram.windowRemainingMs` değerleri yüksekse `events.suppression.rules` altındaki `suppressForMs` veya `rateLimit.cooldownMs` değerlerini gözden geçirin.
 - CLI komutları beklenen çıktıyı vermiyorsa `guardian daemon status --json` ve `pnpm exec tsx src/cli.ts status --json` komutlarının exit kodunun 0 olduğundan emin olun; farklı bir config dosyasını `--config` parametresiyle doğrulayabilirsiniz. `guardian daemon ready` çıktısı `"status":"ready"` değilse bir shutdown hook'u blokluyor olabilir.
+- `pipelines.ffmpeg.watchdogRestarts` veya `pipelines.ffmpeg.watchdogRestartsByChannel` değerleri artıyorsa [Operasyon kılavuzu](docs/operations.md)
+  içindeki devre kesici sıfırlama adımlarını uygulayın ve `guardian daemon hooks --reason watchdog-reset` komutuyla manuel toparlanmayı deneyin.
 

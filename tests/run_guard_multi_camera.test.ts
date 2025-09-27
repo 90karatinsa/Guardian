@@ -6,6 +6,7 @@ let metrics: typeof import('../src/metrics/index.js').default;
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
+  static startCounts: number[] = [];
   constructor(
     public readonly options: {
       file: string;
@@ -24,11 +25,28 @@ class MockVideoSource extends EventEmitter {
   ) {
     super();
     MockVideoSource.instances.push(this);
+    MockVideoSource.startCounts.push(0);
   }
-  start() {}
+  public circuitBroken = false;
+  start() {
+    const index = MockVideoSource.instances.indexOf(this);
+    if (index >= 0) {
+      MockVideoSource.startCounts[index] = (MockVideoSource.startCounts[index] ?? 0) + 1;
+    }
+  }
   stop() {
     this.emit('stopped');
+    this.circuitBroken = false;
   }
+  resetCircuitBreaker = vi.fn(() => {
+    const wasBroken = this.circuitBroken;
+    this.circuitBroken = false;
+    if (wasBroken) {
+      this.start();
+    }
+    return wasBroken;
+  });
+  isCircuitBroken = vi.fn(() => this.circuitBroken);
 }
 
 class MockPersonDetector {
@@ -180,6 +198,7 @@ describe('run-guard multi camera orchestration', () => {
     vi.resetModules();
     ({ default: metrics } = await import('../src/metrics/index.js'));
     MockVideoSource.instances = [];
+    MockVideoSource.startCounts = [];
     MockPersonDetector.instances = [];
     MockPersonDetector.calls = [];
     MockMotionDetector.instances = [];
@@ -377,6 +396,176 @@ describe('run-guard multi camera orchestration', () => {
       diffThreshold: 22,
       areaThreshold: 0.018
     });
+
+    runtime.stop();
+  });
+
+  it('RunGuardChannelOverrides tracks per-channel restart metrics', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const bus = new EventEmitter();
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 4,
+          ffmpeg: {
+            restartDelayMs: 250,
+            restartMaxDelayMs: 2000,
+            restartJitterFactor: 0.1,
+            watchdogTimeoutMs: 5000
+          },
+          channels: {},
+          cameras: [
+            {
+              id: 'cam-a',
+              channel: 'video:cam-a',
+              input: 'rtsp://cam-a',
+              ffmpeg: { watchdogTimeoutMs: 6000 },
+              person: { score: 0.5 },
+              motion: { diffThreshold: 15, areaThreshold: 0.02 }
+            },
+            {
+              id: 'cam-b',
+              channel: 'video:cam-b',
+              input: 'rtsp://cam-b',
+              person: { score: 0.55 },
+              motion: { diffThreshold: 18, areaThreshold: 0.018 }
+            }
+          ]
+        },
+        person: {
+          modelPath: 'model.onnx',
+          score: 0.5,
+          maxDetections: 1
+        },
+        motion: {
+          diffThreshold: 20,
+          areaThreshold: 0.02
+        },
+        events: {
+          thresholds: { info: 0, warning: 5, critical: 10 }
+        }
+      }
+    });
+
+    const [camA, camB] = MockVideoSource.instances;
+
+    camA.emit('recover', {
+      reason: 'watchdog-timeout',
+      attempt: 1,
+      delayMs: 420,
+      meta: {
+        minDelayMs: 250,
+        maxDelayMs: 2000,
+        baseDelayMs: 250,
+        appliedJitterMs: 170
+      },
+      channel: camA.options.channel,
+      errorCode: null,
+      exitCode: null,
+      signal: null
+    });
+
+    camB.emit('recover', {
+      reason: 'stream-error',
+      attempt: 2,
+      delayMs: 600,
+      meta: {
+        minDelayMs: 250,
+        maxDelayMs: 2000,
+        baseDelayMs: 250,
+        appliedJitterMs: 350
+      },
+      channel: camB.options.channel,
+      errorCode: 'EPIPE',
+      exitCode: 1,
+      signal: null
+    });
+
+    await Promise.resolve();
+
+    const snapshot = metrics.snapshot();
+    const camASnapshot = snapshot.pipelines.ffmpeg.byChannel[camA.options.channel!];
+    const camBSnapshot = snapshot.pipelines.ffmpeg.byChannel[camB.options.channel!];
+
+    expect(camASnapshot.restarts).toBe(1);
+    expect(camASnapshot.byReason['watchdog-timeout']).toBe(1);
+    expect(camASnapshot.watchdogBackoffMs).toBe(420);
+
+    expect(camBSnapshot.restarts).toBe(1);
+    expect(camBSnapshot.byReason['stream-error']).toBe(1);
+    expect(camBSnapshot.totalRestartDelayMs).toBe(600);
+
+    runtime.stop();
+  });
+
+  it('RunGuardCircuitBreakerRecovery restarts a circuit-broken pipeline', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const bus = new EventEmitter();
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 2,
+          cameras: [
+            {
+              id: 'cam-reset',
+              channel: 'video:cam-reset',
+              input: 'rtsp://reset',
+              ffmpeg: { circuitBreakerThreshold: 2 },
+              person: { score: 0.5 },
+              motion: { diffThreshold: 20, areaThreshold: 0.02 }
+            }
+          ]
+        },
+        person: {
+          modelPath: 'model.onnx',
+          score: 0.5
+        },
+        motion: {
+          diffThreshold: 20,
+          areaThreshold: 0.02
+        },
+        events: {
+          thresholds: { info: 0, warning: 5, critical: 10 }
+        }
+      }
+    });
+
+    const source = MockVideoSource.instances[0];
+    const channel = source.options.channel!;
+
+    expect(MockVideoSource.startCounts[0]).toBeGreaterThanOrEqual(1);
+
+    source.circuitBroken = true;
+
+    const resetResult = runtime.resetCircuitBreaker(channel);
+    expect(resetResult).toBe(true);
+    expect(source.resetCircuitBreaker).toHaveBeenCalledTimes(1);
+    expect(MockVideoSource.startCounts[0]).toBeGreaterThan(1);
+
+    const snapshot = metrics.snapshot();
+    const channelSnapshot = snapshot.pipelines.ffmpeg.byChannel[channel];
+    expect(channelSnapshot.byReason['manual-circuit-reset']).toBe(1);
+
+    const secondReset = runtime.resetCircuitBreaker(channel);
+    expect(secondReset).toBe(false);
 
     runtime.stop();
   });

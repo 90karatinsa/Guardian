@@ -47,6 +47,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('Audio source recovering (reason=ffmpeg-missing|stream-idle)');
     expect(readme).toContain('pipelines.ffmpeg.jitterHistogram');
     expect(readme).toContain('watchdogBackoffByChannel');
+    expect(readme).toContain('pipelines.ffmpeg.watchdogRestartsByChannel');
+    expect(readme).toContain('pipelines.ffmpeg.watchdogRestarts');
     expect(readme).toContain('guardian daemon start');
     expect(readme).toContain('guardian daemon status --json');
     expect(readme).toContain('guardian daemon health');
@@ -57,6 +59,7 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('pnpm exec tsx src/cli.ts status --json');
     expect(readme).toContain('guardian log-level set debug');
     expect(readme).toContain('metrics.histograms.pipeline.ffmpeg.restarts');
+    expect(readme).toContain('metrics.logs.histogram.error');
     expect(readme).toContain('pipelines.ffmpeg.restartHistogram.delay');
     expect(readme).toContain('metrics.suppression.histogram.historyCount');
     expect(readme).toContain('metrics.logs.byLevel.error');
@@ -65,6 +68,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('pose.forecast');
     expect(readme).toContain('threat.summary');
     expect(readme).toContain('Sorun giderme');
+    expect(readme).toContain('Operasyon kılavuzu');
+    expect(readme).toContain('docs/operations.md');
     expect(readme).toContain('pnpm tsx src/cli.ts --health');
     expect(readme).toContain('status: ok');
 
@@ -92,5 +97,20 @@ describe('ReadmeExamples', () => {
     const restoreCapture = createIo();
     const restoreExit = await runCli(['log-level', 'set', initialLevel], restoreCapture.io);
     expect(restoreExit).toBe(0);
+  });
+});
+
+describe('OperationsDocLinks', () => {
+  it('OperationsDocLinks ensures README links to operations manual and sections are present', () => {
+    const readme = readReadme();
+    expect(readme).toContain('[Operasyon kılavuzu](docs/operations.md)');
+
+    const operationsPath = path.resolve(__dirname, '..', 'docs', 'operations.md');
+    const operations = fs.readFileSync(operationsPath, 'utf8');
+    expect(operations).toContain('# Guardian Operasyon Kılavuzu');
+    expect(operations).toContain('watchdogRestarts');
+    expect(operations).toContain('guardian daemon health --json');
+    expect(operations).toContain('pnpm exec tsx src/tasks/retention.ts --run');
+    expect(operations).toContain('detector latency histogramlarını');
   });
 });
