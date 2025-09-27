@@ -1063,7 +1063,7 @@ function parseChannelParams(params: URLSearchParams): string[] {
   }
   return values
     .flatMap(value => value.split(','))
-    .map(value => value.trim())
+    .map(value => normalizeChannelId(value))
     .filter(value => value.length > 0);
 }
 
@@ -1707,22 +1707,33 @@ function resolveEventChannels(meta: Record<string, unknown>): string[] {
   const channels: string[] = [];
   const candidate = meta.channel;
   if (typeof candidate === 'string') {
-    const trimmed = candidate.trim();
-    if (trimmed) {
-      channels.push(trimmed);
+    const normalized = normalizeChannelId(candidate);
+    if (normalized) {
+      channels.push(normalized);
     }
   } else if (Array.isArray(candidate)) {
     for (const value of candidate) {
       if (typeof value !== 'string') {
         continue;
       }
-      const trimmed = value.trim();
-      if (trimmed) {
-        channels.push(trimmed);
+      const normalized = normalizeChannelId(value);
+      if (normalized) {
+        channels.push(normalized);
       }
     }
   }
   return channels;
+}
+
+function normalizeChannelId(value: string | null | undefined) {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) {
+    return '';
+  }
+  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `video:${trimmed}`;
 }
 
 function filterFaces(faces: FaceRecord[], search: string | null, channels?: string[]): FaceRecord[] {

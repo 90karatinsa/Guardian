@@ -456,7 +456,8 @@ function projectBoundingBox(
         continue;
       }
 
-      const score = (areaRatio <= 1 ? areaRatio : 1 / Math.max(areaRatio, 1e-6)) - (assumeNormalized ? 0.02 : 0);
+      const normalizedPenalty = assumeNormalized && projection.normalized !== true ? 0.02 : 0;
+      const score = (areaRatio <= 1 ? areaRatio : 1 / Math.max(areaRatio, 1e-6)) - normalizedPenalty;
       if (score <= 0) {
         continue;
       }

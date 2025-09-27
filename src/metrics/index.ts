@@ -90,6 +90,7 @@ type SuppressionSnapshot = {
   byReason: CounterMap;
   byType: CounterMap;
   byChannel: CounterMap;
+  byChannelReason: Record<string, CounterMap>;
   historyTotals: {
     historyCount: number;
     combinedHistoryCount: number;
@@ -110,6 +111,18 @@ type SuppressionSnapshot = {
     windowEndsAt?: string | null;
     cooldownRemainingMs?: number | null;
     cooldownEndsAt?: string | null;
+    channelStates?: Record<
+      string,
+      {
+        hits?: number;
+        reasons?: string[];
+        types?: Array<'window' | 'rate-limit'>;
+        windowRemainingMs?: number | null;
+        cooldownRemainingMs?: number | null;
+        historyCount?: number | null;
+        combinedHistoryCount?: number | null;
+      }
+    > | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
   histogram: {
@@ -122,6 +135,7 @@ type SuppressionSnapshot = {
       cooldownMs: Record<string, HistogramSnapshot>;
       cooldownRemainingMs: Record<string, HistogramSnapshot>;
       windowRemainingMs: Record<string, HistogramSnapshot>;
+      historyCount: Record<string, HistogramSnapshot>;
     };
   };
 };
@@ -164,6 +178,18 @@ type SuppressedEventMetric = {
   windowRemainingMs?: number;
   cooldownRemainingMs?: number;
   cooldownExpiresAt?: number;
+  channelStates?: Record<
+    string,
+    {
+      hits?: number;
+      reasons?: string[];
+      types?: Array<'window' | 'rate-limit'>;
+      windowRemainingMs?: number | null;
+      cooldownRemainingMs?: number | null;
+      historyCount?: number | null;
+      combinedHistoryCount?: number | null;
+    }
+  >;
 };
 
 type RetentionTotals = {
@@ -244,6 +270,30 @@ type PrometheusHistogramOptions = {
   labels?: Record<string, string>;
 };
 
+type PrometheusGaugeOptions = {
+  metricName?: string;
+  help?: string;
+  labels?: Record<string, string>;
+};
+
+type PrometheusLogLevelOptions = {
+  levelMetricName?: string;
+  levelHelp?: string;
+  detectorMetricName?: string;
+  detectorHelp?: string;
+  lastErrorMetricName?: string;
+  lastErrorHelp?: string;
+  labels?: Record<string, string>;
+};
+
+type PrometheusDetectorOptions = {
+  counterMetricName?: string;
+  counterHelp?: string;
+  gaugeMetricName?: string;
+  gaugeHelp?: string;
+  labels?: Record<string, string>;
+};
+
 const DEFAULT_HISTOGRAM: HistogramConfig = {
   buckets: [25, 50, 100, 250, 500, 1000, 2000, 5000, 10000],
   format: (bucket, previous) => {
@@ -290,7 +340,24 @@ const RESTART_ATTEMPT_HISTOGRAM: HistogramConfig = {
   }
 };
 
+type PipelineType = 'ffmpeg' | 'audio';
+type PipelineHistogramVariant = 'delay' | 'attempt' | 'jitter' | 'restarts';
+
 const DEFAULT_RESTART_HISTORY_LIMIT = 50;
+
+const PIPELINE_HISTOGRAM_SUFFIX: Record<PipelineHistogramVariant, string> = {
+  delay: 'restart_delay_ms',
+  attempt: 'restart_attempt',
+  jitter: 'restart_jitter_ms',
+  restarts: 'restarts_total'
+} as const;
+
+const PIPELINE_HISTOGRAM_HELP: Record<PipelineHistogramVariant, string> = {
+  delay: 'Pipeline restart delay in milliseconds',
+  attempt: 'Pipeline restart attempts recorded for exponential backoff',
+  jitter: 'Pipeline restart jitter applied in milliseconds',
+  restarts: 'Pipeline restart counter histogram'
+} as const;
 
 type DetectorLatencyState = {
   count: number;
@@ -333,6 +400,8 @@ class MetricsRegistry {
     Map<string, number>
   >();
   private readonly suppressionChannelWindowHistogram = new Map<string, Map<string, number>>();
+  private readonly suppressionChannelHistoryHistogram = new Map<string, Map<string, number>>();
+  private readonly suppressionChannelReasonCounters = new Map<string, Map<string, number>>();
   private lastSuppressedEvent: {
     ruleId?: string;
     reason?: string;
@@ -349,6 +418,7 @@ class MetricsRegistry {
     windowEndsAt?: number | null;
     cooldownRemainingMs?: number | null;
     cooldownEndsAt?: number | null;
+    channelStates?: SuppressedEventMetric['channelStates'];
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -379,9 +449,11 @@ class MetricsRegistry {
     this.registerReservedHistogram('pipeline.ffmpeg.restart.delay', DEFAULT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.ffmpeg.restart.attempt', RESTART_ATTEMPT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.ffmpeg.restarts', COUNTER_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.ffmpeg.restart.jitter', DEFAULT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.audio.restart.delay', DEFAULT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.audio.restart.attempt', RESTART_ATTEMPT_HISTOGRAM);
     this.registerReservedHistogram('pipeline.audio.restarts', COUNTER_HISTOGRAM);
+    this.registerReservedHistogram('pipeline.audio.restart.jitter', DEFAULT_HISTOGRAM);
     this.registerReservedHistogram('suppression.historyCount', COUNTER_HISTOGRAM);
     this.registerReservedHistogram('suppression.combinedHistoryCount', COUNTER_HISTOGRAM);
     this.registerReservedHistogram('suppression.cooldownMs', DEFAULT_HISTOGRAM);
@@ -420,6 +492,8 @@ class MetricsRegistry {
     this.suppressionChannelCooldownHistogram.clear();
     this.suppressionChannelCooldownRemainingHistogram.clear();
     this.suppressionChannelWindowHistogram.clear();
+    this.suppressionChannelHistoryHistogram.clear();
+    this.suppressionChannelReasonCounters.clear();
     this.lastSuppressedEvent = null;
     this.suppressionHistoryCount = 0;
     this.suppressionCombinedHistoryCount = 0;
@@ -558,6 +632,16 @@ class MetricsRegistry {
       typeof normalizedDetail.cooldownMs === 'number' && Number.isFinite(normalizedDetail.cooldownMs)
         ? normalizedDetail.cooldownMs
         : null;
+    const normalizedChannelStates = normalizedDetail.channelStates
+      ? Object.fromEntries(
+          Object.entries(normalizedDetail.channelStates)
+            .map(([key, value]) => [
+              typeof key === 'string' ? key.trim() : '',
+              value ?? {}
+            ])
+            .filter(([key]) => key.length > 0)
+        )
+      : null;
     const detailChannels = Array.isArray(normalizedDetail.channels)
       ? normalizedDetail.channels
           .map(channel => (typeof channel === 'string' ? channel.trim() : ''))
@@ -574,7 +658,12 @@ class MetricsRegistry {
     if (explicitChannel) {
       channelSet.add(explicitChannel);
     }
-    const channelList = Array.from(channelSet);
+    if (normalizedChannelStates) {
+      for (const channel of Object.keys(normalizedChannelStates)) {
+        channelSet.add(channel);
+      }
+    }
+    const channelList = Array.from(channelSet).sort((a, b) => a.localeCompare(b));
     const primaryChannel = explicitChannel ?? channelList[0] ?? null;
     const windowExpiresAtValue =
       typeof normalizedDetail.windowExpiresAt === 'number' &&
@@ -620,26 +709,74 @@ class MetricsRegistry {
     if (channelList.length > 0) {
       for (const channel of channelList) {
         this.suppressionByChannel.set(channel, (this.suppressionByChannel.get(channel) ?? 0) + 1);
-        if (typeof cooldownValue === 'number') {
+        const channelState = normalizedChannelStates?.[channel];
+        const channelCooldown =
+          typeof channelState?.cooldownRemainingMs === 'number' &&
+          Number.isFinite(channelState.cooldownRemainingMs)
+            ? Math.max(0, channelState.cooldownRemainingMs ?? 0)
+            : cooldownRemainingValue;
+        const channelWindow =
+          typeof channelState?.windowRemainingMs === 'number' &&
+          Number.isFinite(channelState.windowRemainingMs)
+            ? Math.max(0, channelState.windowRemainingMs ?? 0)
+            : windowRemainingValue;
+        const channelHistoryCount =
+          typeof channelState?.historyCount === 'number' && Number.isFinite(channelState.historyCount)
+            ? Math.max(0, channelState.historyCount ?? 0)
+            : null;
+        const channelCooldownTotal =
+          typeof cooldownValue === 'number' ? cooldownValue : channelState?.cooldownRemainingMs ?? null;
+
+        if (typeof channelCooldownTotal === 'number' && Number.isFinite(channelCooldownTotal)) {
           recordSuppressionChannelHistogram(
             this.suppressionChannelCooldownHistogram,
             channel,
-            cooldownValue
+            channelCooldownTotal
           );
         }
-        if (typeof windowRemainingValue === 'number') {
+        if (typeof channelWindow === 'number') {
           recordSuppressionChannelHistogram(
             this.suppressionChannelWindowHistogram,
             channel,
-            windowRemainingValue
+            channelWindow
           );
         }
-        if (typeof cooldownRemainingValue === 'number') {
+        if (typeof channelCooldown === 'number') {
           recordSuppressionChannelHistogram(
             this.suppressionChannelCooldownRemainingHistogram,
             channel,
-            cooldownRemainingValue
+            channelCooldown
           );
+        }
+        if (typeof channelHistoryCount === 'number') {
+          recordSuppressionChannelHistogram(
+            this.suppressionChannelHistoryHistogram,
+            channel,
+            channelHistoryCount
+          );
+        } else if (
+          typeof normalizedDetail.historyCount === 'number' &&
+          Number.isFinite(normalizedDetail.historyCount)
+        ) {
+          recordSuppressionChannelHistogram(
+            this.suppressionChannelHistoryHistogram,
+            channel,
+            normalizedDetail.historyCount
+          );
+        }
+
+        const reasonsForChannel = Array.isArray(channelState?.reasons) && channelState?.reasons?.length
+          ? channelState.reasons.filter(reasonKey => typeof reasonKey === 'string' && reasonKey.trim().length > 0)
+          : reason
+          ? [reason]
+          : [];
+        if (reasonsForChannel.length > 0) {
+          const counter = this.suppressionChannelReasonCounters.get(channel) ?? new Map<string, number>();
+          for (const entry of reasonsForChannel) {
+            const normalizedReason = entry.trim();
+            counter.set(normalizedReason, (counter.get(normalizedReason) ?? 0) + 1);
+          }
+          this.suppressionChannelReasonCounters.set(channel, counter);
         }
       }
     }
@@ -661,6 +798,7 @@ class MetricsRegistry {
           : null,
       channel: primaryChannel,
       channels: channelList.length > 0 ? [...channelList] : null,
+      channelStates: normalizedChannelStates,
       windowExpiresAt: windowExpiresAtValue,
       windowRemainingMs: windowRemainingValue,
       cooldownRemainingMs: cooldownRemainingValue,
@@ -1018,6 +1156,77 @@ class MetricsRegistry {
     };
   }
 
+  exportLogLevelCountersForPrometheus(options: PrometheusLogLevelOptions = {}) {
+    const baseLabels = options.labels ?? {};
+    const lines: string[] = [];
+
+    const levelCounters = mapLogLevelCounters(this.logLevelCounters);
+    const levelSamples = Object.entries(levelCounters).map(([level, value]) => ({
+      value,
+      labels: { level }
+    }));
+    const levelMetric = formatPrometheusGauge(
+      'logs.level.total',
+      levelSamples,
+      {
+        metricName: options.levelMetricName ?? 'guardian_log_level_total',
+        help: options.levelHelp ?? 'Total log events grouped by Pino level',
+        labels: baseLabels
+      }
+    );
+    if (levelMetric) {
+      lines.push(levelMetric);
+    }
+
+    const detectorSamples: Array<{ value: number; labels: Record<string, string> }> = [];
+    for (const [detector, counters] of this.logLevelByDetector.entries()) {
+      for (const [level, value] of counters.entries()) {
+        detectorSamples.push({
+          value,
+          labels: { detector, level: level.toLowerCase() }
+        });
+      }
+    }
+    const detectorMetric = formatPrometheusGauge(
+      'logs.level.detector.total',
+      detectorSamples,
+      {
+        metricName: options.detectorMetricName ?? 'guardian_log_level_detector_total',
+        help:
+          options.detectorHelp ?? 'Total log events grouped by Pino level and detector source',
+        labels: baseLabels
+      }
+    );
+    if (detectorMetric) {
+      lines.push(detectorMetric);
+    }
+
+    if (this.lastErrorAt) {
+      const lastErrorMetric = formatPrometheusGauge(
+        'logs.level.last_error_timestamp_seconds',
+        [
+          {
+            value: Math.floor(this.lastErrorAt / 1000),
+            labels: {}
+          }
+        ],
+        {
+          metricName:
+            options.lastErrorMetricName ?? 'guardian_log_last_error_timestamp_seconds',
+          help:
+            options.lastErrorHelp ??
+            'Unix timestamp (seconds) for the most recent error or fatal log entry',
+          labels: baseLabels
+        }
+      );
+      if (lastErrorMetric) {
+        lines.push(lastErrorMetric);
+      }
+    }
+
+    return lines.filter(Boolean).join('\n');
+  }
+
   exportPipelineWatchdogCounters() {
     const project = (state: PipelineChannelState, channels: Map<string, PipelineChannelState>) => ({
       total: state.watchdogRestarts,
@@ -1033,11 +1242,71 @@ class MetricsRegistry {
     };
   }
 
+  exportPipelineRestartHistogram(
+    pipeline: PipelineType,
+    variant: PipelineHistogramVariant,
+    options: PrometheusHistogramOptions = {}
+  ): string {
+    const key =
+      variant === 'restarts'
+        ? `pipeline.${pipeline}.restarts`
+        : `pipeline.${pipeline}.restart.${variant}`;
+
+    return this.exportHistogramForPrometheus(key, {
+      ...options,
+      metricName: options.metricName ?? `guardian_${pipeline}_${PIPELINE_HISTOGRAM_SUFFIX[variant]}`,
+      help: options.help ?? PIPELINE_HISTOGRAM_HELP[variant],
+      labels: { pipeline, ...(options.labels ?? {}) }
+    });
+  }
+
   exportDetectorLatencyHistogram(
     detector: string,
     options: PrometheusHistogramOptions = {}
   ): string {
     return this.exportHistogramForPrometheus(`detector.${detector}.latency`, options);
+  }
+
+  exportDetectorCountersForPrometheus(options: PrometheusDetectorOptions = {}) {
+    const baseLabels = options.labels ?? {};
+    const counterSamples: Array<{ value: number; labels: Record<string, string> }> = [];
+    const gaugeSamples: Array<{ value: number; labels: Record<string, string> }> = [];
+
+    for (const [detector, state] of this.detectorMetrics.entries()) {
+      for (const [counter, value] of state.counters.entries()) {
+        counterSamples.push({
+          value,
+          labels: { detector, counter }
+        });
+      }
+      for (const [gauge, value] of state.gauges.entries()) {
+        gaugeSamples.push({
+          value,
+          labels: { detector, gauge }
+        });
+      }
+    }
+
+    const lines: string[] = [];
+    const counterMetric = formatPrometheusGauge('detector.counter.total', counterSamples, {
+      metricName: options.counterMetricName ?? 'guardian_detector_counter_total',
+      help: options.counterHelp ?? 'Detector counter totals grouped by detector and counter name',
+      labels: baseLabels
+    });
+    if (counterMetric) {
+      lines.push(counterMetric);
+    }
+
+    const gaugeMetric = formatPrometheusGauge('detector.gauge', gaugeSamples, {
+      metricName: options.gaugeMetricName ?? 'guardian_detector_gauge',
+      help: options.gaugeHelp ?? 'Detector gauge values grouped by detector and gauge name',
+      labels: baseLabels
+    });
+    if (gaugeMetric) {
+      lines.push(gaugeMetric);
+    }
+
+    return lines.filter(Boolean).join('\n');
   }
 
   observeDetectorLatency(detector: string, durationMs: number) {
@@ -1142,7 +1411,8 @@ class MetricsRegistry {
           cooldownEndsAt:
             typeof this.lastSuppressedEvent.cooldownEndsAt === 'number'
               ? new Date(this.lastSuppressedEvent.cooldownEndsAt).toISOString()
-              : null
+              : null,
+          channelStates: mapSuppressionChannelStates(this.lastSuppressedEvent.channelStates)
         }
       : null;
     const logLevelSnapshot = mapLogLevelCounters(this.logLevelCounters);
@@ -1152,7 +1422,8 @@ class MetricsRegistry {
       cooldownRemainingMs: mapSuppressionChannelHistograms(
         this.suppressionChannelCooldownRemainingHistogram
       ),
-      windowRemainingMs: mapSuppressionChannelHistograms(this.suppressionChannelWindowHistogram)
+      windowRemainingMs: mapSuppressionChannelHistograms(this.suppressionChannelWindowHistogram),
+      historyCount: mapSuppressionChannelHistograms(this.suppressionChannelHistoryHistogram)
     };
     const suppressionHistogramSnapshot = {
       historyCount: mapHistogram(this.histograms.get('suppression.historyCount') ?? new Map()),
@@ -1252,6 +1523,7 @@ class MetricsRegistry {
         byReason: mapFrom(this.suppressionByReason),
         byType: mapFrom(this.suppressionByType),
         byChannel: mapFrom(this.suppressionByChannel),
+        byChannelReason: mapFromNested(this.suppressionChannelReasonCounters),
         historyTotals: {
           historyCount: this.suppressionHistoryCount,
           combinedHistoryCount: this.suppressionCombinedHistoryCount
@@ -1377,7 +1649,8 @@ function mapFrom(source: Map<string, number>): CounterMap {
 
 function mapFromNested(source: Map<string, Map<string, number>>): Record<string, CounterMap> {
   const result: Record<string, CounterMap> = {};
-  for (const [key, inner] of source.entries()) {
+  const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [key, inner] of ordered) {
     result[key] = mapFrom(inner);
   }
   return result;
@@ -1414,6 +1687,50 @@ function mapSuppressionChannelHistograms(
   const ordered = Array.from(source.entries()).sort(([a], [b]) => a.localeCompare(b));
   for (const [channel, histogram] of ordered) {
     result[channel] = mapHistogram(histogram);
+  }
+  return result;
+}
+
+function mapSuppressionChannelStates(
+  source: SuppressedEventMetric['channelStates'] | undefined
+): SuppressedEventMetric['channelStates'] | null {
+  if (!source) {
+    return null;
+  }
+  const result: SuppressedEventMetric['channelStates'] = {};
+  const entries = Object.entries(source).sort(([a], [b]) => a.localeCompare(b));
+  for (const [channel, state] of entries) {
+    if (!channel) {
+      continue;
+    }
+    const reasons = Array.isArray(state?.reasons)
+      ? Array.from(
+          new Set(
+            state.reasons
+              .map(reason => (typeof reason === 'string' ? reason.trim() : ''))
+              .filter(reason => reason.length > 0)
+          )
+        )
+      : undefined;
+    const types = Array.isArray(state?.types)
+      ? Array.from(
+          new Set(
+            state.types.filter(type => type === 'window' || type === 'rate-limit')
+          )
+        )
+      : undefined;
+    result[channel] = {
+      hits: typeof state?.hits === 'number' ? state.hits : undefined,
+      reasons: reasons && reasons.length > 0 ? reasons : undefined,
+      types: types && types.length > 0 ? types : undefined,
+      windowRemainingMs:
+        typeof state?.windowRemainingMs === 'number' ? state.windowRemainingMs : null,
+      cooldownRemainingMs:
+        typeof state?.cooldownRemainingMs === 'number' ? state.cooldownRemainingMs : null,
+      historyCount: typeof state?.historyCount === 'number' ? state.historyCount : null,
+      combinedHistoryCount:
+        typeof state?.combinedHistoryCount === 'number' ? state.combinedHistoryCount : null
+    };
   }
   return result;
 }
@@ -1508,6 +1825,51 @@ function formatPrometheusHistogram(
   const sumValue = stats?.sum ?? 0;
   lines.push(`${metricName}_sum${baseLabelString} ${formatPrometheusValue(sumValue)}`);
   lines.push(`${metricName}_count${baseLabelString} ${formatPrometheusValue(totalCount)}`);
+
+  return lines.join('\n');
+}
+
+function formatPrometheusGauge(
+  metricKey: string,
+  samples: Array<{ value: number; labels?: Record<string, string> }>,
+  options: PrometheusGaugeOptions
+): string {
+  const filtered = samples.filter(sample => Number.isFinite(sample.value));
+  if (filtered.length === 0) {
+    return '';
+  }
+
+  const defaultName = `guardian_${metricKey}`;
+  const metricName = sanitizePrometheusMetricName(options.metricName ?? defaultName);
+  const help = options.help ? escapePrometheusHelp(options.help) : null;
+  const baseLabels = sanitizeHistogramLabels(options.labels);
+
+  const normalized = filtered.map(sample => {
+    const mergedLabels = { ...baseLabels, ...sanitizeHistogramLabels(sample.labels) };
+    const labelString = formatPrometheusLabels(mergedLabels);
+    return {
+      value: sample.value,
+      labels: mergedLabels,
+      labelString
+    };
+  });
+
+  normalized.sort((a, b) => {
+    if (a.labelString === b.labelString) {
+      return a.value - b.value;
+    }
+    return a.labelString.localeCompare(b.labelString);
+  });
+
+  const lines: string[] = [];
+  if (help) {
+    lines.push(`# HELP ${metricName} ${help}`);
+  }
+  lines.push(`# TYPE ${metricName} gauge`);
+
+  for (const sample of normalized) {
+    lines.push(`${metricName}${sample.labelString} ${formatPrometheusValue(sample.value)}`);
+  }
 
   return lines.join('\n');
 }
@@ -1854,7 +2216,10 @@ export type {
   DetectorSnapshot,
   SuppressedEventMetric,
   RetentionSnapshot,
-  PrometheusHistogramOptions
+  PrometheusHistogramOptions,
+  PrometheusGaugeOptions,
+  PrometheusLogLevelOptions,
+  PrometheusDetectorOptions
 };
 export { MetricsRegistry };
 export default defaultRegistry;

@@ -87,7 +87,7 @@ describe('RestApiEvents', () => {
     return runtime;
   }
 
-  it('HttpApiSnapshotListing surfaces summary, metrics, and snapshot URLs', async () => {
+  it('HttpApiChannelSnapshots surfaces summary, metrics, and snapshot URLs', async () => {
     const now = Date.now();
     const snapshotPath = path.join(snapshotDir, 'sample.png');
     fs.writeFileSync(snapshotPath, Buffer.from([0, 1, 2, 3]));
@@ -149,6 +149,15 @@ describe('RestApiEvents', () => {
     expect(channelPayload.items.every((item: { meta: { channel: string } }) => item.meta?.channel === 'video:cam-1')).toBe(
       true
     );
+
+    const normalizedResponse = await fetch(`http://localhost:${port}/api/events/snapshots?channels=cam-1`);
+    expect(normalizedResponse.status).toBe(200);
+    const normalizedPayload = await normalizedResponse.json();
+    expect(normalizedPayload.items.every((item: { meta: { resolvedChannels?: string[] } }) =>
+      Array.isArray(item.meta?.resolvedChannels) && item.meta.resolvedChannels.includes('video:cam-1')
+    )).toBe(true);
+    const channelIds = new Set((normalizedPayload.summary?.channels ?? []).map((entry: { id: string }) => entry.id));
+    expect(channelIds.has('video:cam-1')).toBe(true);
 
     const cameraResponse = await fetch(
       `http://localhost:${port}/api/events?camera=${encodeURIComponent('video:test-camera')}`
@@ -766,7 +775,7 @@ describe('RestApiEvents', () => {
     expect(identifyMock).toHaveBeenCalledTimes(2);
   });
 
-  it('DashboardChannelFilter updates widget counts on SSE events', async () => {
+  it('DashboardSseHeartbeat updates widget counts and health status', async () => {
     const originalWindow = globalThis.window;
     const originalDocument = globalThis.document;
     const originalEventSource = globalThis.EventSource;
@@ -792,19 +801,20 @@ describe('RestApiEvents', () => {
     globalThis.HTMLElement = window.HTMLElement;
     globalThis.MessageEvent = window.MessageEvent;
 
+    const now = Date.now();
     const metricsSnapshot = {
-      fetchedAt: new Date(1700000000000).toISOString(),
+      fetchedAt: new Date(now).toISOString(),
       pipelines: {
         ffmpeg: {
           restarts: 2,
-          lastRestartAt: new Date(1700000000400).toISOString(),
+          lastRestartAt: new Date(now - 1000).toISOString(),
           byReason: { 'watchdog-timeout': 2 },
           lastRestart: { reason: 'watchdog-timeout' },
           attempts: {},
           byChannel: {
             'video:lobby': {
               restarts: 2,
-              lastRestartAt: new Date(1700000000400).toISOString(),
+              lastRestartAt: new Date(now - 1000).toISOString(),
               byReason: { 'watchdog-timeout': 2 },
               lastRestart: { reason: 'watchdog-timeout' }
             }
@@ -947,6 +957,7 @@ describe('RestApiEvents', () => {
         { id: 2, label: 'Backdoor', metadata: { camera: 'video:backdoor' } }
       ]
     }));
+    instance!.dispatch('metrics', JSON.stringify(metricsSnapshot));
     const eventPayload = {
       id: 42,
       ts: 1700000000500,
@@ -983,6 +994,7 @@ describe('RestApiEvents', () => {
     const stateText = window.document.getElementById('stream-state')?.textContent;
     expect(stateText).toBe('Connected');
     expect(window.document.getElementById('stream-heartbeats')?.textContent).toBe('1');
+    expect(window.document.getElementById('stream-health')?.textContent).toBe('Degraded');
     expect(window.document.getElementById('stream-events')?.textContent).toBe('2');
     const updatedText = window.document.getElementById('stream-updated')?.textContent ?? '';
     expect(updatedText).not.toBe('—');
@@ -990,6 +1002,7 @@ describe('RestApiEvents', () => {
     const dashboardState = (window as any).__guardianDashboardState;
     expect(dashboardState).toBeTruthy();
     expect(Array.from(dashboardState.filters.channels)).toContain('video:stream');
+    expect(dashboardState.stream.health).toBe('Degraded');
 
     const eventCards = window.document.querySelectorAll('#events .event');
     expect(eventCards.length).toBe(1);

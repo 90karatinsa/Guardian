@@ -322,6 +322,8 @@ describe('RetentionMaintenance', () => {
       error: vi.fn()
     };
 
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase');
+
     try {
       const result = await runRetentionOnce({
         enabled: true,
@@ -357,6 +359,7 @@ describe('RetentionMaintenance', () => {
       expect(result.vacuum.reindex).toBe(true);
       expect(result.vacuum.optimize).toBe(true);
       expect(result.vacuum.pragmas).toEqual(['PRAGMA optimize']);
+      expect(vacuumSpy).toHaveBeenCalledTimes(1);
 
       expect(metrics.recordRetentionRun).toHaveBeenCalled();
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
@@ -375,7 +378,27 @@ describe('RetentionMaintenance', () => {
 
       const completionCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
       expect(completionCall?.[0]).toMatchObject({ vacuumRunMode: 'always', vacuumMode: 'full' });
+
+      vacuumSpy.mockClear();
+
+      const disabled = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir, cameraTwoDir],
+        vacuum: false,
+        snapshot: { mode: 'archive', retentionDays: 10 },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(disabled.vacuum.ran).toBe(false);
+      expect(disabled.vacuum.runMode).toBe('never');
+      expect(disabled.vacuum.mode).toBe('skipped');
+      expect(vacuumSpy).not.toHaveBeenCalled();
     } finally {
+      vacuumSpy.mockRestore();
       vi.useRealTimers();
     }
   });

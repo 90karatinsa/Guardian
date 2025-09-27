@@ -54,6 +54,7 @@ export class LightDetector {
   private lastDenoiseStrategy = 'gaussian-median';
   private noiseWarmupRemaining: number;
   private noiseBackoffPadding: number;
+  private rebaselineFramesRemaining = 0;
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
@@ -265,6 +266,33 @@ export class LightDetector {
       metrics.setDetectorGauge('light', 'noiseWindowPressure', noiseWindowPressure);
       metrics.setDetectorGauge('light', 'noiseWindowBoost', this.sustainedNoiseBoost);
 
+      const shouldScheduleRebaseline =
+        this.noiseWarmupRemaining === 0 &&
+        (noiseWindowPressure > 0.5 || this.sustainedNoiseBoost >= 1.6);
+
+      if (shouldScheduleRebaseline && this.rebaselineFramesRemaining === 0) {
+        const baseWindow = Math.max(
+          effectiveDebounce + effectiveBackoff,
+          Math.round(DELTA_WINDOW_SIZE * 0.5)
+        );
+        this.rebaselineFramesRemaining = baseWindow;
+      }
+
+      if (this.rebaselineFramesRemaining > 0) {
+        const decay = shouldScheduleRebaseline ? 1 : 2;
+        this.rebaselineFramesRemaining = Math.max(0, this.rebaselineFramesRemaining - decay);
+        metrics.setDetectorGauge('light', 'rebaselineCountdown', this.rebaselineFramesRemaining);
+        if (this.rebaselineFramesRemaining === 0 && shouldScheduleRebaseline) {
+          this.resetAdaptiveState({ preserveBaseline: false, preserveWarmup: true });
+          metrics.incrementDetectorCounter('light', 'adaptiveRebaselines', 1);
+          metrics.setDetectorGauge('light', 'rebaselineCountdown', 0);
+          metrics.setDetectorGauge('light', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+          return;
+        }
+      } else {
+        metrics.setDetectorGauge('light', 'rebaselineCountdown', 0);
+      }
+
       this.lastDenoiseStrategy = denoiseStrategy;
 
       const effectiveSmoothing = clamp(
@@ -465,6 +493,8 @@ export class LightDetector {
       this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
     }
     this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.rebaselineFramesRemaining = 0;
+    metrics.setDetectorGauge('light', 'rebaselineCountdown', 0);
   }
 
   private isWithinNormalHours(ts: number) {

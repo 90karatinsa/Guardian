@@ -320,7 +320,7 @@ export interface VacuumOptions {
   reindex?: boolean;
   optimize?: boolean;
   pragmas?: string[];
-  run?: 'always' | 'on-change';
+  run?: 'always' | 'on-change' | 'never';
 }
 
 export interface RetentionPolicyOptions {
@@ -822,7 +822,12 @@ function normalizeVacuumOptions(options: VacuumOptions | VacuumMode): Required<V
     reindex: options.reindex === true,
     optimize: options.optimize === true,
     pragmas,
-    run: options.run === 'always' ? 'always' : 'on-change'
+    run:
+      options.run === 'always'
+        ? 'always'
+        : options.run === 'never'
+          ? 'never'
+          : 'on-change'
   };
 }
 
@@ -833,9 +838,9 @@ function escapeLike(value: string) {
 function collectChannelFilters(options: { channel?: string; channels?: string[] }): string[] {
   const set = new Set<string>();
   if (typeof options.channel === 'string') {
-    const trimmed = options.channel.trim();
-    if (trimmed) {
-      set.add(trimmed);
+    const normalized = normalizeChannelId(options.channel);
+    if (normalized) {
+      set.add(normalized);
     }
   }
   if (Array.isArray(options.channels)) {
@@ -843,13 +848,24 @@ function collectChannelFilters(options: { channel?: string; channels?: string[] 
       if (typeof candidate !== 'string') {
         continue;
       }
-      const trimmed = candidate.trim();
-      if (trimmed) {
-        set.add(trimmed);
+      const normalized = normalizeChannelId(candidate);
+      if (normalized) {
+        set.add(normalized);
       }
     }
   }
   return Array.from(set);
+}
+
+function normalizeChannelId(value: string | undefined | null): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) {
+    return '';
+  }
+  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `video:${trimmed}`;
 }
 
 export default db;

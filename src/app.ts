@@ -32,6 +32,32 @@ export type ShutdownHookContext = {
 
 export type ShutdownHook = (context: ShutdownHookContext) => void | Promise<void>;
 
+export type IntegrationManifest = {
+  docker: {
+    healthcheck: string;
+    stopCommand: string;
+    logLevel: {
+      get: string;
+      set: string;
+    };
+  };
+  systemd: {
+    serviceFile: string;
+    execStartPre: string;
+    execStart: string;
+    execReload: string;
+    execStop: string;
+    execStopPost: string[];
+    hooksCommand: string;
+    healthCommand: string;
+    readyCommand: string;
+    logLevel: {
+      get: string;
+      set: string;
+    };
+  };
+};
+
 type RegisteredIndicator = {
   name: string;
   indicator: HealthIndicator;
@@ -44,6 +70,66 @@ type RegisteredHook = {
 
 const healthIndicators: RegisteredIndicator[] = [];
 const shutdownHooks: RegisteredHook[] = [];
+
+const CLI_BIN = 'pnpm exec tsx src/cli.ts';
+const SYSTEMD_CLI = `/usr/bin/env ${CLI_BIN}`;
+
+const integrationManifest: IntegrationManifest = {
+  docker: {
+    healthcheck: `${CLI_BIN} --health || exit 1`,
+    stopCommand: `${CLI_BIN} stop`,
+    logLevel: {
+      get: `${CLI_BIN} log-level get`,
+      set: `${CLI_BIN} log-level set <level>`
+    }
+  },
+  systemd: {
+    serviceFile: 'deploy/guardian.service',
+    execStartPre: `${SYSTEMD_CLI} --health`,
+    execStart: `${SYSTEMD_CLI} daemon start`,
+    execReload: `${SYSTEMD_CLI} daemon status --json`,
+    execStop: `${SYSTEMD_CLI} daemon stop`,
+    execStopPost: [
+      `${SYSTEMD_CLI} daemon hooks --reason systemd-stop --signal SIGTERM`,
+      '/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts'
+    ],
+    hooksCommand: `${SYSTEMD_CLI} daemon hooks --reason systemd-stop --signal SIGTERM`,
+    healthCommand: `${SYSTEMD_CLI} --health`,
+    readyCommand: `${SYSTEMD_CLI} --ready`,
+    logLevel: {
+      get: `${SYSTEMD_CLI} log-level get`,
+      set: `${SYSTEMD_CLI} log-level set <level>`
+    }
+  }
+};
+
+export function getIntegrationManifest(): IntegrationManifest {
+  return {
+    docker: {
+      healthcheck: integrationManifest.docker.healthcheck,
+      stopCommand: integrationManifest.docker.stopCommand,
+      logLevel: {
+        get: integrationManifest.docker.logLevel.get,
+        set: integrationManifest.docker.logLevel.set
+      }
+    },
+    systemd: {
+      serviceFile: integrationManifest.systemd.serviceFile,
+      execStartPre: integrationManifest.systemd.execStartPre,
+      execStart: integrationManifest.systemd.execStart,
+      execReload: integrationManifest.systemd.execReload,
+      execStop: integrationManifest.systemd.execStop,
+      execStopPost: [...integrationManifest.systemd.execStopPost],
+      hooksCommand: integrationManifest.systemd.hooksCommand,
+      healthCommand: integrationManifest.systemd.healthCommand,
+      readyCommand: integrationManifest.systemd.readyCommand,
+      logLevel: {
+        get: integrationManifest.systemd.logLevel.get,
+        set: integrationManifest.systemd.logLevel.set
+      }
+    }
+  };
+}
 
 export function registerHealthIndicator(name: string, indicator: HealthIndicator) {
   const existingIndex = healthIndicators.findIndex(entry => entry.name === name);

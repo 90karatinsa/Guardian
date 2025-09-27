@@ -40,6 +40,10 @@
           <input type="text" name="search" placeholder="message or detector" />
         </label>
         <label>
+          Channels
+          <input type="text" name="channels" placeholder="video:lobby,video:yard" />
+        </label>
+        <label>
           Severity
           <select name="severity">
             <option value="">All levels</option>
@@ -75,6 +79,8 @@
           <dl>
             <dt>Status</dt>
             <dd id="stream-state">Connecting…</dd>
+            <dt>Health</dt>
+            <dd id="stream-health">Unknown</dd>
             <dt>Heartbeats</dt>
             <dd id="stream-heartbeats">0</dd>
             <dt>Events</dt>

@@ -713,6 +713,108 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioSourceDeviceFallback rotates binaries, caches discovery, and records analysis windows', async () => {
+    vi.useFakeTimers();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    AudioSource.clearDeviceCache();
+
+    const deviceOutput = `
+      [alsa] "default"
+      [alsa] "hw:0"
+      [dshow] "Microphone"
+    `;
+
+    execFileMock.mockImplementation((_command: string, _args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      callback(null, deviceOutput, '');
+      return child;
+    });
+
+    const firstDevices = await AudioSource.listDevices('auto', { timeoutMs: 0 });
+    expect(firstDevices.length).toBeGreaterThan(0);
+    execFileMock.mockClear();
+    const cachedDevices = await AudioSource.listDevices('auto', { timeoutMs: 0 });
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(cachedDevices).toHaveLength(firstDevices.length);
+
+    const processes: ReturnType<typeof createFakeProcess>[] = [];
+    let spawnAttempts = 0;
+    spawnMock.mockImplementation((command: string, args: string[]) => {
+      spawnAttempts += 1;
+      if (spawnAttempts === 1) {
+        const err = new Error('missing') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      const proc = createFakeProcess();
+      processes.push(proc);
+      return proc;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:fallback',
+      sampleRate: 8000,
+      channels: 1,
+      frameDurationMs: 40,
+      silenceDurationMs: 80,
+      silenceThreshold: 0.0001,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      deviceDiscoveryTimeoutMs: 0,
+      micFallbacks: { linux: [{ format: 'alsa', device: 'hw:1' }] }
+    });
+
+    const recoverReasons: string[] = [];
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(spawnMock).toHaveBeenCalledTimes(2);
+      expect(spawnMock.mock.calls[0]?.[0]).toBe('ffmpeg');
+      expect(spawnMock.mock.calls[1]?.[0]).toBe('avconv');
+
+      const proc = processes[0];
+      const frameBytes = ((8000 * 40) / 1000) * 2;
+      const silenceFrames = Math.ceil(80 / 40);
+      for (let i = 0; i < silenceFrames; i += 1) {
+        proc.stdout.emit('data', Buffer.alloc(frameBytes));
+        await Promise.resolve();
+      }
+
+      expect(recoverReasons).toContain('stream-silence');
+
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+
+      expect(spawnMock).toHaveBeenCalledTimes(3);
+      const restartCommand = spawnMock.mock.calls[2]?.[0];
+      expect(restartCommand).toBe('ffmpeg');
+      const restartArgs = spawnMock.mock.calls[2]?.[1] ?? [];
+      const deviceIndex = restartArgs.indexOf('-i');
+      expect(deviceIndex).toBeGreaterThan(-1);
+      expect(restartArgs[deviceIndex + 1]).toBe('hw:1');
+
+      const analysis = source.getAnalysisSnapshot();
+      expect(analysis.alsa?.frames ?? 0).toBeGreaterThan(0);
+      expect(typeof analysis.alsa?.rms).toBe('number');
+      expect(typeof analysis.alsa?.spectralCentroid).toBe('number');
+    } finally {
+      source.stop();
+      platformSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('AudioSourceFallback parses device list output with fallback chain', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 

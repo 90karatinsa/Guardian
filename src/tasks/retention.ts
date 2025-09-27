@@ -21,7 +21,7 @@ export interface RetentionTaskOptions {
   snapshotDirs: string[];
   maxArchivesPerCamera?: number;
   vacuumMode?: VacuumMode;
-  vacuum?: VacuumMode | VacuumOptions;
+  vacuum?: boolean | VacuumMode | VacuumOptions;
   snapshot?: SnapshotRotationOptions & {
     maxArchivesPerCamera?: number | Record<string, number>;
   };
@@ -264,6 +264,30 @@ function normalizeVacuumConfig(options: RetentionTaskOptions): Required<VacuumOp
   const base = options.vacuum;
   const legacyMode = options.vacuumMode;
 
+  if (base === false) {
+    return {
+      mode: legacyMode ?? 'auto',
+      target: undefined,
+      analyze: false,
+      reindex: false,
+      optimize: false,
+      pragmas: undefined,
+      run: 'never'
+    } satisfies Required<VacuumOptions>;
+  }
+
+  if (base === true) {
+    return {
+      mode: legacyMode ?? 'auto',
+      target: undefined,
+      analyze: false,
+      reindex: false,
+      optimize: false,
+      pragmas: undefined,
+      run: 'on-change'
+    } satisfies Required<VacuumOptions>;
+  }
+
   if (typeof base === 'string') {
     return normalizeVacuumConfig({ ...options, vacuum: { mode: base } });
   }
@@ -282,7 +306,12 @@ function normalizeVacuumConfig(options: RetentionTaskOptions): Required<VacuumOp
       reindex: base.reindex === true,
       optimize: base.optimize === true,
       pragmas,
-      run: base.run === 'always' ? 'always' : 'on-change'
+      run:
+        base.run === 'always'
+          ? 'always'
+          : base.run === 'never'
+            ? 'never'
+            : 'on-change'
     } satisfies Required<VacuumOptions>;
   }
 
@@ -339,9 +368,11 @@ async function executeRetentionRun(
   });
 
   const shouldVacuum =
-    options.vacuum.run === 'always' ||
-    (options.vacuum.run !== 'always' &&
-      (outcome.removedEvents > 0 || outcome.archivedSnapshots > 0 || outcome.prunedArchives > 0));
+    options.vacuum.run === 'always'
+      ? true
+      : options.vacuum.run === 'on-change'
+        ? outcome.removedEvents > 0 || outcome.archivedSnapshots > 0 || outcome.prunedArchives > 0
+        : false;
 
   const warnings: RetentionWarningSnapshot[] = [];
   for (const warning of outcome.warnings) {

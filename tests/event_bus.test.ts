@@ -261,6 +261,59 @@ describe('EventSuppressionRateLimit', () => {
     expect(Object.values(channelHist.windowRemainingMs['cam:b'])).not.toHaveLength(0);
   });
 
+  it('EventSuppressionCooldownWindow aggregates per-channel cooldown feedback', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'channel-rate',
+        detector: 'test-detector',
+        channel: 'cam:1',
+        rateLimit: { count: 1, perMs: 600, cooldownMs: 400 },
+        suppressForMs: 500,
+        reason: 'rate limited'
+      },
+      {
+        id: 'channel-window',
+        detector: 'test-detector',
+        channel: 'cam:1',
+        suppressForMs: 700,
+        reason: 'window limited'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:1' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 100, meta: { channel: 'cam:1' } })).toBe(false);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 350, meta: { channel: 'cam:1' } })).toBe(false);
+
+    const suppressionMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressionMeta.length).toBeGreaterThanOrEqual(2);
+    const firstSuppression = suppressionMeta[0];
+    expect(firstSuppression.suppressionChannelStates?.['cam:1']?.hits).toBeGreaterThanOrEqual(1);
+    expect(firstSuppression.suppressionChannelStates?.['cam:1']?.reasons).toEqual(
+      expect.arrayContaining(['rate limited'])
+    );
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.byChannel['cam:1']).toBeGreaterThanOrEqual(2);
+    const channelReasons = snapshot.suppression.byChannelReason['cam:1'];
+    expect(channelReasons['rate limited']).toBeGreaterThanOrEqual(1);
+    expect(channelReasons['window limited']).toBeGreaterThanOrEqual(1);
+    const historyHistogram = snapshot.suppression.histogram.channel.historyCount['cam:1'];
+    expect(Object.keys(historyHistogram)).not.toHaveLength(0);
+    const lastStates = snapshot.suppression.lastEvent?.channelStates?.['cam:1'];
+    expect(lastStates?.historyCount).toBeGreaterThanOrEqual(1);
+    expect(lastStates?.reasons).toEqual(expect.arrayContaining(['window limited']));
+  });
+
   it('EventSuppressionMetricsSnapshot exposes cooldown endpoints and history', () => {
     const metrics = new MetricsRegistry();
     metrics.reset();

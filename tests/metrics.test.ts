@@ -2,7 +2,12 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { EventBus } from '../src/eventBus.js';
 import metrics, { MetricsRegistry } from '../src/metrics/index.js';
 import { collectHealthChecks, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
-import logger, { getLogLevel, getLogLevelMetrics, setLogLevel } from '../src/logger.js';
+import logger, {
+  getLogLevel,
+  getLogLevelMetrics,
+  getLogLevelPrometheusMetrics,
+  setLogLevel
+} from '../src/logger.js';
 
 function createBus() {
   const metrics = {
@@ -272,6 +277,9 @@ describe('MetricsCounters', () => {
       expect(exported.byDetector.pose.error).toBe(1);
       expect(exported.lastErrorMessage).toBe('error baseline');
       expect(exported.lastErrorAt).toMatch(/T/);
+      const prom = getLogLevelPrometheusMetrics({ labels: { instance: 'lab' } });
+      expect(prom).toMatch(/guardian_log_level_total\{instance="lab",level="error"\} 1/);
+      expect(prom).toMatch(/guardian_log_last_error_timestamp_seconds\{instance="lab"\} \d+/);
     } finally {
       setLogLevel(defaultLevel);
       metrics.reset();
@@ -329,6 +337,79 @@ describe('MetricsCounters', () => {
     expect(prom).toContain('guardian_motion_latency_ms_bucket');
     expect(prom).toMatch(/detector="motion"/);
     expect(prom).toMatch(/_count/);
+  });
+
+  it('MetricsPipelineHistograms exports Prometheus histograms and gauges for pipelines and detectors', () => {
+    const registry = new MetricsRegistry();
+
+    registry.incrementLogLevel('warn', { detector: 'motion' });
+    registry.incrementLogLevel('error', { detector: 'motion', message: 'ffmpeg crashed' });
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      delayMs: 1500,
+      jitterMs: 250,
+      attempt: 2
+    });
+    registry.recordPipelineRestart('ffmpeg', 'spawn-error', {
+      delayMs: 300,
+      jitterMs: 75
+    });
+    registry.recordPipelineRestart('audio', 'spawn-error', {
+      jitterMs: 600
+    });
+
+    registry.incrementDetectorCounter('motion', 'detections', 3);
+    registry.incrementDetectorCounter('motion', 'detections');
+    registry.setDetectorGauge('motion', 'backoffFactor', 0.5);
+
+    const jitterProm = registry.exportPipelineRestartHistogram('ffmpeg', 'jitter', {
+      metricName: 'guardian_ffmpeg_restart_jitter_ms',
+      labels: { instance: 'lab' }
+    });
+    expect(jitterProm).toContain('# TYPE guardian_ffmpeg_restart_jitter_ms histogram');
+    expect(jitterProm).toContain(
+      'guardian_ffmpeg_restart_jitter_ms_bucket{instance="lab",le="500",pipeline="ffmpeg"} 2'
+    );
+    expect(jitterProm).toContain(
+      'guardian_ffmpeg_restart_jitter_ms_bucket{instance="lab",le="2000",pipeline="ffmpeg"} 2'
+    );
+
+    const restartsProm = registry.exportPipelineRestartHistogram('ffmpeg', 'restarts', {
+      metricName: 'guardian_ffmpeg_restarts_total',
+      labels: { env: 'test' }
+    });
+    expect(restartsProm).toContain('# TYPE guardian_ffmpeg_restarts_total histogram');
+    expect(restartsProm).toContain(
+      'guardian_ffmpeg_restarts_total_bucket{env="test",le="5",pipeline="ffmpeg"} 2'
+    );
+
+    const audioJitterProm = registry.exportPipelineRestartHistogram('audio', 'jitter', {
+      metricName: 'guardian_audio_restart_jitter_ms'
+    });
+    expect(audioJitterProm).toMatch(/pipeline="audio"/);
+
+    const logProm = registry.exportLogLevelCountersForPrometheus({
+      labels: { instance: 'lab-node' }
+    });
+    expect(logProm).toContain('# TYPE guardian_log_level_total gauge');
+    expect(logProm).toMatch(
+      /guardian_log_level_total\{instance="lab-node",level="error"\} 1/
+    );
+    expect(logProm).toMatch(
+      /guardian_log_level_detector_total\{detector="motion",instance="lab-node",level="error"\} 1/
+    );
+    expect(logProm).toMatch(/guardian_log_last_error_timestamp_seconds\{instance="lab-node"\} \d+/);
+
+    const detectorProm = registry.exportDetectorCountersForPrometheus({
+      labels: { instance: 'lab-node' }
+    });
+    expect(detectorProm).toContain('# TYPE guardian_detector_counter_total gauge');
+    expect(detectorProm).toMatch(
+      /guardian_detector_counter_total\{counter="detections",detector="motion",instance="lab-node"\} 4/
+    );
+    expect(detectorProm).toMatch(
+      /guardian_detector_gauge\{detector="motion",gauge="backoffFactor",instance="lab-node"\} 0.5/
+    );
   });
 });
 

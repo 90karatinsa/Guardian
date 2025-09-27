@@ -81,7 +81,7 @@ const setRunMock = (ort as unknown as { __setRunMock: (modelPath: string, run: R
 const Tensor = ort.Tensor as typeof import('onnxruntime-node').Tensor;
 const { PNG } = await import('pngjs');
 
-describe('ObjectThreatProbabilityFusion', () => {
+describe('ObjectClassifierThreatScoring', () => {
   const snapshotsDir = path.resolve('snapshots');
   beforeEach(() => {
     runMocks.clear();
@@ -96,11 +96,11 @@ describe('ObjectThreatProbabilityFusion', () => {
     }
   });
 
-  it('ObjectThreatProbabilityFusion annotates person events with fused threat scores', async () => {
+  it('ObjectClassifierThreatScoring merges mapped labels and threat summaries into person events', async () => {
     const detectionRun = vi.fn(async () => {
       const classCount = 3;
       const attributes = YOLO_CLASS_START_INDEX + classCount;
-      const detections = 2;
+      const detections = 3;
       const data = new Float32Array(attributes * detections).fill(0);
 
       setDetection(data, detections, 0, {
@@ -125,15 +125,26 @@ describe('ObjectThreatProbabilityFusion', () => {
         class2Logit: -3
       });
 
+      setDetection(data, detections, 2, {
+        cx: 280,
+        cy: 220,
+        width: 160,
+        height: 200,
+        objectnessLogit: 1.6,
+        personLogit: -3.8,
+        class1Logit: 1.2,
+        class2Logit: 2.6
+      });
+
       return {
         output0: { data, dims: [1, attributes, detections] }
       };
     });
 
     const classifierRun = vi.fn(async () => {
-      const logits = new Float32Array([0.2, 0.4, 2.1]);
+      const logits = new Float32Array([0.2, 0.4, 2.1, 1.5, 1.2, -1.3]);
       return {
-        logits: new Tensor('float32', logits, [1, 3])
+        logits: new Tensor('float32', logits, [2, 3])
       };
     });
 
@@ -142,8 +153,13 @@ describe('ObjectThreatProbabilityFusion', () => {
 
     const objectClassifier = await ObjectClassifier.create({
       modelPath: 'models/object.onnx',
-      labels: ['pet', 'delivery', 'threat'],
-      threatLabels: ['threat'],
+      labels: ['cat', 'dog', 'threat'],
+      labelMap: {
+        cat: 'pet',
+        dog: 'pet',
+        threat: 'intruder'
+      },
+      threatLabels: ['threat', 'intruder'],
       threatThreshold: 0.6
     });
 
@@ -172,24 +188,40 @@ describe('ObjectThreatProbabilityFusion', () => {
     const objects = meta.objects as Array<Record<string, unknown>>;
     expect(Array.isArray(objects)).toBe(true);
     expect(objects.length).toBeGreaterThanOrEqual(1);
-    const threatObject = objects.find(object => object.label === 'threat');
+    const threatObject = objects.find(object => object.label === 'intruder');
     expect(threatObject).toBeDefined();
+    expect(threatObject?.rawLabel).toBe('threat');
     expect(threatObject?.threat).toBe(true);
     expect(threatObject?.threatScore ?? 0).toBeGreaterThan(0.6);
     expect(threatObject?.confidence ?? 0).toBeGreaterThan(0);
     expect(threatObject?.confidence ?? 0).toBeLessThanOrEqual(1);
     const detectionScore = (threatObject?.detection as Record<string, number>).score;
-    const threatProbability = (threatObject?.probabilities as Record<string, number>).threat ?? 0;
+    const threatProbability = (threatObject?.probabilities as Record<string, number>).intruder ?? 0;
     const expectedFusedScore = detectionScore * threatProbability;
     expect(threatObject?.threatScore ?? 0).toBeCloseTo(expectedFusedScore, 5);
     const thresholds = meta.thresholds as { classScoreThresholds?: Record<string, number>; classIndices?: number[] };
     expect(thresholds.classIndices).toContain(0);
     expect(meta.detections[0].appliedThreshold).toBeDefined();
-    expect((meta.threat as Record<string, unknown>).label).toBe('threat');
+    expect((meta.threat as Record<string, unknown>).label).toBe('intruder');
     expect((meta.threat as Record<string, unknown>).confidence).toBe(threatObject?.confidence);
+    const threatSummary = meta.threatSummary as Record<string, unknown>;
+    expect(threatSummary?.maxThreatLabel).toBe('intruder');
+    expect(threatSummary?.totalDetections).toBeGreaterThan(0);
+    const intruderEntry = (meta.objects as Array<Record<string, unknown>>).find(
+      object => object.label === 'intruder'
+    );
+    const intruderRawProbabilities = intruderEntry?.rawProbabilities as Record<string, number> | undefined;
+    expect(intruderRawProbabilities?.threat).toBeDefined();
+    const petEntry = (meta.objects as Array<Record<string, unknown>>).find(
+      object => object.label === 'pet'
+    );
+    const petProbabilities = petEntry?.probabilities as Record<string, number> | undefined;
+    expect(petProbabilities?.pet).toBeGreaterThan(0);
+    const petRawProbabilities = petEntry?.rawProbabilities as Record<string, number> | undefined;
+    expect(petRawProbabilities?.dog ?? 0).toBeGreaterThan(0);
   });
 
-  it('ObjectClassifierThreatBlend respects detection confidence bounds', async () => {
+  it('ObjectClassifierThreatScoring clamps fused threat score within detection confidence', async () => {
     const logits = new Float32Array([0.5, 1.2, 2.8]);
     const detectionRun = vi.fn(async () => ({
       output0: {
@@ -207,7 +239,12 @@ describe('ObjectThreatProbabilityFusion', () => {
     const classifier = await ObjectClassifier.create({
       modelPath: 'models/object.onnx',
       labels: ['package', 'pet', 'threat'],
-      threatLabels: ['threat'],
+      labelMap: {
+        package: 'delivery',
+        pet: 'pet',
+        threat: 'intruder'
+      },
+      threatLabels: ['threat', 'intruder'],
       threatThreshold: 0.4
     });
 
@@ -235,6 +272,9 @@ describe('ObjectThreatProbabilityFusion', () => {
 
     expect(object.threatScore).toBeCloseTo(expected, 5);
     expect(object.threatScore).toBeLessThanOrEqual(detection.score);
+    expect(object.rawLabel).toBe('threat');
+    expect(object.probabilities.intruder).toBeCloseTo(object.score, 5);
+    expect(object.rawProbabilities.threat).toBeGreaterThan(0);
   });
 });
 

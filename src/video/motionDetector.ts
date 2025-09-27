@@ -79,6 +79,7 @@ export class MotionDetector {
   private sustainedNoiseBoost = 1;
   private noiseWarmupRemaining: number;
   private noiseBackoffPadding: number;
+  private rebaselineFramesRemaining = 0;
 
   constructor(
     private options: MotionDetectorOptions,
@@ -266,6 +267,33 @@ export class MotionDetector {
       metrics.setDetectorGauge('motion', 'noiseWindowMedian', noiseWindowMedian ?? noiseRatio);
       metrics.setDetectorGauge('motion', 'noiseWindowPressure', noiseWindowPressure);
       metrics.setDetectorGauge('motion', 'noiseWindowBoost', this.sustainedNoiseBoost);
+
+      const shouldScheduleRebaseline =
+        this.noiseWarmupRemaining === 0 &&
+        (noiseWindowPressure > 0.55 || this.sustainedNoiseBoost >= 1.8);
+
+      if (shouldScheduleRebaseline && this.rebaselineFramesRemaining === 0) {
+        const baseWindow = Math.max(
+          effectiveDebounceFrames + effectiveBackoffFrames,
+          Math.round(NOISE_WINDOW_SIZE * 0.6)
+        );
+        this.rebaselineFramesRemaining = baseWindow;
+      }
+
+      if (this.rebaselineFramesRemaining > 0) {
+        const decay = shouldScheduleRebaseline ? 1 : 2;
+        this.rebaselineFramesRemaining = Math.max(0, this.rebaselineFramesRemaining - decay);
+        metrics.setDetectorGauge('motion', 'rebaselineCountdown', this.rebaselineFramesRemaining);
+        if (this.rebaselineFramesRemaining === 0 && shouldScheduleRebaseline) {
+          this.resetAdaptiveState({ preserveWarmup: true });
+          metrics.incrementDetectorCounter('motion', 'adaptiveRebaselines', 1);
+          metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
+          metrics.setDetectorGauge('motion', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+          return;
+        }
+      } else {
+        metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
+      }
 
       const dynamicDiffThreshold = Math.max(diffThreshold, updatedNoiseFloor * noiseMultiplier);
       const adaptiveDiffThreshold = clamp(
@@ -565,6 +593,8 @@ export class MotionDetector {
     }
     this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
     this.lastDenoiseStrategy = 'gaussian-median';
+    this.rebaselineFramesRemaining = 0;
+    metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
   }
 
   private recordHistory(entry: MotionHistoryEntry) {

@@ -21,7 +21,7 @@ export type EventsConfig = {
 
 export type RetentionVacuumMode = 'auto' | 'full';
 
-export type RetentionVacuumRunMode = 'always' | 'on-change';
+export type RetentionVacuumRunMode = 'always' | 'on-change' | 'never';
 
 export type RetentionVacuumConfig = {
   mode?: RetentionVacuumMode;
@@ -48,7 +48,7 @@ export type RetentionConfig = {
   intervalMinutes?: number;
   archiveDir: string;
   maxArchivesPerCamera?: number;
-  vacuum?: RetentionVacuumMode | RetentionVacuumConfig;
+  vacuum?: boolean | RetentionVacuumMode | RetentionVacuumConfig;
   snapshot?: RetentionSnapshotConfig;
 };
 
@@ -179,6 +179,7 @@ export type ObjectsConfig = {
   threatLabels?: string[];
   threatThreshold?: number;
   classIndices?: number[];
+  labelMap?: Record<string, string>;
 };
 
 export type ObjectsOverrideConfig = Partial<
@@ -419,21 +420,26 @@ const guardianConfigSchema: JsonSchema = {
             retentionDays: { type: 'number', minimum: 0 },
             intervalMinutes: { type: 'number', minimum: 1 },
             vacuum: {
-              type: ['string', 'object'],
-              enum: ['auto', 'full'],
-              additionalProperties: false,
-              properties: {
-                mode: { type: 'string', enum: ['auto', 'full'] },
-                target: { type: 'string' },
-                analyze: { type: 'boolean' },
-                reindex: { type: 'boolean' },
-                optimize: { type: 'boolean' },
-                pragmas: {
-                  type: 'array',
-                  items: { type: 'string' }
-                },
-                run: { type: 'string', enum: ['always', 'on-change'] }
-              }
+              anyOf: [
+                { type: 'boolean' },
+                { type: 'string', enum: ['auto', 'full'] },
+                {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    mode: { type: 'string', enum: ['auto', 'full'] },
+                    target: { type: 'string' },
+                    analyze: { type: 'boolean' },
+                    reindex: { type: 'boolean' },
+                    optimize: { type: 'boolean' },
+                    pragmas: {
+                      type: 'array',
+                      items: { type: 'string' }
+                    },
+                    run: { type: 'string', enum: ['always', 'on-change', 'never'] }
+                  }
+                }
+              ]
             },
             archiveDir: { type: 'string' },
             maxArchivesPerCamera: { type: 'number', minimum: 0 },
@@ -991,6 +997,41 @@ export function loadConfigFromFile(filePath: string): GuardianConfig {
 function validateLogicalConfig(config: GuardianConfig) {
   const messages: string[] = [];
 
+  const validatePersonScore = (value: unknown, path: string) => {
+    if (typeof value === 'undefined') {
+      return;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      messages.push(`${path}.score must be a finite number between 0 and 1`);
+      return;
+    }
+    if (value < 0 || value > 1) {
+      messages.push(`${path}.score must be between 0 and 1`);
+    }
+  };
+
+  const validateMotionThresholds = (motion: Partial<MotionConfig> | undefined, path: string) => {
+    if (!motion) {
+      return;
+    }
+    if (typeof motion.diffThreshold !== 'undefined') {
+      const diff = motion.diffThreshold;
+      if (typeof diff !== 'number' || !Number.isFinite(diff)) {
+        messages.push(`${path}.diffThreshold must be a finite number greater than 0`);
+      } else if (diff <= 0) {
+        messages.push(`${path}.diffThreshold must be greater than 0`);
+      }
+    }
+    if (typeof motion.areaThreshold !== 'undefined') {
+      const area = motion.areaThreshold;
+      if (typeof area !== 'number' || !Number.isFinite(area)) {
+        messages.push(`${path}.areaThreshold must be a finite number between 0 and 1`);
+      } else if (area <= 0 || area > 1) {
+        messages.push(`${path}.areaThreshold must be between 0 and 1`);
+      }
+    }
+  };
+
   const channelDefinitions = config.video.channels ? new Set(Object.keys(config.video.channels)) : null;
   const normalizedChannelDefinitions = new Map<string, string>();
   if (config.video.channels) {
@@ -1058,6 +1099,28 @@ function validateLogicalConfig(config: GuardianConfig) {
             cameraChannelNormalized.set(normalized, { id: camera.id ?? label, label });
           }
         }
+      }
+    });
+  }
+
+  validatePersonScore(config.person.score, 'config.person');
+  validateMotionThresholds(config.motion, 'config.motion');
+
+  if (config.video.channels) {
+    for (const [channelId, channelConfig] of Object.entries(config.video.channels)) {
+      validatePersonScore(channelConfig.person?.score, `config.video.channels.${channelId}.person`);
+      validateMotionThresholds(channelConfig.motion, `config.video.channels.${channelId}.motion`);
+    }
+  }
+
+  if (Array.isArray(config.video.cameras)) {
+    config.video.cameras.forEach((camera, index) => {
+      const label = camera.id ?? `#${index}`;
+      if (camera.person && typeof camera.person.score !== 'undefined') {
+        validatePersonScore(camera.person.score, `config.video.cameras[${label}].person`);
+      }
+      if (camera.motion) {
+        validateMotionThresholds(camera.motion, `config.video.cameras[${label}].motion`);
       }
     });
   }
