@@ -12,6 +12,7 @@ const streamState = document.getElementById('stream-state');
 const streamHeartbeats = document.getElementById('stream-heartbeats');
 const streamEvents = document.getElementById('stream-events');
 const streamUpdated = document.getElementById('stream-updated');
+const streamHealth = document.getElementById('stream-health');
 const poseConfidence = document.getElementById('pose-confidence');
 const poseMovement = document.getElementById('pose-movement');
 const poseThreatIndicator = document.getElementById('pose-threat');
@@ -55,6 +56,7 @@ const state = {
     to: '',
     search: '',
     snapshot: '',
+    channelQuery: '',
     channels: new Set()
   },
   activeId: null,
@@ -64,7 +66,8 @@ const state = {
     heartbeats: 0,
     events: 0,
     lastUpdate: null,
-    status: 'connecting'
+    status: 'connecting',
+    health: 'Unknown'
   },
   channelStats: new Map(),
   metrics: {
@@ -86,6 +89,20 @@ function getSelectedChannels() {
     state.filters.channels = new Set();
   }
   return state.filters.channels;
+}
+
+function normalizeChannelId(value) {
+  if (!value) {
+    return '';
+  }
+  const trimmed = String(value).trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `video:${trimmed}`;
 }
 
 function getEventKey(event) {
@@ -134,13 +151,13 @@ function formatRelativeTime(input) {
 function getEventChannel(event) {
   const meta = event.meta ?? {};
   if (typeof meta.channel === 'string' && meta.channel) {
-    return meta.channel;
+    return normalizeChannelId(meta.channel);
   }
   if (typeof meta.camera === 'string' && meta.camera) {
-    return meta.camera;
+    return normalizeChannelId(meta.camera);
   }
   if (typeof event.source === 'string' && event.source) {
-    return event.source;
+    return normalizeChannelId(event.source);
   }
   return '';
 }
@@ -148,8 +165,12 @@ function getEventChannel(event) {
 function matchesFilters(event) {
   const meta = event.meta ?? {};
   const resolvedChannel = getEventChannel(event);
-  const metaChannel = typeof meta.channel === 'string' ? meta.channel : '';
-  const cameraMeta = typeof meta.camera === 'string' ? meta.camera : '';
+  const metaChannel = typeof meta.channel === 'string' ? normalizeChannelId(meta.channel) : '';
+  const cameraMeta = typeof meta.camera === 'string' ? normalizeChannelId(meta.camera) : '';
+  const channelQuery = state.filters.channelQuery
+    .split(',')
+    .map(token => normalizeChannelId(token))
+    .filter(token => token.length > 0);
   const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : '';
   const ts = typeof event.ts === 'number' ? event.ts : Date.now();
   const selectedChannels = getSelectedChannels();
@@ -158,10 +179,16 @@ function matchesFilters(event) {
     return false;
   }
   if (state.filters.camera) {
+    const normalizedCameraFilter = normalizeChannelId(state.filters.camera);
     const cameraMatches =
       event.source === state.filters.camera ||
       cameraMeta === state.filters.camera ||
-      resolvedChannel === state.filters.camera;
+      metaChannel === state.filters.camera ||
+      resolvedChannel === state.filters.camera ||
+      normalizeChannelId(event.source) === normalizedCameraFilter ||
+      cameraMeta === normalizedCameraFilter ||
+      metaChannel === normalizedCameraFilter ||
+      resolvedChannel === normalizedCameraFilter;
     if (!cameraMatches) {
       return false;
     }
@@ -170,6 +197,9 @@ function matchesFilters(event) {
     if (!resolvedChannel || !selectedChannels.has(resolvedChannel)) {
       return false;
     }
+  }
+  if (channelQuery.length > 0 && !channelQuery.includes(resolvedChannel)) {
+    return false;
   }
   if (state.filters.severity && event.severity !== state.filters.severity) {
     return false;
@@ -187,8 +217,10 @@ function matchesFilters(event) {
       event.message,
       event.detector,
       event.source,
+      meta.channel,
       metaChannel,
       resolvedChannel,
+      meta.camera,
       cameraMeta,
       snapshotPath
     ]
@@ -430,6 +462,9 @@ function updateStreamWidget() {
       ? new Date(state.stream.lastUpdate).toLocaleTimeString()
       : '—';
   }
+  if (streamHealth) {
+    streamHealth.textContent = state.stream.health ?? 'Unknown';
+  }
 }
 
 function updatePoseWidget() {
@@ -474,6 +509,7 @@ function resetStreamStats() {
   state.stream.heartbeats = 0;
   state.stream.events = 0;
   state.stream.lastUpdate = null;
+  setHealthStatus('Unknown');
   updateStreamWidget();
 }
 
@@ -533,11 +569,12 @@ function insertEvent(event) {
 }
 
 function registerChannel(channel, timestamp = Date.now()) {
-  if (!channel) {
+  const normalized = normalizeChannelId(channel);
+  if (!normalized) {
     return;
   }
 
-  const stats = state.channelStats.get(channel);
+  const stats = state.channelStats.get(normalized);
   if (stats) {
     if (timestamp > stats.lastSeen) {
       stats.lastSeen = timestamp;
@@ -546,7 +583,7 @@ function registerChannel(channel, timestamp = Date.now()) {
     return;
   }
 
-  state.channelStats.set(channel, { firstSeen: timestamp, lastSeen: timestamp });
+  state.channelStats.set(normalized, { firstSeen: timestamp, lastSeen: timestamp });
   updateChannelFilterControls();
 }
 
@@ -714,8 +751,12 @@ function renderChannelStatus() {
   const channelMap = new Map();
   if (summary?.channels) {
     summary.channels.forEach(channel => {
-      channelMap.set(channel.id, {
-        id: channel.id,
+      const channelId = normalizeChannelId(channel.id);
+      if (!channelId) {
+        return;
+      }
+      channelMap.set(channelId, {
+        id: channelId,
         events: channel.total,
         lastEventTs: channel.lastEventTs,
         severity: channel.bySeverity ?? {},
@@ -729,8 +770,12 @@ function renderChannelStatus() {
   }
   const pipelineChannels = digest?.pipelines?.ffmpeg?.channels ?? [];
   pipelineChannels.forEach(entry => {
-    const existing = channelMap.get(entry.channel) ?? {
-      id: entry.channel,
+    const channelId = normalizeChannelId(entry.channel);
+    if (!channelId) {
+      return;
+    }
+    const existing = channelMap.get(channelId) ?? {
+      id: channelId,
       events: 0,
       lastEventTs: null,
       severity: {},
@@ -744,7 +789,7 @@ function renderChannelStatus() {
     existing.lastRestartAt = entry.lastRestartAt ?? null;
     existing.lastRestartReason = entry.lastRestart?.reason ?? null;
     existing.watchdogBackoffMs = entry.watchdogBackoffMs ?? null;
-    channelMap.set(entry.channel, existing);
+    channelMap.set(channelId, existing);
   });
 
   const entries = Array.from(channelMap.values()).sort((a, b) => {
@@ -1336,7 +1381,71 @@ function applyPoseSummary(summary) {
 
 function setMetricsDigest(digest) {
   state.digest = digest ?? null;
+  setHealthStatus(computeHealthStatus(state.digest));
   renderChannelStatus();
+}
+
+function setHealthStatus(status) {
+  const label = status || 'Unknown';
+  state.stream.health = label;
+  if (streamHealth) {
+    streamHealth.textContent = label;
+  }
+}
+
+function computeHealthStatus(digest) {
+  if (!digest || typeof digest !== 'object') {
+    return 'Unknown';
+  }
+  const pipelineDigest = digest.pipelines;
+  const ffmpeg = pipelineDigest?.ffmpeg;
+  if (!ffmpeg || typeof ffmpeg !== 'object') {
+    return 'Unknown';
+  }
+
+  const entries = [];
+  if (Array.isArray(ffmpeg.channels)) {
+    entries.push(...ffmpeg.channels.filter(Boolean));
+  }
+  if (ffmpeg.byChannel && typeof ffmpeg.byChannel === 'object') {
+    entries.push(...Object.values(ffmpeg.byChannel).filter(Boolean));
+  }
+
+  const now = Date.now();
+  const hasRecentRestart = entries.some(entry => {
+    if (!entry || typeof entry !== 'object') {
+      return false;
+    }
+    const restarts = typeof entry.restarts === 'number' ? entry.restarts : 0;
+    if (restarts > 0) {
+      const ts = typeof entry.lastRestartAt === 'string' ? Date.parse(entry.lastRestartAt) : NaN;
+      if (Number.isFinite(ts) && now - ts >= 0 && now - ts < 5 * 60_000) {
+        return true;
+      }
+    }
+    const lastRestart = entry.lastRestart;
+    if (lastRestart && typeof lastRestart === 'object') {
+      const ts =
+        typeof lastRestart.at === 'string'
+          ? Date.parse(lastRestart.at)
+          : typeof lastRestart.at === 'number'
+          ? lastRestart.at
+          : NaN;
+      if (Number.isFinite(ts) && now - ts >= 0 && now - ts < 5 * 60_000) {
+        return true;
+      }
+    }
+    return false;
+  });
+
+  if (!hasRecentRestart && typeof ffmpeg.lastRestartAt === 'string') {
+    const ts = Date.parse(ffmpeg.lastRestartAt);
+    if (Number.isFinite(ts) && now - ts >= 0 && now - ts < 5 * 60_000) {
+      return 'Degraded';
+    }
+  }
+
+  return hasRecentRestart ? 'Degraded' : 'Healthy';
 }
 
 function updateChannelFilterControls() {
@@ -1517,6 +1626,7 @@ function syncFiltersFromForm() {
   state.filters.snapshot = snapshot === 'with' || snapshot === 'without' ? snapshot : '';
   state.filters.from = (formData.get('from') ?? '').toString();
   state.filters.to = (formData.get('to') ?? '').toString();
+  state.filters.channelQuery = (formData.get('channels') ?? '').toString().trim();
 }
 
 function resetFilters() {
@@ -1527,6 +1637,7 @@ function resetFilters() {
   state.filters.to = '';
   state.filters.search = '';
   state.filters.snapshot = '';
+  state.filters.channelQuery = '';
   getSelectedChannels().clear();
   filtersForm.reset();
   clearPreview();
@@ -1574,6 +1685,7 @@ function buildQueryParams() {
   if (state.filters.snapshot) params.set('snapshot', state.filters.snapshot);
   if (state.filters.from) params.set('from', state.filters.from);
   if (state.filters.to) params.set('to', state.filters.to);
+  if (state.filters.channelQuery) params.set('channels', state.filters.channelQuery);
   const selectedChannels = Array.from(getSelectedChannels());
   selectedChannels.forEach(channel => {
     params.append('channel', channel);
@@ -1596,12 +1708,7 @@ function buildSnapshotCacheKey(event) {
   const meta = event.meta ?? {};
   const hash = typeof meta.snapshotHash === 'string' ? meta.snapshotHash : '';
   const ts = typeof meta.snapshotTs === 'number' ? meta.snapshotTs : event.ts;
-  const channel =
-    typeof meta.channel === 'string'
-      ? meta.channel
-      : typeof meta.camera === 'string'
-      ? meta.camera
-      : '';
+  const channel = getEventChannel(event);
   const camera =
     typeof meta.camera === 'string'
       ? meta.camera

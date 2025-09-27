@@ -63,6 +63,12 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('pipelines.ffmpeg.restartHistogram.delay');
     expect(readme).toContain('metrics.suppression.histogram.historyCount');
     expect(readme).toContain('metrics.logs.byLevel.error');
+    expect(readme).toContain('metrics.exportLogLevelCountersForPrometheus');
+    expect(readme).toContain('guardian_log_level_total');
+    expect(readme).toContain('guardian_log_last_error_timestamp_seconds');
+    expect(readme).toContain('guardian_ffmpeg_restart_jitter_ms');
+    expect(readme).toContain('guardian_ffmpeg_restarts_total_bucket');
+    expect(readme).toContain('guardian_detector_counter_total');
     expect(readme).toContain('"maxArchivesPerCamera": 3');
     expect(readme).toContain('vacuum=auto (run=on-change)');
     expect(readme).toContain('pose.forecast');
@@ -81,6 +87,7 @@ describe('ReadmeExamples', () => {
     const payload = JSON.parse(capture.stdout().trim());
     expect(payload.metrics.pipelines.ffmpeg.byChannel).toBeDefined();
     expect(payload.metrics.pipelines.audio.byChannel).toBeDefined();
+    expect(payload.metrics.pipelines.ffmpeg.jitterHistogram).toBeDefined();
 
     const initialLevel = getLogLevel();
     const setCapture = createIo();
@@ -112,5 +119,8 @@ describe('OperationsDocLinks', () => {
     expect(operations).toContain('guardian daemon health --json');
     expect(operations).toContain('pnpm exec tsx src/tasks/retention.ts --run');
     expect(operations).toContain('detector latency histogramlarını');
+    expect(operations).toContain('guardian_log_level_total');
+    expect(operations).toContain('guardian_ffmpeg_restart_jitter_ms');
+    expect(operations).toContain('guardian_detector_counter_total');
   });
 });

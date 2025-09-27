@@ -275,6 +275,31 @@ daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
 - `detectors.motion.counters.backoffActivations`, `detectors.light.counters.backoffSuppressedFrames`: Debounce/backoff sayaçları.
 
 `registerHealthIndicator` ile özel health check ekleyebilir, `collectHealthChecks` çağrısında `metrics.logs.byLevel.error` veya `metrics.suppression.lastEvent` gibi alanlara erişebilirsiniz.
+Guardian, Prometheus entegrasyonları için log seviyeleri, pipeline jitter dağılımları ve dedektör sayaçlarını ayrı yüzeyler
+olarak dışa aktarır. Aşağıdaki örnekler, CLI yerine `pnpm exec tsx` ile doğrudan Node.js üzerinden metrikleri elde etmeyi
+gösterir:
+
+```bash
+# Log seviyelerini ve son hata zaman damgasını gauge olarak alın
+pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
+console.log(metrics.exportLogLevelCountersForPrometheus({ labels: { instance: 'lab-node' } }));"
+
+# Pipeline jitter/deneme histogramlarını Prometheus formatında yazdırın
+pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
+console.log(metrics.exportPipelineRestartHistogram('ffmpeg', 'jitter', {
+  metricName: 'guardian_ffmpeg_restart_jitter_ms',
+  labels: { pipeline: 'ffmpeg', region: 'lab' }
+}));"
+
+# Dedektör sayaç ve gauge değerlerini inceleyin
+pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
+console.log(metrics.exportDetectorCountersForPrometheus({ labels: { instance: 'lab-node' } }));"
+```
+
+Çıktıda `guardian_log_level_total`, `guardian_log_level_detector_total`,
+`guardian_ffmpeg_restart_jitter_ms_bucket`, `guardian_ffmpeg_restarts_total_bucket` ve
+`guardian_detector_counter_total` gibi metrikleri göreceksiniz. `guardian_log_last_error_timestamp_seconds`
+satırı, son hata logunun Unix zaman damgasını bildirir.
 
 ## Video ve ses boru hatları
 Video için ffmpeg süreçleri, `src/video/source.ts` altında watchdog tarafından izlenir. `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırlarını loglarda görüyorsanız, fallback listesi üzerinde iterasyon yapıldığını bilirsiniz. Her yeniden başlatma `pipelines.ffmpeg.byReason`, `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.jitterHistogram` alanlarını artırır.

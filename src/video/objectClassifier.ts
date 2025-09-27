@@ -8,6 +8,7 @@ export interface ObjectClassifierOptions {
   labels: string[];
   threatLabels?: string[];
   threatThreshold?: number;
+  labelMap?: Record<string, string>;
 }
 
 type InferenceSessionLike = {
@@ -19,8 +20,10 @@ type InferenceSessionLike = {
 export interface ClassifiedObject {
   detection: YoloDetection;
   label: string;
+  rawLabel: string;
   score: number;
   probabilities: Record<string, number>;
+  rawProbabilities: Record<string, number>;
   threatScore: number;
   isThreat: boolean;
 }
@@ -47,9 +50,35 @@ export class ObjectClassifier {
   private outputName: string | null = null;
   private readonly threatLabels: Set<string>;
   private readonly threatThreshold: number;
+  private readonly labelMap: Map<string, string>;
 
   private constructor(private readonly options: ObjectClassifierOptions) {
-    this.threatLabels = new Set(options.threatLabels ?? ['threat']);
+    const labelEntries: Array<[string, string]> = [];
+    for (const [key, value] of Object.entries(options.labelMap ?? {})) {
+      if (typeof key !== 'string' || typeof value !== 'string') {
+        continue;
+      }
+      const trimmedKey = key.trim();
+      const trimmedValue = value.trim();
+      if (!trimmedKey || !trimmedValue) {
+        continue;
+      }
+      labelEntries.push([trimmedKey, trimmedValue]);
+    }
+    this.labelMap = new Map(labelEntries);
+    const threatLabels = options.threatLabels ?? ['threat'];
+    this.threatLabels = new Set<string>();
+    for (const label of threatLabels) {
+      if (typeof label !== 'string') {
+        continue;
+      }
+      const trimmed = label.trim();
+      if (!trimmed) {
+        continue;
+      }
+      this.threatLabels.add(trimmed);
+      this.threatLabels.add(this.mapLabel(trimmed));
+    }
     this.threatThreshold = options.threatThreshold ?? DEFAULT_THREAT_THRESHOLD;
   }
 
@@ -110,31 +139,58 @@ export class ObjectClassifier {
       const end = start + labelCount;
       const logits = scores.slice(start, end);
       const probabilities = softmax(logits);
-      let bestIndex = 0;
-      let bestScore = probabilities[0] ?? 0;
-      for (let i = 1; i < probabilities.length; i += 1) {
-        if (probabilities[i] > bestScore) {
-          bestScore = probabilities[i];
-          bestIndex = i;
+      const rawProbabilities: Record<string, number> = {};
+      const resolvedProbabilities: Record<string, number> = {};
+      const aggregateLeaders = new Map<
+        string,
+        { label: string; probability: number; combined: number }
+      >();
+
+      for (let i = 0; i < labels.length; i += 1) {
+        const rawLabel = labels[i] ?? `class-${i}`;
+        const probability = probabilities[i] ?? 0;
+        rawProbabilities[rawLabel] = probability;
+        const resolved = this.mapLabel(rawLabel);
+        const current = resolvedProbabilities[resolved] ?? 0;
+        const combined = current + probability;
+        resolvedProbabilities[resolved] = combined;
+        const leader = aggregateLeaders.get(resolved);
+        if (!leader || probability > leader.probability) {
+          aggregateLeaders.set(resolved, { label: rawLabel, probability, combined });
+        } else if (leader && combined !== leader.combined) {
+          aggregateLeaders.set(resolved, { ...leader, combined });
         }
       }
 
-      const probabilityMap: Record<string, number> = {};
-      for (let i = 0; i < labels.length; i += 1) {
-        probabilityMap[labels[i]] = probabilities[i] ?? 0;
+      const initialRaw = labels[0] ?? 'class-0';
+      let bestLabel = this.mapLabel(initialRaw);
+      let bestScore = resolvedProbabilities[bestLabel] ?? probabilities[0] ?? 0;
+      let bestRawLabel = aggregateLeaders.get(bestLabel)?.label ?? initialRaw;
+      for (const [resolved, aggregate] of Object.entries(resolvedProbabilities)) {
+        if (aggregate > bestScore) {
+          bestScore = aggregate;
+          const leader = aggregateLeaders.get(resolved);
+          bestLabel = resolved;
+          bestRawLabel = leader?.label ?? resolved;
+        }
       }
 
-      const label = labels[bestIndex] ?? `class-${bestIndex}`;
       const detectionConfidence = clamp(detection.score, 0, 1);
-      const threatProbability = this.resolveThreatProbability(label, probabilityMap);
+      const threatProbability = this.resolveThreatProbability(
+        bestLabel,
+        resolvedProbabilities,
+        rawProbabilities
+      );
       const threatScore = clamp(threatProbability * detectionConfidence, 0, 1);
       const isThreat = threatScore >= this.threatThreshold;
 
       objects.push({
         detection: detections[index],
-        label,
+        label: bestLabel,
+        rawLabel: bestRawLabel,
         score: bestScore,
-        probabilities: probabilityMap,
+        probabilities: resolvedProbabilities,
+        rawProbabilities,
         threatScore,
         isThreat
       });
@@ -149,16 +205,26 @@ export class ObjectClassifier {
     return objects;
   }
 
-  private resolveThreatProbability(label: string, probabilities: Record<string, number>) {
+  private resolveThreatProbability(
+    label: string,
+    probabilities: Record<string, number>,
+    rawProbabilities: Record<string, number>
+  ) {
     let maxThreat = 0;
-    if (this.threatLabels.has(label)) {
-      maxThreat = Math.max(maxThreat, probabilities[label] ?? 0);
+    const resolved = this.mapLabel(label);
+    if (this.threatLabels.has(resolved) || this.threatLabels.has(label)) {
+      maxThreat = Math.max(maxThreat, probabilities[resolved] ?? probabilities[label] ?? 0);
     }
 
     for (const threat of this.threatLabels) {
-      const score = probabilities[threat];
+      const threatLabel = this.mapLabel(threat);
+      const score = probabilities[threatLabel];
       if (typeof score === 'number' && score > maxThreat) {
         maxThreat = score;
+      }
+      const rawScore = rawProbabilities[threat];
+      if (typeof rawScore === 'number' && rawScore > maxThreat) {
+        maxThreat = rawScore;
       }
     }
 
@@ -180,6 +246,11 @@ export class ObjectClassifier {
 
     this.inputName = this.session.inputNames[0] ?? null;
     this.outputName = this.session.outputNames[0] ?? null;
+  }
+
+  private mapLabel(label: string) {
+    const normalized = label.trim();
+    return this.labelMap.get(normalized) ?? normalized;
   }
 }
 

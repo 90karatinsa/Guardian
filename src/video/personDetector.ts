@@ -14,7 +14,7 @@ import {
   parseYoloDetections
 } from './yoloParser.js';
 import type { PreprocessMeta, YoloDetection } from './yoloParser.js';
-import ObjectClassifier, { ClassifiedObject } from './objectClassifier.js';
+import ObjectClassifier, { ClassifiedObject, summarizeThreatMetadata } from './objectClassifier.js';
 
 export interface PersonDetectorOptions {
   source: string;
@@ -170,12 +170,14 @@ export class PersonDetector {
       if (classifiedObjects.length > 0) {
         const objects = classifiedObjects.map(object => ({
           label: object.label,
+          rawLabel: object.rawLabel,
           score: object.score,
           confidence: resolveDetectionConfidence(object.detection),
           threat: object.isThreat,
           threatScore: object.threatScore,
           detection: serializeDetection(object.detection),
-          probabilities: object.probabilities
+          probabilities: object.probabilities,
+          rawProbabilities: object.rawProbabilities
         }));
         const threat = classifiedObjects.find(object => object.isThreat);
         payload.meta!.objects = objects;
@@ -185,6 +187,10 @@ export class PersonDetector {
             score: threat.threatScore,
             confidence: resolveDetectionConfidence(threat.detection)
           };
+        }
+        const summary = summarizeThreatMetadata(payload.meta);
+        if (summary) {
+          payload.meta!.threatSummary = summary;
         }
       }
 
@@ -290,8 +296,48 @@ function probabilityToLogit(probability: number) {
   return Math.log(clamped / (1 - clamped));
 }
 
+function logistic(value: number) {
+  const clamped = Math.max(-20, Math.min(20, value));
+  return 1 / (1 + Math.exp(-clamped));
+}
+
 function resolveDetectionConfidence(detection: YoloDetection) {
-  return clamp(detection.score, 0, 1);
+  const baseScore = clamp(detection.score, 0, 1);
+  const objectness = clamp(
+    typeof detection.objectness === 'number' ? detection.objectness : baseScore,
+    0,
+    1
+  );
+  const classProbability = clamp(
+    typeof detection.classProbability === 'number' ? detection.classProbability : baseScore,
+    0,
+    1
+  );
+  const harmonic =
+    objectness + classProbability === 0
+      ? Math.min(objectness, classProbability)
+      : (2 * objectness * classProbability) / (objectness + classProbability);
+  const fusedLogit = probabilityToLogit(baseScore) + probabilityToLogit(Math.max(harmonic, 1e-6));
+  const synergy = logistic(fusedLogit);
+  const areaRatio = clamp(
+    typeof detection.areaRatio === 'number' ? detection.areaRatio : baseScore,
+    0,
+    1
+  );
+
+  let combined = clamp(
+    baseScore * 0.55 + harmonic * 0.2 + synergy * 0.15 + Math.sqrt(areaRatio) * 0.1,
+    0,
+    1
+  );
+
+  if (detection.classId === PERSON_CLASS_INDEX) {
+    const minimum = Math.min(objectness, classProbability);
+    const geometric = Math.sqrt(Math.max(objectness * classProbability, 0));
+    combined = clamp(combined * 0.6 + minimum * 0.2 + geometric * 0.15 + areaRatio * 0.05, 0, 1);
+  }
+
+  return combined;
 }
 
 function isMissingModelError(error: unknown) {

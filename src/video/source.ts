@@ -110,9 +110,11 @@ export class VideoSource extends EventEmitter {
   private circuitBreakerFailures = 0;
   private circuitBroken = false;
   private readonly commandClassifications = new Set<string>();
+  private readonly channel: string | null;
 
   constructor(private readonly options: VideoSourceOptions) {
     super();
+    this.channel = normalizeChannelId(options.channel);
   }
 
   start() {
@@ -440,15 +442,26 @@ export class VideoSource extends EventEmitter {
     this.restartCount += 1;
     const attempt = this.restartCount;
 
-    const channel = this.options.channel ?? null;
+    const resolvedContext: RecoveryContext = {
+      errorCode:
+        typeof context.errorCode === 'string' || typeof context.errorCode === 'number'
+          ? context.errorCode
+          : reason === 'watchdog-timeout' || reason === 'stream-idle'
+            ? reason
+            : null,
+      exitCode: typeof context.exitCode === 'number' ? context.exitCode : null,
+      signal: context.signal ?? null
+    };
+
+    const channel = this.channel;
     const errorCode =
-      typeof context.errorCode === 'string' || typeof context.errorCode === 'number'
-        ? context.errorCode
-        : typeof context.exitCode === 'number'
-          ? context.exitCode
+      typeof resolvedContext.errorCode === 'string' || typeof resolvedContext.errorCode === 'number'
+        ? resolvedContext.errorCode
+        : typeof resolvedContext.exitCode === 'number'
+          ? resolvedContext.exitCode
           : null;
-    const exitCode = typeof context.exitCode === 'number' ? context.exitCode : null;
-    const signal = context.signal ?? null;
+    const exitCode = resolvedContext.exitCode;
+    const signal = resolvedContext.signal ?? null;
 
     const isCircuitCandidate =
       reason === 'start-timeout' ||
@@ -470,7 +483,11 @@ export class VideoSource extends EventEmitter {
     this.clearStreamIdleTimer();
     this.cleanupStream();
 
-    const shouldForceImmediateKill = shouldTripCircuit || reason === 'rtsp-timeout';
+    const shouldForceImmediateKill =
+      shouldTripCircuit ||
+      reason === 'rtsp-timeout' ||
+      reason === 'watchdog-timeout' ||
+      reason === 'stream-idle';
     const termination = this.terminateCommand(true, { skipForceDelay: shouldForceImmediateKill });
     const waitForTermination = termination ?? Promise.resolve();
 
@@ -939,6 +956,20 @@ export function slicePng(buffer: Buffer): SliceResult | null {
   }
 
   return null;
+}
+
+function normalizeChannelId(value: string | undefined | null) {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `video:${trimmed}`;
 }
 
 export function slicePngStream(stream: Readable, handler: (frame: Buffer) => void) {

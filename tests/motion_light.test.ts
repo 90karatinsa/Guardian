@@ -198,6 +198,67 @@ describe('MotionDetector', () => {
     expect(meta.areaWindowMedian ?? 0).toBeGreaterThan(0);
   });
 
+  it('MotionLightRebaselineWindows recalibrates after sustained noise pressure', () => {
+    const motion = new MotionDetector(
+      {
+        source: 'rebaseline-motion',
+        diffThreshold: 6,
+        areaThreshold: 0.04,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.2,
+        areaSmoothing: 0.2,
+        areaInflation: 1.05
+      },
+      bus
+    );
+
+    const light = new LightDetector(
+      {
+        source: 'rebaseline-light',
+        deltaThreshold: 12,
+        smoothingFactor: 0.1,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.8,
+        noiseSmoothing: 0.2
+      },
+      bus
+    );
+
+    const baseMotion = createUniformFrame(14, 14, 32);
+    const baseLight = createUniformFrame(12, 12, 140);
+    motion.handleFrame(baseMotion, 0);
+    light.handleFrame(baseLight, 0);
+
+    for (let i = 0; i < 36; i += 1) {
+      const noisyMotion = createFrame(14, 14, (x, y) => 32 + ((x * 3 + y + i) % 2 === 0 ? 40 : -35));
+      const noisyLight = createFrame(12, 12, (x, y) => 140 + ((x + 2 * y + i) % 3 === 0 ? 50 : -45));
+      motion.handleFrame(noisyMotion, i + 1);
+      light.handleFrame(noisyLight, i + 1);
+    }
+
+    let snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.gauges?.rebaselineCountdown ?? 0).toBeGreaterThan(0);
+    expect(snapshot.detectors.light?.gauges?.rebaselineCountdown ?? 0).toBeGreaterThan(0);
+
+    for (let i = 0; i < 24; i += 1) {
+      const noisyMotion = createFrame(14, 14, (x, y) => 30 + ((x + y + i) % 2 === 0 ? 35 : -30));
+      const noisyLight = createFrame(12, 12, (x, y) => 135 + ((x * 2 + y + i) % 2 === 0 ? 48 : -42));
+      motion.handleFrame(noisyMotion, 100 + i);
+      light.handleFrame(noisyLight, 100 + i);
+    }
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.motion?.counters?.adaptiveRebaselines ?? 0).toBeGreaterThan(0);
+    expect(snapshot.detectors.light?.counters?.adaptiveRebaselines ?? 0).toBeGreaterThan(0);
+    expect(snapshot.detectors.motion?.gauges?.rebaselineCountdown ?? 0).toBe(0);
+    expect(snapshot.detectors.light?.gauges?.rebaselineCountdown ?? 0).toBe(0);
+  });
+
   it('MotionNoiseAdaptiveBackoff applies warmup padding and reload updates counters', () => {
     const detector = new MotionDetector(
       {

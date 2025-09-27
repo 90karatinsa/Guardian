@@ -4,7 +4,12 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import logger, { getAvailableLogLevels, getLogLevel, setLogLevel } from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
-import { collectHealthChecks, runShutdownHooks } from './app.js';
+import {
+  collectHealthChecks,
+  runShutdownHooks,
+  getIntegrationManifest,
+  type IntegrationManifest
+} from './app.js';
 import configManager, { loadConfigFromFile, type GuardianConfig } from './config/index.js';
 import { runRetentionOnce, type RetentionTaskOptions } from './tasks/retention.js';
 import packageJson from '../package.json' assert { type: 'json' };
@@ -65,6 +70,7 @@ type HealthPayload = {
       audioRestarts: number;
     };
   };
+  integration: IntegrationManifest;
   application: {
     name: string;
     version: string;
@@ -238,6 +244,8 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
     hooks: state.lastShutdownHooks.map(hook => ({ ...hook }))
   } satisfies HealthPayload['application']['shutdown'];
 
+  const integration = getIntegrationManifest();
+
   return {
     status,
     state: state.status,
@@ -266,6 +274,7 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
       version: packageJson.version ?? '0.0.0',
       shutdown: shutdownSummary
     },
+    integration,
     runtime: {
       pipelines: {
         videoChannels,

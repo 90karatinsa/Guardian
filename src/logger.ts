@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
 import config from 'config';
-import metrics from './metrics/index.js';
+import metrics, { type PrometheusLogLevelOptions } from './metrics/index.js';
 
 const level = config.has('logging.level') ? config.get<string>('logging.level') : 'info';
 const name = config.has('app.name') ? config.get<string>('app.name') : 'Guardian';
@@ -113,6 +113,10 @@ export function onLogLevelChange(listener: (level: string, previous: string | nu
 
 export function getLogLevelMetrics() {
   return metrics.exportLogLevelMetrics();
+}
+
+export function getLogLevelPrometheusMetrics(options?: PrometheusLogLevelOptions) {
+  return metrics.exportLogLevelCountersForPrometheus(options);
 }
 
 export default logger;

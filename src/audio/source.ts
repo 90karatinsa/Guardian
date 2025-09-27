@@ -7,6 +7,7 @@ import {
 } from 'node:child_process';
 import { Readable } from 'node:stream';
 import ffmpegStatic from 'ffmpeg-static';
+import Meyda from 'meyda';
 import type { AudioMicFallbackCandidate } from '../config/index.js';
 import metrics from '../metrics/index.js';
 
@@ -127,6 +128,10 @@ export class AudioSource extends EventEmitter {
   private circuitBroken = false;
   private lastCircuitCandidateReason: AudioRecoverEvent['reason'] | null = null;
   private startSequencePromise: Promise<void> | null = null;
+  private readonly analysisByFormat = new Map<
+    string,
+    { frames: number; rms: number; spectralCentroid: number }
+  >();
 
   constructor(private options: AudioSourceOptions) {
     super();
@@ -148,6 +153,7 @@ export class AudioSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.circuitBroken = false;
     this.lastCircuitCandidateReason = null;
+    this.analysisByFormat.clear();
     if (this.options.type === 'mic') {
       this.micInputArgs = buildMicInputArgs(
         process.platform,
@@ -252,6 +258,14 @@ export class AudioSource extends EventEmitter {
     }
   }
 
+  getAnalysisSnapshot() {
+    const snapshot: Record<string, { frames: number; rms: number; spectralCentroid: number }> = {};
+    for (const [format, state] of this.analysisByFormat.entries()) {
+      snapshot[format] = { ...state };
+    }
+    return snapshot;
+  }
+
   stop() {
     this.shouldStop = true;
     this.hasReceivedChunk = false;
@@ -262,6 +276,7 @@ export class AudioSource extends EventEmitter {
     this.circuitBroken = false;
     this.lastCircuitCandidateReason = null;
     this.startSequencePromise = null;
+    this.analysisByFormat.clear();
     this.terminateProcess(true, { skipForceDelay: true });
   }
 
@@ -942,7 +957,10 @@ export class AudioSource extends EventEmitter {
       FFMPEG_CANDIDATES.length <= 1 ||
       (reason !== 'ffmpeg-missing' &&
         reason !== 'stream-silence' &&
-        reason !== 'watchdog-timeout')
+        reason !== 'watchdog-timeout' &&
+        reason !== 'process-exit' &&
+        reason !== 'spawn-error' &&
+        reason !== 'start-timeout')
     ) {
       return;
     }
@@ -1043,7 +1061,81 @@ export class AudioSource extends EventEmitter {
       }
 
       this.emit('data', samples);
+      this.analyzeFrame(samples, sampleRate, rms);
     }
+  }
+
+  private analyzeFrame(samples: Int16Array, sampleRate: number, fallbackRms: number) {
+    if (!samples.length) {
+      return;
+    }
+
+    const format = this.resolveAnalysisFormat();
+    if (!format) {
+      return;
+    }
+
+    let rms = fallbackRms;
+    let spectral: number | null = null;
+
+    if (Meyda && typeof Meyda.extract === 'function') {
+      try {
+        const floatSamples = int16ToFloat32(samples);
+        const features = Meyda.extract(['rms', 'spectralCentroid'], floatSamples, {
+          sampleRate,
+          bufferSize: floatSamples.length
+        }) as { rms?: number; spectralCentroid?: number } | null;
+        if (features) {
+          if (typeof features.rms === 'number' && Number.isFinite(features.rms)) {
+            rms = features.rms;
+          }
+          if (
+            typeof features.spectralCentroid === 'number' &&
+            Number.isFinite(features.spectralCentroid)
+          ) {
+            spectral = features.spectralCentroid;
+          }
+        }
+      } catch (error) {
+        // Ignore analysis errors; fallback to existing metrics
+      }
+    }
+
+    const state = this.analysisByFormat.get(format) ?? {
+      frames: 0,
+      rms: 0,
+      spectralCentroid: 0
+    };
+    state.frames += 1;
+    state.rms = rms;
+    if (typeof spectral === 'number') {
+      state.spectralCentroid = spectral;
+    }
+    this.analysisByFormat.set(format, state);
+    this.emit('analysis', {
+      format,
+      rms: state.rms,
+      spectralCentroid: state.spectralCentroid,
+      frames: state.frames
+    });
+  }
+
+  private resolveAnalysisFormat() {
+    if (this.options.type === 'mic') {
+      const active =
+        this.activeMicCandidateIndex !== null
+          ? this.micInputArgs[this.activeMicCandidateIndex]
+          : this.micInputArgs[this.micCandidateIndex] ?? [];
+      if (Array.isArray(active)) {
+        const formatIndex = active.findIndex(arg => arg === '-f');
+        if (formatIndex >= 0 && typeof active[formatIndex + 1] === 'string') {
+          return active[formatIndex + 1];
+        }
+      }
+      const resolved = resolveMicFormatValue(process.platform, this.options.inputFormat);
+      return resolved ?? defaultMicFormat(process.platform);
+    }
+    return 'ffmpeg';
   }
 
   private calculateFrameSize(sampleRate: number, channels: number) {
@@ -1101,6 +1193,14 @@ function bufferToSamples(buffer: Buffer): { samples: Int16Array; rms: number; pe
   const normalizedPeak = peak / 32768;
 
   return { samples, rms, peak: normalizedPeak };
+}
+
+function int16ToFloat32(samples: Int16Array): Float32Array {
+  const result = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) {
+    result[i] = samples[i] / 32768;
+  }
+  return result;
 }
 
 function calculateFrameDurationMs(totalSamples: number, sampleRate: number, channels: number) {

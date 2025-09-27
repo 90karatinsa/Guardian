@@ -125,6 +125,85 @@ describe('ConfigHotReload', () => {
     retentionMock.stop.mockReset();
   });
 
+  it('ConfigHotReloadChannelThresholds validates thresholds and restarts pipelines after rollback', async () => {
+    const base = createConfig({ diffThreshold: 28 });
+    base.video.channels = {
+      'video:cam-1': {
+        motion: { diffThreshold: 22, areaThreshold: 0.025 },
+        person: { score: 0.55 }
+      }
+    };
+
+    const invalid = JSON.parse(JSON.stringify(base)) as GuardianConfig;
+    invalid.video.channels!['video:cam-1']!.person = { score: 1.4 };
+    if (invalid.video.cameras) {
+      invalid.video.cameras[0].motion = {
+        ...(invalid.video.cameras[0].motion ?? {}),
+        areaThreshold: 1.2
+      } as CameraConfig['motion'];
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(invalid, null, 2));
+    expect(() => loadConfigFromFile(configPath)).toThrowErrorMatchingInlineSnapshot(
+      "[Error: config.video.channels.video:cam-1.person.score must be between 0 and 1; config.video.cameras[cam-1].motion.areaThreshold must be between 0 and 1]"
+    );
+
+    fs.writeFileSync(configPath, JSON.stringify(base, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const initialInstance = MockVideoSource.instances[0];
+      const initialCount = MockVideoSource.instances.length;
+
+      const broken = JSON.parse(JSON.stringify(base)) as GuardianConfig;
+      broken.video.channels!['video:cam-1']!.person = { score: 2 };
+      if (broken.video.cameras) {
+        broken.video.cameras[0].motion = {
+          ...(broken.video.cameras[0].motion ?? {}),
+          areaThreshold: 1.5
+        } as CameraConfig['motion'];
+      }
+
+      fs.writeFileSync(configPath, JSON.stringify(broken, null, 2));
+
+      await waitFor(
+        () => logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed'),
+        4000
+      );
+      await waitFor(
+        () => logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied'),
+        4000
+      );
+
+      await waitFor(() => MockVideoSource.instances.length > initialCount, 4000);
+
+      const latestInstance = MockVideoSource.instances.at(-1);
+      expect(latestInstance).not.toBe(initialInstance);
+      expect(latestInstance?.options.channel).toBe('video:cam-1');
+
+      await waitFor(() => runtime.pipelines.get('video:cam-1')?.pipelineState.person.score === 0.5, 4000);
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigSchemaValidationErrors enforces channel, fallback, and rate limit rules', () => {
     const config = createConfig({ diffThreshold: 20 });
     config.video.channels = { 'video:present': {} };

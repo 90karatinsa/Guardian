@@ -303,7 +303,8 @@ class EventBus extends EventEmitter {
           channels: [...eventChannels],
           windowRemainingMs: suppressedMeta.windowRemainingMs,
           cooldownRemainingMs: suppressedMeta.cooldownRemainingMs,
-          cooldownExpiresAt: suppressedMeta.cooldownExpiresAt
+          cooldownExpiresAt: suppressedMeta.cooldownExpiresAt,
+          channelStates: meta.suppressionChannelStates
         };
         this.metrics.recordSuppressedEvent(detail);
       });

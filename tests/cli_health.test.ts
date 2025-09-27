@@ -52,6 +52,26 @@ function createTestIo(): TestIo {
   };
 }
 
+function parseSystemdUnit(content: string): Record<string, string[]> {
+  const map: Record<string, string[]> = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#') || line.startsWith('[')) {
+      continue;
+    }
+    const eqIndex = line.indexOf('=');
+    if (eqIndex <= 0) {
+      continue;
+    }
+    const key = line.slice(0, eqIndex);
+    const value = line.slice(eqIndex + 1);
+    const bucket = map[key] ?? [];
+    bucket.push(value);
+    map[key] = bucket;
+  }
+  return map;
+}
+
 beforeEach(async () => {
   startGuardMock.mockReset();
   metrics.reset();
@@ -66,7 +86,7 @@ afterEach(async () => {
 });
 
 describe('GuardianCliHealthcheck', () => {
-  it('CliHealthExitCodes maps health states to exit codes and readiness payload', async () => {
+  it('CliDaemonLifecycleHealth maps health states to exit codes and readiness payload', async () => {
     expect(resolveHealthExitCode('ok')).toBe(0);
     expect(resolveHealthExitCode('degraded')).toBe(1);
     expect(resolveHealthExitCode('starting')).toBe(2);
@@ -220,31 +240,42 @@ describe('GuardianCliHealthcheck', () => {
     expect(stopIo.stdout()).toContain('Guardian daemon is not running');
   });
 
-  it('SystemdShutdownHook unit definitions call daemon commands and shutdown hooks', () => {
-    const guardianService = fs.readFileSync(path.join('deploy', 'guardian.service'), 'utf8');
-    expect(guardianService).toContain('ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start');
-    expect(guardianService).toContain('ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health');
-    expect(guardianService).toContain('ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop');
-    expect(guardianService).toContain(
-      'ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM'
-    );
-    expect(guardianService).toContain('ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts');
+  it('CliSystemdIntegration reports integration manifest and matches packaged commands', async () => {
+    const health = await buildHealthPayload();
+    const manifest = health.integration;
 
-    const systemdService = fs.readFileSync(path.join('deploy', 'systemd.service'), 'utf8');
-    expect(systemdService).toContain('ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start');
-    expect(systemdService).toContain('ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health');
-    expect(systemdService).toContain('ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop');
-    expect(systemdService).toContain(
-      'ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM'
-    );
-    expect(systemdService).toContain('ExecStopPost=/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts');
+    expect(manifest.docker.healthcheck).toContain('pnpm exec tsx src/cli.ts');
+    expect(manifest.docker.stopCommand).toContain('pnpm exec tsx src/cli.ts stop');
+    expect(manifest.docker.logLevel.get).toContain('log-level get');
+    expect(manifest.docker.logLevel.set).toContain('log-level set');
+
+    const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
+    expect(dockerfile).toContain(manifest.docker.healthcheck);
+
+    const guardianUnit = parseSystemdUnit(fs.readFileSync(path.join('deploy', 'guardian.service'), 'utf8'));
+    expect(guardianUnit.ExecStart?.[0]).toBe(manifest.systemd.execStart);
+    expect(guardianUnit.ExecStartPre?.[0]).toBe(manifest.systemd.execStartPre);
+    expect(guardianUnit.ExecStop?.[0]).toBe(manifest.systemd.execStop);
+    expect(guardianUnit.ExecReload?.[0]).toBe(manifest.systemd.execReload);
+    expect(guardianUnit.ExecStopPost).toEqual(manifest.systemd.execStopPost);
+
+    const systemdUnit = parseSystemdUnit(fs.readFileSync(path.join('deploy', 'systemd.service'), 'utf8'));
+    expect(systemdUnit.ExecStartPre?.[0]).toBe(manifest.systemd.execStartPre);
+    expect(systemdUnit.ExecStart?.[0]).toBe(manifest.systemd.execStart);
+    expect(systemdUnit.ExecStop?.[0]).toBe(manifest.systemd.execStop);
+    expect(systemdUnit.ExecStopPost).toEqual(manifest.systemd.execStopPost);
+
+    expect(manifest.systemd.healthCommand).toBe(manifest.systemd.execStartPre);
+    expect(manifest.systemd.readyCommand).toContain('--ready');
+    expect(manifest.systemd.logLevel.get).toContain('log-level get');
+    expect(manifest.systemd.logLevel.set).toContain('log-level set');
   });
 
   it('DockerHealthProbeConfig wires CLI health command and entrypoint', () => {
     const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
     expect(dockerfile).toContain('STOPSIGNAL SIGTERM');
     expect(dockerfile).toContain('HEALTHCHECK');
-    expect(dockerfile).toContain('cli.ts daemon health');
+    expect(dockerfile).toContain('cli.ts --health');
     expect(dockerfile).toContain('"daemon", "start"');
   });
 });

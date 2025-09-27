@@ -786,6 +786,73 @@ describe('YoloParser utilities', () => {
     const classIds = results.map(result => result.classId).sort();
     expect(classIds).toEqual([0, 0]);
   });
+  it('YoloParserNormalizedProjection rescales normalized candidates with padding', () => {
+    const attributes = YOLO_CLASS_START_INDEX + 1;
+    const detections = 1;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assignNormalized = (
+      index: number,
+      values: { cx: number; cy: number; width: number; height: number; objectness: number; classProbability: number }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      data[YOLO_CLASS_START_INDEX * detections + index] = logit(values.classProbability);
+    };
+
+    assignNormalized(0, {
+      cx: 0.52,
+      cy: 0.46,
+      width: 0.28,
+      height: 0.48,
+      objectness: 0.82,
+      classProbability: 0.88
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 0.5,
+      padX: 0,
+      padY: 140,
+      originalWidth: 1280,
+      originalHeight: 720,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 640 / 1280,
+      scaleY: 640 / 720,
+      variants: [
+        {
+          scale: 0.5,
+          padX: 0,
+          padY: 140,
+          originalWidth: 1280,
+          originalHeight: 720,
+          resizedWidth: 640,
+          resizedHeight: 640,
+          scaleX: 640 / 1280,
+          scaleY: 640 / 720,
+          normalized: true
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const [detection] = parseYoloDetections(tensor, meta, { scoreThreshold: 0.3, classIndex: 0 });
+    expect(detection).toBeDefined();
+    expect(detection.normalizedProjection).toBe(true);
+    expect(detection.projectionIndex).toBe(1);
+    expect(detection.bbox.left).toBeCloseTo(486.4, 1);
+    expect(detection.bbox.top).toBeCloseTo(0.9, 1);
+    expect(detection.bbox.width).toBeCloseTo(358.4, 1);
+    expect(detection.bbox.height).toBeCloseTo(345.6, 1);
+    expect(detection.areaRatio).toBeCloseTo((358.4 * 345.6) / (1280 * 720), 5);
+    expect(detection.score).toBeGreaterThan(0.6);
+  });
+
+
 });
 
 describe('PersonDetector', () => {
@@ -866,12 +933,24 @@ describe('PersonDetector', () => {
     const meta = events[0].meta as Record<string, unknown>;
     const expectedObjectness = sigmoid(2.2);
     const expectedClassProbability = sigmoid(2.1);
+    const expectedScore = sigmoid(2.2 + 2.1);
+    const areaRatio = (400 * 400) / (1280 * 720);
+    const harmonic = expectedObjectness + expectedClassProbability === 0
+      ? 0
+      : (2 * expectedObjectness * expectedClassProbability) /
+        (expectedObjectness + expectedClassProbability);
+    const synergy = 1 / (1 + Math.exp(-(logit(expectedScore) + logit(Math.max(harmonic, 1e-6)))));
+    let expectedConfidence = Math.max(0, Math.min(1, expectedScore * 0.55 + harmonic * 0.2 + synergy * 0.15 + Math.sqrt(areaRatio) * 0.1));
+    const minimum = Math.min(expectedObjectness, expectedClassProbability);
+    const geometric = Math.sqrt(expectedObjectness * expectedClassProbability);
+    expectedConfidence = Math.max(0, Math.min(1, expectedConfidence * 0.6 + minimum * 0.2 + geometric * 0.15 + areaRatio * 0.05));
     expect(meta?.score).toBeCloseTo(expectedObjectness * expectedClassProbability, 5);
     expect(meta?.score).toBeGreaterThan(0);
     expect(meta?.score).toBeLessThanOrEqual(1);
     expect(meta?.classId).toBe(0);
     expect(meta?.objectness).toBeCloseTo(expectedObjectness, 5);
     expect(meta?.classProbability).toBeCloseTo(expectedClassProbability, 5);
+    expect(meta?.confidence).toBeCloseTo(expectedConfidence, 5);
     expect(meta?.thresholds).toMatchObject({ score: 0.5, nms: 0.45 });
     expect(meta?.thresholds?.classScoreThresholds).toMatchObject({ 0: 0.5 });
 

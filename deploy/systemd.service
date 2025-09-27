@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/opt/guardian
 Environment=NODE_ENV=production
 EnvironmentFile=-/etc/default/guardian
-ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts daemon health
+ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts --health
 ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start
 ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop
 ExecStopPost=/usr/bin/env pnpm exec tsx src/cli.ts daemon hooks --reason systemd-stop --signal SIGTERM

@@ -108,6 +108,81 @@ describe('VideoSource', () => {
     expect(recoverReasons.filter(reason => reason === 'watchdog-timeout')).not.toHaveLength(0);
   });
 
+  it('VideoSourceWatchdogRecovery records jitter metrics and watchdog restart details', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const randomValues = [0.9, 0.1];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:watchdog-retry',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      watchdogTimeoutMs: 20,
+      restartDelayMs: 40,
+      restartMaxDelayMs: 80,
+      restartJitterFactor: 0.5,
+      forceKillTimeoutMs: 0,
+      random: () => (randomValues.shift() ?? 0.5),
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => {
+          command.emit('start');
+        }, 0);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    const recoverEvents: RecoverEvent[] = [];
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      expect(recoverEvents[0]).toMatchObject({
+        reason: 'watchdog-timeout',
+        channel: 'video:watchdog-retry',
+        errorCode: 'watchdog-timeout'
+      });
+      expect(commands[0].killedSignals).toEqual(expect.arrayContaining(['SIGTERM', 'SIGKILL']));
+
+      const firstDelay = recoverEvents[0]?.delayMs ?? 0;
+      expect(firstDelay).toBeGreaterThan(0);
+
+      await vi.advanceTimersByTimeAsync(firstDelay);
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      const watchdogRecoveries = recoverEvents.filter(event => event.reason === 'watchdog-timeout');
+      expect(watchdogRecoveries).toHaveLength(2);
+      expect(commands[1].killedSignals).toEqual(expect.arrayContaining(['SIGTERM', 'SIGKILL']));
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+
+    const snapshot = metrics.snapshot();
+    const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:watchdog-retry'];
+    expect(channelStats.watchdogRestarts).toBeGreaterThanOrEqual(2);
+    expect(channelStats.watchdogBackoffMs).toBeGreaterThan(0);
+    expect(channelStats.lastWatchdogJitterMs).not.toBeNull();
+    expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('watchdog-timeout');
+  });
+
   it('VideoFfmpegGracefulRecovery tracks start-timeout and watchdog restarts with metrics', async () => {
     metrics.reset();
 
@@ -246,6 +321,86 @@ describe('VideoSource', () => {
       await source.stop();
       vi.useRealTimers();
     }
+  });
+
+  it('VideoSourceCircuitBreakerResets restarts after clearing breaker and closes commands on stop', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const fatalEvents: FatalEvent[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:circuit-reset',
+      startTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      watchdogTimeoutMs: 15,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 2,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => {
+          command.emit('start');
+        }, 0);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('fatal', event => fatalEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      expect(fatalEvents).toHaveLength(0);
+
+      const firstDelay = 10;
+      await vi.advanceTimersByTimeAsync(firstDelay);
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      expect(fatalEvents).toHaveLength(1);
+      expect(source.isCircuitBroken()).toBe(true);
+
+      const terminated = commands.slice(0, fatalEvents.length + 1);
+      expect(
+        terminated.every(command => command.killedSignals.includes('SIGKILL'))
+      ).toBe(true);
+
+      const wasBroken = source.resetCircuitBreaker();
+      expect(wasBroken).toBe(true);
+      expect(source.isCircuitBroken()).toBe(false);
+
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+
+      expect(commands.length).toBeGreaterThanOrEqual(3);
+
+      await source.stop();
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+
+    const snapshot = metrics.snapshot();
+    const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:circuit-reset'];
+    expect(channelStats.byReason['watchdog-timeout']).toBeGreaterThanOrEqual(2);
+    expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('watchdog-timeout');
   });
 
   it('VideoFfmpegSpawnFallbacks recovers when ffmpeg binary is missing', async () => {

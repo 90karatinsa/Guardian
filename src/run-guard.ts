@@ -183,6 +183,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   let retentionTask: RetentionTask | null = null;
   let syncPromise: Promise<void> = Promise.resolve();
   let handleConfigError: ((error: unknown) => void) | null = null;
+  let handleManagerError: ((error: unknown) => void) | null = null;
   let audioRuntime: AudioRuntime | null = null;
 
   const applyConfiguredLogLevel = (value: unknown) => {
@@ -459,7 +460,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
           modelPath: context.pipelineState.objects.modelPath,
           labels: context.pipelineState.objects.labels,
           threatLabels: context.pipelineState.objects.threatLabels,
-          threatThreshold: context.pipelineState.objects.threatThreshold
+          threatThreshold: context.pipelineState.objects.threatThreshold,
+          labelMap: context.pipelineState.objects.labelMap
         })
       : null;
 
@@ -578,7 +580,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     return runtime;
   };
 
-  const syncPipelines = async (config: GuardConfig) => {
+  const syncPipelines = async (config: GuardConfig, options: { forceRestart?: boolean } = {}) => {
+    const forceRestart = options.forceRestart === true;
     const camerasForConfig = buildCameraList(config.video);
     const desiredIds = new Set(camerasForConfig.map(camera => camera.id));
 
@@ -608,7 +611,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         continue;
       }
 
-      if (needsPipelineRestart(existing.pipelineState, context.pipelineState)) {
+      const restartRequested = forceRestart || needsPipelineRestart(existing.pipelineState, context.pipelineState);
+
+      if (restartRequested) {
         pipelines.delete(existing.channel);
         pipelinesById.delete(existing.id);
         existing.cleanup.forEach(fn => {
@@ -688,9 +693,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     }
   };
 
-  const runSync = (config: GuardConfig) => {
+  const runSync = (config: GuardConfig, options: { forceRestart?: boolean } = {}) => {
     syncPromise = syncPromise
-      .then(() => syncPipelines(config))
+      .then(() => syncPipelines(config, options))
       .catch(error => {
         logger.error({ err: error }, 'Failed to apply camera configuration');
       });
@@ -752,7 +757,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         'Configuration rollback applied'
       );
     };
-    manager.on('error', handleConfigError);
+    handleManagerError = error => {
+      handleConfigError?.(error);
+      runSync(activeConfig, { forceRestart: true });
+    };
+    manager.on('error', handleManagerError);
   }
 
   const eventHandler = (payload: { detector?: string; source?: string }) => {
@@ -812,8 +821,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     bus.off('event', eventHandler);
     if (!injectedConfig) {
       manager.off('reload', handleReload);
-      if (handleConfigError) {
-        manager.off('error', handleConfigError);
+      if (handleManagerError) {
+        manager.off('error', handleManagerError);
       }
       stopWatching?.();
     }
@@ -876,7 +885,22 @@ function resolveCameraInput(camera: CameraConfig, videoConfig: VideoConfig) {
 }
 
 function resolveVideoChannel(videoConfig: VideoConfig, channel: string): VideoChannelConfig | undefined {
-  return videoConfig.channels?.[channel];
+  const channels = videoConfig.channels;
+  if (!channels) {
+    return undefined;
+  }
+  if (channel in channels) {
+    return channels[channel];
+  }
+  const withoutPrefix = channel.startsWith('video:') ? channel.slice('video:'.length) : channel;
+  if (withoutPrefix in channels) {
+    return channels[withoutPrefix];
+  }
+  const normalized = normalizeChannelId(channel);
+  if (normalized !== channel && normalized in channels) {
+    return channels[normalized];
+  }
+  return undefined;
 }
 
 function resolveCameraFfmpeg(
@@ -1038,6 +1062,7 @@ function resolveObjectsConfig(
 
   const threatLabels = cameraObjects?.threatLabels ?? channelObjects?.threatLabels ?? globalObjects?.threatLabels;
   const classIndices = cameraObjects?.classIndices ?? channelObjects?.classIndices ?? globalObjects?.classIndices;
+  const labelMap = cameraObjects?.labelMap ?? channelObjects?.labelMap ?? globalObjects?.labelMap;
 
   return {
     modelPath,
@@ -1045,7 +1070,8 @@ function resolveObjectsConfig(
     threatLabels: threatLabels ? [...threatLabels] : undefined,
     threatThreshold:
       cameraObjects?.threatThreshold ?? channelObjects?.threatThreshold ?? globalObjects?.threatThreshold,
-    classIndices: classIndices ? [...classIndices] : undefined
+    classIndices: classIndices ? [...classIndices] : undefined,
+    labelMap: labelMap ? { ...labelMap } : undefined
   };
 }
 
@@ -1057,7 +1083,7 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   if (!camera.channel) {
     throw new Error(`Camera "${camera.id}" is missing a channel`);
   }
-  const channel = camera.channel;
+  const channel = normalizeChannelId(camera.channel);
   const channelConfig = resolveVideoChannel(config.video, channel);
   const input = resolveCameraInput(camera, config.video);
   const framesPerSecond =
@@ -1080,10 +1106,26 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   const pose = resolvePoseConfig(config.pose, channelConfig?.pose, camera.pose);
   const objects = resolveObjectsConfig(config.objects, channelConfig?.objects, camera.objects);
 
-  const motionDefaults = channelConfig?.motion
+  const channelMotionDefaults = channelConfig?.motion
     ? resolveCameraMotion(channelConfig.motion, config.motion)
-    : config.motion;
+    : null;
+  const motionDefaults = channelMotionDefaults ?? config.motion;
   const motion = resolveCameraMotion(camera.motion, motionDefaults);
+
+  if (channelMotionDefaults) {
+    if (Number.isFinite(channelMotionDefaults.diffThreshold)) {
+      motion.diffThreshold = Math.min(
+        motion.diffThreshold,
+        channelMotionDefaults.diffThreshold
+      );
+    }
+    if (Number.isFinite(channelMotionDefaults.areaThreshold)) {
+      motion.areaThreshold = Math.min(
+        motion.areaThreshold,
+        channelMotionDefaults.areaThreshold
+      );
+    }
+  }
 
   const pipelineState: CameraPipelineState = {
     channel,
@@ -1133,7 +1175,8 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
           labels: [...objects.labels],
           threatLabels: objects.threatLabels ? [...objects.threatLabels] : undefined,
           threatThreshold: objects.threatThreshold,
-          classIndices: objects.classIndices ? [...objects.classIndices] : undefined
+          classIndices: objects.classIndices ? [...objects.classIndices] : undefined,
+          labelMap: objects.labelMap ? { ...objects.labelMap } : undefined
         }
       : null,
     light
@@ -1310,7 +1353,8 @@ function objectConfigsEqual(a?: ObjectsConfig | null, b?: ObjectsConfig | null) 
     a.threatThreshold === b.threatThreshold &&
     arrayEqual(a.labels, b.labels) &&
     arrayEqual(a.threatLabels, b.threatLabels) &&
-    arrayEqual(a.classIndices, b.classIndices)
+    arrayEqual(a.classIndices, b.classIndices) &&
+    recordsEqual(a.labelMap, b.labelMap)
   );
 }
 
@@ -1349,6 +1393,38 @@ function arrayEqual<T>(a: T[] | undefined, b: T[] | undefined) {
   return a.every((value, index) => value === b[index]);
 }
 
+function recordsEqual(
+  a: Record<string, string> | undefined,
+  b: Record<string, string> | undefined
+) {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+  const aEntries = Object.entries(a).sort(([keyA], [keyB]) => keyA.localeCompare(keyB));
+  const bEntries = Object.entries(b).sort(([keyA], [keyB]) => keyA.localeCompare(keyB));
+  if (aEntries.length !== bEntries.length) {
+    return false;
+  }
+  return aEntries.every(([key, value], index) => {
+    const [bKey, bValue] = bEntries[index];
+    return key === bKey && value === bValue;
+  });
+}
+
+function normalizeChannelId(channel: string) {
+  const trimmed = typeof channel === 'string' ? channel.trim() : '';
+  if (!trimmed) {
+    throw new Error('Camera channel is required');
+  }
+  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `video:${trimmed}`;
+}
+
 function summarizePipelineUpdates(
   runtime: CameraRuntime,
   next: ReturnType<typeof buildCameraContext>
@@ -1377,6 +1453,13 @@ function summarizePipelineUpdates(
     updates.light = {
       previous: snapshotLightConfig(runtime.pipelineState.light),
       next: snapshotLightConfig(next.pipelineState.light)
+    };
+  }
+
+  if (!objectConfigsEqual(runtime.pipelineState.objects, next.pipelineState.objects)) {
+    updates.objects = {
+      previous: snapshotObjectsConfig(runtime.pipelineState.objects),
+      next: snapshotObjectsConfig(next.pipelineState.objects)
     };
   }
 
@@ -1425,6 +1508,21 @@ function snapshotLightConfig(config: LightConfig | null | undefined) {
     noiseWarmupFrames: normalizeNumber(config.noiseWarmupFrames),
     noiseBackoffPadding: normalizeNumber(config.noiseBackoffPadding),
     normalHours: config.normalHours?.map(range => ({ ...range })) ?? null
+  };
+}
+
+function snapshotObjectsConfig(config: ObjectsConfig | null | undefined) {
+  if (!config) {
+    return null;
+  }
+
+  return {
+    modelPath: config.modelPath,
+    labels: [...config.labels],
+    threatLabels: config.threatLabels ? [...config.threatLabels] : null,
+    threatThreshold: normalizeNumber(config.threatThreshold),
+    classIndices: config.classIndices ? [...config.classIndices] : null,
+    labelMap: config.labelMap ? { ...config.labelMap } : null
   };
 }
 
@@ -1712,7 +1810,7 @@ function buildRetentionOptions(options: {
   const snapshotDirs = collectSnapshotDirectories(options.video, options.person);
   const archiveDir = retention.archiveDir ?? path.join(process.cwd(), 'archive');
   const intervalMinutes = retention.intervalMinutes ?? 60;
-  const vacuum = retention.vacuum ?? 'auto';
+  const vacuum = retention.vacuum !== undefined ? retention.vacuum : 'auto';
   const snapshot = retention.snapshot;
   const snapshotAliasLimit = resolveSnapshotGlobalLimit(snapshot);
   const maxArchives =
@@ -1730,17 +1828,18 @@ function buildRetentionOptions(options: {
     archiveDir,
     snapshotDirs,
     maxArchivesPerCamera: typeof maxArchives === 'number' ? maxArchives : undefined,
-    vacuum: typeof vacuum === 'string'
-      ? vacuum
-      : {
-          mode: vacuum.mode,
-          target: vacuum.target,
-          analyze: vacuum.analyze,
-          reindex: vacuum.reindex,
-          optimize: vacuum.optimize,
-          pragmas: vacuum.pragmas,
-          run: vacuum.run
-        },
+    vacuum:
+      typeof vacuum === 'string' || typeof vacuum === 'boolean'
+        ? vacuum
+        : {
+            mode: vacuum.mode,
+            target: vacuum.target,
+            analyze: vacuum.analyze,
+            reindex: vacuum.reindex,
+            optimize: vacuum.optimize,
+            pragmas: vacuum.pragmas,
+            run: vacuum.run
+          },
     snapshot: snapshot
       ? {
           mode: snapshot.mode,
