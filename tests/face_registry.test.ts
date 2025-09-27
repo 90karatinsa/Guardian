@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PNG } from 'pngjs';
 import FaceRegistry from '../src/video/faceRegistry.js';
 import { clearFaces } from '../src/db.js';
+import metrics from '../src/metrics/index.js';
 
 const runMock = vi.fn();
 
@@ -32,6 +33,7 @@ describe('FaceRegistryEnrollment', () => {
   beforeEach(() => {
     clearFaces();
     runMock.mockReset();
+    metrics.reset();
   });
 
   afterEach(() => {
@@ -81,6 +83,25 @@ describe('FaceRegistryEnrollment', () => {
     const removed = registry.remove(alice.id);
     expect(removed).toBe(true);
     expect(registry.list()).toHaveLength(1);
+  });
+
+  it('FaceRegistryMockSessionMetric records mock session fallback counter', async () => {
+    metrics.reset();
+    const createSpy = ort.InferenceSession.create as unknown as {
+      mockRejectedValueOnce: (value: unknown) => void;
+    };
+    createSpy.mockRejectedValueOnce(new Error('onnx-failure'));
+
+    const registry = await FaceRegistry.create({ modelPath: 'models/face.onnx', embeddingSize: 4 });
+    const snapshot = metrics.snapshot();
+    const counters = snapshot.detectors.face?.counters ?? {};
+    expect(counters['mock-session']).toBe(1);
+    expect(counters.errors).toBe(1);
+    expect(snapshot.detectors.face?.lastErrorMessage).toBe('mock-session-fallback');
+
+    const embedding = await registry.identify(createSolidFace([120, 120, 120]), 0.25);
+    expect(Array.isArray(embedding.embedding)).toBe(true);
+    expect(embedding.embedding.length).toBe(4);
   });
 });
 

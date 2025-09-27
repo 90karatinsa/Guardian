@@ -138,6 +138,8 @@ export class FaceRegistry {
       const session = await ort.InferenceSession.create(this.options.modelPath);
       this.session = session as InferenceSessionLike;
     } catch (error) {
+      metrics.incrementDetectorCounter('face', 'mock-session');
+      metrics.recordDetectorError('face', 'mock-session-fallback');
       logger.warn({ err: error, modelPath: this.options.modelPath }, 'Falling back to mock face embedding session');
       this.session = createMockSession(this.embeddingSize);
     }

@@ -218,12 +218,42 @@ guardian retention run
 guardian retention run --config config/production.json
 ```
 
+Güncel seçenekler ve yardım çıktısı aşağıdaki komutla görüntülenebilir:
+
+```text
+$ pnpm tsx src/cli.ts retention --help
+Guardian retention commands
+
+Usage:
+  guardian retention run [--config path]  Run retention once with current config
+
+Options:
+  -c, --config <path>   Use an alternate configuration file
+  -h, --help            Show this help message
+```
+
 Komut stdout’a `Retention task completed` özetini yazar ve exit kodu 0 döner; `pipelines.ffmpeg.watchdogBackoffByChannel` ve `retention.totals` alanları üzerinden metrik güncellemelerini takip edebilirsiniz. CLI son kapanış nedeni ve hook sonuçlarını da raporlar.
 
 Retention ayarlarını değiştirip dosyayı kaydettiğinizde hot reload mekanizması yeni değerleri uygular.
 
 ## Guardian'ı çalıştırma
 Guardian CLI, servis kontrolü ve sağlık kontrollerini yönetir:
+
+```text
+$ pnpm tsx src/cli.ts --help
+Guardian CLI
+
+Usage:
+  guardian start        Start the detector daemon (alias of "guardian daemon start")
+  guardian stop         Stop the running daemon (alias of "guardian daemon stop")
+  guardian status       Print service status summary
+  guardian health       Print health JSON
+  guardian ready        Print readiness JSON
+  guardian daemon <command>  Run daemon lifecycle commands
+  guardian audio <command>   Manage audio capture helpers
+  guardian log-level    Get or set the active log level
+  guardian retention run [--config path]  Run retention once with current config
+```
 
 ```bash
 # Daemon modunu başlatır (arka planda çalışır)
@@ -247,6 +277,12 @@ guardian log-level set debug
 
 # Graceful shutdown hook'larını test etmek için
 guardian daemon hooks --reason test-shutdown
+
+# Belirli bir video kanalının devre kesicisini sıfırlar
+guardian daemon restart --channel video:lobby
+
+# Bağlı mikrofonları JSON olarak listeler
+guardian audio devices --json
 
 # Graceful shutdown tetikler
 guardian stop

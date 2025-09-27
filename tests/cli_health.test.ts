@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import metrics from '../src/metrics/index.js';
+import AudioSource from '../src/audio/source.js';
 import { registerShutdownHook, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
 import logger from '../src/logger.js';
 import configManager from '../src/config/index.js';
@@ -108,7 +109,10 @@ describe('GuardianCliHealthcheck', () => {
     expect(typeof initialPayload.metrics.snapshotCapturedAt).toBe('string');
 
     const stopSpy = vi.fn();
-    startGuardMock.mockResolvedValue({ stop: stopSpy });
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+    });
     const startPromise = runCli(['start'], createTestIo().io);
 
     await vi.waitFor(() => {
@@ -190,7 +194,10 @@ describe('GuardianCliHealthcheck', () => {
     const stopSpy = vi.fn();
     const hook = vi.fn();
     registerShutdownHook('status-json-hook', hook);
-    startGuardMock.mockResolvedValue({ stop: stopSpy });
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+    });
 
     const startIo = createTestIo();
     const startPromise = runCli(['start'], startIo.io);
@@ -240,6 +247,33 @@ describe('GuardianCliHealthcheck', () => {
     expect(stopIo.stdout()).toContain('Guardian daemon is not running');
   });
 
+  it('CliDaemonRestartChannel resets circuit breakers for the requested video channel', async () => {
+    const stopSpy = vi.fn();
+    const resetSpy = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({ stop: stopSpy, resetCircuitBreaker: resetSpy });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const restartIo = createTestIo();
+    const code = await runCli(['daemon', 'restart', '--channel', 'video:lobby'], restartIo.io);
+
+    expect(code).toBe(0);
+    expect(resetSpy).toHaveBeenCalledWith('video:lobby');
+    expect(restartIo.stdout()).toContain('video:lobby');
+
+    const helpIo = createTestIo();
+    const helpCode = await runCli(['daemon', 'restart', '--help'], helpIo.io);
+    expect(helpCode).toBe(0);
+    expect(helpIo.stdout()).toContain('guardian daemon restart');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('CliSystemdIntegration reports integration manifest and matches packaged commands', async () => {
     const health = await buildHealthPayload();
     const manifest = health.integration;
@@ -277,6 +311,31 @@ describe('GuardianCliHealthcheck', () => {
     expect(dockerfile).toContain('HEALTHCHECK');
     expect(dockerfile).toContain('cli.ts --health');
     expect(dockerfile).toContain('"daemon", "start"');
+  });
+
+  it('CliAudioDevicesList returns JSON payload for detected devices', async () => {
+    const capture = createTestIo();
+    const devices = [
+      { format: 'alsa', device: 'hw:0' },
+      { format: 'alsa', device: 'default' }
+    ];
+
+    const spy = vi.spyOn(AudioSource, 'listDevices').mockResolvedValue(devices);
+
+    try {
+      const code = await runCli(['audio', 'devices', '--format', 'alsa', '--json'], capture.io);
+      expect(code).toBe(0);
+      expect(capture.stderr()).toBe('');
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith('alsa', { channel: 'cli:audio-devices' });
+
+      const payload = JSON.parse(capture.stdout().trim());
+      expect(payload.format).toBe('alsa');
+      expect(payload.devices).toEqual(devices);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
@@ -355,7 +414,10 @@ describe('GuardianCliRetention', () => {
 describe('GuardianCliShutdown', () => {
   it('CliDaemonLifecycle stops the running guard runtime and reports graceful shutdown', async () => {
     const stopSpy = vi.fn();
-    startGuardMock.mockResolvedValue({ stop: stopSpy });
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+    });
 
     const startIo = createTestIo();
     const startPromise = runCli(['start'], startIo.io);
@@ -381,7 +443,10 @@ describe('GuardianCliShutdown', () => {
       status: 'ok',
       details: { ready: true }
     }));
-    startGuardMock.mockResolvedValue({ stop: stopSpy });
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+    });
 
     const startPromise = runCli(['start'], createTestIo().io);
 

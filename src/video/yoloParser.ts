@@ -107,7 +107,7 @@ export function parseYoloDetections(
       }
 
       const projected = projectBoundingBox(cx, cy, width, height, meta);
-      const bbox = projected.box;
+      const bbox = clampBoundingBoxToFrame(projected.box, meta.originalWidth, meta.originalHeight);
 
       if (
         !isFiniteNumber(bbox.left) ||
@@ -621,6 +621,27 @@ function nonMaxSuppression(detections: YoloDetection[], threshold: number) {
   }
 
   return results;
+}
+
+function clampBoundingBoxToFrame(box: BoundingBox, frameWidth: number, frameHeight: number): BoundingBox {
+  const maxWidth = Number.isFinite(frameWidth) && frameWidth > 0 ? frameWidth : null;
+  const maxHeight = Number.isFinite(frameHeight) && frameHeight > 0 ? frameHeight : null;
+
+  if (maxWidth === null || maxHeight === null) {
+    return { ...box };
+  }
+
+  const right = clamp(box.left + box.width, 0, maxWidth);
+  const bottom = clamp(box.top + box.height, 0, maxHeight);
+  const left = clamp(box.left, 0, maxWidth);
+  const top = clamp(box.top, 0, maxHeight);
+
+  return {
+    left,
+    top,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top)
+  };
 }
 
 function intersectionOverUnion(a: BoundingBox, b: BoundingBox) {
