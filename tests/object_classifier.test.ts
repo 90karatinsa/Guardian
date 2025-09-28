@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import ObjectClassifier from '../src/video/objectClassifier.js';
 import PersonDetector from '../src/video/personDetector.js';
-import { YOLO_CLASS_START_INDEX } from '../src/video/yoloParser.js';
+import { YOLO_CLASS_START_INDEX, parseYoloDetections } from '../src/video/yoloParser.js';
 
 const runMocks = new Map<string, ReturnType<typeof vi.fn>>();
 
@@ -275,6 +275,84 @@ describe('ObjectClassifierThreatScoring', () => {
     expect(object.rawLabel).toBe('threat');
     expect(object.probabilities.intruder).toBeCloseTo(object.score, 5);
     expect(object.rawProbabilities.threat).toBeGreaterThan(0);
+  });
+
+  it('YoloParserAppliesClassThresholds filters detections below class-specific thresholds', () => {
+    const classCount = 3;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    setDetection(data, detections, 0, {
+      cx: 0.52,
+      cy: 0.5,
+      width: 0.46,
+      height: 0.68,
+      objectnessLogit: 2.3,
+      personLogit: -0.2,
+      class1Logit: -1.8,
+      class2Logit: -2.2
+    });
+
+    setDetection(data, detections, 1, {
+      cx: 0.48,
+      cy: 0.46,
+      width: 0.52,
+      height: 0.7,
+      objectnessLogit: 2.6,
+      personLogit: 2.1,
+      class1Logit: -2.4,
+      class2Logit: -2.1
+    });
+
+    const tensor = { data, dims: [1, attributes, detections] } as unknown as import('onnxruntime-node').OnnxValue;
+
+    const meta = {
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      padX: 0,
+      padY: 0,
+      scale: 1,
+      scaleX: 1,
+      scaleY: 1,
+      variants: [
+        {
+          originalWidth: 640,
+          originalHeight: 480,
+          resizedWidth: 640,
+          resizedHeight: 640,
+          padX: 18,
+          padY: 32,
+          scale: 1,
+          scaleX: 1,
+          scaleY: 1,
+          normalized: true
+        }
+      ]
+    } satisfies import('../src/video/yoloParser.js').PreprocessMeta;
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0],
+      classScoreThresholds: { 0: 0.6 },
+      nmsThreshold: 0.45,
+      maxDetections: 5
+    });
+
+    expect(results).toHaveLength(1);
+    const detection = results[0];
+    expect(detection.classId).toBe(0);
+    expect(detection.score).toBeGreaterThanOrEqual(0.6);
+    expect(detection.appliedThreshold).toBeCloseTo(0.6, 3);
+    expect(detection.bbox.width).toBeGreaterThan(0);
+    expect(detection.bbox.height).toBeGreaterThan(0);
+    expect(detection.bbox.left).toBeGreaterThanOrEqual(0);
+    expect(detection.bbox.top).toBeGreaterThanOrEqual(0);
+    expect(detection.bbox.left + detection.bbox.width).toBeLessThanOrEqual(640);
+    expect(detection.bbox.top + detection.bbox.height).toBeLessThanOrEqual(480);
+    expect(detection.projectionIndex).not.toBeUndefined();
+    expect(detection.normalizedProjection).toBe(true);
   });
 });
 

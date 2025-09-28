@@ -11,6 +11,8 @@ nasıl yararlanacağınızı adım adım anlatır.
 - `guardian daemon ready` komutu, SSE ve HTTP API uçlarının trafik kabul etmeye hazır olup olmadığını bildirir.
 - `guardian daemon status --json` çıktısında `pipelines.ffmpeg.watchdogRestartsByChannel` ve
   `pipelines.audio.watchdogRestartsByChannel` metrikleri ile hangi kameranın yeniden başlatma döngüsüne girdiğini belirleyin.
+- Docker ya da systemd ortamında healthcheck scriptini test etmek için `pnpm tsx scripts/healthcheck.ts --health` ve `--ready`
+  seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler.
 
 ## Periyodik bakım görevleri
 - RTSP veya ffmpeg kaynaklı bağlantı sorunları için `guardian daemon hooks --reason watchdog-reset` komutunu kullanarak devre
@@ -24,7 +26,8 @@ nasıl yararlanacağınızı adım adım anlatır.
 - `guardian log-level get` ve `guardian log-level set warn` komutlarıyla log seviyesini değiştirirken, `guardian daemon health`
   çıktısındaki `metrics.logs.byLevel` ve `metrics.logs.histogram` alanlarını izleyin.
 - Prometheus dışa aktarımı için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';\nconsole.log(metrics.exportLogLevelCountersForPrometheus({ labels: { site: 'edge-1' } }));"` komutu ile `guardian_log_level_total`
-  ve `guardian_log_last_error_timestamp_seconds` gauge değerlerini doğrudan gözlemleyin.
+  ve `guardian_log_last_error_timestamp_seconds` gauge değerlerini doğrudan gözlemleyin. Aynı çıktıda `guardian_log_level_state`
+  ve `guardian_log_level_change_total` satırları, log seviyesi değişimlerinin ne kadar sık gerçekleştiğini gösterir.
 - Prometheus entegrasyonları için `metrics.exportDetectorLatencyHistogram('motion')` çıktısını `pnpm exec tsx` üzerinden
   alabilir, histogram buckets ile dedektör gecikme dağılımını inceleyebilirsiniz.
 - Pipeline geri kazanım analizinde `metrics.exportPipelineRestartHistogram('ffmpeg', 'jitter', { metricName: 'guardian_ffmpeg_restart_jitter_ms' })`
@@ -34,6 +37,12 @@ nasıl yararlanacağınızı adım adım anlatır.
   takip ederken hangi kameraların desteklenmesi gerektiğini anlamanıza yardımcı olur.
 
 ## Sorun giderme
+| Belirti | Muhtemel neden | Önerilen komut |
+| --- | --- | --- |
+| `status: "degraded"` ya da `logs.byLevel.error` artışı | Dedektör hatası veya uzun süreli devre kesici gecikmeleri | `pnpm tsx scripts/healthcheck.ts --health` ve `guardian log-level set debug` |
+| `watchdogRestartsByChannel` artıyor | RTSP jitter veya ağ kopması | `guardian daemon restart --channel video:<kanal>` ve `guardian daemon status --json` |
+| `Audio source recovering (reason=ffmpeg-missing)` sürüyor | Mikrofon fallback zinciri başarısız | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
+
 - `guardian health --verbose` ile tüm sağlık kontrollerinin ayrıntılı sonuçlarını gözden geçirin. Özellikle `suppression` ve
   `retention` bölümlerindeki uyarılar yanlış pozitifleri azaltmak veya disk kullanımını kontrol etmek için kritik ipuçları
   sağlar.

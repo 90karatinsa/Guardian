@@ -718,6 +718,164 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('GuardReloadUpdatesChannelThresholds applies channel overrides on reload', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        ffmpeg: {
+          restartDelayMs: 200,
+          restartMaxDelayMs: 900,
+          restartJitterFactor: 0.1,
+          watchdogTimeoutMs: 8000,
+          forceKillTimeoutMs: 2200
+        },
+        channels: {
+          'video:cam-1': {
+            ffmpeg: {
+              restartDelayMs: 320,
+              watchdogTimeoutMs: 10500
+            },
+            motion: { debounceFrames: 2, backoffFrames: 4 }
+          },
+          'video:cam-2': {
+            ffmpeg: {
+              restartDelayMs: 260,
+              idleTimeoutMs: 6400
+            },
+            motion: { debounceFrames: 3, backoffFrames: 5 }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1/stream',
+            ffmpeg: { rtspTransport: 'tcp' },
+            person: { score: 0.5 },
+            motion: { diffThreshold: 18, areaThreshold: 0.021 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://cam-2/stream',
+            person: { score: 0.55 },
+            motion: { diffThreshold: 20, areaThreshold: 0.018 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 },
+      events: { thresholds: { info: 0, warning: 5, critical: 10 } }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const bus = new EventEmitter();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2, 4000);
+
+      const getPipelineSources = () => {
+        const first = runtime.pipelines.get('video:cam-1');
+        const second = runtime.pipelines.get('video:cam-2');
+        return [first, second] as const;
+      };
+
+      manager.setConfig({
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          channels: {
+            'video:cam-1': {
+              ffmpeg: {
+                restartDelayMs: 450,
+                restartMaxDelayMs: 1400,
+                watchdogTimeoutMs: 13200,
+                forceKillTimeoutMs: 2800
+              },
+              motion: { debounceFrames: 7, backoffFrames: 6 }
+            },
+            'video:cam-2': {
+              ffmpeg: {
+                restartDelayMs: 310,
+                restartMaxDelayMs: 1500,
+                idleTimeoutMs: 7000,
+                watchdogTimeoutMs: 9600
+              },
+              motion: { debounceFrames: 5, backoffFrames: 9 }
+            }
+          }
+        }
+      } as GuardianConfig);
+
+      await waitFor(() => {
+        const [nextPipeline1, nextPipeline2] = getPipelineSources();
+        return Boolean(nextPipeline1 && nextPipeline2);
+      });
+
+      const [pipeline1, pipeline2] = getPipelineSources();
+      expect(pipeline1).toBeDefined();
+      expect(pipeline2).toBeDefined();
+
+      const source1 = pipeline1!.source as MockVideoSource;
+      const source2 = pipeline2!.source as MockVideoSource;
+
+      await waitFor(() => source1.updateOptions.mock.calls.length > 0);
+      await waitFor(() => source2.updateOptions.mock.calls.length > 0);
+
+      expect(MockVideoSource.instances.length).toBe(2);
+
+      expect(source1.updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({
+          watchdogTimeoutMs: 13200,
+          restartDelayMs: 450,
+          restartMaxDelayMs: 1400,
+          forceKillTimeoutMs: 2800
+        })
+      );
+      expect(source2.updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({
+          watchdogTimeoutMs: 9600,
+          restartDelayMs: 310,
+          restartMaxDelayMs: 1500,
+          idleTimeoutMs: 7000
+        })
+      );
+      expect(source1.options).toMatchObject({
+        watchdogTimeoutMs: 13200,
+        restartDelayMs: 450,
+        restartMaxDelayMs: 1400,
+        forceKillTimeoutMs: 2800
+      });
+      expect(source2.options).toMatchObject({
+        watchdogTimeoutMs: 9600,
+        restartDelayMs: 310,
+        restartMaxDelayMs: 1500,
+        idleTimeoutMs: 7000
+      });
+
+      const motion1 = pipeline1!.motionDetector as MockMotionDetector;
+      const motion2 = pipeline2!.motionDetector as MockMotionDetector;
+
+      expect(motion1.updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({ debounceFrames: 7, backoffFrames: 6 })
+      );
+      expect(motion2.updateOptions).toHaveBeenCalledWith(
+        expect.objectContaining({ debounceFrames: 5, backoffFrames: 9 })
+      );
+    } finally {
+      runtime.stop();
+    }
+  }, 10000);
+
   it('RunGuardRemovesCameraPipeline clears channel state and metrics when cameras disappear', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 

@@ -66,6 +66,7 @@ const logger = pino({
 });
 
 let currentLevel = logger.level;
+metrics.recordLogLevelChange(currentLevel, currentLevel);
 
 function normalizeLevel(value: string) {
   return value.trim().toLowerCase();
@@ -96,6 +97,7 @@ export function setLogLevel(nextLevel: string): string {
 
   logger.level = normalized as pino.LevelWithSilent;
   currentLevel = logger.level;
+  metrics.recordLogLevelChange(currentLevel, previous);
   levelEvents.emit('change', currentLevel, previous);
   logger.info({ level: currentLevel }, 'Log level updated');
   return currentLevel;

@@ -13,6 +13,7 @@ const previewFaceCaption = document.getElementById('preview-face-caption');
 const streamState = document.getElementById('stream-state');
 const streamHeartbeats = document.getElementById('stream-heartbeats');
 const streamEvents = document.getElementById('stream-events');
+const streamSnapshots = document.getElementById('stream-snapshots');
 const streamUpdated = document.getElementById('stream-updated');
 const streamHealth = document.getElementById('stream-health');
 const poseConfidence = document.getElementById('pose-confidence');
@@ -67,6 +68,7 @@ const state = {
   stream: {
     heartbeats: 0,
     events: 0,
+    snapshots: 0,
     lastUpdate: null,
     status: 'connecting',
     health: 'Unknown'
@@ -445,6 +447,9 @@ function updateStreamWidget() {
   if (streamEvents) {
     streamEvents.textContent = String(state.stream.events);
   }
+  if (streamSnapshots) {
+    streamSnapshots.textContent = String(state.stream.snapshots);
+  }
   if (streamUpdated) {
     streamUpdated.textContent = state.stream.lastUpdate
       ? new Date(state.stream.lastUpdate).toLocaleTimeString()
@@ -496,6 +501,7 @@ function setConnectionState(status) {
 function resetStreamStats() {
   state.stream.heartbeats = 0;
   state.stream.events = 0;
+  state.stream.snapshots = 0;
   state.stream.lastUpdate = null;
   setHealthStatus('Unknown');
   updateStreamWidget();
@@ -510,6 +516,11 @@ function recordHeartbeat(timestamp) {
 function recordStreamEvent(timestamp) {
   state.stream.events += 1;
   state.stream.lastUpdate = typeof timestamp === 'number' ? timestamp : Date.now();
+  updateStreamWidget();
+}
+
+function recordSnapshotEvent() {
+  state.stream.snapshots += 1;
   updateStreamWidget();
 }
 
@@ -1524,6 +1535,8 @@ function subscribe() {
   const params = buildQueryParams();
   params.set('retry', String(state.reconnectDelayMs));
   params.set('faces', '1');
+  params.set('snapshots', '1');
+  params.set('snapshotLimit', '10');
   const source = new EventSource(`/api/events/stream?${params.toString()}`);
   state.eventSource = source;
 
@@ -1604,6 +1617,10 @@ function subscribe() {
       const payload = JSON.parse(event.data);
       const keyed = insertEvent(payload);
       recordStreamEvent(typeof payload?.ts === 'number' ? payload.ts : Date.now());
+      const meta = payload?.meta ?? {};
+      if (meta && (meta.snapshotUrl || meta.faceSnapshotUrl || meta.snapshot)) {
+        recordSnapshotEvent();
+      }
       if (!state.activeId && matchesFilters(keyed)) {
         setActiveEvent(keyed.__key);
       }

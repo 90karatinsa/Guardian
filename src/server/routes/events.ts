@@ -34,6 +34,11 @@ type MetricsSelection = {
   pipelines: Set<'ffmpeg' | 'audio'>;
 };
 
+type SnapshotSelection = {
+  enabled: boolean;
+  historyLimit: number;
+};
+
 type ClientState = {
   heartbeat: NodeJS.Timeout;
   filters: StreamFilters;
@@ -41,6 +46,7 @@ type ClientState = {
   includeFaces: boolean;
   facesQuery: string | null;
   metricsFilter: MetricsSelection;
+  snapshots: SnapshotSelection;
 };
 
 const DEFAULT_FACE_THRESHOLD = 0.5;
@@ -90,8 +96,8 @@ export class EventsRouter {
 
   close() {
     this.bus.off('event', this.handleBusEvent);
-    for (const [client, timer] of this.clients) {
-      clearInterval(timer);
+    for (const [client, state] of this.clients) {
+      clearInterval(state.heartbeat);
       client.end();
     }
     this.clients.clear();
@@ -205,6 +211,7 @@ export class EventsRouter {
     const retryMs = resolveRetryInterval(url.searchParams);
     const facesRequest = resolveFacesRequest(url.searchParams);
     const metricsFilter = resolveMetricsSelection(url.searchParams);
+    const snapshotRequest = resolveSnapshotRequest(url.searchParams);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -235,6 +242,8 @@ export class EventsRouter {
       res.write(`data: ${JSON.stringify(initialDigest)}\n\n`);
     }
 
+    this.sendHeartbeat(res);
+
     const heartbeat = setInterval(() => {
       if (res.writableEnded) {
         clearInterval(heartbeat);
@@ -242,10 +251,7 @@ export class EventsRouter {
         return;
       }
 
-      try {
-        res.write(`event: heartbeat\n`);
-        res.write(`data: ${JSON.stringify({ ts: Date.now() })}\n\n`);
-      } catch (error) {
+      if (!this.sendHeartbeat(res)) {
         clearInterval(heartbeat);
         this.clients.delete(res);
       }
@@ -257,11 +263,16 @@ export class EventsRouter {
       retryMs,
       includeFaces: facesRequest.includeFaces,
       facesQuery: facesRequest.query,
-      metricsFilter
+      metricsFilter,
+      snapshots: snapshotRequest
     });
 
     if (facesRequest.includeFaces) {
       void this.pushFacesSnapshot(res, facesRequest.query, filters.channels);
+    }
+
+    if (snapshotRequest.enabled) {
+      void this.pushSnapshotHistory(res, filters, snapshotRequest);
     }
 
     const cleanup = () => {
@@ -523,6 +534,20 @@ export class EventsRouter {
     sendJson(res, 503, { error: 'Face registry unavailable' });
   }
 
+  private sendHeartbeat(res: ServerResponse): boolean {
+    if (res.writableEnded) {
+      return false;
+    }
+
+    try {
+      res.write(`event: heartbeat\n`);
+      res.write(`data: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
   private async pushFacesSnapshot(target: ServerResponse, query: string | null, channels?: string[]) {
     const registry = await this.ensureFaceRegistry();
     if (!registry) {
@@ -556,6 +581,41 @@ export class EventsRouter {
       );
     } catch (error) {
       logger.debug({ err: error }, 'Failed to dispatch faces snapshot');
+    }
+  }
+
+  private async pushSnapshotHistory(
+    target: ServerResponse,
+    filters: StreamFilters,
+    request: SnapshotSelection
+  ): Promise<void> {
+    if (!request.enabled || request.historyLimit <= 0 || target.writableEnded) {
+      return;
+    }
+
+    const options: ListEventsOptions = {
+      ...filters,
+      snapshot: 'with',
+      limit: request.historyLimit,
+      offset: 0
+    };
+
+    try {
+      const history = listEvents(options);
+      if (!history.items.length) {
+        return;
+      }
+
+      const ordered = history.items.slice().reverse();
+      for (const entry of ordered) {
+        if (target.writableEnded) {
+          return;
+        }
+        const formatted = formatEventForClient(entry);
+        target.write(`data: ${JSON.stringify(formatted)}\n\n`);
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'Failed to stream snapshot history');
     }
   }
 
@@ -1065,6 +1125,25 @@ function resolveFacesRequest(params: URLSearchParams): { includeFaces: boolean; 
   }
 
   return { includeFaces: true, query: normalized };
+}
+
+function resolveSnapshotRequest(params: URLSearchParams): SnapshotSelection {
+  const raw = params.get('snapshots') ?? params.get('snapshotStream');
+  if (!raw) {
+    return { enabled: false, historyLimit: 0 };
+  }
+
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized || ['0', 'false', 'no', 'off', 'none'].includes(normalized)) {
+    return { enabled: false, historyLimit: 0 };
+  }
+
+  const limitParam =
+    params.get('snapshotLimit') ?? params.get('snapshotsLimit') ?? params.get('history') ?? params.get('snapshotsHistory');
+  const parsedLimit = limitParam ? Number(limitParam) : NaN;
+  const defaultLimit = 10;
+  const limit = Number.isFinite(parsedLimit) ? Math.max(0, Math.min(Math.floor(parsedLimit), 100)) : defaultLimit;
+  return { enabled: true, historyLimit: limit };
 }
 
 function parseChannelParams(params: URLSearchParams): string[] {

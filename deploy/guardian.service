@@ -9,7 +9,7 @@ Environment=GUARDIAN_CONFIG=/etc/guardian/config.json
 Environment=GUARDIAN_DATA_DIR=/var/lib/guardian
 Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
-ExecStartPre=/usr/bin/env pnpm exec tsx src/cli.ts --health
+ExecStartPre=/usr/bin/env pnpm exec tsx scripts/healthcheck.ts --health
 ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start
 ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts daemon status --json
 ExecStop=/usr/bin/env pnpm exec tsx src/cli.ts daemon stop

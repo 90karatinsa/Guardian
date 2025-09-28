@@ -53,6 +53,7 @@ export class LightDetector {
   private sustainedNoiseBoost = 1;
   private lastDenoiseStrategy = 'gaussian-median';
   private noiseWarmupRemaining: number;
+  private baseNoiseBackoffPadding: number;
   private noiseBackoffPadding: number;
   private rebaselineFramesRemaining = 0;
 
@@ -62,7 +63,8 @@ export class LightDetector {
       normalHours: options.normalHours?.map(range => ({ ...range }))
     };
     this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
-    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.baseNoiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
   }
 
   updateOptions(options: Partial<Omit<LightDetectorOptions, 'source'>>) {
@@ -110,10 +112,13 @@ export class LightDetector {
     }
 
     if (backoffPaddingChanged) {
-      this.noiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
+      this.baseNoiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
+      this.noiseBackoffPadding = Math.max(this.noiseBackoffPadding, this.baseNoiseBackoffPadding);
       const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
-      const paddedBackoff = baseBackoff + this.noiseBackoffPadding;
+      const padding = Math.max(0, Math.round(this.noiseBackoffPadding));
+      const paddedBackoff = baseBackoff + padding;
       this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
+      this.updatePendingSuppressedGauge();
     }
 
     if (baselineResetNeeded) {
@@ -280,7 +285,7 @@ export class LightDetector {
 
       const debounceMultiplier = clamp(noiseSuppressionFactor, 1, 1.5);
       const sustainedDebounceMultiplier = Math.max(1, this.sustainedNoiseBoost);
-      const effectiveDebounce = Math.max(
+      const baseEffectiveDebounce = Math.max(
         baseDebounce,
         Math.round(baseDebounce * debounceMultiplier * sustainedDebounceMultiplier)
       );
@@ -293,7 +298,13 @@ export class LightDetector {
         baseBackoff,
         Math.round(baseBackoff * backoffMultiplier * Math.max(1, this.sustainedNoiseBoost * 1.05))
       );
-      const effectiveBackoff = dynamicBackoff + this.noiseBackoffPadding;
+      const { backoffPadding, debouncePadding } = this.adjustNoiseBackoffPadding(
+        noiseWindowPressure,
+        dynamicBackoff,
+        baseEffectiveDebounce
+      );
+      const effectiveDebounce = baseEffectiveDebounce + debouncePadding;
+      const effectiveBackoff = dynamicBackoff + backoffPadding;
 
       metrics.setDetectorGauge('light', 'effectiveDebounceFrames', effectiveDebounce);
       metrics.setDetectorGauge('light', 'effectiveBackoffFrames', effectiveBackoff);
@@ -472,6 +483,47 @@ export class LightDetector {
     }
   }
 
+  private adjustNoiseBackoffPadding(
+    noiseWindowPressure: number,
+    dynamicBackoff: number,
+    baseEffectiveDebounce: number
+  ) {
+    const basePadding = this.baseNoiseBackoffPadding;
+    const suppressedBudget = this.suppressedFrames + this.pendingSuppressedFramesBeforeTrigger;
+    const pressureInfluence = Math.max(0, noiseWindowPressure - 0.25);
+    const pressureTarget = pressureInfluence * (dynamicBackoff + baseEffectiveDebounce);
+    const suppressionTarget = suppressedBudget > 0
+      ? Math.min(suppressedBudget, dynamicBackoff + Math.floor(baseEffectiveDebounce / 2))
+      : 0;
+    const targetPadding = Math.max(
+      basePadding,
+      Math.min(
+        basePadding + Math.round(pressureTarget * 0.6) + Math.round(suppressionTarget * 0.3),
+        basePadding + Math.round((dynamicBackoff + baseEffectiveDebounce) * 0.5)
+      )
+    );
+    const smoothing = noiseWindowPressure > 0.5 ? 0.45 : noiseWindowPressure > 0.3 ? 0.3 : 0.2;
+    const blended = Math.max(
+      basePadding,
+      Math.round(this.noiseBackoffPadding * (1 - smoothing) + targetPadding * smoothing)
+    );
+    const shouldDecay = noiseWindowPressure < 0.15 && suppressedBudget === 0;
+    this.noiseBackoffPadding = shouldDecay
+      ? Math.max(basePadding, Math.round(blended * 0.85))
+      : blended;
+
+    const backoffPadding = Math.max(0, Math.round(this.noiseBackoffPadding));
+    const debouncePadding = Math.max(
+      0,
+      Math.min(
+        backoffPadding,
+        Math.round(backoffPadding * (noiseWindowPressure >= 0.45 ? 0.7 : noiseWindowPressure * 0.85))
+      )
+    );
+
+    return { backoffPadding, debouncePadding } as const;
+  }
+
   private updateBaseline(luminance: number, smoothing: number) {
     if (this.baseline === null) {
       this.baseline = luminance;
@@ -507,7 +559,8 @@ export class LightDetector {
     if (!preserveWarmup) {
       this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
     }
-    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.baseNoiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
     this.rebaselineFramesRemaining = 0;
     metrics.setDetectorGauge('light', 'noiseWindowBoost', this.sustainedNoiseBoost);
     metrics.setDetectorGauge('light', 'rebaselineCountdown', 0);

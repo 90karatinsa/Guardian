@@ -150,7 +150,7 @@ export function parseYoloDetections(
         }
 
         const combinedLogit = objectnessLogit + classLogit;
-        const score = clamp(sigmoid(combinedLogit), 0, 1);
+        const score = clamp(objectness * classProbability, 0, 1);
 
         const threshold = resolveThreshold(classId);
         if (score < threshold) {

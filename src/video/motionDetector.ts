@@ -78,6 +78,7 @@ export class MotionDetector {
   private readonly areaWindow: number[] = [];
   private sustainedNoiseBoost = 1;
   private noiseWarmupRemaining: number;
+  private baseNoiseBackoffPadding: number;
   private noiseBackoffPadding: number;
   private rebaselineFramesRemaining = 0;
 
@@ -86,7 +87,9 @@ export class MotionDetector {
     private readonly bus: EventEmitter = eventBus
   ) {
     this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
-    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.baseNoiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
+    this.updateSuppressedGauge();
   }
 
   updateOptions(options: Partial<Omit<MotionDetectorOptions, 'source'>>) {
@@ -126,9 +129,11 @@ export class MotionDetector {
     }
 
     if (backoffPaddingChanged) {
-      this.noiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
+      this.baseNoiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
+      this.noiseBackoffPadding = Math.max(this.noiseBackoffPadding, this.baseNoiseBackoffPadding);
       const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
-      const paddedBackoff = baseBackoff + this.noiseBackoffPadding;
+      const padding = Math.max(0, Math.round(this.noiseBackoffPadding));
+      const paddedBackoff = baseBackoff + padding;
       this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
       if (this.pendingSuppressedFramesBeforeTrigger > 0) {
         this.pendingSuppressedFramesBeforeTrigger = Math.min(
@@ -136,6 +141,7 @@ export class MotionDetector {
           paddedBackoff
         );
       }
+      this.updateSuppressedGauge();
     }
 
     if (referenceResetNeeded) {
@@ -274,33 +280,6 @@ export class MotionDetector {
       metrics.setDetectorGauge('motion', 'noiseWindowPressure', noiseWindowPressure);
       metrics.setDetectorGauge('motion', 'noiseWindowBoost', this.sustainedNoiseBoost);
 
-      const shouldScheduleRebaseline =
-        this.noiseWarmupRemaining === 0 &&
-        (noiseWindowPressure > 0.55 || this.sustainedNoiseBoost >= 1.8);
-
-      if (shouldScheduleRebaseline && this.rebaselineFramesRemaining === 0) {
-        const baseWindow = Math.max(
-          effectiveDebounceFrames + effectiveBackoffFrames,
-          Math.round(NOISE_WINDOW_SIZE * 0.6)
-        );
-        this.rebaselineFramesRemaining = baseWindow;
-      }
-
-      if (this.rebaselineFramesRemaining > 0) {
-        const decay = shouldScheduleRebaseline ? 1 : 2;
-        this.rebaselineFramesRemaining = Math.max(0, this.rebaselineFramesRemaining - decay);
-        metrics.setDetectorGauge('motion', 'rebaselineCountdown', this.rebaselineFramesRemaining);
-        if (this.rebaselineFramesRemaining === 0 && shouldScheduleRebaseline) {
-          this.resetAdaptiveState({ preserveWarmup: true });
-          metrics.incrementDetectorCounter('motion', 'adaptiveRebaselines', 1);
-          metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
-          metrics.setDetectorGauge('motion', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
-          return;
-        }
-      } else {
-        metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
-      }
-
       const dynamicDiffThreshold = Math.max(diffThreshold, updatedNoiseFloor * noiseMultiplier);
       const adaptiveDiffThreshold = clamp(
         dynamicDiffThreshold * noiseSuppressionFactor,
@@ -374,7 +353,7 @@ export class MotionDetector {
       );
       const relaxationMultiplier = normalizedAreaTrend < 0 ? 1.15 : 1;
       const sustainedDebounceMultiplier = Math.max(1, this.sustainedNoiseBoost);
-      const effectiveDebounceFrames = Math.max(
+      const baseEffectiveDebounce = Math.max(
         baseDebounce,
         Math.round(
           baseDebounce * debounceMultiplier * relaxationMultiplier * sustainedDebounceMultiplier
@@ -393,7 +372,40 @@ export class MotionDetector {
         baseBackoff,
         Math.round(baseBackoff * backoffMultiplier * sustainedBackoffMultiplier)
       );
-      const effectiveBackoffFrames = dynamicBackoffFrames + this.noiseBackoffPadding;
+      const { backoffPadding, debouncePadding } = this.adjustNoiseBackoffPadding(
+        noiseWindowPressure,
+        dynamicBackoffFrames,
+        baseEffectiveDebounce
+      );
+      const effectiveDebounceFrames = baseEffectiveDebounce + debouncePadding;
+      const effectiveBackoffFrames = dynamicBackoffFrames + backoffPadding;
+
+      const shouldScheduleRebaseline =
+        this.noiseWarmupRemaining === 0 &&
+        (noiseWindowPressure > 0.55 || this.sustainedNoiseBoost >= 1.8);
+
+      if (shouldScheduleRebaseline && this.rebaselineFramesRemaining === 0) {
+        const baseWindow = Math.max(
+          effectiveDebounceFrames + effectiveBackoffFrames,
+          Math.round(NOISE_WINDOW_SIZE * 0.6)
+        );
+        this.rebaselineFramesRemaining = baseWindow;
+      }
+
+      if (this.rebaselineFramesRemaining > 0) {
+        const decay = shouldScheduleRebaseline ? 1 : 2;
+        this.rebaselineFramesRemaining = Math.max(0, this.rebaselineFramesRemaining - decay);
+        metrics.setDetectorGauge('motion', 'rebaselineCountdown', this.rebaselineFramesRemaining);
+        if (this.rebaselineFramesRemaining === 0 && shouldScheduleRebaseline) {
+          this.resetAdaptiveState({ preserveWarmup: true });
+          metrics.incrementDetectorCounter('motion', 'adaptiveRebaselines', 1);
+          metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
+          metrics.setDetectorGauge('motion', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+          return;
+        }
+      } else {
+        metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
+      }
 
       metrics.setDetectorGauge('motion', 'effectiveDebounceFrames', effectiveDebounceFrames);
       metrics.setDetectorGauge('motion', 'effectiveBackoffFrames', effectiveBackoffFrames);
@@ -427,6 +439,7 @@ export class MotionDetector {
         }
         this.suppressedFrames += 1;
         metrics.incrementDetectorCounter('motion', 'suppressedFrames', 1);
+        this.updateSuppressedGauge();
         historyEntry.suppressed = true;
         historyEntry.reason = 'warmup';
         historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
@@ -443,6 +456,7 @@ export class MotionDetector {
         }
         this.suppressedFrames += 1;
         metrics.incrementDetectorCounter('motion', 'suppressedFrames', 1);
+        this.updateSuppressedGauge();
         historyEntry.suppressed = true;
         historyEntry.reason = 'insufficient-area';
         historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
@@ -459,6 +473,7 @@ export class MotionDetector {
           'suppressedFramesBeforeTrigger',
           suppressedFramesSnapshot
         );
+        this.updateSuppressedGauge();
         historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
       }
 
@@ -488,6 +503,7 @@ export class MotionDetector {
       if (ts - this.lastEventTs < (this.options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS)) {
         const cooldownPending = this.pendingSuppressedFramesBeforeTrigger;
         this.pendingSuppressedFramesBeforeTrigger = 0;
+        this.updateSuppressedGauge();
         historyEntry.suppressed = true;
         historyEntry.reason = 'cooldown';
         historyEntry.pendingBeforeTrigger = cooldownPending;
@@ -501,6 +517,7 @@ export class MotionDetector {
 
       const suppressedFramesBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
       this.pendingSuppressedFramesBeforeTrigger = 0;
+      this.updateSuppressedGauge();
 
       historyEntry.triggered = true;
       historyEntry.suppressed = false;
@@ -564,6 +581,50 @@ export class MotionDetector {
     }
   }
 
+  private adjustNoiseBackoffPadding(
+    noiseWindowPressure: number,
+    dynamicBackoffFrames: number,
+    baseEffectiveDebounce: number
+  ) {
+    const basePadding = this.baseNoiseBackoffPadding;
+    const suppressedBudget = this.suppressedFrames + this.pendingSuppressedFramesBeforeTrigger;
+    const pressureInfluence = Math.max(0, noiseWindowPressure - 0.2);
+    const pressureTarget = pressureInfluence * (dynamicBackoffFrames + baseEffectiveDebounce);
+    const suppressionTarget = suppressedBudget > 0
+      ? Math.min(suppressedBudget, dynamicBackoffFrames + baseEffectiveDebounce)
+      : 0;
+    const pressureContribution = Math.round(pressureTarget * 0.6);
+    const suppressionContribution = Math.round(suppressionTarget * 0.25);
+    const minimumBoost = pressureInfluence > 0 ? 1 : 0;
+    const targetPadding = Math.max(
+      basePadding,
+      Math.min(
+        basePadding + Math.max(pressureContribution + suppressionContribution, minimumBoost),
+        basePadding + Math.round((dynamicBackoffFrames + baseEffectiveDebounce) * 0.6)
+      )
+    );
+    const smoothing = noiseWindowPressure > 0.6 ? 0.5 : noiseWindowPressure > 0.45 ? 0.35 : 0.2;
+    const blended = Math.max(
+      basePadding,
+      Math.round(this.noiseBackoffPadding * (1 - smoothing) + targetPadding * smoothing)
+    );
+    const shouldDecay = noiseWindowPressure < 0.2 && suppressedBudget === 0;
+    this.noiseBackoffPadding = shouldDecay
+      ? Math.max(basePadding, Math.round(blended * 0.85))
+      : blended;
+
+    const backoffPadding = Math.max(0, Math.round(this.noiseBackoffPadding));
+    const debouncePadding = Math.max(
+      0,
+      Math.min(
+        backoffPadding,
+        Math.round(backoffPadding * (noiseWindowPressure >= 0.5 ? 0.75 : noiseWindowPressure * 0.9))
+      )
+    );
+
+    return { backoffPadding, debouncePadding } as const;
+  }
+
   private resetAdaptiveState(
     options: {
       preserveReference?: boolean;
@@ -593,11 +654,13 @@ export class MotionDetector {
     if (!preserveSuppression) {
       this.suppressedFrames = 0;
       this.pendingSuppressedFramesBeforeTrigger = 0;
+      this.updateSuppressedGauge();
     }
     if (!preserveWarmup) {
       this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
     }
-    this.noiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.baseNoiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
+    this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
     this.lastDenoiseStrategy = 'gaussian-median';
     this.rebaselineFramesRemaining = 0;
     metrics.setDetectorGauge('motion', 'rebaselineCountdown', 0);
@@ -608,6 +671,14 @@ export class MotionDetector {
     if (this.motionHistory.length > MAX_HISTORY_SIZE) {
       this.motionHistory.splice(0, this.motionHistory.length - MAX_HISTORY_SIZE);
     }
+  }
+
+  private updateSuppressedGauge() {
+    metrics.setDetectorGauge(
+      'motion',
+      'pendingSuppressedFramesBeforeTrigger',
+      this.pendingSuppressedFramesBeforeTrigger + this.suppressedFrames
+    );
   }
 
   private getHistorySnapshot(limit: number) {

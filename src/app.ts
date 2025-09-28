@@ -72,11 +72,13 @@ const healthIndicators: RegisteredIndicator[] = [];
 const shutdownHooks: RegisteredHook[] = [];
 
 const CLI_BIN = 'pnpm exec tsx src/cli.ts';
+const HEALTH_BIN = 'pnpm exec tsx scripts/healthcheck.ts';
 const SYSTEMD_CLI = `/usr/bin/env ${CLI_BIN}`;
+const SYSTEMD_HEALTH = `/usr/bin/env ${HEALTH_BIN}`;
 
 const integrationManifest: IntegrationManifest = {
   docker: {
-    healthcheck: `${CLI_BIN} --health || exit 1`,
+    healthcheck: `${HEALTH_BIN} --health || exit 1`,
     stopCommand: `${CLI_BIN} stop`,
     logLevel: {
       get: `${CLI_BIN} log-level get`,
@@ -85,7 +87,7 @@ const integrationManifest: IntegrationManifest = {
   },
   systemd: {
     serviceFile: 'deploy/guardian.service',
-    execStartPre: `${SYSTEMD_CLI} --health`,
+    execStartPre: `${SYSTEMD_HEALTH} --health`,
     execStart: `${SYSTEMD_CLI} daemon start`,
     execReload: `${SYSTEMD_CLI} daemon status --json`,
     execStop: `${SYSTEMD_CLI} daemon stop`,
@@ -94,7 +96,7 @@ const integrationManifest: IntegrationManifest = {
       '/usr/bin/env pnpm exec tsx scripts/db-maintenance.ts'
     ],
     hooksCommand: `${SYSTEMD_CLI} daemon hooks --reason systemd-stop --signal SIGTERM`,
-    healthCommand: `${SYSTEMD_CLI} --health`,
+    healthCommand: `${SYSTEMD_HEALTH} --health`,
     readyCommand: `${SYSTEMD_CLI} --ready`,
     logLevel: {
       get: `${SYSTEMD_CLI} log-level get`,

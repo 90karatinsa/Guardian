@@ -120,6 +120,91 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionSnapshotRotation prunes archives per camera and updates vacuum index version', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 11, 1);
+    vi.setSystemTime(now);
+
+    const cameraKey = path.basename(cameraOneDir);
+    const staleTs = now - 35 * dayMs;
+    const olderTs = now - 65 * dayMs;
+    const staleFiles = [
+      path.join(cameraOneDir, 'rot-old-a.jpg'),
+      path.join(cameraOneDir, 'rot-old-b.jpg'),
+      path.join(cameraOneDir, 'rot-old-c.jpg')
+    ];
+    const freshFile = path.join(cameraOneDir, 'rot-fresh.jpg');
+
+    for (const file of staleFiles) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, staleTs / 1000, staleTs / 1000);
+    }
+
+    fs.writeFileSync(freshFile, freshFile);
+    fs.utimesSync(freshFile, now / 1000, now / 1000);
+
+    const existingArchiveDir = path.join(archiveDir, cameraKey, '2024-07-01');
+    fs.mkdirSync(existingArchiveDir, { recursive: true });
+    const preexistingArchive = path.join(existingArchiveDir, 'archived-preexisting.jpg');
+    fs.writeFileSync(preexistingArchive, preexistingArchive);
+    fs.utimesSync(preexistingArchive, olderTs / 1000, olderTs / 1000);
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 20,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        snapshot: {
+          mode: 'archive',
+          retentionDays: 10,
+          maxArchivesPerCamera: {
+            [cameraKey]: 2
+          }
+        },
+        vacuum: {
+          mode: 'auto',
+          run: 'always',
+          pragmas: ['PRAGMA optimize']
+        },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(result.vacuum.ran).toBe(true);
+      expect(result.vacuum.mode).toBe('auto');
+      expect(result.vacuum.pragmas).toEqual(['PRAGMA optimize']);
+      expect(result.vacuum.indexVersion).toBeGreaterThanOrEqual(1);
+      expect(Array.isArray(result.vacuum.ensuredIndexes ?? [])).toBe(true);
+
+      staleFiles.forEach(file => {
+        expect(fs.existsSync(file)).toBe(false);
+      });
+      expect(fs.existsSync(freshFile)).toBe(true);
+
+      const archiveRoot = path.join(archiveDir, cameraKey);
+      const archivedFiles = collectArchiveFiles(archiveRoot);
+      expect(archivedFiles.length).toBeLessThanOrEqual(2);
+
+      const versionRow = db.prepare('PRAGMA user_version').get() as { user_version: number };
+      expect(versionRow.user_version).toBeGreaterThanOrEqual(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionSnapshotDeleteMode deletes stale snapshots without archiving and skips vacuum', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 10, 5);
@@ -324,7 +409,9 @@ describe('RetentionMaintenance', () => {
         reindex: false,
         optimize: false,
         target: undefined,
-        pragmas: undefined
+        pragmas: undefined,
+        indexVersion: 1,
+        ensuredIndexes: []
       });
 
     const task = startRetentionTask({

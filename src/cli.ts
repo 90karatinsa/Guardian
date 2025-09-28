@@ -54,6 +54,18 @@ type HealthPayload = {
         video: number;
         audio: number;
       };
+      watchdogRestarts: {
+        video: number;
+        audio: number;
+      };
+      watchdogBackoffMs: {
+        video: number;
+        audio: number;
+      };
+      lastWatchdogJitterMs: {
+        video: number | null;
+        audio: number | null;
+      };
       channels: {
         video: number;
         audio: number;
@@ -70,6 +82,10 @@ type HealthPayload = {
       audioChannels: number;
       videoRestarts: number;
       audioRestarts: number;
+      videoWatchdogRestarts: number;
+      audioWatchdogRestarts: number;
+      videoWatchdogBackoffMs: number;
+      audioWatchdogBackoffMs: number;
     };
   };
   integration: IntegrationManifest;
@@ -262,6 +278,12 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const audioChannels = Object.keys(snapshot.pipelines.audio.byChannel ?? {}).length;
   const videoRestarts = snapshot.pipelines.ffmpeg.restarts;
   const audioRestarts = snapshot.pipelines.audio.restarts;
+  const videoWatchdogRestarts = snapshot.pipelines.ffmpeg.watchdogRestarts;
+  const audioWatchdogRestarts = snapshot.pipelines.audio.watchdogRestarts;
+  const videoWatchdogBackoffMs = snapshot.pipelines.ffmpeg.watchdogBackoffMs;
+  const audioWatchdogBackoffMs = snapshot.pipelines.audio.watchdogBackoffMs;
+  const lastVideoWatchdogJitter = snapshot.pipelines.ffmpeg.lastWatchdogJitterMs ?? null;
+  const lastAudioWatchdogJitter = snapshot.pipelines.audio.lastWatchdogJitterMs ?? null;
   const metricsCapturedAt = snapshot.createdAt;
 
   let status: HealthStatus = 'ok';
@@ -305,6 +327,18 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
           video: videoRestarts,
           audio: audioRestarts
         },
+        watchdogRestarts: {
+          video: videoWatchdogRestarts,
+          audio: audioWatchdogRestarts
+        },
+        watchdogBackoffMs: {
+          video: videoWatchdogBackoffMs,
+          audio: audioWatchdogBackoffMs
+        },
+        lastWatchdogJitterMs: {
+          video: lastVideoWatchdogJitter,
+          audio: lastAudioWatchdogJitter
+        },
         channels: {
           video: videoChannels,
           audio: audioChannels
@@ -326,7 +360,11 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
         videoChannels,
         audioChannels,
         videoRestarts,
-        audioRestarts
+        audioRestarts,
+        videoWatchdogRestarts,
+        audioWatchdogRestarts,
+        videoWatchdogBackoffMs,
+        audioWatchdogBackoffMs
       }
     },
     checks: [

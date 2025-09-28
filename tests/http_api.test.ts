@@ -354,6 +354,115 @@ describe('RestApiEvents', () => {
     noneController.abort();
   });
 
+  it('HttpApiSnapshotStream delivers snapshot history with heartbeat and metrics', async () => {
+    const now = Date.now();
+    const alphaSnapshot = path.join(snapshotDir, 'alpha.png');
+    fs.writeFileSync(alphaSnapshot, Buffer.from([1, 2, 3]));
+    const betaSnapshot = path.join(snapshotDir, 'beta.png');
+    fs.writeFileSync(betaSnapshot, Buffer.from([4, 5, 6]));
+
+    storeEvent({
+      ts: now - 500,
+      source: 'video:alpha-camera',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Alpha snapshot event',
+      meta: { channel: 'video:alpha', snapshot: alphaSnapshot }
+    });
+
+    storeEvent({
+      ts: now - 400,
+      source: 'video:beta-camera',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Beta snapshot event',
+      meta: { channel: 'video:beta', snapshot: betaSnapshot }
+    });
+
+    const expected = listEvents({ snapshot: 'with', channel: 'video:alpha', limit: 1 });
+    expect(expected.items.length).toBeGreaterThan(0);
+    const expectedId = expected.items[0]?.id;
+
+    const { port } = await ensureServer();
+
+    const controller = new AbortController();
+    const response = await fetch(
+      `http://localhost:${port}/api/events/stream?snapshots=1&snapshotLimit=5&channels=video:alpha`,
+      { signal: controller.signal }
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const messages: any[] = [];
+    const metricsEvents: any[] = [];
+    const heartbeats: any[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              resolve();
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (dataLines.length === 0) {
+                continue;
+              }
+              const payload = JSON.parse(dataLines.join(''));
+              if (eventName === 'metrics') {
+                metricsEvents.push(payload);
+              } else if (eventName === 'heartbeat') {
+                heartbeats.push(payload);
+              } else if (eventName === 'message') {
+                messages.push(payload);
+              }
+            }
+            if (messages.length >= 1 && metricsEvents.length >= 1 && heartbeats.length >= 1) {
+              resolve();
+              return;
+            }
+            readNext();
+          })
+          .catch(reject);
+      };
+      readNext();
+    });
+
+    controller.abort();
+
+    expect(messages.length).toBeGreaterThanOrEqual(1);
+    const streamed = messages.find(message => message.meta?.channel === 'video:alpha') ?? messages[0];
+    expect(streamed?.meta?.snapshotUrl).toBe(`/api/events/${expectedId}/snapshot`);
+    expect(streamed?.id).toBe(expectedId);
+    expect(metricsEvents.length).toBeGreaterThan(0);
+    expect(metricsEvents[0]?.pipelines).toBeTruthy();
+    expect(heartbeats.length).toBeGreaterThan(0);
+  });
+
   it('HttpStreamCombinedMetricsSelection streams selected metrics subsets without extras', async () => {
     metrics.recordRetentionRun({
       removedEvents: 2,

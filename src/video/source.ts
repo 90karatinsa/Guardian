@@ -89,6 +89,17 @@ type RestartDelayResult = {
   meta: RecoverEventMeta;
 };
 
+type PendingRestartContext = {
+  attempt: number;
+  delayMs: number;
+  meta: RecoverEventMeta;
+  channel: string | null;
+  errorCode: string | number | null;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  reportedReasons: Set<string>;
+};
+
 export class VideoSource extends EventEmitter {
   private command: ffmpeg.FfmpegCommand | null = null;
   private commandCleanup: (() => void) | null = null;
@@ -114,6 +125,7 @@ export class VideoSource extends EventEmitter {
   private readonly commandClassifications = new Set<string>();
   private commandGeneration = 0;
   private readonly channel: string | null;
+  private pendingRestartContext: PendingRestartContext | null = null;
 
   constructor(private options: VideoSourceOptions) {
     super();
@@ -172,6 +184,7 @@ export class VideoSource extends EventEmitter {
     this.commandGeneration = 0;
     this.resetCommandClassifications();
     this.lastCircuitCandidateReason = null;
+    this.pendingRestartContext = null;
     this.clearAllTimers();
     this.startCommand();
   }
@@ -219,6 +232,7 @@ export class VideoSource extends EventEmitter {
     this.circuitBroken = false;
     this.lastCircuitCandidateReason = null;
     this.resetCommandClassifications();
+    this.pendingRestartContext = null;
     this.clearRestartTimer();
     this.clearStartTimer();
     this.clearWatchdogTimer();
@@ -546,7 +560,15 @@ export class VideoSource extends EventEmitter {
       reason === 'rtsp-timeout' ||
       reason === 'watchdog-timeout' ||
       reason === 'stream-idle';
-    const termination = this.terminateCommand(true, { skipForceDelay: shouldForceImmediateKill });
+    let restartContext: PendingRestartContext | null = null;
+    const termination = this.terminateCommand(true, {
+      skipForceDelay: shouldForceImmediateKill,
+      onForceKill: () => {
+        if (restartContext) {
+          this.reportRecovery(restartContext, 'force-kill');
+        }
+      }
+    });
     const waitForTermination = termination ?? Promise.resolve();
 
     if (shouldTripCircuit) {
@@ -582,37 +604,28 @@ export class VideoSource extends EventEmitter {
 
     const timing = this.computeRestartDelay(attempt);
 
-    metrics.recordPipelineRestart('ffmpeg', reason, {
+    const sanitizedDelay = Math.max(0, timing.delayMs);
+
+    restartContext = {
       attempt,
-      delayMs: timing.delayMs,
-      baseDelayMs: timing.meta.baseDelayMs,
-      minDelayMs: timing.meta.minDelayMs,
-      maxDelayMs: timing.meta.maxDelayMs,
-      jitterMs: timing.meta.appliedJitterMs,
-      minJitterMs: timing.meta.minJitterMs,
-      maxJitterMs: timing.meta.maxJitterMs,
-      channel: channel ?? undefined,
-      errorCode: errorCode ?? undefined,
-      exitCode: exitCode ?? undefined,
-      signal: signal ?? undefined,
-      at: Date.now()
-    });
-    this.emit(
-      'recover',
-      {
-        reason,
-        attempt,
-        delayMs: timing.delayMs,
-        meta: timing.meta,
-        channel,
-        errorCode: errorCode ?? null,
-        exitCode,
-        signal
-      } satisfies RecoverEvent
-    );
+      delayMs: sanitizedDelay,
+      meta: timing.meta,
+      channel,
+      errorCode: errorCode ?? null,
+      exitCode,
+      signal,
+      reportedReasons: new Set<string>()
+    };
+
+    this.pendingRestartContext = restartContext;
+
+    this.reportRecovery(restartContext, reason);
 
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
+      if (this.pendingRestartContext === restartContext) {
+        this.pendingRestartContext = null;
+      }
       waitForTermination
         .catch(() => {})
         .then(() => {
@@ -621,7 +634,7 @@ export class VideoSource extends EventEmitter {
           }
           this.startCommand();
         });
-    }, Math.max(0, timing.delayMs));
+    }, sanitizedDelay);
   }
 
   private finalizeCommandLifecycle() {
@@ -653,7 +666,7 @@ export class VideoSource extends EventEmitter {
 
   private terminateCommand(
     force = false,
-    options: { skipForceDelay?: boolean } = {}
+    options: { skipForceDelay?: boolean; onForceKill?: () => void } = {}
   ): Promise<void> | null {
     const command = this.command ?? this.terminatingCommand;
     if (!command) {
@@ -686,6 +699,7 @@ export class VideoSource extends EventEmitter {
       } catch (error) {
         // Ignore
       }
+      options.onForceKill?.();
       this.finalizeCommandLifecycle();
       return exitPromise;
     }
@@ -698,10 +712,49 @@ export class VideoSource extends EventEmitter {
       } catch (error) {
         // Ignore forced kill errors
       }
+      options.onForceKill?.();
       this.finalizeCommandLifecycle();
     }, delay);
 
     return exitPromise;
+  }
+
+  private reportRecovery(context: PendingRestartContext, reason: string) {
+    if (context.reportedReasons.has(reason)) {
+      return;
+    }
+
+    context.reportedReasons.add(reason);
+
+    metrics.recordPipelineRestart('ffmpeg', reason, {
+      attempt: context.attempt,
+      delayMs: context.delayMs,
+      baseDelayMs: context.meta.baseDelayMs,
+      minDelayMs: context.meta.minDelayMs,
+      maxDelayMs: context.meta.maxDelayMs,
+      jitterMs: context.meta.appliedJitterMs,
+      minJitterMs: context.meta.minJitterMs,
+      maxJitterMs: context.meta.maxJitterMs,
+      channel: context.channel ?? undefined,
+      errorCode: context.errorCode ?? undefined,
+      exitCode: context.exitCode ?? undefined,
+      signal: context.signal ?? undefined,
+      at: Date.now()
+    });
+
+    this.emit(
+      'recover',
+      {
+        reason,
+        attempt: context.attempt,
+        delayMs: context.delayMs,
+        meta: context.meta,
+        channel: context.channel,
+        errorCode: context.errorCode,
+        exitCode: context.exitCode,
+        signal: context.signal
+      } satisfies RecoverEvent
+    );
   }
 
   private clearStartTimer() {
@@ -737,6 +790,7 @@ export class VideoSource extends EventEmitter {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
+    this.pendingRestartContext = null;
   }
 
   private clearKillTimer() {
