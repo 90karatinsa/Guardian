@@ -480,9 +480,14 @@ function projectBoundingBox(
 
   if (candidates.length === 0) {
     const fallback = projectWithProjection(cx, cy, width, height, projections[0], projections[0].normalized ?? false);
+    const clampedFallback = clampBoundingBoxToFrame(
+      fallback,
+      projections[0].originalWidth,
+      projections[0].originalHeight
+    );
     return {
-      box: fallback,
-      areaRatio: computeAreaRatio(fallback, projections[0].originalWidth, projections[0].originalHeight),
+      box: clampedFallback,
+      areaRatio: computeAreaRatio(clampedFallback, projections[0].originalWidth, projections[0].originalHeight),
       projectionIndex: 0,
       normalized: projections[0].normalized ?? false,
       score: 0
@@ -490,7 +495,15 @@ function projectBoundingBox(
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0];
+  const best = candidates[0];
+  const clamped = clampBoundingBoxToFrame(best.box, meta.originalWidth, meta.originalHeight);
+  return {
+    box: clamped,
+    areaRatio: computeAreaRatio(clamped, meta.originalWidth, meta.originalHeight),
+    projectionIndex: best.projectionIndex,
+    normalized: best.normalized,
+    score: best.score
+  };
 }
 
 function buildProjectionCandidates(meta: PreprocessMeta): ProjectionMeta[] {

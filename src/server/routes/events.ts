@@ -1119,7 +1119,7 @@ function resolveMetricsSelection(params: URLSearchParams): MetricsSelection {
     ? new Set(pipelineTokens as Array<'ffmpeg' | 'audio'>)
     : new Set<'ffmpeg' | 'audio'>();
 
-  const includeEvents = includeAll || recognized.includes('events') || pipelineTokens.length > 0;
+  const includeEvents = includeAll || recognized.includes('events');
 
   return { enabled: true, includeEvents, includeRetention, pipelines };
 }

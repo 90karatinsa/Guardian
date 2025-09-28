@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import AudioAnomalyDetector from '../src/audio/anomaly.js';
+import AudioAnomalyDetector, {
+  type AudioAnomalyThresholdSchedule,
+  type NightHoursConfig
+} from '../src/audio/anomaly.js';
 
 interface CapturedEvent {
   detector: string;
@@ -174,6 +177,66 @@ describe('AudioAnomalyWindowing', () => {
     const state = meta.state as Record<string, any>;
     expect(Number(state?.rms?.recoveryMs ?? 0)).toBeGreaterThanOrEqual(0);
     expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(blendedWindow, 5);
+  });
+
+  it('AudioAnomalyScheduleHotReload applies updated schedules immediately', () => {
+    const nightTs = new Date(2024, 0, 2, 22, 30).getTime();
+    const detector = new AudioAnomalyDetector(
+      {
+        source: 'audio:test',
+        sampleRate,
+        frameDurationMs,
+        hopDurationMs,
+        minIntervalMs: 0,
+        thresholds: {
+          default: {
+            rms: 0.9,
+            rmsWindowMs: hopDurationMs,
+            minTriggerDurationMs: hopDurationMs
+          }
+        },
+        rmsThreshold: 0.9,
+        centroidJumpThreshold: 9999,
+        nightHours: { start: 23, end: 6 }
+      },
+      bus
+    );
+
+    const reloadSchedule = {
+      night: {
+        rms: 0.18,
+        rmsWindowMs: hopDurationMs,
+        minTriggerDurationMs: hopDurationMs
+      }
+    } satisfies AudioAnomalyThresholdSchedule;
+    const reloadNightHours = { start: 21, end: 6 } satisfies NightHoursConfig;
+
+    detector.updateOptions({
+      thresholds: reloadSchedule,
+      nightHours: reloadNightHours,
+      rmsWindowMs: hopDurationMs,
+      centroidWindowMs: hopDurationMs,
+      minTriggerDurationMs: hopDurationMs
+    });
+
+    // Mutate the original objects after updateOptions to verify cloning behaviour.
+    reloadSchedule.night!.rms = 0.45;
+    reloadNightHours.start = 12;
+
+    const loudFrame = createConstantFrame(frameSize, 0.5);
+    for (let i = 0; i < 6; i += 1) {
+      detector.handleChunk(loudFrame, nightTs + i * hopDurationMs);
+    }
+
+    expect(events).toHaveLength(1);
+    const meta = events[0].meta as Record<string, any>;
+    const thresholds = meta.thresholds as Record<string, any>;
+    expect(thresholds.profile).toBe('night');
+    expect(thresholds.rms).toBeCloseTo(0.18, 5);
+    expect(thresholds.rmsWindowMs).toBeCloseTo(hopDurationMs, 5);
+    expect(thresholds.minTriggerDurationMs).toBeCloseTo(hopDurationMs, 5);
+    const state = meta.state as Record<string, any>;
+    expect(Number(state?.rms?.windowMs ?? 0)).toBeCloseTo(hopDurationMs, 5);
   });
 
   it('AudioAnomalyWindowSustain requires consecutive frames to trigger', () => {

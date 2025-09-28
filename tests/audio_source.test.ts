@@ -556,6 +556,62 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioDeviceDiscoveryCircuitBreaker emits fatal event after repeated timeouts', async () => {
+    vi.useFakeTimers();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    spawnMock.mockImplementation(() => createFakeProcess());
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:lobby',
+      restartDelayMs: 20,
+      restartMaxDelayMs: 20,
+      restartJitterFactor: 0,
+      silenceCircuitBreakerThreshold: 2,
+      deviceDiscoveryTimeoutMs: 0,
+      micFallbacks: {
+        linux: [{ format: 'alsa', device: 'default' }]
+      }
+    });
+
+    const fatalSpy = vi.fn();
+    const errorSpy = vi.fn();
+    source.on('fatal', fatalSpy);
+    source.on('error', errorSpy);
+
+    try {
+      source.start();
+      await flushTimers();
+
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+
+      source.triggerDeviceDiscoveryTimeout(new Error('device discovery timed out (1)'));
+      expect(errorSpy).toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(20);
+      await Promise.resolve();
+
+      source.triggerDeviceDiscoveryTimeout(new Error('device discovery timed out (2)'));
+      await Promise.resolve();
+
+      expect(fatalSpy).toHaveBeenCalledTimes(1);
+      const fatalEvent = fatalSpy.mock.calls[0][0] as AudioFatalEvent;
+      expect(fatalEvent.reason).toBe('circuit-breaker');
+      expect(fatalEvent.lastFailure.reason).toBe('device-discovery-timeout');
+      expect(fatalEvent.channel).toBe('audio:lobby');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.audio.byReason['device-discovery-timeout']).toBeGreaterThanOrEqual(2);
+      expect(snapshot.pipelines.audio.lastRestart?.reason).toBe('circuit-breaker');
+    } finally {
+      source.stop();
+      platformSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('AudioSilenceCircuitBreaker stops retries and records fatal restart', async () => {
     vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');

@@ -147,6 +147,92 @@ describe('MotionDetector', () => {
     expect(lightMeta.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(3);
   });
 
+  it('LightDetectorOvernightNormalHours reconfigures normal hours and updates gauges', () => {
+    const light = new LightDetector(
+      {
+        source: 'overnight-light',
+        deltaThreshold: 18,
+        smoothingFactor: 0.08,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.8,
+        noiseSmoothing: 0.15,
+        idleRebaselineMs: 0,
+        noiseWarmupFrames: 0
+      },
+      bus
+    );
+
+    const baseFrame = createUniformFrame(12, 12, 60);
+    const primingTs = Date.UTC(2023, 6, 1, 20, 0, 0);
+    light.handleFrame(baseFrame, primingTs);
+
+    for (let i = 0; i < 80; i += 1) {
+      const noisy = createFrame(12, 12, () => ((i + 1) % 2 === 0 ? 210 : 10));
+      light.handleFrame(noisy, primingTs + (i + 1) * 10_000);
+    }
+
+    let snapshot = metrics.snapshot();
+    const preUpdateBoost = snapshot.detectors.light?.gauges?.noiseWindowBoost ?? 1;
+    expect((light as any).sustainedNoiseBoost).toBeGreaterThan(1);
+    expect(preUpdateBoost).toBeGreaterThanOrEqual(1);
+
+    light.updateOptions({
+      normalHours: [{ start: 23, end: 6 }],
+      noiseWarmupFrames: 0,
+      debounceFrames: 1,
+      backoffFrames: 3
+    });
+
+    const overnightBaselineTs = Date.UTC(2023, 6, 1, 23, 30, 0);
+    light.handleFrame(baseFrame, overnightBaselineTs);
+    light.handleFrame(createUniformFrame(12, 12, 62), overnightBaselineTs + 10_000);
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.normalHoursActive).toBe(1);
+    expect(snapshot.detectors.light?.gauges?.noiseWindowBoost ?? 0).toBeLessThanOrEqual(1.1);
+
+    for (let i = 0; i < 6; i += 1) {
+      const calmOvernight = createFrame(
+        12,
+        12,
+        (x, y) => 62 + ((x * 2 + y + i) % 5 === 0 ? 3 : -3)
+      );
+      light.handleFrame(calmOvernight, overnightBaselineTs + (i + 2) * 10_000);
+    }
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.normalHoursActive).toBe(1);
+
+    events = [];
+
+    const triggerStartTs = Date.UTC(2023, 6, 2, 7, 0, 0);
+    const requiredDebounce = Math.max(
+      3,
+      snapshot.detectors.light?.gauges?.effectiveDebounceFrames ?? 3
+    );
+
+    for (let i = 0; i < requiredDebounce + 6; i += 1) {
+      const level = 150 + i * 12;
+      light.handleFrame(createUniformFrame(12, 12, level), triggerStartTs + i * 10_000);
+      if (events.some(event => event.detector === 'light')) {
+        break;
+      }
+    }
+
+    const lightEvent = events.find(event => event.detector === 'light');
+    expect(lightEvent).toBeDefined();
+
+    const meta = lightEvent?.meta as Record<string, unknown>;
+    expect(meta?.normalHoursActive).toBe(false);
+    expect(meta?.normalHours).toEqual([{ start: 23, end: 6 }]);
+    expect((meta?.sustainedNoiseBoost as number) ?? 0).toBeGreaterThanOrEqual(1);
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.normalHoursActive).toBe(0);
+  });
+
   it('MotionAdaptiveTrendReset reduces sustained noise boost after calm frames', () => {
     const detector = new MotionDetector(
       {

@@ -444,6 +444,23 @@ describe('MetricsCounters', () => {
       /guardian_detector_gauge\{detector="motion",gauge="backoffFactor",instance="lab-node"\} 0.5/
     );
   });
+
+  it('MetricsChannelJitterHistogram exports per-channel jitter histograms', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      channel: 'video:lobby',
+      jitterMs: 275
+    });
+
+    const output = registry.exportPipelineRestartHistogram('ffmpeg', 'jitter', {
+      metricName: 'guardian_ffmpeg_restart_jitter_ms'
+    });
+
+    expect(output).toContain('# TYPE guardian_ffmpeg_restart_jitter_ms_channel_video_lobby histogram');
+    expect(output).toContain('guardian_ffmpeg_restart_jitter_ms_channel_video_lobby_bucket');
+    expect(output).toMatch(/channel="video:lobby"/);
+  });
 });
 
 describe('MetricsSnapshotEnrichment', () => {

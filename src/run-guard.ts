@@ -589,6 +589,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       if (!desiredIds.has(runtime.id)) {
         pipelines.delete(runtime.channel);
         pipelinesById.delete(runtime.id);
+        metrics.clearPipelineChannel('ffmpeg', runtime.channel);
         runtime.cleanup.forEach(fn => {
           try {
             fn();
@@ -861,6 +862,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       });
       runtime.cleanup.length = 0;
       runtime.source.stop();
+      metrics.clearPipelineChannel('ffmpeg', runtime.channel);
     }
     pipelines.clear();
     pipelinesById.clear();

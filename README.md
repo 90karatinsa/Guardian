@@ -283,6 +283,10 @@ guardian daemon hooks --reason test-shutdown
 # Belirli bir video kanalının devre kesicisini sıfırlar
 guardian daemon restart --channel video:lobby
 
+# Bilinmeyen kanal denemesi exit kodu 1 ve anlamlı hata mesajı döndürür
+guardian daemon restart --channel video:missing
+# channel not found: video:missing
+
 # Bağlı mikrofonları JSON olarak listeler
 guardian audio devices --json
 
@@ -302,6 +306,12 @@ daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
 
 ## Dashboard
 `pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir.
+
+Yalnızca belirli metrik bölümlerini tüketmek için `metrics` sorgu parametresiyle SSE'yi daraltabilirsiniz. Örneğin sadece ses ve retention metriklerini dinlemek için aşağıdaki komutu çalıştırabilirsiniz; ffmpeg istatistikleri bu akışta gönderilmez:
+
+```bash
+curl -N "http://localhost:3000/api/events/stream?metrics=audio,retention"
+```
 
 ## Metrikler ve sağlık çıktısı
 `pnpm tsx src/cli.ts --health` veya `guardian daemon status --json` komutları, aşağıdaki gibi bir metrik özeti döndürür:

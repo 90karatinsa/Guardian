@@ -600,7 +600,7 @@ async function runDaemonRestartCommand(args: string[], io: CliIo): Promise<numbe
     }
 
     if (!knownChannels.has(normalized)) {
-      io.stderr.write(`Channel not found: ${channel}\n`);
+      io.stderr.write(`channel not found: ${channel}\n`);
       return 1;
     }
 

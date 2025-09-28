@@ -518,7 +518,8 @@ export class VideoSource extends EventEmitter {
       reason === 'stream-idle' ||
       reason === 'rtsp-timeout' ||
       reason === 'rtsp-connection-failure' ||
-      reason === 'rtsp-auth-failure';
+      reason === 'rtsp-auth-failure' ||
+      reason === 'ffmpeg-missing';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
       this.lastCircuitCandidateReason = reason;
@@ -964,6 +965,15 @@ const RTSP_AUTH_PATTERNS = [
   /unauthorized\s+access/i
 ];
 
+const RTSP_NOT_FOUND_PATTERNS = [
+  /method\s+DESCRIBE\s+failed:.*(404|5\d\d)/i,
+  /RTSP\/1\.0\s+404/i,
+  /RTSP\/1\.0\s+5\d\d/i,
+  /404\s+not\s+found/i,
+  /server\s+returned\s+5\d\d/i,
+  /5\d\d\s+(internal|server)\s+error/i
+];
+
 const RTSP_CONNECTION_PATTERNS = [
   /connection\s+refused/i,
   /connection\s+reset/i,
@@ -992,6 +1002,16 @@ function classifyFfmpegStderr(message: string): FfmpegClassification | null {
       return {
         reason: 'rtsp-auth-failure',
         errorCode: 'rtsp-auth-failure',
+        breakAfter: true
+      };
+    }
+  }
+
+  for (const pattern of RTSP_NOT_FOUND_PATTERNS) {
+    if (pattern.test(message)) {
+      return {
+        reason: 'rtsp-not-found',
+        errorCode: 'rtsp-not-found',
         breakAfter: true
       };
     }
