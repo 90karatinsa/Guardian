@@ -168,6 +168,7 @@ type SuppressedEventMetric = {
   type?: 'window' | 'rate-limit';
   historyCount?: number;
   history?: number[];
+  combinedHistory?: number[];
   windowExpiresAt?: number;
   rateLimit?: RateLimitConfig;
   cooldownMs?: number;
@@ -185,9 +186,13 @@ type SuppressedEventMetric = {
       reasons?: string[];
       types?: Array<'window' | 'rate-limit'>;
       windowRemainingMs?: number | null;
+      maxWindowRemainingMs?: number | null;
       cooldownRemainingMs?: number | null;
+      maxCooldownRemainingMs?: number | null;
       historyCount?: number | null;
       combinedHistoryCount?: number | null;
+      history?: number[];
+      combinedHistory?: number[];
     }
   >;
 };
@@ -198,7 +203,7 @@ type RetentionTotals = {
   prunedArchives: number;
 };
 
-type RetentionWarningSnapshot = {
+export type RetentionWarningSnapshot = {
   camera: string | null;
   path: string;
   reason: string;
@@ -247,6 +252,9 @@ type MetricsSnapshot = {
     lastErrorAt: string | null;
     lastErrorMessage: string | null;
     histogram: CounterMap;
+    currentLevel: string;
+    lastLevelChangeAt: string | null;
+    levelChanges: CounterMap;
   };
   latencies: Record<string, LatencyStats>;
   histograms: Record<string, HistogramSnapshot>;
@@ -283,6 +291,12 @@ type PrometheusLogLevelOptions = {
   detectorHelp?: string;
   lastErrorMetricName?: string;
   lastErrorHelp?: string;
+  stateMetricName?: string;
+  stateHelp?: string;
+  changeMetricName?: string;
+  changeHelp?: string;
+  lastChangeMetricName?: string;
+  lastChangeHelp?: string;
   labels?: Record<string, string>;
 };
 
@@ -370,6 +384,9 @@ class MetricsRegistry {
   private readonly logLevelCounters = new Map<string, number>();
   private readonly logLevelByDetector = new Map<string, Map<string, number>>();
   private readonly logLevelHistogram = new Map<string, number>();
+  private currentLogLevel = 'info';
+  private lastLogLevelChangeAt: number | null = null;
+  private readonly logLevelChangeCounters = new Map<string, number>();
   private readonly detectorCounters = new Map<string, number>();
   private readonly severityCounters = new Map<string, number>();
   private readonly latencyStats = new Map<string, { count: number; totalMs: number; minMs: number; maxMs: number }>();
@@ -465,6 +482,9 @@ class MetricsRegistry {
     this.logLevelCounters.clear();
     this.logLevelByDetector.clear();
     this.logLevelHistogram.clear();
+    this.logLevelChangeCounters.clear();
+    this.currentLogLevel = 'info';
+    this.lastLogLevelChangeAt = null;
     this.detectorCounters.clear();
     this.severityCounters.clear();
     this.latencyStats.clear();
@@ -571,6 +591,22 @@ class MetricsRegistry {
       if (context?.message) {
         this.lastErrorMessage = context.message;
       }
+    }
+  }
+
+  recordLogLevelChange(level: string, previous?: string | null) {
+    const normalized = level.toLowerCase();
+    const previousNormalized = typeof previous === 'string' ? previous.toLowerCase() : null;
+    this.currentLogLevel = normalized;
+    if (previousNormalized && previousNormalized === normalized) {
+      return;
+    }
+    if (previousNormalized) {
+      this.lastLogLevelChangeAt = Date.now();
+      this.logLevelChangeCounters.set(
+        normalized,
+        (this.logLevelChangeCounters.get(normalized) ?? 0) + 1
+      );
     }
   }
 
@@ -1169,7 +1205,12 @@ class MetricsRegistry {
       byDetector: mapFromNested(this.logLevelByDetector),
       histogram: mapLogLevelCounters(this.logLevelHistogram),
       lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
-      lastErrorMessage: this.lastErrorMessage
+      lastErrorMessage: this.lastErrorMessage,
+      currentLevel: this.currentLogLevel,
+      lastLevelChangeAt: this.lastLogLevelChangeAt
+        ? new Date(this.lastLogLevelChangeAt).toISOString()
+        : null,
+      levelChanges: mapFrom(this.logLevelChangeCounters)
     };
   }
 
@@ -1193,6 +1234,39 @@ class MetricsRegistry {
     );
     if (levelMetric) {
       lines.push(levelMetric);
+    }
+
+    const stateMetric = formatPrometheusGauge(
+      'logs.level.state',
+      [
+        {
+          value: 1,
+          labels: { level: this.currentLogLevel }
+        }
+      ],
+      {
+        metricName: options.stateMetricName ?? 'guardian_log_level_state',
+        help: options.stateHelp ?? 'Current active Pino log level reported by Guardian',
+        labels: baseLabels
+      }
+    );
+    if (stateMetric) {
+      lines.push(stateMetric);
+    }
+
+    const changeSamples = Array.from(this.logLevelChangeCounters.entries()).map(
+      ([level, value]) => ({
+        value,
+        labels: { level }
+      })
+    );
+    const changeMetric = formatPrometheusGauge('logs.level.change.total', changeSamples, {
+      metricName: options.changeMetricName ?? 'guardian_log_level_change_total',
+      help: options.changeHelp ?? 'Total log level changes grouped by target level',
+      labels: baseLabels
+    });
+    if (changeMetric) {
+      lines.push(changeMetric);
     }
 
     const detectorSamples: Array<{ value: number; labels: Record<string, string> }> = [];
@@ -1238,6 +1312,29 @@ class MetricsRegistry {
       );
       if (lastErrorMetric) {
         lines.push(lastErrorMetric);
+      }
+    }
+
+    if (this.lastLogLevelChangeAt) {
+      const lastChangeMetric = formatPrometheusGauge(
+        'logs.level.last_change_timestamp_seconds',
+        [
+          {
+            value: Math.floor(this.lastLogLevelChangeAt / 1000),
+            labels: {}
+          }
+        ],
+        {
+          metricName:
+            options.lastChangeMetricName ?? 'guardian_log_level_last_change_timestamp_seconds',
+          help:
+            options.lastChangeHelp ??
+            'Unix timestamp (seconds) for the most recent log level change',
+          labels: baseLabels
+        }
+      );
+      if (lastChangeMetric) {
+        lines.push(lastChangeMetric);
       }
     }
 
@@ -1498,7 +1595,12 @@ class MetricsRegistry {
         byDetector: mapFromNested(this.logLevelByDetector),
         lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
         lastErrorMessage: this.lastErrorMessage,
-        histogram: logHistogramSnapshot
+        histogram: logHistogramSnapshot,
+        currentLevel: this.currentLogLevel,
+        lastLevelChangeAt: this.lastLogLevelChangeAt
+          ? new Date(this.lastLogLevelChangeAt).toISOString()
+          : null,
+        levelChanges: mapFrom(this.logLevelChangeCounters)
       },
       latencies: mapFromLatencies(this.latencyStats),
       histograms: mapFromHistograms(this.histograms),
@@ -1764,17 +1866,41 @@ function mapSuppressionChannelStates(
           )
         )
       : undefined;
+    const historyArray = Array.isArray(state?.history)
+      ? Array.from(
+          new Set(
+            state.history
+              .map(value => (typeof value === 'number' && Number.isFinite(value) ? value : undefined))
+              .filter((value): value is number => typeof value === 'number')
+          )
+        ).sort((a, b) => a - b)
+      : undefined;
+    const combinedHistoryArray = Array.isArray(state?.combinedHistory)
+      ? Array.from(
+          new Set(
+            state.combinedHistory
+              .map(value => (typeof value === 'number' && Number.isFinite(value) ? value : undefined))
+              .filter((value): value is number => typeof value === 'number')
+          )
+        ).sort((a, b) => a - b)
+      : undefined;
     result[channel] = {
       hits: typeof state?.hits === 'number' ? state.hits : undefined,
       reasons: reasons && reasons.length > 0 ? reasons : undefined,
       types: types && types.length > 0 ? types : undefined,
       windowRemainingMs:
         typeof state?.windowRemainingMs === 'number' ? state.windowRemainingMs : null,
+      maxWindowRemainingMs:
+        typeof state?.maxWindowRemainingMs === 'number' ? state.maxWindowRemainingMs : null,
       cooldownRemainingMs:
         typeof state?.cooldownRemainingMs === 'number' ? state.cooldownRemainingMs : null,
+      maxCooldownRemainingMs:
+        typeof state?.maxCooldownRemainingMs === 'number' ? state.maxCooldownRemainingMs : null,
       historyCount: typeof state?.historyCount === 'number' ? state.historyCount : null,
       combinedHistoryCount:
-        typeof state?.combinedHistoryCount === 'number' ? state.combinedHistoryCount : null
+        typeof state?.combinedHistoryCount === 'number' ? state.combinedHistoryCount : null,
+      history: historyArray,
+      combinedHistory: combinedHistoryArray
     };
   }
   return result;
@@ -2261,6 +2387,7 @@ export type {
   DetectorSnapshot,
   SuppressedEventMetric,
   RetentionSnapshot,
+  RetentionWarningSnapshot,
   PrometheusHistogramOptions,
   PrometheusGaugeOptions,
   PrometheusLogLevelOptions,

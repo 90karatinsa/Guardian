@@ -108,6 +108,59 @@ describe('VideoSource', () => {
     expect(recoverReasons.filter(reason => reason === 'watchdog-timeout')).not.toHaveLength(0);
   });
 
+  it('VideoSourceForceKillKillsHungProcess', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 10,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 20,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      expect(commands).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(15);
+      await Promise.resolve();
+
+      expect(recoverEvents.some(event => event.reason === 'start-timeout')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      expect(recoverEvents.filter(event => event.reason === 'force-kill')).not.toHaveLength(0);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['force-kill'] ?? 0).toBeGreaterThanOrEqual(1);
+      expect(commands[0]?.killedSignals).toContain('SIGTERM');
+      expect(commands[0]?.killedSignals).toContain('SIGKILL');
+
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+    } finally {
+      await source.stop();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
+    }
+  });
+
   it('VideoSourceRtspErrorDedupes', async () => {
     vi.useFakeTimers();
 

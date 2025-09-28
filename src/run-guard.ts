@@ -778,11 +778,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     handleConfigError = error => {
       const err = error instanceof Error ? error : new Error(String(error));
       logger.warn(
-        { err, configPath: manager.getPath(), action: 'reload', restored: true },
-        'configuration reload failed'
+        { err, configPath: manager.getPath(), action: 'reload', restored: true, reloadRejected: true },
+        'ConfigReloadRejected'
       );
       logger.info(
-        { configPath: manager.getPath(), action: 'reload', restored: true },
+        { configPath: manager.getPath(), action: 'reload', restored: true, reloadRejected: true },
         'Configuration rollback applied'
       );
     };
@@ -1332,10 +1332,6 @@ function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelin
     return true;
   }
 
-  if (!motionConfigsEqual(previous.motion, next.motion)) {
-    return true;
-  }
-
   return false;
 }
 
@@ -1434,25 +1430,6 @@ function objectConfigsEqual(a?: ObjectsConfig | null, b?: ObjectsConfig | null) 
   );
 }
 
-function motionConfigsEqual(
-  a: CameraPipelineState['motion'],
-  b: CameraPipelineState['motion']
-) {
-  return (
-    Math.abs(a.diffThreshold - b.diffThreshold) < 1e-6 &&
-    Math.abs(a.areaThreshold - b.areaThreshold) < 1e-6 &&
-    (a.minIntervalMs ?? null) === (b.minIntervalMs ?? null) &&
-    (a.debounceFrames ?? null) === (b.debounceFrames ?? null) &&
-    (a.backoffFrames ?? null) === (b.backoffFrames ?? null) &&
-    (a.noiseMultiplier ?? null) === (b.noiseMultiplier ?? null) &&
-    (a.noiseSmoothing ?? null) === (b.noiseSmoothing ?? null) &&
-    (a.areaSmoothing ?? null) === (b.areaSmoothing ?? null) &&
-    (a.areaInflation ?? null) === (b.areaInflation ?? null) &&
-    (a.areaDeltaThreshold ?? null) === (b.areaDeltaThreshold ?? null) &&
-    (a.idleRebaselineMs ?? null) === (b.idleRebaselineMs ?? null)
-  );
-}
-
 function arrayEqual<T>(a: T[] | undefined, b: T[] | undefined) {
   if (!a && !b) {
     return true;
@@ -1499,7 +1476,21 @@ function summarizePipelineUpdates(
   const motionChanges = collectNumericChanges(
     runtime.pipelineState.motion,
     next.pipelineState.motion,
-    ['noiseWarmupFrames', 'noiseBackoffPadding']
+    [
+      'diffThreshold',
+      'areaThreshold',
+      'minIntervalMs',
+      'debounceFrames',
+      'backoffFrames',
+      'noiseMultiplier',
+      'noiseSmoothing',
+      'areaSmoothing',
+      'areaInflation',
+      'areaDeltaThreshold',
+      'idleRebaselineMs',
+      'noiseWarmupFrames',
+      'noiseBackoffPadding'
+    ]
   );
   if (Object.keys(motionChanges).length > 0) {
     updates.motion = motionChanges;

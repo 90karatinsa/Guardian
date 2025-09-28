@@ -299,6 +299,9 @@ describe('MetricsCounters', () => {
       expect(snapshot.logs.byLevel.info).toBe(1);
       expect(snapshot.logs.byLevel.warn).toBe(1);
       expect(snapshot.logs.byLevel.error).toBe(1);
+      expect(snapshot.logs.currentLevel).toBe('trace');
+      expect(snapshot.logs.levelChanges.trace).toBe(1);
+      expect(snapshot.logs.lastLevelChangeAt).toMatch(/T/);
       expect(snapshot.logs.byDetector.pose.info).toBe(1);
       expect(snapshot.logs.byDetector.pose.warn).toBe(1);
       expect(snapshot.logs.byDetector.pose.error).toBe(1);
@@ -310,9 +313,15 @@ describe('MetricsCounters', () => {
       expect(exported.byDetector.pose.error).toBe(1);
       expect(exported.lastErrorMessage).toBe('error baseline');
       expect(exported.lastErrorAt).toMatch(/T/);
+      expect(exported.currentLevel).toBe('trace');
+      expect(exported.lastLevelChangeAt).toMatch(/T/);
+      expect(exported.levelChanges.trace).toBe(1);
       const prom = getLogLevelPrometheusMetrics({ labels: { instance: 'lab' } });
       expect(prom).toMatch(/guardian_log_level_total\{instance="lab",level="error"\} 1/);
       expect(prom).toMatch(/guardian_log_last_error_timestamp_seconds\{instance="lab"\} \d+/);
+      expect(prom).toMatch(/guardian_log_level_state\{instance="lab",level="trace"\} 1/);
+      expect(prom).toMatch(/guardian_log_level_change_total\{instance="lab",level="trace"\} 1/);
+      expect(prom).toMatch(/guardian_log_level_last_change_timestamp_seconds\{instance="lab"\} \d+/);
     } finally {
       setLogLevel(defaultLevel);
       metrics.reset();
@@ -335,6 +344,9 @@ describe('MetricsCounters', () => {
     expect(exported.byDetector.motion.error).toBe(1);
     expect(exported.lastErrorMessage).toBe('pipeline failed');
     expect(exported.lastErrorAt).toMatch(/T/);
+    expect(exported.currentLevel).toBe('info');
+    expect(exported.lastLevelChangeAt).toBeNull();
+    expect(exported.levelChanges).toEqual({});
   });
 
   it('MetricsHistogramBuckets exports pipeline watchdog counters and detector latency histograms', () => {

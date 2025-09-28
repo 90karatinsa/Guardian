@@ -38,7 +38,7 @@ function createIo() {
 }
 
 describe('ReadmeExamples', () => {
-  it('ReadmeUsageExamples ensures README snippets and CLI output stay in sync', async () => {
+  it('ReadmeExamplesStayValid ensures README snippets and CLI output stay in sync', async () => {
     const readme = readReadme();
 
     expect(readme).toContain('"idleTimeoutMs": 5000');
@@ -81,6 +81,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('docs/operations.md');
     expect(readme).toContain('pnpm tsx src/cli.ts --health');
     expect(readme).toContain('status: ok');
+    expect(readme).toContain('scripts/healthcheck.ts --health');
+    expect(readme).toContain('Offline kullanım');
 
     metrics.reset();
     const capture = createIo();

@@ -31,17 +31,95 @@ db.exec(`
   );
 `);
 
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
-  CREATE INDEX IF NOT EXISTS idx_events_source_detector ON events (source, detector);
-  CREATE INDEX IF NOT EXISTS idx_events_channel ON events (json_extract(meta, '$.channel'));
-  CREATE INDEX IF NOT EXISTS idx_events_camera ON events (json_extract(meta, '$.camera'));
-  CREATE INDEX IF NOT EXISTS idx_events_snapshot_path ON events (json_extract(meta, '$.snapshot'));
-  CREATE INDEX IF NOT EXISTS idx_events_face_snapshot ON events (
+const EVENT_INDEX_SCHEMA_VERSION = 1;
+
+type IndexDefinition = { name: string; sql: string };
+
+const EVENT_INDEX_DEFINITIONS: IndexDefinition[] = [
+  { name: 'idx_events_ts', sql: "CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts)" },
+  {
+    name: 'idx_events_source_detector',
+    sql: "CREATE INDEX IF NOT EXISTS idx_events_source_detector ON events (source, detector)"
+  },
+  {
+    name: 'idx_events_channel',
+    sql: "CREATE INDEX IF NOT EXISTS idx_events_channel ON events (json_extract(meta, '$.channel'))"
+  },
+  {
+    name: 'idx_events_camera',
+    sql: "CREATE INDEX IF NOT EXISTS idx_events_camera ON events (json_extract(meta, '$.camera'))"
+  },
+  {
+    name: 'idx_events_snapshot_path',
+    sql: "CREATE INDEX IF NOT EXISTS idx_events_snapshot_path ON events (json_extract(meta, '$.snapshot'))"
+  },
+  {
+    name: 'idx_events_face_snapshot',
+    sql: `CREATE INDEX IF NOT EXISTS idx_events_face_snapshot ON events (
     COALESCE(json_extract(meta, '$.faceSnapshot'), json_extract(meta, '$.face.snapshot'))
+  )`
+  }
+];
+
+const FACE_INDEX_DEFINITIONS: IndexDefinition[] = [
+  { name: 'idx_faces_label', sql: 'CREATE INDEX IF NOT EXISTS idx_faces_label ON faces (label)' }
+];
+
+for (const definition of EVENT_INDEX_DEFINITIONS.concat(FACE_INDEX_DEFINITIONS)) {
+  db.exec(definition.sql);
+}
+
+ensureEventIndexes();
+
+function readUserVersion(): number {
+  const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
+  const value = typeof row?.user_version === 'number' ? row.user_version : 0;
+  return Number.isFinite(value) ? value : 0;
+}
+
+function setUserVersion(version: number) {
+  const normalized = Math.max(0, Math.floor(Number(version)) || 0);
+  db.exec(`PRAGMA user_version = ${normalized}`);
+}
+
+type IndexEnsureResult = { created: string[]; version: number };
+
+function ensureEventIndexes(): IndexEnsureResult {
+  const created: string[] = [];
+  const existingEvents = new Set(
+    (db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }> | undefined)?.map(
+      entry => entry.name
+    ) ?? []
   );
-  CREATE INDEX IF NOT EXISTS idx_faces_label ON faces (label);
-`);
+
+  for (const definition of EVENT_INDEX_DEFINITIONS) {
+    if (!existingEvents.has(definition.name)) {
+      db.exec(definition.sql);
+      created.push(definition.name);
+    }
+  }
+
+  const existingFaces = new Set(
+    (db.prepare("PRAGMA index_list('faces')").all() as Array<{ name: string }> | undefined)?.map(
+      entry => entry.name
+    ) ?? []
+  );
+
+  for (const definition of FACE_INDEX_DEFINITIONS) {
+    if (!existingFaces.has(definition.name)) {
+      db.exec(definition.sql);
+      created.push(definition.name);
+    }
+  }
+
+  let version = readUserVersion();
+  if (version < EVENT_INDEX_SCHEMA_VERSION) {
+    setUserVersion(EVENT_INDEX_SCHEMA_VERSION);
+    version = EVENT_INDEX_SCHEMA_VERSION;
+  }
+
+  return { created, version };
+}
 
 const insertStatement = db.prepare(
   'INSERT INTO events (ts, source, detector, severity, message, meta) VALUES (@ts, @source, @detector, @severity, @message, @meta)'
@@ -325,6 +403,11 @@ export interface VacuumOptions {
   run?: 'always' | 'on-change' | 'never';
 }
 
+export interface VacuumExecutionResult extends Required<VacuumOptions> {
+  indexVersion: number;
+  ensuredIndexes: string[];
+}
+
 export interface RetentionPolicyOptions {
   retentionDays: number;
   snapshotDir?: string;
@@ -393,9 +476,11 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   return { removedEvents, archivedSnapshots, prunedArchives, warnings, perCamera };
 }
 
-export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto'): Required<VacuumOptions> {
+export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto'): VacuumExecutionResult {
   const normalized = normalizeVacuumOptions(options);
   const { run: _run, ...vacuum } = normalized;
+
+  const indexState = ensureEventIndexes();
 
   if (vacuum.mode === 'full') {
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -423,7 +508,7 @@ export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto'): Re
     }
   }
 
-  return normalized;
+  return { ...normalized, indexVersion: indexState.version, ensuredIndexes: indexState.created };
 }
 
 type SnapshotDirectory = {

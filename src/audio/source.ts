@@ -280,12 +280,23 @@ export class AudioSource extends EventEmitter {
     this.terminateProcess(true, { skipForceDelay: true });
   }
 
-  triggerDeviceDiscoveryTimeout(error?: Error) {
+  triggerDeviceDiscoveryTimeout(
+    error?: Error,
+    options: { format?: AudioSourceOptions['inputFormat'] } = {}
+  ) {
     if (this.shouldStop || this.circuitBroken) {
       return;
     }
 
     const err = error ?? new Error('Audio device discovery timed out');
+    const format = options.format ?? this.options.inputFormat;
+    AudioSource.clearDeviceCache(format);
+    if (this.options.type === 'mic') {
+      this.micInputArgs = [];
+      this.micCandidateIndex = 0;
+      this.activeMicCandidateIndex = null;
+      this.lastSuccessfulMicIndex = null;
+    }
     metrics.recordAudioDeviceDiscovery('device-discovery-timeout', {
       channel: this.options.channel
     });
@@ -437,7 +448,7 @@ export class AudioSource extends EventEmitter {
     } catch (error) {
       if (isTimeoutError(error)) {
         const err = error instanceof Error ? error : new Error('Audio device discovery timed out');
-        this.triggerDeviceDiscoveryTimeout(err);
+        this.triggerDeviceDiscoveryTimeout(err, { format });
         return false;
       }
 
@@ -1122,6 +1133,7 @@ export class AudioSource extends EventEmitter {
       `analysis.${format}.spectral-centroid`,
       state.spectralCentroid
     );
+    metrics.setDetectorGauge('audio-anomaly', `analysis.${format}.windows`, state.frames);
     this.emit('analysis', {
       format,
       rms: state.rms,

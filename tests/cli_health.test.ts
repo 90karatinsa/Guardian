@@ -141,6 +141,28 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('CliHealthcheckOutputsStatus reports ok status and pipeline summaries for daemon health JSON', async () => {
+    const capture = createTestIo();
+    const code = await runCli(['daemon', 'health', '--json'], capture.io);
+
+    expect(code).toBe(0);
+    const payload = JSON.parse(capture.stdout().trim());
+
+    expect(payload.status).toBe('ok');
+    expect(payload.metricsSummary.pipelines.restarts.video).toBe(0);
+    expect(payload.metricsSummary.pipelines.restarts.audio).toBe(0);
+    expect(payload.metricsSummary.pipelines.watchdogRestarts.video).toBe(0);
+    expect(payload.metricsSummary.pipelines.watchdogRestarts.audio).toBe(0);
+    expect(payload.metricsSummary.pipelines.watchdogBackoffMs.video).toBe(0);
+    expect(payload.metricsSummary.pipelines.watchdogBackoffMs.audio).toBe(0);
+    expect(payload.metricsSummary.pipelines.lastWatchdogJitterMs.video).toBeNull();
+    expect(payload.metricsSummary.pipelines.lastWatchdogJitterMs.audio).toBeNull();
+    expect(payload.metricsSummary.pipelines.channels.video).toBe(0);
+    expect(payload.metricsSummary.pipelines.channels.audio).toBe(0);
+    expect(payload.metricsSummary.pipelines.lastRestartAt.video).toBeNull();
+    expect(payload.metricsSummary.pipelines.lastRestartAt.audio).toBeNull();
+  });
+
   it('HealthcheckMetricsSnapshot includes runtime fields and degraded status', async () => {
     const capture = createTestIo();
     const flagCode = await runCli(['--health'], capture.io);
@@ -260,7 +282,7 @@ describe('GuardianCliHealthcheck', () => {
 
     expect(readyCode).toBe(1);
     expect(readyPayload.ready).toBe(false);
-    expect(readyPayload.reason).toBe('service-idle');
+    expect(readyPayload.reason).toBe('service-stopped');
 
     const stopIo = createTestIo();
     const stopCode = await runCli(['daemon', 'stop'], stopIo.io);
@@ -322,13 +344,15 @@ describe('GuardianCliHealthcheck', () => {
     const health = await buildHealthPayload();
     const manifest = health.integration;
 
-    expect(manifest.docker.healthcheck).toContain('pnpm exec tsx src/cli.ts');
+    expect(manifest.docker.healthcheck).toContain('pnpm exec tsx scripts/healthcheck.ts');
     expect(manifest.docker.stopCommand).toContain('pnpm exec tsx src/cli.ts stop');
     expect(manifest.docker.logLevel.get).toContain('log-level get');
     expect(manifest.docker.logLevel.set).toContain('log-level set');
 
     const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
     expect(dockerfile).toContain(manifest.docker.healthcheck);
+
+    expect(manifest.systemd.execStartPre).toContain('scripts/healthcheck.ts');
 
     const guardianUnit = parseSystemdUnit(fs.readFileSync(path.join('deploy', 'guardian.service'), 'utf8'));
     expect(guardianUnit.ExecStart?.[0]).toBe(manifest.systemd.execStart);
@@ -353,7 +377,7 @@ describe('GuardianCliHealthcheck', () => {
     const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
     expect(dockerfile).toContain('STOPSIGNAL SIGTERM');
     expect(dockerfile).toContain('HEALTHCHECK');
-    expect(dockerfile).toContain('cli.ts --health');
+    expect(dockerfile).toContain('scripts/healthcheck.ts --health');
     expect(dockerfile).toContain('"daemon", "start"');
   });
 
@@ -418,7 +442,17 @@ describe('GuardianCliRetention', () => {
       warnings: [],
       perCamera: {}
     });
-    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase').mockImplementation(() => {});
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase').mockImplementation(() => ({
+      run: 'always',
+      mode: 'auto',
+      target: undefined,
+      analyze: false,
+      reindex: false,
+      optimize: false,
+      pragmas: undefined,
+      indexVersion: 1,
+      ensuredIndexes: []
+    }));
     const runSpy = vi.spyOn(metrics, 'recordRetentionRun');
     const warnSpy = vi.spyOn(metrics, 'recordRetentionWarning');
     const infoSpy = vi.spyOn(logger, 'info');

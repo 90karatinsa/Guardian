@@ -55,6 +55,82 @@ describe('MotionDetector', () => {
     metrics.reset();
   });
 
+  it('MotionDetectorNoiseBackoffPadding adapts debounce/backoff under sustained noise', () => {
+    const motion = new MotionDetector(
+      {
+        source: 'adaptive-motion',
+        diffThreshold: 5,
+        areaThreshold: 0.32,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.08,
+        areaSmoothing: 0.18,
+        areaInflation: 1.08,
+        areaDeltaThreshold: 0.05,
+        noiseWarmupFrames: 0,
+        noiseBackoffPadding: 0
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(16, 16, 90);
+    motion.handleFrame(baseline, 0);
+
+    for (let i = 0; i < 45; i += 1) {
+      const noiseFrame = createFrame(16, 16, (x, y) => {
+        const offset = ((x * 5 + y * 7 + i * 3) % 15) - 7;
+        return 90 + offset * 3;
+      });
+      motion.handleFrame(noiseFrame, i + 1);
+    }
+
+    let snapshot = metrics.snapshot();
+    const initialPadding = snapshot.detectors.motion?.gauges?.noiseBackoffPadding ?? 0;
+    const initialDebounce = snapshot.detectors.motion?.gauges?.effectiveDebounceFrames ?? 0;
+
+    const internals = motion as unknown as {
+      noiseLevel: number;
+      noiseWindow: number[];
+      suppressedFrames: number;
+      pendingSuppressedFramesBeforeTrigger: number;
+      noiseBackoffPadding: number;
+      baseNoiseBackoffPadding: number;
+      activationFrames: number;
+      backoffFrames: number;
+    };
+    internals.noiseLevel = 1;
+    internals.noiseWindow.length = 0;
+    internals.noiseWindow.push(...Array(30).fill(1.35));
+    internals.noiseBackoffPadding = 0;
+    internals.baseNoiseBackoffPadding = 0;
+
+    const triggerFrame = createFrame(16, 16, (x, y) => (x < 12 ? 255 : 35 + ((x + y) % 5) * 8));
+
+    internals.activationFrames = 20;
+    internals.suppressedFrames = 0;
+    internals.pendingSuppressedFramesBeforeTrigger = 18;
+    internals.backoffFrames = 0;
+
+    motion.handleFrame(triggerFrame, 200);
+
+    const motionEvents = events.filter(event => event.detector === 'motion');
+    expect(motionEvents.length).toBeGreaterThanOrEqual(1);
+    const meta = motionEvents.at(-1)?.meta as Record<string, number>;
+    expect(meta).toBeDefined();
+    snapshot = metrics.snapshot();
+    const paddingGauge = snapshot.detectors.motion?.gauges?.noiseBackoffPadding ?? 0;
+    const debounceGauge = snapshot.detectors.motion?.gauges?.effectiveDebounceFrames ?? 0;
+    expect(paddingGauge).toBeGreaterThan(initialPadding);
+    expect(debounceGauge).toBeGreaterThan(initialDebounce);
+    expect((meta?.noiseBackoffPadding ?? 0)).toBeGreaterThan(initialPadding);
+    expect((meta?.effectiveDebounceFrames ?? 0)).toBeGreaterThan(initialDebounce);
+    expect((meta?.effectiveBackoffFrames ?? 0)).toBeGreaterThanOrEqual(4);
+
+    expect(snapshot.detectors.motion?.counters?.backoffActivations ?? 0).toBeGreaterThanOrEqual(1);
+  });
+
   it('MotionLightNoiseWindowing expands windows under sustained noise and records gauges', () => {
     const motion = new MotionDetector(
       {

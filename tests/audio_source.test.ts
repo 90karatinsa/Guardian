@@ -207,6 +207,7 @@ describe('AudioSource resilience', () => {
 
     const analysis = source.getAnalysisSnapshot();
     expect(analysis.ffmpeg).toBeDefined();
+    expect(analysis.ffmpeg.frames).toBe(1);
 
     const snapshot = metrics.snapshot();
     const gauges = snapshot.detectors['audio-anomaly'].gauges;
@@ -215,6 +216,7 @@ describe('AudioSource resilience', () => {
       analysis.ffmpeg.spectralCentroid,
       6
     );
+    expect(gauges['analysis.ffmpeg.windows']).toBe(analysis.ffmpeg.frames);
 
     source.stop();
   });
@@ -408,6 +410,64 @@ describe('AudioSource resilience', () => {
     source.stop();
     await vi.runOnlyPendingTimersAsync();
     platformSpy.mockRestore();
+  });
+
+  it('AudioSourceDeviceDiscoveryTimeout recovers and records metrics', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const clearSpy = vi.spyOn(AudioSource, 'clearDeviceCache');
+    execFileMock.mockImplementation((_cmd: string, _args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      const error = new Error('timed out') as ExecFileException;
+      (error as NodeJS.ErrnoException).code = 'ETIME';
+      callback(error, '', '');
+      return child;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:discovery-timeout',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 50,
+      restartDelayMs: 120,
+      restartMaxDelayMs: 120,
+      restartJitterFactor: 0,
+      deviceDiscoveryTimeoutMs: 200,
+      random: () => 0.5
+    });
+
+    const recoverSpy = vi.fn();
+    const errorSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', errorSpy);
+
+    source.start();
+
+    await waitForCondition(() => recoverSpy.mock.calls.length > 0, 1000);
+    const event = recoverSpy.mock.calls[0]?.[0];
+    expect(event?.reason).toBe('device-discovery-timeout');
+    expect(errorSpy).toHaveBeenCalledWith(expect.any(Error));
+    expect(clearSpy).toHaveBeenCalled();
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.audio.byReason['device-discovery-timeout']).toBeGreaterThanOrEqual(1);
+
+    const sampleFrame = new Int16Array([0, 1200, -600, 400, -200, 50, -75, 25]);
+    (source as any).analyzeFrame(sampleFrame, 16000, 0.05);
+    (source as any).analyzeFrame(sampleFrame, 16000, 0.05);
+
+    const analysis = source.getAnalysisSnapshot();
+    expect(analysis.alsa).toBeDefined();
+    expect(analysis.alsa.frames).toBe(2);
+
+    const analysisSnapshot = metrics.snapshot();
+    const detectorSnapshot = analysisSnapshot.detectors['audio-anomaly'];
+    expect(detectorSnapshot).toBeDefined();
+    expect(detectorSnapshot.gauges['analysis.alsa.windows']).toBe(2);
+
+    source.stop();
+    clearSpy.mockRestore();
   });
 
   it('AudioDeviceCircuitBreakerReset rotates ffmpeg candidates after silence', async () => {

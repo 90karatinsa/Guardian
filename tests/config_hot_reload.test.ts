@@ -125,7 +125,7 @@ describe('ConfigHotReload', () => {
     retentionMock.stop.mockReset();
   });
 
-  it('ConfigHotReloadChannelThresholds validates thresholds and restarts pipelines after rollback', async () => {
+  it('ConfigHotReloadRollsBack restores previous thresholds and flags rejected reloads', async () => {
     const base = createConfig({ diffThreshold: 28 });
     base.video.channels = {
       'video:cam-1': {
@@ -184,13 +184,22 @@ describe('ConfigHotReload', () => {
       fs.writeFileSync(configPath, JSON.stringify(broken, null, 2));
 
       await waitFor(
-        () => logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed'),
+        () =>
+          logger.warn.mock.calls.some(([payload, message]) => {
+            return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+          }),
         4000
       );
       await waitFor(
         () => logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied'),
         4000
       );
+
+      expect(
+        logger.warn.mock.calls.some(([payload, message]) => {
+          return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+        })
+      ).toBe(true);
 
       await waitFor(() => MockVideoSource.instances.length > initialCount, 4000);
 
@@ -545,7 +554,9 @@ describe('ConfigHotReload', () => {
       fs.writeFileSync(configPath, JSON.stringify(invalidConfig, null, 2));
 
       await waitFor(() =>
-        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+        logger.warn.mock.calls.some(([payload, message]) => {
+          return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+        })
       );
 
       expect(
@@ -592,13 +603,16 @@ describe('ConfigHotReload', () => {
       fs.writeFileSync(configPath, JSON.stringify(invalidChannel, null, 2));
 
       await waitFor(() =>
-        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+        logger.warn.mock.calls.some(([payload, message]) => {
+          return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+        })
       );
       await waitFor(() =>
         logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied')
       );
 
-      const channelWarn = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      const channelWarn = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
+      expect(channelWarn?.[0]?.reloadRejected).toBe(true);
       expect(channelWarn?.[0]?.err).toBeInstanceOf(Error);
       const channelMessage = channelWarn?.[0]?.err?.message ?? '';
       expect(channelMessage).toContain('must specify a non-empty channel');
@@ -618,13 +632,16 @@ describe('ConfigHotReload', () => {
       fs.writeFileSync(configPath, JSON.stringify(invalidThreshold, null, 2));
 
       await waitFor(() =>
-        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+        logger.warn.mock.calls.some(([payload, message]) => {
+          return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+        })
       );
       await waitFor(() =>
         logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied')
       );
 
-      const thresholdWarn = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      const thresholdWarn = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
+      expect(thresholdWarn?.[0]?.reloadRejected).toBe(true);
       expect(thresholdWarn?.[0]?.err).toBeInstanceOf(Error);
       const thresholdMessage = thresholdWarn?.[0]?.err?.message ?? '';
       expect(thresholdMessage).toContain('config.motion.diffThreshold must be >= 0');
@@ -736,7 +753,7 @@ describe('ConfigHotReload', () => {
       );
 
       expect(
-        logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed')
+        logger.warn.mock.calls.some(([, message]) => message === 'ConfigReloadRejected')
       ).toBe(false);
 
       const diffCall = logger.info.mock.calls.find(([, message]) => message === 'configuration overrides diff');
@@ -873,9 +890,9 @@ describe('ConfigHotReload', () => {
       const current = manager.getConfig();
       expect(current.motion.diffThreshold).toBe(20);
       expect(logger.error).not.toHaveBeenCalled();
-      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
       expect(warnCall).toBeDefined();
-      expect(warnCall?.[0]).toMatchObject({ configPath, action: 'reload', restored: true });
+      expect(warnCall?.[0]).toMatchObject({ configPath, action: 'reload', restored: true, reloadRejected: true });
       expect(warnCall?.[0]?.err).toBeInstanceOf(Error);
     } finally {
       runtime.stop();
@@ -916,7 +933,10 @@ describe('ConfigHotReload', () => {
       fs.writeFileSync(configPath, JSON.stringify(conflicting, null, 2));
 
       await waitFor(
-        () => logger.warn.mock.calls.some(([, message]) => message === 'configuration reload failed'),
+        () =>
+          logger.warn.mock.calls.some(([payload, message]) => {
+            return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+          }),
         4000
       );
       await waitFor(
@@ -924,7 +944,8 @@ describe('ConfigHotReload', () => {
         4000
       );
 
-      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'configuration reload failed');
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
+      expect(warnCall?.[0]?.reloadRejected).toBe(true);
       expect(warnCall?.[0]?.err).toBeInstanceOf(Error);
       expect(warnCall?.[0]?.err?.message ?? '').toContain(
         'config.audio.channel "video:lobby" conflicts with video channel definition "video:lobby"'

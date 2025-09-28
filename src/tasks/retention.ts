@@ -1,6 +1,6 @@
 import path from 'node:path';
 import loggerModule from '../logger.js';
-import metricsModule, { MetricsRegistry } from '../metrics/index.js';
+import metricsModule, { MetricsRegistry, type RetentionWarningSnapshot } from '../metrics/index.js';
 import {
   applyRetentionPolicy,
   RetentionOutcome,
@@ -49,6 +49,8 @@ export type RetentionVacuumSummary = {
   optimize: boolean;
   target?: string;
   pragmas?: string[];
+  indexVersion?: number;
+  ensuredIndexes?: string[];
 };
 
 export type RetentionRunResult = {
@@ -399,7 +401,7 @@ async function executeRetentionRun(
     metrics.recordRetentionWarning(summary);
   }
 
-  let vacuumResult: Required<VacuumOptions> | null = null;
+  let vacuumResult: ReturnType<typeof vacuumDatabase> | null = null;
   if (shouldVacuum) {
     vacuumResult = vacuumDatabase(options.vacuum);
   }
@@ -419,7 +421,12 @@ async function executeRetentionRun(
     reindex: shouldVacuum ? vacuumResult?.reindex === true : false,
     optimize: shouldVacuum ? vacuumResult?.optimize === true : false,
     target: shouldVacuum ? vacuumResult?.target ?? options.vacuum.target ?? undefined : undefined,
-    pragmas: shouldVacuum ? vacuumResult?.pragmas : undefined
+    pragmas: shouldVacuum ? vacuumResult?.pragmas : undefined,
+    indexVersion: shouldVacuum ? vacuumResult?.indexVersion : undefined,
+    ensuredIndexes:
+      shouldVacuum && vacuumResult?.ensuredIndexes && vacuumResult.ensuredIndexes.length > 0
+        ? vacuumResult.ensuredIndexes
+        : undefined
   };
 
   logger.info(
@@ -436,7 +443,9 @@ async function executeRetentionRun(
             reindex: vacuumSummary.reindex,
             optimize: vacuumSummary.optimize,
             target: vacuumSummary.target,
-            pragmas: vacuumSummary.pragmas
+            pragmas: vacuumSummary.pragmas,
+            indexVersion: vacuumSummary.indexVersion,
+            ensuredIndexes: vacuumSummary.ensuredIndexes
           }
         : undefined,
       perCamera: outcome.perCamera

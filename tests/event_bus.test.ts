@@ -392,6 +392,60 @@ describe('EventSuppressionRateLimit', () => {
     expect(ruleHistory.history.lastCooldownEndsAt).toBe(lastEvent?.cooldownEndsAt ?? null);
   });
 
+  it('EventSuppressionWindowRateLimitMerge combines channel histories for overlapping hits', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'window-rule',
+        detector: 'test-detector',
+        channel: 'cam:1',
+        suppressForMs: 600,
+        reason: 'window limited'
+      },
+      {
+        id: 'rate-rule',
+        detector: 'test-detector',
+        channel: 'cam:1',
+        rateLimit: { count: 1, perMs: 500, cooldownMs: 400 },
+        suppressForMs: 400,
+        reason: 'rate limited'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:1' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 250, meta: { channel: 'cam:1' } })).toBe(false);
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressedMeta).toHaveLength(1);
+    const merged = suppressedMeta[0];
+    expect(Array.isArray(merged.suppressedBy)).toBe(true);
+    expect(merged.suppressedBy?.length).toBeGreaterThanOrEqual(2);
+    merged.suppressedBy?.forEach(entry => {
+      expect(entry?.combinedHistoryCount).toBe(merged.suppressionHistoryCount);
+      expect(entry?.combinedHistory).toEqual(merged.suppressionHistory);
+    });
+
+    const channelState = merged.suppressionChannelStates?.['cam:1'];
+    expect(channelState?.historyCount).toBe(merged.suppressionHistoryCount);
+    expect(channelState?.combinedHistoryCount).toBe(merged.suppressionHistoryCount);
+    expect(channelState?.history).toEqual(merged.suppressionHistory);
+    expect(channelState?.combinedHistory).toEqual(merged.suppressionHistory);
+
+    const snapshot = metrics.snapshot();
+    const lastState = snapshot.suppression.lastEvent?.channelStates?.['cam:1'];
+    expect(lastState?.historyCount).toBe(channelState?.historyCount ?? null);
+    expect(lastState?.combinedHistoryCount).toBe(channelState?.combinedHistoryCount ?? null);
+  });
+
   it('EventSuppressionMaxEvents enforces burst limits with history metadata', () => {
     bus.configureSuppression([
       {

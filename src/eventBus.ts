@@ -60,8 +60,8 @@ type ChannelSuppressionState = {
   maxWindowRemainingMs: number | null;
   cooldownRemainingMs: number | null;
   maxCooldownRemainingMs: number | null;
-  historyCount: number;
-  combinedHistoryCount: number;
+  history: Set<number>;
+  combinedHistory: Set<number>;
 };
 
 class EventBus extends EventEmitter {
@@ -176,7 +176,9 @@ class EventBus extends EventEmitter {
           channels: [...eventChannels],
           windowRemainingMs,
           cooldownRemainingMs,
-          cooldownExpiresAt
+          cooldownExpiresAt,
+          combinedHistory,
+          combinedHistoryCount: combinedHistory.length
         };
       });
       suppressedBy.forEach((suppressedMeta, index) => {
@@ -198,15 +200,13 @@ class EventBus extends EventEmitter {
         if (candidateChannels.size === 0) {
           return;
         }
-        const historyCount =
-          typeof suppressedMeta.historyCount === 'number' && Number.isFinite(suppressedMeta.historyCount)
-            ? suppressedMeta.historyCount
-            : 0;
-        const combinedHistoryCount =
-          typeof suppressedMeta.combinedHistoryCount === 'number' &&
-          Number.isFinite(suppressedMeta.combinedHistoryCount)
-            ? suppressedMeta.combinedHistoryCount
-            : 0;
+        const perHitHistory = Array.isArray(suppressedMeta.history)
+          ? suppressedMeta.history.filter(entry => Number.isFinite(entry))
+          : [];
+        const perHitHistorySet = new Set<number>(perHitHistory);
+        const combinedHistoryEntries = Array.isArray(suppressedMeta.combinedHistory)
+          ? suppressedMeta.combinedHistory.filter(entry => Number.isFinite(entry))
+          : combinedHistory;
         for (const channel of candidateChannels) {
           const existing = channelStates.get(channel) ?? {
             hits: 0,
@@ -216,8 +216,8 @@ class EventBus extends EventEmitter {
             maxWindowRemainingMs: null,
             cooldownRemainingMs: null,
             maxCooldownRemainingMs: null,
-            historyCount: 0,
-            combinedHistoryCount: 0
+            history: new Set<number>(),
+            combinedHistory: new Set<number>()
           } satisfies ChannelSuppressionState;
           existing.hits += 1;
           existing.reasons.add(hit.reason);
@@ -236,8 +236,12 @@ class EventBus extends EventEmitter {
                 ? suppressedMeta.cooldownRemainingMs
                 : Math.max(existing.maxCooldownRemainingMs, suppressedMeta.cooldownRemainingMs);
           }
-          existing.historyCount = Math.max(existing.historyCount, historyCount);
-          existing.combinedHistoryCount = Math.max(existing.combinedHistoryCount, combinedHistoryCount);
+          perHitHistorySet.forEach(entry => {
+            existing.history.add(entry);
+          });
+          combinedHistoryEntries.forEach(entry => {
+            existing.combinedHistory.add(entry);
+          });
           channelStates.set(channel, existing);
         }
       });
@@ -273,8 +277,10 @@ class EventBus extends EventEmitter {
               maxWindowRemainingMs: state.maxWindowRemainingMs,
               cooldownRemainingMs: state.cooldownRemainingMs,
               maxCooldownRemainingMs: state.maxCooldownRemainingMs,
-              historyCount: state.historyCount,
-              combinedHistoryCount: state.combinedHistoryCount
+              history: dedupeAndSortHistory(Array.from(state.history)),
+              historyCount: state.history.size,
+              combinedHistory: dedupeAndSortHistory(Array.from(state.combinedHistory)),
+              combinedHistoryCount: state.combinedHistory.size
             }
           ])
         )
@@ -295,6 +301,7 @@ class EventBus extends EventEmitter {
           type: hit.type,
           historyCount: history.length,
           history,
+          combinedHistory,
           windowExpiresAt: hit.windowExpiresAt,
           rateLimit: hit.rateLimit,
           cooldownMs: hit.cooldownMs,

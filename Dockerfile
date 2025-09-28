@@ -25,6 +25,6 @@ COPY . .
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD pnpm exec tsx src/cli.ts --health || exit 1
+  CMD pnpm exec tsx scripts/healthcheck.ts --health || exit 1
 
 CMD ["pnpm", "exec", "tsx", "src/cli.ts", "daemon", "start"]
