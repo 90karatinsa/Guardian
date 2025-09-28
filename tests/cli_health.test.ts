@@ -224,6 +224,28 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('CliAudioCircuitReset triggers audio circuit breaker resets and reports the channel', async () => {
+    const stopSpy = vi.fn();
+    const resetSpy = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({ stop: stopSpy, resetCircuitBreaker: resetSpy });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const restartIo = createTestIo();
+    const code = await runCli(['daemon', 'restart', '--channel', 'audio:CLI-Stream'], restartIo.io);
+
+    expect(code).toBe(0);
+    expect(resetSpy).toHaveBeenCalledWith('audio:CLI-Stream');
+    expect(restartIo.stdout()).toContain('Requested circuit breaker reset for audio channel audio:cli-stream');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('CliDaemonHealthcheck exposes daemon subcommands and exit codes', async () => {
     const healthIo = createTestIo();
     const healthCode = await runCli(['daemon', 'health'], healthIo.io);

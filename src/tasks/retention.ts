@@ -57,6 +57,7 @@ export type RetentionRunResult = {
   outcome?: RetentionOutcome;
   warnings: RetentionWarningSnapshot[];
   vacuum: RetentionVacuumSummary;
+  rescheduled: boolean;
 };
 
 export class RetentionTask {
@@ -122,15 +123,27 @@ export class RetentionTask {
 
     this.running = true;
 
+    let result: RetentionRunResult | null = null;
+    const options = this.options;
+
     try {
-      await executeRetentionRun(this.options, this.logger, this.metrics);
+      result = await executeRetentionRun(options, this.logger, this.metrics);
     } catch (error) {
       this.logger.error({ err: error }, 'Retention task failed');
     } finally {
       this.running = false;
 
       if (!this.stopped) {
-        this.scheduleNext(this.options.intervalMs);
+        const latestOptions = this.options;
+        const shouldReschedule =
+          (result?.rescheduled ?? latestOptions.enabled) && latestOptions.enabled;
+
+        if (shouldReschedule) {
+          this.scheduleNext(latestOptions.intervalMs);
+        } else if (this.timer) {
+          clearTimeout(this.timer);
+          this.timer = null;
+        }
       }
     }
   }
@@ -353,7 +366,7 @@ async function executeRetentionRun(
       optimize: false
     };
     logger.info({ enabled: false }, 'Retention task skipped');
-    return { skipped: true, reason: 'disabled', warnings: [], vacuum };
+    return { skipped: true, reason: 'disabled', warnings: [], vacuum, rescheduled: false };
   }
 
   const snapshotDirs = dedupeDirectories(options.snapshotDirs);
@@ -435,6 +448,7 @@ async function executeRetentionRun(
     skipped: false,
     outcome,
     warnings,
-    vacuum: vacuumSummary
+    vacuum: vacuumSummary,
+    rescheduled: true
   };
 }

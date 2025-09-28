@@ -189,7 +189,8 @@ Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kam
 
 ### RTSP ve çoklu kamera
 - `video.cameras` dizisine her kamera için benzersiz bir nesne ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
-- `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Dashboard filtreleri ve metriklerdeki `pipelines.ffmpeg.byChannel` haritası bu alanı kullanır.
+- `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Guardian bu değerleri `normalizeChannelId` yardımcı fonksiyonuyla normalize eder; `video:lobby` ve `lobby` girişleri aynı video kanalına, `audio:microphone` ve sadece `microphone` girişleri ise aynı ses kanalına eşlenir. Dashboard filtreleri, HTTP API ve metriklerdeki `pipelines.ffmpeg.byChannel` ile `pipelines.audio.byChannel` haritaları bu normalleştirilmiş değerleri kullanır.
+- Prefixsiz girişler video kanalları için `video:` önekiyle, ses kanalları için ise `audio:` önekiyle saklanır. Örneğin `events.suppression.rules` altında `channel: "MICROPHONE"` tanımı yaparsanız Guardian bunu `audio:microphone` olarak kaydeder; CLI ve dashboard filtreleri aynı kimlikle eşleşir.
 - `ffmpeg` altındaki `idleTimeoutMs`, `watchdogTimeoutMs`, `startTimeoutMs`, `forceKillTimeoutMs`, `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` seçenekleri boru hattının yeniden deneme davranışını ve watchdog zamanlamalarını kontrol eder. RTSP hataları art arda yaşandığında, exponential backoff ve jitter uygulaması `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.watchdogBackoffByChannel` alanlarına işlenir; maksimum gecikmeye ulaşıldığında devre kesici tetiklenir ve hata logu üretir.
 - Kamera bazlı `motion` ve `person` blokları debounce/backoff gibi gürültü bastırma katsayılarını içerir; aynı dosyada birden fazla kamera tanımlayarak her kanal için farklı eşikler uygulayabilirsiniz.
 - Her kamera için tanımlanan `channel` değerinin `video.channels` altında karşılığı bulunmalıdır. Ayrıca `audio.micFallbacks` dizilerindeki `device` alanları boş bırakılamaz ve oran sınırlayıcı (`rateLimit`) tanımlarında `perMs` değeri `count` değerinden küçük olamaz; aksi halde konfigürasyon yüklenmez.
@@ -287,6 +288,14 @@ guardian daemon restart --channel video:lobby
 guardian daemon restart --channel video:missing
 # channel not found: video:missing
 
+# Belirli bir ses kanalının devre kesicisini sıfırlar ve normalize edilmiş kimliği raporlar
+guardian daemon restart --channel audio:microphone
+# Requested circuit breaker reset for audio channel audio:microphone
+
+Komut tamamlandığında `metrics.snapshot().pipelines.audio.restarts` sayacı ile
+`pipelines.audio.byChannel['audio:microphone'].byReason['manual-circuit-reset']` alanı 1 artar; `guardian daemon status --json`
+veya `guardian daemon health` komutlarının çıktılarına yansıyan `Restarts - video: …, audio: …` satırında artışı görebilirsiniz.
+
 # Bağlı mikrofonları JSON olarak listeler
 guardian audio devices --json
 
@@ -312,6 +321,8 @@ Yalnızca belirli metrik bölümlerini tüketmek için `metrics` sorgu parametre
 ```bash
 curl -N "http://localhost:3000/api/events/stream?metrics=audio,retention"
 ```
+
+Dashboard filtreleri ve REST uç noktaları, kanalları case-insensitive olarak normalize eder. `channel` sorgu parametresine `microphone`, `AUDIO:MICROPHONE` veya `Video:Lobby` yazmanız fark etmez; Guardian `audio:microphone` ve `video:lobby` kimliklerine dönüştürerek aynı olayları döndürür. Prefixsiz ses kanallarını denemek için `curl "http://localhost:3000/api/events?channel=microphone"` komutu `audio:microphone` kanalına ait kayıtları listeleyecektir.
 
 ## Metrikler ve sağlık çıktısı
 `pnpm tsx src/cli.ts --health` veya `guardian daemon status --json` komutları, aşağıdaki gibi bir metrik özeti döndürür:
@@ -378,6 +389,7 @@ operasyonel rehber ile birlikte okunmalıdır.
 - `guardian daemon status --json` veya `pnpm exec tsx src/cli.ts --health` çıktısında `metrics.logs.byLevel.error` hızla artıyorsa log seviyesini `guardian log-level set debug` ile yükseltip detaylı inceleme yapın.
 - `pipelines.ffmpeg.watchdogBackoffByChannel` veya `pipelines.ffmpeg.restartHistogram.delay` değerleri sürekli yükseliyorsa RTSP bağlantılarını kontrol edin; `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` parametrelerini düşürmek backoff süresini azaltır.
 - `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırları kesintisiz devam ediyorsa `audio.micFallbacks` listesinde çalışan bir cihaz kalmamış olabilir.
+- `Audio source recovering (reason=ffmpeg-missing)` hataları devre kesiciyi tetiklemişse `guardian daemon restart --channel audio:microphone` komutunu çalıştırarak `audio:microphone` kanalının devre kesicisini sıfırlayın. Komut başarılı olduğunda loglar manuel devre sıfırlamasını, metrikler ise `pipelines.audio.byReason['manual-circuit-reset']` artışını rapor eder; ardından ffmpeg ikililerinin PATH'te erişilebilir olduğunu `ffmpeg -version` ile doğrulayın.
 - `metrics.suppression.histogram.cooldownRemainingMs` ve `metrics.suppression.histogram.windowRemainingMs` değerleri yüksekse `events.suppression.rules` altındaki `suppressForMs` veya `rateLimit.cooldownMs` değerlerini gözden geçirin.
 - CLI komutları beklenen çıktıyı vermiyorsa `guardian daemon status --json` ve `pnpm exec tsx src/cli.ts status --json` komutlarının exit kodunun 0 olduğundan emin olun; farklı bir config dosyasını `--config` parametresiyle doğrulayabilirsiniz. `guardian daemon ready` çıktısı `"status":"ready"` değilse bir shutdown hook'u blokluyor olabilir.
 - `pipelines.ffmpeg.watchdogRestarts` veya `pipelines.ffmpeg.watchdogRestartsByChannel` değerleri artıyorsa [Operasyon kılavuzu](docs/operations.md)

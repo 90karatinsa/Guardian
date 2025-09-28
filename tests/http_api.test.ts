@@ -190,6 +190,46 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
   });
 
+  it('HttpApiChannelNormalizationSupportsAudio', async () => {
+    const now = Date.now();
+    storeEvent({
+      ts: now - 200,
+      source: 'audio:Lobby',
+      detector: 'audio-anomaly',
+      severity: 'warning',
+      message: 'Raised noise level',
+      meta: { channel: 'Audio:Lobby' }
+    });
+    storeEvent({
+      ts: now - 100,
+      source: 'video:cam-1',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Motion event',
+      meta: { channel: 'video:cam-1' }
+    });
+
+    const { port } = await ensureServer();
+
+    const prefixlessResponse = await fetch(`http://localhost:${port}/api/events?channel=lobby`);
+    expect(prefixlessResponse.status).toBe(200);
+    const prefixlessPayload = await prefixlessResponse.json();
+    expect(prefixlessPayload.items).toHaveLength(1);
+    const audioMeta = prefixlessPayload.items[0].meta ?? {};
+    expect(Array.isArray(audioMeta.resolvedChannels)).toBe(true);
+    expect(audioMeta.resolvedChannels).toContain('audio:lobby');
+    const prefixlessSummaryChannels = new Set(
+      (prefixlessPayload.summary?.channels ?? []).map((entry: { id: string }) => entry.id)
+    );
+    expect(prefixlessSummaryChannels.has('audio:lobby')).toBe(true);
+
+    const casedResponse = await fetch(`http://localhost:${port}/api/events?channel=AUDIO:LOBBY`);
+    expect(casedResponse.status).toBe(200);
+    const casedPayload = await casedResponse.json();
+    expect(casedPayload.items).toHaveLength(1);
+    expect((casedPayload.items[0].meta?.resolvedChannels ?? [])).toContain('audio:lobby');
+  });
+
   it('HttpApiSnapshotFaces filters snapshot listings, faces, and SSE metrics selections', async () => {
     const now = Date.now();
     const snapshotA = path.join(snapshotDir, 'snap-a.png');

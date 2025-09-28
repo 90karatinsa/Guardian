@@ -9,6 +9,7 @@ import {
   EventSuppressionRule,
   RateLimitConfig
 } from './types.js';
+import { canonicalChannel } from './utils/channel.js';
 
 const EVENT_CHANNEL = 'event';
 
@@ -485,12 +486,13 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
   const rateLimit = normalizeRateLimit(rule.rateLimit);
   const maxEvents = normalizeMaxEvents(rule.maxEvents);
   const windowMs = normalizeWindowMs(rule.suppressForMs);
+  const channels = normalizeRuleChannels(asArray(rule.channel));
   return {
     id: rule.id,
     detectors: asArray(rule.detector),
     sources: asArray(rule.source),
     severities: asArray(rule.severity),
-    channels: asArray(rule.channel),
+    channels,
     suppressForMs: windowMs > 0 ? windowMs : undefined,
     rateLimit,
     maxEvents,
@@ -525,6 +527,7 @@ function ruleMatchesEvent(
   event: EventRecord,
   eventChannelsArg?: string[]
 ): boolean {
+  const eventChannels = normalizeEventChannels(eventChannelsArg ?? extractEventChannels(event.meta));
   if (rule.detectors && !rule.detectors.includes(event.detector)) {
     return false;
   }
@@ -538,7 +541,6 @@ function ruleMatchesEvent(
   }
 
   if (rule.channels) {
-    const eventChannels = eventChannelsArg ?? extractEventChannels(event.meta);
     if (eventChannels.length === 0) {
       return false;
     }
@@ -623,7 +625,7 @@ function getTimelineForRule(
   rule: InternalSuppressionRule,
   channel: string | null
 ): SuppressionTimeline {
-  const normalized = typeof channel === 'string' ? channel.trim() : '';
+  const normalized = canonicalChannel(channel);
   if (!normalized) {
     return rule.timeline;
   }
@@ -671,22 +673,65 @@ function normalizeWindowMs(value: number | undefined): number {
   return Math.max(1, Math.floor(value));
 }
 
+function normalizeRuleChannels(channels: string[] | undefined): string[] | undefined {
+  if (!channels || channels.length === 0) {
+    return undefined;
+  }
+
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of channels) {
+    const canonical = canonicalChannel(candidate);
+    if (!canonical || seen.has(canonical)) {
+      continue;
+    }
+    normalized.push(canonical);
+    seen.add(canonical);
+  }
+
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeEventChannels(channels: string[] | undefined): string[] {
+  if (!channels || channels.length === 0) {
+    return [];
+  }
+
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of channels) {
+    const canonical = canonicalChannel(candidate);
+    if (!canonical || seen.has(canonical)) {
+      continue;
+    }
+    normalized.push(canonical);
+    seen.add(canonical);
+  }
+
+  return normalized;
+}
+
 function extractEventChannels(meta: Record<string, unknown> | undefined): string[] {
   if (!meta) {
     return [];
   }
 
   const candidate = meta.channel;
+  const collected: string[] = [];
 
   if (typeof candidate === 'string') {
-    return [candidate];
+    collected.push(candidate);
+  } else if (Array.isArray(candidate)) {
+    for (const value of candidate) {
+      if (typeof value === 'string') {
+        collected.push(value);
+      }
+    }
   }
 
-  if (Array.isArray(candidate)) {
-    return candidate.filter((value): value is string => typeof value === 'string');
-  }
-
-  return [];
+  return normalizeEventChannels(collected);
 }
 
 function mergeSuppressionHistory(hits: SuppressionHit[], eventTs: number): number[] {

@@ -496,10 +496,11 @@ function projectBoundingBox(
 
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
-  const clamped = clampBoundingBoxToFrame(best.box, meta.originalWidth, meta.originalHeight);
+  const projection = projections[best.projectionIndex ?? 0] ?? projections[0];
+  const clamped = clampBoundingBoxToFrame(best.box, projection.originalWidth, projection.originalHeight);
   return {
     box: clamped,
-    areaRatio: computeAreaRatio(clamped, meta.originalWidth, meta.originalHeight),
+    areaRatio: computeAreaRatio(clamped, projection.originalWidth, projection.originalHeight),
     projectionIndex: best.projectionIndex,
     normalized: best.normalized,
     score: best.score

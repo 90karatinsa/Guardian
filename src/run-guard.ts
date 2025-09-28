@@ -36,6 +36,7 @@ import { RetentionTask, RetentionTaskOptions, startRetentionTask } from './tasks
 import metrics from './metrics/index.js';
 import { AudioSource, type AudioFatalEvent } from './audio/source.js';
 import AudioAnomalyDetector from './audio/anomaly.js';
+import { canonicalChannel, normalizeChannelId } from './utils/channel.js';
 
 type CameraPipelineState = {
   channel: string;
@@ -230,6 +231,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       return;
     }
 
+    metrics.clearPipelineChannel('audio', runtime.channel);
+
     for (const fn of runtime.cleanup) {
       try {
         fn();
@@ -295,6 +298,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         source.off('data', runtime.dataListener);
       }
     });
+
+    runtime.cleanup.push(() => metrics.clearPipelineChannel('audio', runtime.channel));
 
     const configureAnomaly = (anomalyConfig?: AudioConfig['anomaly']) => {
       if (!anomalyConfig) {
@@ -807,33 +812,75 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   await runSync(activeConfig);
 
   const resetPipelineCircuitBreaker = (identifier: string) => {
+    const trimmed = typeof identifier === 'string' ? identifier.trim() : '';
+    if (!trimmed) {
+      return false;
+    }
+
+    const canonicalVideo = canonicalChannel(trimmed);
     const runtime =
-      pipelines.get(identifier) ??
-      pipelinesById.get(identifier) ??
-      pipelinesById.get(identifier.replace(/^video:/, '')) ??
+      pipelines.get(trimmed) ??
+      (canonicalVideo ? pipelines.get(canonicalVideo) : null) ??
+      pipelinesById.get(trimmed) ??
+      pipelinesById.get(trimmed.replace(/^video:/i, '')) ??
       null;
 
     const target = runtime ?? Array.from(pipelines.values()).find(candidate => {
-      return candidate.channel === identifier || candidate.id === identifier;
+      return (
+        candidate.channel === trimmed ||
+        candidate.channel === canonicalVideo ||
+        candidate.id === trimmed
+      );
     });
 
-    if (!target) {
+    if (target) {
+      if (!target.source.isCircuitBroken()) {
+        return false;
+      }
+
+      const wasBroken = target.source.resetCircuitBreaker();
+      if (!wasBroken) {
+        return false;
+      }
+
+      const channel = target.channel;
+      logger.info({ camera: target.id, channel }, 'Resetting video circuit breaker');
+      metrics.recordPipelineRestart('ffmpeg', 'manual-circuit-reset', {
+        channel,
+        at: Date.now(),
+        attempt: 0,
+        delayMs: 0
+      });
+      return true;
+    }
+
+    if (!audioRuntime) {
       return false;
     }
 
-    if (!target.source.isCircuitBroken()) {
+    const canonicalIdentifier = canonicalChannel(trimmed, { defaultType: 'audio' });
+    if (!canonicalIdentifier.startsWith('audio:')) {
       return false;
     }
 
-    const wasBroken = target.source.resetCircuitBreaker();
+    const audioChannel = audioRuntime.channel;
+    const canonicalAudioChannel = canonicalChannel(audioChannel, { defaultType: 'audio' });
+    if (!canonicalAudioChannel || canonicalAudioChannel !== canonicalIdentifier) {
+      return false;
+    }
+
+    if (!audioRuntime.source.isCircuitBroken()) {
+      return false;
+    }
+
+    const wasBroken = audioRuntime.source.resetCircuitBreaker();
     if (!wasBroken) {
       return false;
     }
 
-    const channel = target.channel;
-    logger.info({ camera: target.id, channel }, 'Resetting video circuit breaker');
-    metrics.recordPipelineRestart('ffmpeg', 'manual-circuit-reset', {
-      channel,
+    logger.info({ channel: audioChannel }, 'Resetting audio circuit breaker');
+    metrics.recordPipelineRestart('audio', 'manual-circuit-reset', {
+      channel: audioChannel,
       at: Date.now(),
       attempt: 0,
       delayMs: 0
@@ -924,6 +971,17 @@ function resolveVideoChannel(videoConfig: VideoConfig, channel: string): VideoCh
   const normalized = normalizeChannelId(channel);
   if (normalized !== channel && normalized in channels) {
     return channels[normalized];
+  }
+  const canonical = canonicalChannel(channel);
+  if (canonical) {
+    if (canonical in channels) {
+      return channels[canonical];
+    }
+    for (const key of Object.keys(channels)) {
+      if (canonicalChannel(key) === canonical) {
+        return channels[key];
+      }
+    }
   }
   return undefined;
 }
@@ -1108,7 +1166,10 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   if (!camera.channel) {
     throw new Error(`Camera "${camera.id}" is missing a channel`);
   }
-  const channel = normalizeChannelId(camera.channel);
+  const channel = canonicalChannel(camera.channel);
+  if (!channel) {
+    throw new Error(`Camera "${camera.id}" is missing a channel`);
+  }
   const channelConfig = resolveVideoChannel(config.video, channel);
   const input = resolveCameraInput(camera, config.video);
   const framesPerSecond =
@@ -1427,17 +1488,6 @@ function recordsEqual(
     const [bKey, bValue] = bEntries[index];
     return key === bKey && value === bValue;
   });
-}
-
-function normalizeChannelId(channel: string) {
-  const trimmed = typeof channel === 'string' ? channel.trim() : '';
-  if (!trimmed) {
-    throw new Error('Camera channel is required');
-  }
-  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
-    return trimmed;
-  }
-  return `video:${trimmed}`;
 }
 
 function summarizePipelineUpdates(

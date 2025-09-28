@@ -89,6 +89,62 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioCircuitBreakerFfmpegMissing halts retries after repeated missing binaries', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    spawnMock.mockImplementation(() => {
+      const error = new Error('ffmpeg missing') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      throw error;
+    });
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      channel: 'audio:missing-ffmpeg',
+      restartDelayMs: 20,
+      restartMaxDelayMs: 20,
+      restartJitterFactor: 0,
+      silenceCircuitBreakerThreshold: 3,
+      random: () => 0
+    });
+
+    const fatalSpy = vi.fn();
+    const recoverReasons: string[] = [];
+    source.on('fatal', fatalSpy);
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      expect(spawnMock).toHaveBeenCalled();
+
+      await flushTimers(20);
+      await flushTimers(20);
+
+      expect(fatalSpy).toHaveBeenCalledTimes(1);
+      const fatalEvent = fatalSpy.mock.calls[0][0] as AudioFatalEvent;
+      expect(fatalEvent.reason).toBe('circuit-breaker');
+      expect(fatalEvent.lastFailure.reason).toBe('ffmpeg-missing');
+      expect(fatalEvent.channel).toBe('audio:missing-ffmpeg');
+      expect(fatalEvent.attempts).toBe(3);
+      expect(recoverReasons.filter(reason => reason === 'ffmpeg-missing')).toHaveLength(2);
+      expect(source.isCircuitBroken()).toBe(true);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.audio.byReason['ffmpeg-missing']).toBeGreaterThanOrEqual(3);
+      expect(snapshot.pipelines.audio.byReason['circuit-breaker']).toBe(1);
+      const channelStats = snapshot.pipelines.audio.byChannel['audio:missing-ffmpeg'];
+      expect(channelStats).toBeDefined();
+      expect(channelStats.byReason['ffmpeg-missing']).toBeGreaterThanOrEqual(3);
+      expect(channelStats.byReason['circuit-breaker']).toBe(1);
+      expect(snapshot.pipelines.audio.lastRestart?.reason).toBe('circuit-breaker');
+      expect(snapshot.pipelines.audio.lastRestart?.attempt).toBe(3);
+    } finally {
+      source.stop();
+    }
+  });
+
   it('AudioSourceFallback feeds anomaly detector with aligned windows', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
     const { default: AudioAnomalyDetector } = await import('../src/audio/anomaly.js');
@@ -161,6 +217,131 @@ describe('AudioSource resilience', () => {
     );
 
     source.stop();
+  });
+
+  it('AudioCircuitResetManualMetric records manual circuit resets in metrics', async () => {
+    vi.useRealTimers();
+    metrics.reset();
+
+    const { AudioSource } = await import('../src/audio/source.js');
+    const startSpy = vi.spyOn(AudioSource.prototype, 'start').mockImplementation(function () {
+      (this as unknown as { circuitBroken?: boolean }).circuitBroken = true;
+    });
+    const stopSpy = vi.spyOn(AudioSource.prototype, 'stop').mockImplementation(() => {});
+    const resetSpy = vi
+      .spyOn(AudioSource.prototype, 'resetCircuitBreaker')
+      .mockImplementation(function (this: unknown) {
+        const context = this as { circuitBroken?: boolean };
+        const wasBroken = Boolean(context.circuitBroken);
+        context.circuitBroken = false;
+        return wasBroken;
+      });
+    const isBrokenSpy = vi
+      .spyOn(AudioSource.prototype, 'isCircuitBroken')
+      .mockImplementation(function (this: unknown) {
+        return Boolean((this as { circuitBroken?: boolean }).circuitBroken);
+      });
+
+    vi.doMock('../src/video/source.js', () => {
+      class MockVideoSource extends EventEmitter {
+        start() {}
+        stop() {}
+        updateOptions() {}
+        resetCircuitBreaker() {
+          return false;
+        }
+        isCircuitBroken() {
+          return false;
+        }
+      }
+
+      return { VideoSource: MockVideoSource };
+    });
+
+    vi.doMock('../src/video/motionDetector.js', () => ({
+      default: vi.fn().mockImplementation(() => ({
+        handleFrame: vi.fn(),
+        updateOptions: vi.fn()
+      }))
+    }));
+
+    vi.doMock('../src/video/personDetector.js', () => ({
+      default: {
+        create: vi.fn().mockResolvedValue({
+          handleFrame: vi.fn(),
+          updateOptions: vi.fn()
+        })
+      },
+      normalizeClassScoreThresholds: vi.fn(() => ({}))
+    }));
+
+    vi.doMock('../src/video/sampleVideo.js', () => ({
+      ensureSampleVideo: vi.fn((input: string) => input)
+    }));
+
+    vi.doMock('../src/tasks/retention.js', () => ({
+      startRetentionTask: vi.fn(() => ({
+        configure: vi.fn(),
+        stop: vi.fn()
+      }))
+    }));
+
+    const info = vi.fn();
+    const warn = vi.fn();
+    const error = vi.fn();
+
+    const { startGuard } = await import('../src/run-guard.js');
+
+    const runtime = await startGuard({
+      logger: { info, warn, error },
+      config: {
+        video: {
+          framesPerSecond: 1,
+          cameras: [
+            {
+              id: 'camera-1',
+              channel: 'video:camera-1',
+              input: 'test-source'
+            }
+          ]
+        },
+        person: {
+          modelPath: 'noop',
+          score: 0.5
+        },
+        motion: {
+          diffThreshold: 1,
+          areaThreshold: 0.01
+        },
+        audio: {
+          channel: 'audio:test-reset'
+        }
+      }
+    });
+
+    metrics.reset();
+
+    const triggered = runtime.resetCircuitBreaker('audio:test-reset');
+    expect(triggered).toBe(true);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.audio.byReason['manual-circuit-reset']).toBe(1);
+    const channelStats = snapshot.pipelines.audio.byChannel['audio:test-reset'];
+    expect(channelStats?.byReason['manual-circuit-reset']).toBe(1);
+
+    await runtime.stop();
+
+    startSpy.mockRestore();
+    stopSpy.mockRestore();
+    resetSpy.mockRestore();
+    isBrokenSpy.mockRestore();
+
+    vi.resetModules();
+    vi.doUnmock('../src/video/source.js');
+    vi.doUnmock('../src/video/motionDetector.js');
+    vi.doUnmock('../src/video/personDetector.js');
+    vi.doUnmock('../src/video/sampleVideo.js');
+    vi.doUnmock('../src/tasks/retention.js');
   });
 
   it('AudioDeviceFallbackDiscovery preserves discovered device ordering', async () => {

@@ -309,6 +309,62 @@ describe('YoloParser utilities', () => {
     expect(bbox.height).toBeGreaterThan(0);
   });
 
+  it('YoloProjectionClampUsesVariant', () => {
+    const attributes = YOLO_CLASS_START_INDEX + 1;
+    const detections = 1;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    data[0 * detections + 0] = 0.5;
+    data[1 * detections + 0] = 0.5;
+    data[2 * detections + 0] = 1.4;
+    data[3 * detections + 0] = 1.4;
+    data[OBJECTNESS_INDEX * detections + 0] = 4.2;
+    data[(YOLO_CLASS_START_INDEX + 0) * detections + 0] = 4.1;
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      padX: 0,
+      padY: 0,
+      originalWidth: 1280,
+      originalHeight: 720,
+      resizedWidth: 640,
+      resizedHeight: 360,
+      scale: 0.5,
+      scaleX: 0.5,
+      scaleY: 0.5,
+      variants: [
+        {
+          padX: 0,
+          padY: 0,
+          originalWidth: 640,
+          originalHeight: 360,
+          resizedWidth: 640,
+          resizedHeight: 360,
+          scale: 1,
+          scaleX: 1,
+          scaleY: 1,
+          normalized: true
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0],
+      scoreThreshold: 0.1
+    });
+
+    expect(results).toHaveLength(1);
+    const detection = results[0]!;
+    expect(detection.projectionIndex).toBe(1);
+    expect(detection.normalizedProjection).toBe(true);
+    expect(detection.bbox.left).toBeCloseTo(0, 5);
+    expect(detection.bbox.top).toBeCloseTo(0, 5);
+    expect(detection.bbox.width).toBeCloseTo(640, 5);
+    expect(detection.bbox.height).toBeCloseTo(360, 5);
+    expect(detection.areaRatio).toBeCloseTo(1, 5);
+  });
+
   it('YoloParserPersonConfidence prioritizes person detections across projections', () => {
     const classCount = 2;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

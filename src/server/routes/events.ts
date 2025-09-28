@@ -14,6 +14,7 @@ import FaceRegistry, { IdentifyResult } from '../../video/faceRegistry.js';
 import logger from '../../logger.js';
 import { EventRecord } from '../../types.js';
 import metricsModule, { MetricsRegistry } from '../../metrics/index.js';
+import { canonicalChannel, normalizeChannelId } from '../../utils/channel.js';
 
 interface EventsRouterOptions {
   bus: EventEmitter;
@@ -832,7 +833,9 @@ function summarizeEvents(events: SummarizedEvent[]) {
       ? (meta.resolvedChannels as unknown[]).filter((value): value is string => typeof value === 'string')
       : resolveEventChannels(meta);
     const fallbackChannel =
-      (typeof meta.channel === 'string' && meta.channel.trim()) || event.source || 'unassigned';
+      canonicalChannel(typeof meta.channel === 'string' ? meta.channel : null) ||
+      canonicalChannel(event.source ?? null) ||
+      'unassigned';
     const channels = resolvedChannels.length > 0 ? resolvedChannels : [fallbackChannel];
     const tsCandidate = normalizeTimestamp(event.ts);
     const hasSnapshot = Boolean(meta.snapshotUrl || meta.snapshot || meta.faceSnapshotUrl);
@@ -1065,16 +1068,32 @@ function resolveFacesRequest(params: URLSearchParams): { includeFaces: boolean; 
 }
 
 function parseChannelParams(params: URLSearchParams): string[] {
-  const values: string[] = [];
-  values.push(...params.getAll('channel'));
+  const raw: string[] = [];
+  raw.push(...params.getAll('channel'));
   const multi = params.getAll('channels');
   for (const entry of multi) {
-    values.push(entry);
+    raw.push(entry);
   }
-  return values
-    .flatMap(value => value.split(','))
-    .map(value => normalizeChannelId(value))
-    .filter(value => value.length > 0);
+
+  const values: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw.flatMap(value => value.split(','))) {
+    const normalized = canonicalChannel(entry);
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      values.push(normalized);
+    }
+
+    const trimmed = typeof entry === 'string' ? entry.trim() : '';
+    if (trimmed && !trimmed.includes(':')) {
+      const audioVariant = canonicalChannel(entry, { defaultType: 'audio' });
+      if (audioVariant && !seen.has(audioVariant)) {
+        seen.add(audioVariant);
+        values.push(audioVariant);
+      }
+    }
+  }
+  return values;
 }
 
 function resolveMetricsSelection(params: URLSearchParams): MetricsSelection {
@@ -1717,7 +1736,7 @@ function resolveEventChannels(meta: Record<string, unknown>): string[] {
   const channels: string[] = [];
   const candidate = meta.channel;
   if (typeof candidate === 'string') {
-    const normalized = normalizeChannelId(candidate);
+    const normalized = canonicalChannel(candidate);
     if (normalized) {
       channels.push(normalized);
     }
@@ -1726,24 +1745,13 @@ function resolveEventChannels(meta: Record<string, unknown>): string[] {
       if (typeof value !== 'string') {
         continue;
       }
-      const normalized = normalizeChannelId(value);
+      const normalized = canonicalChannel(value);
       if (normalized) {
         channels.push(normalized);
       }
     }
   }
   return channels;
-}
-
-function normalizeChannelId(value: string | null | undefined) {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
-  }
-  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
-    return trimmed;
-  }
-  return `video:${trimmed}`;
 }
 
 function filterFaces(faces: FaceRecord[], search: string | null, channels?: string[]): FaceRecord[] {

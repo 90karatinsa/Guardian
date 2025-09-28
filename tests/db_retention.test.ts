@@ -293,6 +293,85 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionDisabledDoesNotReschedule stops scheduling after a disabled run', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const policySpy = vi
+      .spyOn(dbModule, 'applyRetentionPolicy')
+      .mockReturnValue({
+        removedEvents: 0,
+        archivedSnapshots: 0,
+        prunedArchives: 0,
+        perCamera: {},
+        warnings: []
+      } as any);
+    const vacuumSpy = vi
+      .spyOn(dbModule, 'vacuumDatabase')
+      .mockReturnValue({
+        run: 'never',
+        mode: 'auto',
+        analyze: false,
+        reindex: false,
+        optimize: false,
+        target: undefined,
+        pragmas: undefined
+      });
+
+    const task = startRetentionTask({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 1000,
+      archiveDir,
+      snapshotDirs: [cameraOneDir],
+      vacuum: { mode: 'auto', run: 'never' },
+      logger,
+      metrics: metrics as any
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+
+      logger.info.mockClear();
+
+      task.configure({
+        enabled: false,
+        retentionDays: 30,
+        intervalMs: 1000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        vacuum: { mode: 'auto', run: 'never' },
+        logger,
+        metrics: metrics as any
+      });
+
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(logger.info).toHaveBeenCalledWith({ enabled: false }, 'Retention task skipped');
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(5000);
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+    } finally {
+      task.stop();
+      policySpy.mockRestore();
+      vacuumSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('DatabaseChannelIndexMaintenance validates channel index and on-change vacuum', async () => {
     const indexes = db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }>;
     const indexNames = indexes.map(entry => entry.name);

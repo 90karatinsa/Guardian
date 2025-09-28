@@ -1,3 +1,5 @@
+import { normalizeChannelId } from '../src/utils/channel.js';
+
 const list = document.getElementById('events');
 const filtersForm = document.getElementById('filters');
 const resetButton = document.getElementById('reset-filters');
@@ -89,20 +91,6 @@ function getSelectedChannels() {
     state.filters.channels = new Set();
   }
   return state.filters.channels;
-}
-
-function normalizeChannelId(value) {
-  if (!value) {
-    return '';
-  }
-  const trimmed = String(value).trim();
-  if (!trimmed) {
-    return '';
-  }
-  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
-    return trimmed;
-  }
-  return `video:${trimmed}`;
 }
 
 function getEventKey(event) {

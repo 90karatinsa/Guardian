@@ -671,6 +671,56 @@ describe('VideoSource', () => {
     ).toBe(1);
   });
 
+  it('VideoRtspNotFoundTripsCircuit', async () => {
+    const commands: FakeCommand[] = [];
+    const fatalEvents: FatalEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-not-found-circuit',
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 1,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        queueMicrotask(() => {
+          command.emit('start');
+          command.emit('stderr', 'method DESCRIBE failed: 404 Not Found');
+          command.emitClose(1);
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('fatal', event => {
+      fatalEvents.push(event);
+    });
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length >= 1, 500);
+      await waitFor(() => fatalEvents.length === 1, 500);
+
+      expect(source.isCircuitBroken()).toBe(true);
+    } finally {
+      await source.stop();
+    }
+
+    const fatal = fatalEvents[0];
+    expect(fatal).toBeDefined();
+    expect(fatal?.reason).toBe('circuit-breaker');
+    expect(fatal?.lastFailure.reason).toBe('rtsp-not-found');
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byReason['circuit-breaker']).toBe(1);
+  });
+
   it('VideoFfmpegIdleTimeout restarts idle streams with metrics reason tracking', async () => {
     vi.useFakeTimers();
 
