@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import config from 'config';
 import fs from 'node:fs';
 import path from 'node:path';
+import { canonicalChannel, normalizeChannelId } from './utils/channel.js';
 import { EventRecord, EventSeverity } from './types.js';
 
 const dbPath = config.get<string>('database.path');
@@ -113,13 +114,14 @@ export interface FaceMatchResult {
 }
 
 export function storeEvent(event: EventRecord) {
+  const normalizedMeta = normalizeEventMeta(event.meta);
   insertStatement.run({
     ts: event.ts,
     source: event.source,
     detector: event.detector,
     severity: event.severity,
     message: event.message,
-    meta: event.meta ? JSON.stringify(event.meta) : null
+    meta: normalizedMeta ? JSON.stringify(normalizedMeta) : null
   });
 }
 
@@ -847,34 +849,74 @@ function escapeLike(value: string) {
 function collectChannelFilters(options: { channel?: string; channels?: string[] }): string[] {
   const set = new Set<string>();
   if (typeof options.channel === 'string') {
-    const normalized = normalizeChannelId(options.channel);
-    if (normalized) {
-      set.add(normalized);
-    }
+    addChannelVariants(set, options.channel);
   }
   if (Array.isArray(options.channels)) {
     for (const candidate of options.channels) {
       if (typeof candidate !== 'string') {
         continue;
       }
-      const normalized = normalizeChannelId(candidate);
-      if (normalized) {
-        set.add(normalized);
-      }
+      addChannelVariants(set, candidate);
     }
   }
   return Array.from(set);
 }
 
-function normalizeChannelId(value: string | undefined | null): string {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  if (!trimmed) {
-    return '';
+function addChannelVariants(set: Set<string>, value: string) {
+  const normalized = canonicalChannel(value);
+  if (normalized) {
+    set.add(normalized);
   }
-  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
-    return trimmed;
+  const trimmed = value.trim();
+  if (trimmed && !trimmed.includes(':')) {
+    const audioVariant = canonicalChannel(value, { defaultType: 'audio' });
+    if (audioVariant) {
+      set.add(audioVariant);
+    }
   }
-  return `video:${trimmed}`;
+}
+
+function normalizeEventMeta(meta: EventRecord['meta']): Record<string, unknown> | null {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+    return null;
+  }
+
+  const normalized: Record<string, unknown> = { ...meta };
+
+  const channel = (meta as Record<string, unknown>).channel;
+  if (typeof channel === 'string') {
+    const canonical = canonicalChannel(channel);
+    if (canonical) {
+      normalized.channel = canonical;
+    } else {
+      delete normalized.channel;
+    }
+  } else if (Array.isArray(channel)) {
+    const normalizedChannels = channel
+      .filter((value): value is string => typeof value === 'string')
+      .map(value => canonicalChannel(value))
+      .filter(value => value.length > 0);
+    if (normalizedChannels.length > 0) {
+      normalized.channel = normalizedChannels;
+    } else {
+      delete normalized.channel;
+    }
+  }
+
+  const resolvedChannels = (meta as Record<string, unknown>).resolvedChannels;
+  if (Array.isArray(resolvedChannels)) {
+    const normalizedResolved = resolvedChannels
+      .filter((value): value is string => typeof value === 'string')
+      .map(value => canonicalChannel(value))
+      .filter(value => value.length > 0);
+    if (normalizedResolved.length > 0) {
+      normalized.resolvedChannels = Array.from(new Set(normalizedResolved));
+    } else {
+      delete normalized.resolvedChannels;
+    }
+  }
+
+  return normalized;
 }
 
 export default db;

@@ -3,6 +3,7 @@ import ffmpegStatic from 'ffmpeg-static';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import metrics from '../metrics/index.js';
+import { normalizeChannelId } from '../utils/channel.js';
 
 type Errno = NodeJS.ErrnoException & { errno?: number };
 
@@ -116,7 +117,8 @@ export class VideoSource extends EventEmitter {
 
   constructor(private options: VideoSourceOptions) {
     super();
-    this.channel = normalizeChannelId(options.channel);
+    const normalizedChannel = normalizeChannelId(options.channel);
+    this.channel = normalizedChannel || null;
   }
 
   updateOptions(
@@ -519,6 +521,7 @@ export class VideoSource extends EventEmitter {
       reason === 'rtsp-timeout' ||
       reason === 'rtsp-connection-failure' ||
       reason === 'rtsp-auth-failure' ||
+      reason === 'rtsp-not-found' ||
       reason === 'ffmpeg-missing';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
@@ -1066,20 +1069,6 @@ export function slicePng(buffer: Buffer): SliceResult | null {
   }
 
   return null;
-}
-
-function normalizeChannelId(value: string | undefined | null) {
-  if (!value) {
-    return null;
-  }
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-  if (/^[a-z0-9_-]+:/i.test(trimmed)) {
-    return trimmed;
-  }
-  return `video:${trimmed}`;
 }
 
 export function slicePngStream(stream: Readable, handler: (frame: Buffer) => void) {

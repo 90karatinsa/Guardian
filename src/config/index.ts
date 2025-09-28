@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { EventSuppressionRule } from '../types.js';
+import { canonicalChannel, normalizeChannelId } from '../utils/channel.js';
 
 export type ThresholdConfig = {
   info: number;
@@ -1042,7 +1043,7 @@ function validateLogicalConfig(config: GuardianConfig) {
         messages.push('config.video.channels must not include empty channel identifiers');
         continue;
       }
-      const normalized = trimmed.toLowerCase();
+      const normalized = canonicalChannel(trimmed);
       const existing = normalizedChannelDefinitions.get(normalized);
       if (existing && existing !== channelId) {
         messages.push(
@@ -1089,7 +1090,7 @@ function validateLogicalConfig(config: GuardianConfig) {
           channelMap.set(camera.channel, { id: camera.id ?? label, label });
         }
 
-        const normalized = camera.channel.trim().toLowerCase();
+        const normalized = canonicalChannel(camera.channel);
         if (normalized) {
           const existingNormalized = cameraChannelNormalized.get(normalized);
           if (existingNormalized) {
@@ -1135,7 +1136,7 @@ function validateLogicalConfig(config: GuardianConfig) {
       ? config.audio.channel.trim()
       : 'audio:microphone';
   if (audioChannelCandidate) {
-    const normalized = audioChannelCandidate.toLowerCase();
+    const normalized = canonicalChannel(audioChannelCandidate, { defaultType: 'audio' });
     const normalizedVideo = normalizedChannelDefinitions.get(normalized);
     if (normalizedVideo) {
       messages.push(

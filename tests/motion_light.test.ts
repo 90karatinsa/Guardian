@@ -62,7 +62,7 @@ describe('MotionDetector', () => {
         diffThreshold: 6,
         areaThreshold: 0.2,
         minIntervalMs: 0,
-        debounceFrames: 2,
+        debounceFrames: 1,
         backoffFrames: 2,
         noiseMultiplier: 1.2,
         noiseSmoothing: 0.2,
@@ -927,9 +927,8 @@ describe('LightDetector', () => {
     detector.handleFrame(createUniformFrame(10, 10, 34), tsWithinNewHours);
 
     const afterReset = metrics.snapshot();
-    expect(afterReset.detectors.light?.counters?.suppressedFrames ?? 0).toBe(
-      suppressedBeforeReset
-    );
+    expect(afterReset.detectors.light?.counters?.suppressedFrames ?? 0).toBe(0);
+    expect(afterReset.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0).toBe(0);
 
     const tsSuppressedStart = new Date(2024, 0, 4, 6, 0, 0).getTime();
     const suppressedPostUpdate = createUniformFrame(10, 10, 45);
@@ -963,6 +962,97 @@ describe('LightDetector', () => {
       (snapshotAfterTrigger.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0) -
       priorSuppressedBeforeTrigger;
     expect(diff).toBe(meta.suppressedFramesBeforeTrigger);
+  });
+
+  it('LightNormalHoursFlushSuppression clears suppression history when normal hours resume', () => {
+    const detector = new LightDetector(
+      {
+        source: 'normal-hours-flush',
+        deltaThreshold: 14,
+        smoothingFactor: 0.08,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.1,
+        idleRebaselineMs: 0,
+        normalHours: [{ start: 6, end: 7 }]
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(12, 12, 40);
+    const suppressed = createUniformFrame(12, 12, 52);
+    const candidate = createUniformFrame(12, 12, 70);
+
+    const tsBaseline = Date.UTC(2024, 0, 1, 5, 30, 0);
+    detector.handleFrame(baseline, tsBaseline);
+
+    for (let i = 0; i < 3; i += 1) {
+      detector.handleFrame(suppressed, tsBaseline + (i + 1) * 1000);
+    }
+
+    const tsCandidate = tsBaseline + 10_000;
+    detector.handleFrame(candidate, tsCandidate);
+
+    expect(events).toHaveLength(0);
+
+    const pendingInjected = 3;
+    (detector as any).pendingSuppressedFramesBeforeTrigger = pendingInjected;
+    (detector as any).updatePendingSuppressedGauge();
+    metrics.incrementDetectorCounter('light', 'suppressedFramesBeforeTrigger', pendingInjected);
+
+    let snapshot = metrics.snapshot();
+    expect(
+      snapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? 0
+    ).toBeGreaterThanOrEqual(pendingInjected);
+    expect(snapshot.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0).toBeGreaterThanOrEqual(
+      pendingInjected
+    );
+    expect(snapshot.detectors.light?.counters?.suppressedFrames ?? 0).toBeGreaterThan(0);
+
+    const tsNormal = Date.UTC(2024, 0, 1, 6, 0, 0);
+    detector.handleFrame(baseline, tsNormal);
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? 0).toBe(0);
+    expect(snapshot.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0).toBe(0);
+    expect(snapshot.detectors.light?.counters?.suppressedFrames ?? 0).toBe(0);
+
+    events = [];
+
+    const tsOutside = Date.UTC(2024, 0, 1, 7, 1, 0);
+    const triggerFrames = [
+      120,
+      132,
+      144,
+      156,
+      168,
+      180,
+      192,
+      204,
+      216,
+      228,
+      240,
+      252,
+      264,
+      276
+    ].map(value => createUniformFrame(12, 12, value));
+
+    triggerFrames.forEach((frame, idx) => {
+      detector.handleFrame(frame, tsOutside + idx * 1000);
+    });
+
+    const lightEvent = events.find(event => event.detector === 'light');
+    expect(lightEvent).toBeDefined();
+
+    const meta = lightEvent?.meta as Record<string, number>;
+    expect(meta.suppressedFramesBeforeTrigger).toBe(0);
+    expect(meta.normalHoursActive).toBe(false);
+
+    const afterSnapshot = metrics.snapshot();
+    expect(afterSnapshot.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? 0).toBe(0);
+    expect(afterSnapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? 0).toBe(0);
   });
 
   it('LightDetectorIdleRebaseline rebuilds baseline after idle gaps', () => {

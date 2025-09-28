@@ -4,6 +4,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import logger, { getAvailableLogLevels, getLogLevel, setLogLevel } from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
+import { canonicalChannel } from './utils/channel.js';
 import {
   collectHealthChecks,
   runShutdownHooks,
@@ -139,7 +140,7 @@ const DAEMON_USAGE = [
   '  guardian daemon health           Print health JSON',
   '  guardian daemon ready            Print readiness JSON',
   '  guardian daemon hooks [options]  Run shutdown hooks without stopping the daemon',
-  '  guardian daemon restart [--channel id]  Reset video circuit breakers for a channel',
+  '  guardian daemon restart [--channel id]  Reset circuit breakers for a video or audio channel',
   '',
   'Options for "hooks":',
   '  -r, --reason <reason>  Override shutdown reason (default: daemon-hooks)',
@@ -154,8 +155,12 @@ const DAEMON_RESTART_USAGE = [
   '  guardian daemon restart [--channel id]',
   '',
   'Options:',
-  '  -c, --channel <id>  Reset the video circuit breaker for the specified channel',
-  '  -h, --help          Show this help message'
+  '  -c, --channel <id>  Reset the circuit breaker for the specified channel (video or audio)',
+  '  -h, --help          Show this help message',
+  '',
+  'Examples:',
+  '  guardian daemon restart --channel video:front-door',
+  '  guardian daemon restart --channel audio:microphone'
 ].join('\n');
 
 const RETENTION_USAGE = [
@@ -569,6 +574,13 @@ async function runDaemonRestartCommand(args: string[], io: CliIo): Promise<numbe
     return 1;
   }
 
+  const canonicalVideo = canonicalChannel(channel);
+  const canonicalAudio = canonicalChannel(channel, { defaultType: 'audio' });
+  const normalizedInput = channel.toLowerCase();
+  const isAudioChannel = normalizedInput.startsWith('audio:') || canonicalVideo.startsWith('audio:');
+  const canonicalTarget = (isAudioChannel ? canonicalAudio : canonicalVideo) || channel;
+  const typeLabel = isAudioChannel ? 'audio' : 'video';
+
   if (state.status !== 'running' || !state.runtime) {
     io.stderr.write('Guardian daemon is not running\n');
     return 1;
@@ -583,32 +595,52 @@ async function runDaemonRestartCommand(args: string[], io: CliIo): Promise<numbe
   const triggered = reset(channel);
   if (!triggered) {
     const snapshot = metrics.snapshot();
-    const byChannel = snapshot.pipelines.ffmpeg.byChannel ?? {};
-    const normalized = channel.trim().toLowerCase();
+    const ffmpegChannels = snapshot.pipelines.ffmpeg.byChannel ?? {};
+    const audioChannels = snapshot.pipelines.audio.byChannel ?? {};
     const knownChannels = new Set<string>();
 
-    for (const key of Object.keys(byChannel)) {
-      const trimmed = key.trim();
+    const registerChannel = (value: string) => {
+      const trimmed = value.trim();
       if (!trimmed) {
-        continue;
+        return;
       }
-      const normalizedKey = trimmed.toLowerCase();
-      knownChannels.add(normalizedKey);
-      if (trimmed.startsWith('video:')) {
+      const lower = trimmed.toLowerCase();
+      knownChannels.add(lower);
+      if (trimmed.toLowerCase().startsWith('video:')) {
         knownChannels.add(trimmed.slice('video:'.length).trim().toLowerCase());
       }
+      if (trimmed.toLowerCase().startsWith('audio:')) {
+        knownChannels.add(trimmed.slice('audio:'.length).trim().toLowerCase());
+      }
+      const canonicalVideoKey = canonicalChannel(trimmed);
+      if (canonicalVideoKey) {
+        knownChannels.add(canonicalVideoKey.toLowerCase());
+      }
+      const canonicalAudioKey = canonicalChannel(trimmed, { defaultType: 'audio' });
+      if (canonicalAudioKey) {
+        knownChannels.add(canonicalAudioKey.toLowerCase());
+      }
+    };
+
+    for (const key of Object.keys(ffmpegChannels)) {
+      registerChannel(key);
+    }
+    for (const key of Object.keys(audioChannels)) {
+      registerChannel(key);
     }
 
-    if (!knownChannels.has(normalized)) {
-      io.stderr.write(`channel not found: ${channel}\n`);
+    const videoLookup = canonicalVideo.toLowerCase();
+    const audioLookup = canonicalAudio.toLowerCase();
+    if (!knownChannels.has(videoLookup) && !knownChannels.has(audioLookup)) {
+      io.stderr.write(`channel not found: ${canonicalTarget}\n`);
       return 1;
     }
 
-    io.stderr.write(`No circuit breaker reset performed for channel ${channel}\n`);
+    io.stderr.write(`No circuit breaker reset performed for ${typeLabel} channel ${canonicalTarget}\n`);
     return 1;
   }
 
-  io.stdout.write(`Requested circuit breaker reset for channel ${channel}\n`);
+  io.stdout.write(`Requested circuit breaker reset for ${typeLabel} channel ${canonicalTarget}\n`);
   return 0;
 }
 

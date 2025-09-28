@@ -85,6 +85,49 @@ describe('EventSuppressionRateLimit', () => {
     expect(metricArgs[1]).toMatchObject({ type: 'window', ruleId: 'channel-limit' });
   });
 
+  it('EventSuppressionChannelNormalization normalizes rule and event channels', () => {
+    bus.configureSuppression([
+      {
+        id: 'normalized',
+        detector: 'test-detector',
+        channel: ['LobbyCam', 'AuDiO:Mic-A'],
+        suppressForMs: 200,
+        reason: 'normalized channels'
+      }
+    ]);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'LobbyCam' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 50, meta: { channel: 'VIDEO:LOBBYCAM' } })).toBe(false);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 250, meta: { channel: 'AuDiO:Mic-A' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 300, meta: { channel: 'audio:MIC-a' } })).toBe(false);
+
+    expect(store).toHaveBeenCalledTimes(2);
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+
+    expect(suppressedMeta).toHaveLength(2);
+    const [videoSuppression, audioSuppression] = suppressedMeta;
+
+    expect(videoSuppression.suppressionChannel).toBe('video:lobbycam');
+    expect(videoSuppression.suppressionChannels).toEqual(['video:lobbycam']);
+    expect(audioSuppression.suppressionChannel).toBe('audio:mic-a');
+    expect(audioSuppression.suppressionChannels).toEqual(['audio:mic-a']);
+
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledTimes(2);
+    const metricDetails = metricsMock.recordSuppressedEvent.mock.calls.map(call => call[0]);
+    expect(metricDetails[0]).toMatchObject({
+      channel: 'video:lobbycam',
+      channels: ['video:lobbycam']
+    });
+    expect(metricDetails[1]).toMatchObject({
+      channel: 'audio:mic-a',
+      channels: ['audio:mic-a']
+    });
+  });
+
   it('EventSuppressionChannelMetrics records channel and window metadata', () => {
     const metrics = new MetricsRegistry();
     metrics.reset();
@@ -561,7 +604,7 @@ describe('MetricsSuppressionSnapshot', () => {
       historyCount: 3,
       combinedHistoryCount: 3,
       channel: 'video:lobby',
-      channels: ['video:lobby', 'alerts'],
+      channels: ['video:lobby', 'video:alerts'],
       cooldownMs: 600,
       windowExpiresAt: Date.now() + 400,
       windowRemainingMs: 250,
@@ -573,7 +616,7 @@ describe('MetricsSuppressionSnapshot', () => {
     expect(snapshot.suppression.historyTotals.historyCount).toBe(5);
     expect(snapshot.suppression.historyTotals.combinedHistoryCount).toBe(5);
     expect(snapshot.suppression.lastEvent?.channel).toBe('video:lobby');
-    expect(snapshot.suppression.lastEvent?.channels).toEqual(['video:lobby', 'alerts']);
+    expect(snapshot.suppression.lastEvent?.channels).toEqual(['video:lobby', 'video:alerts']);
     expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(200);
     expect(snapshot.suppression.lastEvent?.windowRemainingMs).toBe(250);
 
@@ -584,7 +627,7 @@ describe('MetricsSuppressionSnapshot', () => {
     expect(ruleSnapshot.history.lastCount).toBe(3);
     expect(ruleSnapshot.history.lastCombinedCount).toBe(3);
     expect(ruleSnapshot.history.lastChannel).toBe('video:lobby');
-    expect(ruleSnapshot.history.lastChannels).toEqual(['video:lobby', 'alerts']);
+    expect(ruleSnapshot.history.lastChannels).toEqual(['video:lobby', 'video:alerts']);
     expect(ruleSnapshot.history.lastCooldownMs).toBe(600);
     expect(ruleSnapshot.history.lastCooldownRemainingMs).toBe(200);
     expect(ruleSnapshot.history.lastWindowRemainingMs).toBe(250);

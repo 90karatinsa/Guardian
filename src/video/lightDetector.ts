@@ -168,6 +168,7 @@ export class LightDetector {
         this.suppressedFrames = 0;
         this.deltaTrend = 0;
         this.lastDenoiseStrategy = denoiseStrategy;
+        this.updatePendingSuppressedGauge();
         return;
       }
 
@@ -337,6 +338,7 @@ export class LightDetector {
         this.noiseLevel = updatedNoiseFloor;
         this.pendingFrames = 0;
         this.suppressedFrames += 1;
+        this.updatePendingSuppressedGauge();
         metrics.incrementDetectorCounter('light', 'suppressedFrames', 1);
         return;
       }
@@ -348,7 +350,10 @@ export class LightDetector {
         this.pendingFrames = 0;
         this.backoffFrames = 0;
         this.suppressedFrames = 0;
+        this.pendingSuppressedFramesBeforeTrigger = 0;
         this.noiseLevel = updatedNoiseFloor;
+        this.updatePendingSuppressedGauge();
+        metrics.resetDetectorCounters('light', ['suppressedFrames', 'suppressedFramesBeforeTrigger']);
         return;
       }
 
@@ -364,6 +369,7 @@ export class LightDetector {
         }
         this.noiseLevel = updatedNoiseFloor;
         this.suppressedFrames += 1;
+        this.updatePendingSuppressedGauge();
         metrics.incrementDetectorCounter('light', 'suppressedFrames', 1);
         return;
       }
@@ -377,6 +383,7 @@ export class LightDetector {
           'suppressedFramesBeforeTrigger',
           suppressedFramesSnapshot
         );
+        this.updatePendingSuppressedGauge();
       }
 
       this.noiseLevel = Math.max(
@@ -402,6 +409,7 @@ export class LightDetector {
         this.pendingFrames = 0;
         this.backoffFrames = Math.max(this.backoffFrames, Math.ceil(effectiveBackoff / 2));
         this.pendingSuppressedFramesBeforeTrigger = 0;
+        this.updatePendingSuppressedGauge();
         return;
       }
 
@@ -416,6 +424,7 @@ export class LightDetector {
 
       const suppressedFramesBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
       this.pendingSuppressedFramesBeforeTrigger = 0;
+      this.updatePendingSuppressedGauge();
 
       const payload: EventPayload = {
         ts,
@@ -491,6 +500,7 @@ export class LightDetector {
     if (!preserveSuppression) {
       this.suppressedFrames = 0;
       this.pendingSuppressedFramesBeforeTrigger = 0;
+      this.updatePendingSuppressedGauge();
     }
     this.deltaTrend = 0;
     this.lastDenoiseStrategy = 'gaussian-median';
@@ -501,6 +511,14 @@ export class LightDetector {
     this.rebaselineFramesRemaining = 0;
     metrics.setDetectorGauge('light', 'noiseWindowBoost', this.sustainedNoiseBoost);
     metrics.setDetectorGauge('light', 'rebaselineCountdown', 0);
+  }
+
+  private updatePendingSuppressedGauge() {
+    metrics.setDetectorGauge(
+      'light',
+      'pendingSuppressedFramesBeforeTrigger',
+      this.pendingSuppressedFramesBeforeTrigger + this.suppressedFrames
+    );
   }
 
   private isWithinNormalHours(ts: number) {

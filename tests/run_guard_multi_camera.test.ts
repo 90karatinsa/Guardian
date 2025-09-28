@@ -781,6 +781,70 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('AudioMetricsClearedOnStop clears audio metrics when configuration disables the channel', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 },
+      audio: {
+        channel: 'audio:mic-test'
+      }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const bus = new EventEmitter();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => MockAudioSource.instances.length === 1);
+
+      metrics.recordPipelineRestart('audio', 'watchdog-timeout', {
+        channel: 'audio:mic-test',
+        at: Date.now(),
+        attempt: 1,
+        delayMs: 150
+      });
+
+      const initialSnapshot = metrics.snapshot();
+      expect(initialSnapshot.pipelines.audio.byChannel['audio:mic-test']).toBeDefined();
+
+      const audioSource = MockAudioSource.instances[0];
+      const stopSpy = vi.fn();
+      audioSource.once('stopped', stopSpy);
+
+      manager.setConfig({
+        ...initialConfig,
+        audio: undefined
+      } as GuardianConfig);
+
+      await waitFor(() => stopSpy.mock.calls.length === 1);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.audio.byChannel['audio:mic-test']).toBeUndefined();
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('RunGuardMultiCameraChannels normalizes channels and isolates restart stats', async () => {
     const recordSpy = vi.spyOn(metrics, 'recordPipelineRestart');
     const { startGuard } = await import('../src/run-guard.ts');
@@ -900,6 +964,64 @@ describe('run-guard multi camera orchestration', () => {
       );
     } finally {
       recordSpy.mockRestore();
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardChannelNormalization aligns mixed-case channels to canonical identifiers', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      config: {
+        video: {
+          framesPerSecond: 8,
+          channels: {
+            'Video:FrontDoor': {
+              ffmpeg: { restartDelayMs: 250 },
+              motion: { diffThreshold: 36, areaThreshold: 0.03 }
+            },
+            PORCH: {
+              motion: { diffThreshold: 28, areaThreshold: 0.022 }
+            }
+          },
+          cameras: [
+            {
+              id: 'frontdoor',
+              channel: 'frontdoor',
+              input: 'rtsp://front-door',
+              person: { score: 0.5 },
+              motion: { diffThreshold: 40, areaThreshold: 0.03 }
+            },
+            {
+              id: 'porch',
+              channel: 'VIDEO:PORCH',
+              input: 'rtsp://porch',
+              person: { score: 0.55 },
+              motion: { diffThreshold: 24, areaThreshold: 0.02 }
+            }
+          ]
+        },
+        person: { modelPath: 'model.onnx', score: 0.5 },
+        motion: { diffThreshold: 20, areaThreshold: 0.02 },
+        events: { thresholds: { info: 0, warning: 5, critical: 10 } }
+      } as GuardianConfig
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2);
+      const pipelineIds = Array.from(runtime.pipelines.keys()).sort();
+      expect(pipelineIds).toEqual(['video:frontdoor', 'video:porch']);
+      const sourceChannels = MockVideoSource.instances
+        .map(instance => instance.options.channel ?? null)
+        .filter((channel): channel is string => typeof channel === 'string')
+        .sort();
+      expect(sourceChannels).toEqual(['video:frontdoor', 'video:porch']);
+      expect(MockMotionDetector.instances).toHaveLength(2);
+      expect(MockMotionDetector.instances[0]?.options).toMatchObject({ diffThreshold: 36 });
+      expect(MockMotionDetector.instances[1]?.options).toMatchObject({ diffThreshold: 24 });
+    } finally {
       runtime.stop();
     }
   });

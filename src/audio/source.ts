@@ -663,7 +663,8 @@ export class AudioSource extends EventEmitter {
     const isCircuitCandidate =
       reason === 'stream-silence' ||
       reason === 'watchdog-timeout' ||
-      reason === 'device-discovery-timeout';
+      reason === 'device-discovery-timeout' ||
+      reason === 'ffmpeg-missing';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
       this.lastCircuitCandidateReason = reason;
