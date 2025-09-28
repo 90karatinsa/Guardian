@@ -660,7 +660,10 @@ export class AudioSource extends EventEmitter {
 
     this.retryCount += 1;
     const attempt = this.retryCount;
-    const isCircuitCandidate = reason === 'stream-silence' || reason === 'watchdog-timeout';
+    const isCircuitCandidate =
+      reason === 'stream-silence' ||
+      reason === 'watchdog-timeout' ||
+      reason === 'device-discovery-timeout';
     if (isCircuitCandidate) {
       this.circuitBreakerFailures += 1;
       this.lastCircuitCandidateReason = reason;

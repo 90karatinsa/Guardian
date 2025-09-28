@@ -521,6 +521,55 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoSourceCircuitBreakerMissingFfmpeg trips when ffmpeg is repeatedly missing', async () => {
+    const commands: FakeCommand[] = [];
+    const fatalEvents: FatalEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:missing-ffmpeg',
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 2,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        const error = Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) as NodeJS.ErrnoException;
+        command.setPipeError(error);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('fatal', event => fatalEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length >= 2, 500);
+      await waitFor(() => fatalEvents.length === 1, 500);
+
+      expect(source.isCircuitBroken()).toBe(true);
+      const fatal = fatalEvents[0];
+      expect(fatal.reason).toBe('circuit-breaker');
+      expect(fatal.channel).toBe('video:missing-ffmpeg');
+      expect(fatal.attempts).toBeGreaterThanOrEqual(2);
+      expect(fatal.lastFailure.reason).toBe('ffmpeg-missing');
+    } finally {
+      await source.stop();
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byReason['ffmpeg-missing']).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.byReason['circuit-breaker']).toBe(1);
+    expect(
+      snapshot.pipelines.ffmpeg.byChannel['video:missing-ffmpeg'].byReason['circuit-breaker']
+    ).toBe(1);
+  });
+
   it('VideoFfmpegAuthRetry classifies auth failures and records restart metrics', async () => {
     vi.useFakeTimers();
     metrics.reset();
@@ -574,6 +623,52 @@ describe('VideoSource', () => {
       recoverReasons.filter(reason => reason === 'rtsp-auth-failure').length
     ).toBeGreaterThanOrEqual(1);
     expect(snapshot.pipelines.ffmpeg.byChannel['video:test'].byReason['rtsp-auth-failure']).toBe(1);
+  });
+
+  it('VideoSourceRtspNotFoundTriggersRecovery', async () => {
+    const commands: FakeCommand[] = [];
+    const recoverReasons: string[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-not-found',
+      restartDelayMs: 20,
+      restartMaxDelayMs: 20,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        queueMicrotask(() => {
+          command.emit('start');
+          command.emit('stderr', 'method DESCRIBE failed: 404 Not Found');
+          command.emitClose(1);
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitFor(() => recoverReasons.includes('rtsp-not-found'), 500);
+      expect(recoverReasons).toContain('rtsp-not-found');
+      expect(commands[0]?.killedSignals).toContain('SIGTERM');
+
+      await waitFor(() => commands.length >= 2, 500);
+    } finally {
+      await source.stop();
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byReason['rtsp-not-found']).toBe(1);
+    expect(
+      snapshot.pipelines.ffmpeg.byChannel['video:rtsp-not-found'].byReason['rtsp-not-found']
+    ).toBe(1);
   });
 
   it('VideoFfmpegIdleTimeout restarts idle streams with metrics reason tracking', async () => {

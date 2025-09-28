@@ -530,7 +530,8 @@ class MetricsRegistry {
   private ensureHistogram(metric: string, config: HistogramConfig) {
     const histogram = this.histograms.get(metric);
     if (histogram) {
-      if (!this.histogramConfigs.has(metric)) {
+      const existing = this.histogramConfigs.get(metric);
+      if (!existing || existing !== config) {
         this.histogramConfigs.set(metric, config);
       }
       return histogram;
@@ -539,6 +540,12 @@ class MetricsRegistry {
     this.histograms.set(metric, map);
     this.histogramConfigs.set(metric, config);
     return map;
+  }
+
+  private clearHistogram(metric: string) {
+    this.histograms.delete(metric);
+    this.histogramConfigs.delete(metric);
+    this.histogramStats.delete(metric);
   }
 
   incrementLogLevel(level: string, context?: { message?: string; detector?: string }) {
@@ -1083,6 +1090,16 @@ class MetricsRegistry {
     }
   }
 
+  clearPipelineChannel(pipeline: PipelineType, channel: string) {
+    const registry = pipeline === 'ffmpeg' ? this.ffmpegRestartsByChannel : this.audioRestartsByChannel;
+    if (!registry.delete(channel)) {
+      return;
+    }
+
+    const jitterMetric = `pipeline.${pipeline}.restart.jitter.channel.${channel}`;
+    this.clearHistogram(jitterMetric);
+  }
+
   recordAudioDeviceDiscovery(reason: string, meta: { channel?: string } = {}) {
     const normalized = reason || 'unknown';
     this.audioDeviceDiscovery.set(
@@ -1252,12 +1269,40 @@ class MetricsRegistry {
         ? `pipeline.${pipeline}.restarts`
         : `pipeline.${pipeline}.restart.${variant}`;
 
-    return this.exportHistogramForPrometheus(key, {
+    const metricName = options.metricName ?? `guardian_${pipeline}_${PIPELINE_HISTOGRAM_SUFFIX[variant]}`;
+    const baseOptions: PrometheusHistogramOptions = {
       ...options,
-      metricName: options.metricName ?? `guardian_${pipeline}_${PIPELINE_HISTOGRAM_SUFFIX[variant]}`,
+      metricName,
       help: options.help ?? PIPELINE_HISTOGRAM_HELP[variant],
       labels: { pipeline, ...(options.labels ?? {}) }
-    });
+    };
+
+    const rendered: string[] = [];
+    const baseHistogram = this.exportHistogramForPrometheus(key, baseOptions);
+    if (baseHistogram) {
+      rendered.push(baseHistogram);
+    }
+
+    if (variant === 'jitter') {
+      const prefix = `${key}.channel.`;
+      const channelMetrics = Array.from(this.histograms.keys())
+        .filter(metricKey => metricKey.startsWith(prefix))
+        .sort((a, b) => a.localeCompare(b));
+
+      for (const metricKey of channelMetrics) {
+        const channel = metricKey.slice(prefix.length);
+        const channelHistogram = this.exportHistogramForPrometheus(metricKey, {
+          ...options,
+          metricName: `${metricName}_channel_${channel}`,
+          labels: { pipeline, channel, ...(options.labels ?? {}) }
+        });
+        if (channelHistogram) {
+          rendered.push(channelHistogram);
+        }
+      }
+    }
+
+    return rendered.join('\n\n');
   }
 
   exportDetectorLatencyHistogram(

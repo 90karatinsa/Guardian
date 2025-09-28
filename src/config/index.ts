@@ -500,6 +500,7 @@ const guardianConfigSchema: JsonSchema = {
                     type: ['string', 'array'],
                     items: { type: 'string' }
                   },
+                  maxEvents: { type: 'number', minimum: 1 },
                   suppressForMs: { type: 'number', minimum: 0 },
                   rateLimit: {
                     type: 'object',

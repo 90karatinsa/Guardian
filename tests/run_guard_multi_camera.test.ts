@@ -718,6 +718,69 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('RunGuardRemovesCameraPipeline clears channel state and metrics when cameras disappear', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const bus = new EventEmitter();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+
+      const firstPipeline = runtime.pipelines.values().next().value;
+      expect(firstPipeline?.channel).toBe('video:cam-1');
+
+      metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+        channel: 'video:cam-1',
+        jitterMs: 180
+      });
+
+      const stopListener = vi.fn();
+      const instance = MockVideoSource.instances[0];
+      instance.once('stopped', stopListener);
+
+      manager.setConfig({
+        ...initialConfig,
+        video: { framesPerSecond: 5, cameras: [] }
+      } as GuardianConfig);
+
+      await waitFor(() => runtime.pipelines.size === 0);
+      await waitFor(() => stopListener.mock.calls.length === 1);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']).toBeUndefined();
+      expect(
+        snapshot.histograms['pipeline.ffmpeg.restart.jitter.channel.video:cam-1']
+      ).toBeUndefined();
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('RunGuardMultiCameraChannels normalizes channels and isolates restart stats', async () => {
     const recordSpy = vi.spyOn(metrics, 'recordPipelineRestart');
     const { startGuard } = await import('../src/run-guard.ts');

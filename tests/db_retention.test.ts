@@ -778,6 +778,86 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionPerCameraMaxRotation prioritizes per-camera overrides over global limits', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 8, 15);
+    vi.setSystemTime(now);
+
+    const camOneKey = path.basename(cameraOneDir);
+    const camTwoKey = path.basename(cameraTwoDir);
+    const staleTs = now - 45 * dayMs;
+
+    const camOneFiles = [
+      path.join(cameraOneDir, 'cam1-a.jpg'),
+      path.join(cameraOneDir, 'cam1-b.jpg'),
+      path.join(cameraOneDir, 'cam1-c.jpg')
+    ];
+    const camTwoFiles = [
+      path.join(cameraTwoDir, 'cam2-a.jpg'),
+      path.join(cameraTwoDir, 'cam2-b.jpg'),
+      path.join(cameraTwoDir, 'cam2-c.jpg')
+    ];
+
+    for (const file of [...camOneFiles, ...camTwoFiles]) {
+      fs.writeFileSync(file, file);
+      fs.utimesSync(file, staleTs / 1000, staleTs / 1000);
+    }
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir, cameraTwoDir],
+        maxArchivesPerCamera: 2,
+        snapshot: {
+          mode: 'archive',
+          retentionDays: 20,
+          perCameraMax: {
+            [camOneKey]: 1
+          }
+        },
+        vacuum: { mode: 'auto', run: 'never' },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(result.outcome).toBeDefined();
+      const perCamera = result.outcome?.perCamera ?? {};
+      expect(perCamera[camOneKey]).toMatchObject({
+        archivedSnapshots: camOneFiles.length,
+        prunedArchives: camOneFiles.length - 1
+      });
+      expect(perCamera[camTwoKey]).toMatchObject({
+        archivedSnapshots: camTwoFiles.length,
+        prunedArchives: camTwoFiles.length - 2
+      });
+
+      const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runCall?.perCamera?.[camOneKey]?.prunedArchives).toBe(camOneFiles.length - 1);
+      expect(runCall?.perCamera?.[camTwoKey]?.prunedArchives).toBe(camTwoFiles.length - 2);
+
+      const camOneArchives = collectArchiveFiles(path.join(archiveDir, camOneKey));
+      const camTwoArchives = collectArchiveFiles(path.join(archiveDir, camTwoKey));
+      expect(camOneArchives.length).toBeLessThanOrEqual(1);
+      expect(camTwoArchives.length).toBeLessThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionChannelSnapshotRotation rotates channel snapshots and records per-camera totals', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 5, 10);

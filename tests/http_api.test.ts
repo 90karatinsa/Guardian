@@ -300,7 +300,7 @@ describe('RestApiEvents', () => {
     const firstMetrics = metricsEvents[0];
     expect(firstMetrics.pipelines?.audio?.restarts).toBeDefined();
     expect(firstMetrics.pipelines?.ffmpeg).toBeUndefined();
-    expect(firstMetrics.events).toBeDefined();
+    expect(firstMetrics.events).toBeUndefined();
 
     const noneController = new AbortController();
     const noneResponse = await fetch(`http://localhost:${port}/api/events/stream?metrics=none`, {
@@ -312,6 +312,79 @@ describe('RestApiEvents', () => {
     const chunkText = decoder.decode(firstChunk.value ?? new Uint8Array());
     expect(chunkText.includes('event: metrics')).toBe(false);
     noneController.abort();
+  });
+
+  it('HttpStreamCombinedMetricsSelection streams selected metrics subsets without extras', async () => {
+    metrics.recordRetentionRun({
+      removedEvents: 2,
+      archivedSnapshots: 1,
+      prunedArchives: 0,
+      perCamera: { 'video:test': { archivedSnapshots: 1, prunedArchives: 0 } }
+    });
+
+    const { port } = await ensureServer();
+    const controller = new AbortController();
+    const response = await fetch(
+      `http://localhost:${port}/api/events/stream?metrics=audio,retention`,
+      { signal: controller.signal }
+    );
+
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const payload = await new Promise<any>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              reject(new Error('stream ended before metrics arrived'));
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (eventName === 'metrics' && dataLines.length > 0) {
+                resolve(JSON.parse(dataLines.join('')));
+                return;
+              }
+            }
+            readNext();
+          })
+          .catch(reject);
+      };
+      readNext();
+    });
+
+    controller.abort();
+    await reader?.cancel().catch(() => undefined);
+
+    expect(payload).toBeDefined();
+    expect(payload.events).toBeUndefined();
+    expect(payload.pipelines?.ffmpeg).toBeUndefined();
+    expect(payload.pipelines?.audio?.restarts).toBeDefined();
+    expect(payload.retention?.runs).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(payload).sort()).toEqual(['fetchedAt', 'pipelines', 'retention']);
   });
 
   it('HttpStreamRetentionMetricsToggle streams retention-only metrics and updates dashboard widget', async () => {

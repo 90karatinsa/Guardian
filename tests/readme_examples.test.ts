@@ -54,6 +54,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('guardian daemon health');
     expect(readme).toContain('guardian daemon ready');
     expect(readme).toContain('guardian daemon hooks --reason');
+    expect(readme).toContain('guardian daemon restart --channel video:missing');
+    expect(readme).toContain('channel not found: video:missing');
     expect(readme).toContain('guardian health');
     expect(readme).toContain('guardian retention run');
     expect(readme).toContain('pnpm exec tsx src/cli.ts status --json');
@@ -67,6 +69,7 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('guardian_log_level_total');
     expect(readme).toContain('guardian_log_last_error_timestamp_seconds');
     expect(readme).toContain('guardian_ffmpeg_restart_jitter_ms');
+    expect(readme).toContain('metrics=audio,retention');
     expect(readme).toContain('guardian_ffmpeg_restarts_total_bucket');
     expect(readme).toContain('guardian_detector_counter_total');
     expect(readme).toContain('"maxArchivesPerCamera": 3');
@@ -105,6 +108,13 @@ describe('ReadmeExamples', () => {
     const restoreExit = await runCli(['log-level', 'set', initialLevel], restoreCapture.io);
     expect(restoreExit).toBe(0);
   });
+});
+
+it('ReadmeIncludesDaemonRestart documents channel restarts and SSE metric filters', () => {
+  const readme = readReadme();
+  expect(readme).toContain('guardian daemon restart --channel video:missing');
+  expect(readme).toContain('channel not found: video:missing');
+  expect(readme).toContain('metrics=audio,retention');
 });
 
 it('ReadmeAudioSilenceDocs documents silence circuit breaker and device discovery timeout expectations', () => {

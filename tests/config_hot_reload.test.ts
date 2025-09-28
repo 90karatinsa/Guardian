@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
-import { ConfigManager, loadConfigFromFile } from '../src/config/index.js';
+import { ConfigManager, loadConfigFromFile, validateConfig } from '../src/config/index.js';
 import type { CameraConfig, GuardianConfig, MotionTuningConfig } from '../src/config/index.js';
 import { EventBus } from '../src/eventBus.js';
 import AudioAnomalyDetector from '../src/audio/anomaly.js';
@@ -935,6 +935,42 @@ describe('ConfigHotReload', () => {
     } finally {
       runtime.stop();
     }
+  });
+
+  it('ConfigAudioChannelConflict rejects case-insensitive audio channel collisions', () => {
+    const config = createConfig({ diffThreshold: 20 });
+    config.video.channels = { 'video:lobby': {} };
+    if (config.video.cameras) {
+      config.video.cameras[0].channel = 'video:lobby';
+    }
+    config.audio = { channel: 'VIDEO:LOBBY' } as GuardianConfig['audio'];
+
+    const candidate = JSON.parse(JSON.stringify(config)) as GuardianConfig;
+
+    expect(() => validateConfig(candidate)).toThrowErrorMatchingInlineSnapshot(
+      "[Error: config.audio.channel \"VIDEO:LOBBY\" conflicts with video channel definition \"video:lobby\"; config.audio.channel \"VIDEO:LOBBY\" conflicts with camera \"cam-1\" channel]"
+    );
+  });
+
+  it('ConfigSuppressionMaxEventsRequiresWindow enforces suppressForMs when maxEvents is set', () => {
+    const config = createConfig({
+      diffThreshold: 20,
+      suppressionRules: [
+        {
+          id: 'burst-limit',
+          detector: 'motion',
+          source: 'video:cam-1',
+          maxEvents: 3,
+          reason: 'burst protection'
+        }
+      ]
+    });
+
+    const candidate = JSON.parse(JSON.stringify(config)) as GuardianConfig;
+
+    expect(() => validateConfig(candidate)).toThrowErrorMatchingInlineSnapshot(
+      "[Error: config.events.suppression.rules[0].suppressForMs must be set when maxEvents is defined]"
+    );
   });
 
   it('AudioHotReloadThresholds refreshes audio fallbacks and anomaly windows', async () => {

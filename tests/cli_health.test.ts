@@ -290,7 +290,7 @@ describe('GuardianCliHealthcheck', () => {
 
     expect(code).toBe(1);
     expect(resetSpy).toHaveBeenCalledWith('video:unknown');
-    expect(restartIo.stderr()).toContain('Channel not found');
+    expect(restartIo.stderr()).toContain('channel not found');
 
     await runCli(['stop'], createTestIo().io);
     await expect(startPromise).resolves.toBe(0);
