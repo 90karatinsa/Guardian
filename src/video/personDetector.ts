@@ -126,6 +126,13 @@ export class PersonDetector {
         classifiedObjects = await this.objectClassifier.classify(nonPersonDetections);
       }
 
+      const appliedThresholds = new Map<number, number>();
+      for (const detection of personDetections) {
+        if (Number.isFinite(detection.appliedThreshold)) {
+          appliedThresholds.set(detection.classId, detection.appliedThreshold);
+        }
+      }
+
       const payload: EventPayload = {
         ts,
         source: this.options.source,
@@ -144,12 +151,14 @@ export class PersonDetector {
           projectionIndex: primaryDetection.projectionIndex,
           normalizedProjection: primaryDetection.normalizedProjection,
           confidence: detectionConfidence,
+          fusion: serializeFusion(primaryDetection),
           thresholds: {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
             nms: DEFAULT_NMS_IOU_THRESHOLD,
             classScoreThresholds: this.classScoreThresholds
               ? { ...this.classScoreThresholds }
               : undefined,
+            applied: appliedThresholds.size > 0 ? Object.fromEntries(appliedThresholds) : undefined,
             classIndices: [...this.classIndices]
           },
           detections: personDetections.map(serializeDetection),
@@ -235,7 +244,33 @@ function serializeDetection(detection: YoloDetection) {
     appliedThreshold: detection.appliedThreshold,
     projectionIndex: detection.projectionIndex,
     normalizedProjection: detection.normalizedProjection,
-    confidence: resolveDetectionConfidence(detection)
+    confidence: resolveDetectionConfidence(detection),
+    fusion: serializeFusion(detection)
+  };
+}
+
+function serializeFusion(detection: YoloDetection) {
+  const fusion = detection.fusion;
+  if (!fusion) {
+    return undefined;
+  }
+
+  return {
+    confidence: fusion.confidence,
+    weight: fusion.weight,
+    areaRatio: fusion.areaRatio,
+    normalizedSupport: fusion.normalizedSupport,
+    contributors: fusion.contributors.map(contributor => ({
+      weight: contributor.weight,
+      score: contributor.score,
+      objectness: contributor.objectness,
+      classProbability: contributor.classProbability,
+      areaRatio: contributor.areaRatio,
+      projectionIndex: contributor.projectionIndex,
+      normalizedProjection: contributor.normalizedProjection,
+      iou: contributor.iou,
+      bbox: contributor.bbox
+    }))
   };
 }
 
@@ -302,6 +337,9 @@ function logistic(value: number) {
 }
 
 function resolveDetectionConfidence(detection: YoloDetection) {
+  if (detection.fusion && Number.isFinite(detection.fusion.confidence)) {
+    return clamp(detection.fusion.confidence, 0, 1);
+  }
   const baseScore = clamp(detection.score, 0, 1);
   const objectness = clamp(
     typeof detection.objectness === 'number' ? detection.objectness : baseScore,

@@ -473,6 +473,71 @@ describe('MetricsCounters', () => {
     expect(output).toContain('guardian_ffmpeg_restart_jitter_ms_channel_video_lobby_bucket');
     expect(output).toMatch(/channel="video:lobby"/);
   });
+
+  it('MetricsTransportFallbackHistogram exports transport fallback counters and retention gauges', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel: 'video:lobby',
+      from: 'tcp',
+      to: 'udp'
+    });
+    registry.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel: 'video:alley',
+      from: 'udp',
+      to: 'tcp'
+    });
+    registry.recordTransportFallback('ffmpeg', 'connect-error', {
+      from: 'tcp',
+      to: 'udp'
+    });
+
+    registry.recordSuppressionHistoryTtlPruned({ count: 3, ruleId: 'motion-cooldown' });
+    registry.recordRetentionRun({ diskSavingsBytes: 2048 });
+
+    const fallbackProm = registry.exportTransportFallbackMetricsForPrometheus({
+      labels: { site: 'edge-1' }
+    });
+    expect(fallbackProm).toContain('# TYPE guardian_transport_fallback_total gauge');
+    expect(fallbackProm).toMatch(/guardian_transport_fallback_total\{[^}]*pipeline="ffmpeg"[^}]*\} 3/);
+    expect(fallbackProm).toMatch(
+      /guardian_transport_fallback_total\{[^}]*reason="rtsp-timeout"[^}]*\} 2/
+    );
+    expect(fallbackProm).toMatch(/guardian_transport_fallback_total\{[^}]*target="udp"[^}]*\} 2/);
+    expect(fallbackProm).toMatch(
+      /guardian_transport_fallback_channel_total\{[^}]*channel="video:lobby"[^}]*\} 1/
+    );
+
+    const ttlProm = registry.exportSuppressionHistoryTtlHistogramForPrometheus({
+      labels: { site: 'edge-1' }
+    });
+    expect(ttlProm).toContain('# TYPE guardian_suppression_history_ttl_pruned_total histogram');
+    expect(ttlProm).toMatch(/guardian_suppression_history_ttl_pruned_total_bucket\{[^}]*le="5"[^}]*\} 1/);
+    expect(ttlProm).toMatch(/guardian_suppression_history_ttl_pruned_total_count\{[^}]*\} 1/);
+
+    const retentionProm = registry.exportRetentionDiskSavingsForPrometheus({
+      labels: { site: 'edge-1' }
+    });
+    expect(retentionProm).toContain('# TYPE guardian_retention_disk_savings_bytes_total gauge');
+    expect(retentionProm).toMatch(
+      /guardian_retention_disk_savings_bytes_total\{[^}]*scope="total"[^}]*\} 2048/
+    );
+
+    const snapshot = registry.snapshot();
+    expect(snapshot.pipelines.ffmpeg.transportFallbacks.total).toBe(3);
+    expect(snapshot.suppression.historyTotals.historyTtlPruned).toBe(3);
+    expect(snapshot.retention.totals.diskSavingsBytes).toBe(2048);
+
+    registry.reset();
+
+    const resetSnapshot = registry.snapshot();
+    expect(resetSnapshot.pipelines.ffmpeg.transportFallbacks.total).toBe(0);
+    expect(resetSnapshot.suppression.historyTotals.historyTtlPruned).toBe(0);
+    expect(resetSnapshot.retention.totals.diskSavingsBytes).toBe(0);
+
+    const resetProm = registry.exportTransportFallbackMetricsForPrometheus();
+    expect(resetProm).toMatch(/guardian_transport_fallback_total\{[^}]*pipeline="ffmpeg"[^}]*\} 0/);
+  });
 });
 
 describe('MetricsSnapshotEnrichment', () => {
@@ -562,7 +627,9 @@ describe('MetricsSnapshotEnrichment', () => {
     metrics.recordAudioDeviceDiscovery('probe-success', { channel: 'audio:lobby' });
 
     const unregister = registerHealthIndicator('audio-device-discovery', context => {
-      expect(context.metrics?.pipelines.audio.deviceDiscovery['probe-failed']).toBeGreaterThanOrEqual(2);
+      expect(
+        context.metrics?.pipelines.audio.deviceDiscovery.byReason['probe-failed']
+      ).toBeGreaterThanOrEqual(2);
       expect(
         context.metrics?.pipelines.audio.deviceDiscoveryByChannel['audio:lobby']['probe-failed']
       ).toBe(1);
@@ -575,7 +642,7 @@ describe('MetricsSnapshotEnrichment', () => {
     unregister();
 
     const snapshot = metrics.snapshot();
-    expect(snapshot.pipelines.audio.deviceDiscovery['probe-failed']).toBeGreaterThanOrEqual(2);
+    expect(snapshot.pipelines.audio.deviceDiscovery.byReason['probe-failed']).toBeGreaterThanOrEqual(2);
     expect(snapshot.pipelines.audio.deviceDiscoveryByChannel['audio:lobby']['probe-failed']).toBe(1);
 
     const deviceCheck = checks.find(check => check.name === 'audio-device-discovery');

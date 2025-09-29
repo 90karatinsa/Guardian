@@ -1394,6 +1394,102 @@ describe('PersonDetector', () => {
     const snapshotPath = path.resolve('snapshots', `${ts}-person.png`);
     expect(fs.existsSync(snapshotPath)).toBe(true);
   });
+
+  it('PersonDetectorFusionThresholds annotates fusion confidence and applied overrides', async () => {
+    const logit = (probability: number) => Math.log(probability / (1 - probability));
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        classProbabilities: [number, number];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      values.classProbabilities.forEach((probability, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit(probability);
+      });
+    };
+
+    assign(0, {
+      cx: 0.49,
+      cy: 0.51,
+      width: 0.3,
+      height: 0.45,
+      objectness: 0.88,
+      classProbabilities: [0.82, 0.1]
+    });
+
+    assign(1, {
+      cx: 0.51,
+      cy: 0.5,
+      width: 0.28,
+      height: 0.43,
+      objectness: 0.86,
+      classProbabilities: [0.79, 0.18]
+    });
+
+    assign(2, {
+      cx: 420,
+      cy: 320,
+      width: 190,
+      height: 210,
+      objectness: 0.83,
+      classProbabilities: [0.24, 0.76]
+    });
+
+    runMock.mockResolvedValueOnce({
+      output0: { data, dims: [1, attributes, detections] }
+    });
+
+    const detector = await PersonDetector.create(
+      {
+        source: 'video:fusion-thresholds',
+        modelPath: 'models/yolov8n.onnx',
+        scoreThreshold: 0.45,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0,
+        classIndices: [0, 1],
+        classScoreThresholds: { 1: 0.75 },
+        maxDetections: 3
+      },
+      bus
+    );
+
+    const frame = createUniformFrame(1280, 720, 72);
+    await detector.handleFrame(frame, 4242);
+
+    expect(events).toHaveLength(1);
+    const meta = events[0].meta as Record<string, any>;
+    expect(meta?.fusion).toBeDefined();
+    const fusion = meta!.fusion as { confidence: number; contributors: unknown[] };
+    expect(typeof fusion.confidence).toBe('number');
+    expect(fusion.contributors.length).toBeGreaterThanOrEqual(2);
+
+    const thresholds = meta!.thresholds as { applied?: Record<string, number>; classScoreThresholds?: Record<string, number> };
+    expect(thresholds.applied?.['0']).toBeCloseTo(0.45, 5);
+    expect(thresholds.classScoreThresholds?.['1']).toBeCloseTo(0.75, 5);
+
+    const detectionsMeta = Array.isArray(meta?.detections) ? (meta!.detections as Array<Record<string, any>>) : [];
+    expect(detectionsMeta.length).toBeGreaterThanOrEqual(1);
+    const person = detectionsMeta.find(entry => entry.classId === 0);
+    expect(person).toBeDefined();
+    expect(person?.fusion?.confidence).toBeCloseTo(fusion.confidence, 5);
+    expect(person?.appliedThreshold).toBeCloseTo(thresholds.applied?.['0'] ?? 0, 5);
+  });
 });
 
 function createUniformFrame(width: number, height: number, value: number) {

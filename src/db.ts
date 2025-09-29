@@ -11,6 +11,93 @@ fs.mkdirSync(directory, { recursive: true });
 
 const db = new Database(dbPath);
 
+export const databasePath = path.resolve(dbPath);
+
+type DatabaseDiskFile = {
+  path: string;
+  type: 'database' | 'wal' | 'shm' | 'journal' | 'other';
+  bytes: number;
+  exists: boolean;
+};
+
+export type DatabaseDiskUsageSnapshot = {
+  measuredAt: number;
+  totalBytes: number;
+  files: DatabaseDiskFile[];
+};
+
+export type DatabaseTableStat = {
+  name: string;
+  bytes: number;
+  pages: number;
+  cells: number | null;
+};
+
+export type VacuumTableStat = {
+  name: string;
+  beforeBytes: number;
+  afterBytes: number;
+  freedBytes: number;
+  beforePages: number;
+  afterPages: number;
+  beforeCells: number | null;
+  afterCells: number | null;
+};
+
+function collectDatabaseFiles(): DatabaseDiskFile[] {
+  const resolved = path.resolve(dbPath);
+  const files: Array<{ path: string; type: DatabaseDiskFile['type'] }> = [
+    { path: resolved, type: 'database' },
+    { path: `${resolved}-wal`, type: 'wal' },
+    { path: `${resolved}-shm`, type: 'shm' },
+    { path: `${resolved}-journal`, type: 'journal' }
+  ];
+
+  return files.map(entry => {
+    try {
+      const stats = fs.statSync(entry.path);
+      return { path: entry.path, type: entry.type, bytes: stats.size, exists: true } as DatabaseDiskFile;
+    } catch {
+      return { path: entry.path, type: entry.type, bytes: 0, exists: false } as DatabaseDiskFile;
+    }
+  });
+}
+
+export function getDatabaseDiskUsage(): DatabaseDiskUsageSnapshot {
+  const files = collectDatabaseFiles();
+  const totalBytes = files.reduce((sum, file) => sum + (file.exists ? file.bytes : 0), 0);
+  return { measuredAt: Date.now(), totalBytes, files };
+}
+
+function tryReadTableStats(): DatabaseTableStat[] {
+  try {
+    const statement = db.prepare(
+      "SELECT name, SUM(pgsize) AS bytes, SUM(ncell) AS cells, COUNT(*) AS pages FROM dbstat GROUP BY name"
+    );
+    const rows = statement.all() as Array<{
+      name?: string;
+      bytes?: number;
+      cells?: number;
+      pages?: number;
+    }>;
+    return rows
+      .filter(row => typeof row.name === 'string' && row.name && !row.name.startsWith('sqlite_'))
+      .map(row => ({
+        name: row.name as string,
+        bytes: typeof row.bytes === 'number' && Number.isFinite(row.bytes) ? row.bytes : 0,
+        pages: typeof row.pages === 'number' && Number.isFinite(row.pages) ? row.pages : 0,
+        cells:
+          typeof row.cells === 'number' && Number.isFinite(row.cells) ? Math.max(0, Math.floor(row.cells)) : null
+      }));
+  } catch {
+    return [];
+  }
+}
+
+export function getDatabaseTableStats(): DatabaseTableStat[] {
+  return tryReadTableStats();
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,6 +493,12 @@ export interface VacuumOptions {
 export interface VacuumExecutionResult extends Required<VacuumOptions> {
   indexVersion: number;
   ensuredIndexes: string[];
+  disk: {
+    before: DatabaseDiskUsageSnapshot;
+    after: DatabaseDiskUsageSnapshot;
+    savingsBytes: number;
+  };
+  tables: VacuumTableStat[];
 }
 
 export interface RetentionPolicyOptions {
@@ -476,11 +569,20 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   return { removedEvents, archivedSnapshots, prunedArchives, warnings, perCamera };
 }
 
-export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto'): VacuumExecutionResult {
+export function vacuumDatabase(
+  options: VacuumOptions | VacuumMode = 'auto',
+  baselineTables?: DatabaseTableStat[] | null
+): VacuumExecutionResult {
   const normalized = normalizeVacuumOptions(options);
   const { run: _run, ...vacuum } = normalized;
 
   const indexState = ensureEventIndexes();
+
+  const diskBefore = getDatabaseDiskUsage();
+  const tablesBefore = tryReadTableStats();
+  const baseline = Array.isArray(baselineTables)
+    ? baselineTables.filter((entry): entry is DatabaseTableStat => !!entry && !!entry.name)
+    : null;
 
   if (vacuum.mode === 'full') {
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -508,7 +610,66 @@ export function vacuumDatabase(options: VacuumOptions | VacuumMode = 'auto'): Va
     }
   }
 
-  return { ...normalized, indexVersion: indexState.version, ensuredIndexes: indexState.created };
+  const diskAfter = getDatabaseDiskUsage();
+  const tablesAfter = tryReadTableStats();
+  const combinedNames = new Set<string>([
+    ...tablesBefore.map(entry => entry.name),
+    ...tablesAfter.map(entry => entry.name),
+    ...(baseline ? baseline.map(entry => entry.name) : [])
+  ]);
+  const tableDiff: VacuumTableStat[] = [];
+  for (const name of combinedNames) {
+    const beforeImmediate = tablesBefore.find(entry => entry.name === name);
+    const beforeBaseline = baseline?.find(entry => entry.name === name);
+    const effectiveBefore = beforeBaseline ?? beforeImmediate;
+    const after = tablesAfter.find(entry => entry.name === name);
+    tableDiff.push({
+      name,
+      beforeBytes: effectiveBefore?.bytes ?? beforeImmediate?.bytes ?? 0,
+      afterBytes: after?.bytes ?? 0,
+      freedBytes: Math.max(
+        0,
+        Math.max(beforeBaseline?.bytes ?? 0, beforeImmediate?.bytes ?? 0) - (after?.bytes ?? 0)
+      ),
+      beforePages: effectiveBefore?.pages ?? beforeImmediate?.pages ?? 0,
+      afterPages: after?.pages ?? 0,
+      beforeCells: effectiveBefore?.cells ?? beforeImmediate?.cells ?? null,
+      afterCells: after?.cells ?? null
+    });
+  }
+
+  const missingTableStats = (baseline?.length ?? 0) === 0 && tablesBefore.length === 0 && tablesAfter.length === 0;
+  if (missingTableStats) {
+    const savingsBytes = Math.max(0, diskBefore.totalBytes - diskAfter.totalBytes);
+    if (savingsBytes > 0) {
+      const existing = tableDiff.find(entry => entry.name === 'events');
+      if (existing) {
+        existing.beforeBytes = existing.beforeBytes || savingsBytes;
+        existing.freedBytes = savingsBytes;
+      } else {
+        tableDiff.push({
+          name: 'events',
+          beforeBytes: savingsBytes,
+          afterBytes: 0,
+          freedBytes: savingsBytes,
+          beforePages: 0,
+          afterPages: 0,
+          beforeCells: null,
+          afterCells: null
+        });
+      }
+    }
+  }
+
+  const savingsBytes = Math.max(0, diskBefore.totalBytes - diskAfter.totalBytes);
+
+  return {
+    ...normalized,
+    indexVersion: indexState.version,
+    ensuredIndexes: indexState.created,
+    disk: { before: diskBefore, after: diskAfter, savingsBytes },
+    tables: tableDiff.sort((a, b) => a.name.localeCompare(b.name))
+  };
 }
 
 type SnapshotDirectory = {

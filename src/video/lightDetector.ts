@@ -23,6 +23,8 @@ export interface LightDetectorOptions {
   idleRebaselineMs?: number;
   noiseWarmupFrames?: number;
   noiseBackoffPadding?: number;
+  temporalMedianWindow?: number;
+  temporalMedianBackoffSmoothing?: number;
 }
 
 const DEFAULT_DELTA_THRESHOLD = 30;
@@ -36,6 +38,8 @@ const DEFAULT_IDLE_REBASELINE_MS = 120_000;
 const NOISE_WINDOW_SIZE = 40;
 const DELTA_WINDOW_SIZE = 24;
 const SUSTAINED_NOISE_THRESHOLD = 1.1;
+const DEFAULT_TEMPORAL_WINDOW = 6;
+const DEFAULT_TEMPORAL_BACKOFF_SMOOTHING = 0.35;
 
 export class LightDetector {
   private options: LightDetectorOptions;
@@ -56,6 +60,8 @@ export class LightDetector {
   private baseNoiseBackoffPadding: number;
   private noiseBackoffPadding: number;
   private rebaselineFramesRemaining = 0;
+  private readonly temporalWindow: number[] = [];
+  private temporalSuppression = 0;
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
@@ -65,6 +71,7 @@ export class LightDetector {
     this.noiseWarmupRemaining = Math.max(0, this.options.noiseWarmupFrames ?? 0);
     this.baseNoiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
     this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
+    this.resetTemporalGate();
   }
 
   updateOptions(options: Partial<Omit<LightDetectorOptions, 'source'>>) {
@@ -97,13 +104,17 @@ export class LightDetector {
 
     const warmupChanged = hasOptionChanged('noiseWarmupFrames');
     const backoffPaddingChanged = hasOptionChanged('noiseBackoffPadding');
+    const temporalOptionsChanged =
+      hasOptionChanged('temporalMedianWindow') ||
+      hasOptionChanged('temporalMedianBackoffSmoothing');
 
     const countersResetNeeded =
       baselineResetNeeded ||
       hasOptionChanged('debounceFrames') ||
       hasOptionChanged('backoffFrames') ||
       warmupChanged ||
-      backoffPaddingChanged;
+      backoffPaddingChanged ||
+      temporalOptionsChanged;
 
     this.options = next;
 
@@ -119,6 +130,10 @@ export class LightDetector {
       const paddedBackoff = baseBackoff + padding;
       this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
       this.updatePendingSuppressedGauge();
+    }
+
+    if (temporalOptionsChanged) {
+      this.resetTemporalGate();
     }
 
     if (baselineResetNeeded) {
@@ -237,6 +252,32 @@ export class LightDetector {
       const stabilizedDelta = Math.max(delta, this.deltaTrend, deltaWindowMedian ?? delta);
       metrics.setDetectorGauge('light', 'deltaWindowMedian', deltaWindowMedian ?? delta);
 
+      const temporalWindowSize = Math.min(
+        60,
+        Math.max(3, Math.round(this.options.temporalMedianWindow ?? DEFAULT_TEMPORAL_WINDOW))
+      );
+      recordWindowSample(this.temporalWindow, stabilizedDelta, temporalWindowSize);
+      const temporalMedianValue = median(this.temporalWindow);
+      const temporalBackoffSmoothing = clamp(
+        this.options.temporalMedianBackoffSmoothing ?? DEFAULT_TEMPORAL_BACKOFF_SMOOTHING,
+        0.05,
+        0.95
+      );
+      const temporalSuppression = this.updateTemporalSuppression(
+        stabilizedDelta,
+        temporalMedianValue,
+        temporalWindowSize,
+        temporalBackoffSmoothing
+      );
+      metrics.setDetectorGauge('light', 'temporalWindow', temporalMedianValue ?? stabilizedDelta);
+      metrics.setDetectorGauge('light', 'temporalWindowSize', temporalWindowSize);
+      metrics.setDetectorGauge('light', 'temporalSuppression', temporalSuppression);
+      const temporalSuppressionRatio =
+        temporalWindowSize === 0 ? 0 : temporalSuppression / Math.max(1, temporalWindowSize);
+      const temporalGateMultiplier =
+        this.temporalSuppression > 0 ? 1 + Math.min(1.5, temporalSuppressionRatio) * 0.85 : 1;
+      metrics.setDetectorGauge('light', 'temporalGateMultiplier', temporalGateMultiplier);
+
       const effectiveNoiseSmoothing = clamp(
         baseNoiseSmoothing * (noiseRatio > 1 ? 1 + Math.min(noiseRatio - 1, 1) * 0.6 : 0.65),
         0.05,
@@ -255,7 +296,10 @@ export class LightDetector {
         3
       );
       const adaptiveThreshold = baseAdaptiveThreshold * noiseSuppressionFactor;
-      const intensityRatio = adaptiveThreshold === 0 ? 0 : stabilizedDelta / adaptiveThreshold;
+      const temporalAdaptiveThreshold = adaptiveThreshold * temporalGateMultiplier;
+      const intensityRatio =
+        temporalAdaptiveThreshold === 0 ? 0 : stabilizedDelta / temporalAdaptiveThreshold;
+      metrics.setDetectorGauge('light', 'temporalAdaptiveThreshold', temporalAdaptiveThreshold);
 
       recordWindowSample(this.noiseWindow, noiseRatio, NOISE_WINDOW_SIZE);
       const noiseWindowMedian = median(this.noiseWindow);
@@ -276,7 +320,7 @@ export class LightDetector {
       metrics.setDetectorGauge('light', 'noiseWindowBoost', this.sustainedNoiseBoost);
 
       const effectiveSmoothing = clamp(
-        delta < adaptiveThreshold
+        delta < temporalAdaptiveThreshold
           ? smoothing * 0.75
           : smoothing * (1 + Math.min(noiseRatio - 1, 1) * 0.25),
         0.01,
@@ -303,8 +347,22 @@ export class LightDetector {
         dynamicBackoff,
         baseEffectiveDebounce
       );
-      const effectiveDebounce = baseEffectiveDebounce + debouncePadding;
-      const effectiveBackoff = dynamicBackoff + backoffPadding;
+      const noiseAdjustedDebounce = baseEffectiveDebounce + debouncePadding;
+      const noiseAdjustedBackoff = dynamicBackoff + backoffPadding;
+      const temporalDebouncePadding = this.computeTemporalDebouncePadding(
+        noiseAdjustedDebounce,
+        temporalWindowSize,
+        temporalBackoffSmoothing
+      );
+      const temporalBackoffPadding = this.computeTemporalBackoffPadding(
+        noiseAdjustedBackoff,
+        temporalWindowSize,
+        temporalBackoffSmoothing
+      );
+      const effectiveDebounce = noiseAdjustedDebounce + temporalDebouncePadding;
+      const effectiveBackoff = noiseAdjustedBackoff + temporalBackoffPadding;
+      metrics.setDetectorGauge('light', 'temporalDebouncePadding', temporalDebouncePadding);
+      metrics.setDetectorGauge('light', 'temporalBackoffPadding', temporalBackoffPadding);
 
       metrics.setDetectorGauge('light', 'effectiveDebounceFrames', effectiveDebounce);
       metrics.setDetectorGauge('light', 'effectiveBackoffFrames', effectiveBackoff);
@@ -368,7 +426,7 @@ export class LightDetector {
         return;
       }
 
-      if (stabilizedDelta < adaptiveThreshold) {
+      if (stabilizedDelta < temporalAdaptiveThreshold) {
         this.updateBaseline(luminance, effectiveSmoothing);
         if (this.pendingFrames > 0) {
           this.pendingFrames = Math.max(0, this.pendingFrames - 1);
@@ -451,6 +509,7 @@ export class LightDetector {
           stabilizedDelta,
           deltaThreshold,
           adaptiveThreshold,
+          temporalAdaptiveThreshold,
           rawAdaptiveThreshold: baseAdaptiveThreshold,
           intensityRatio,
           noiseLevel: this.noiseLevel,
@@ -472,6 +531,12 @@ export class LightDetector {
           denoiseStrategy: this.lastDenoiseStrategy,
           noiseWarmupRemaining: this.noiseWarmupRemaining,
           noiseBackoffPadding: this.noiseBackoffPadding,
+          temporalMedian: temporalMedianValue ?? stabilizedDelta,
+          temporalSuppression: this.temporalSuppression,
+          temporalDebouncePadding,
+          temporalBackoffPadding,
+          temporalWindowSize,
+          temporalGateMultiplier,
           normalHoursActive: withinNormalHours,
           normalHours: this.options.normalHours?.map(range => ({ ...range })) ?? []
         }
@@ -524,6 +589,78 @@ export class LightDetector {
     return { backoffPadding, debouncePadding } as const;
   }
 
+  private updateTemporalSuppression(
+    value: number,
+    medianValue: number | null,
+    windowSize: number,
+    smoothing: number
+  ) {
+    const clampedSmoothing = clamp(smoothing, 0.05, 0.95);
+    const safeWindow = Math.max(1, windowSize);
+    const baseline = medianValue ?? value;
+    if (!Number.isFinite(value) || !Number.isFinite(baseline)) {
+      this.temporalSuppression *= 1 - clampedSmoothing;
+      return this.temporalSuppression;
+    }
+    const normalizedBaseline = baseline <= 0 ? Math.max(value, 0) : baseline;
+    const ratio = normalizedBaseline === 0 ? (value > 0 ? 2 : 1) : value / normalizedBaseline;
+    const gatingMargin = 0.12;
+    let target = 0;
+    if (ratio >= 1 + gatingMargin) {
+      target = 0;
+    } else if (ratio >= 1) {
+      const shortfall = (1 + gatingMargin - ratio) / gatingMargin;
+      target = shortfall * safeWindow * 0.5;
+    } else {
+      const deficit = Math.min(1.5, Math.max(0, 1 - ratio));
+      target = deficit * safeWindow;
+    }
+    const blended = this.temporalSuppression * (1 - clampedSmoothing) + target * clampedSmoothing;
+    this.temporalSuppression = clamp(blended, 0, safeWindow);
+    return this.temporalSuppression;
+  }
+
+  private computeTemporalDebouncePadding(
+    baseDebounce: number,
+    windowSize: number,
+    smoothing: number
+  ) {
+    if (this.temporalSuppression <= 0) {
+      return 0;
+    }
+    const windowLimit = Math.max(
+      1,
+      Math.round(windowSize * Math.min(0.85, 0.4 + smoothing))
+    );
+    const baseLimit = Math.max(
+      1,
+      Math.round(baseDebounce * Math.min(1.3, 0.8 + smoothing))
+    );
+    const limit = Math.max(1, Math.min(windowLimit, Math.max(baseLimit, Math.round(windowSize * 0.5))));
+    const target = Math.round(
+      this.temporalSuppression * Math.min(2, 1 + smoothing * 0.8)
+    );
+    return Math.min(limit, Math.max(1, target));
+  }
+
+  private computeTemporalBackoffPadding(
+    baseBackoff: number,
+    windowSize: number,
+    smoothing: number
+  ) {
+    if (this.temporalSuppression <= 0) {
+      return 0;
+    }
+    const windowLimit = Math.max(
+      1,
+      Math.round(Math.max(baseBackoff, windowSize) * Math.min(1, 0.55 + smoothing))
+    );
+    const target = Math.round(
+      this.temporalSuppression * Math.min(1.6, 0.7 + smoothing)
+    );
+    return Math.min(windowLimit, Math.max(1, target));
+  }
+
   private updateBaseline(luminance: number, smoothing: number) {
     if (this.baseline === null) {
       this.baseline = luminance;
@@ -548,6 +685,7 @@ export class LightDetector {
     this.backoffFrames = 0;
     this.noiseWindow.length = 0;
     this.deltaWindow.length = 0;
+    this.resetTemporalGate();
     this.sustainedNoiseBoost = 1;
     if (!preserveSuppression) {
       this.suppressedFrames = 0;
@@ -572,6 +710,22 @@ export class LightDetector {
       'pendingSuppressedFramesBeforeTrigger',
       this.pendingSuppressedFramesBeforeTrigger + this.suppressedFrames
     );
+  }
+
+  private resetTemporalGate() {
+    this.temporalWindow.length = 0;
+    this.temporalSuppression = 0;
+    const windowSize = Math.min(
+      60,
+      Math.max(3, Math.round(this.options.temporalMedianWindow ?? DEFAULT_TEMPORAL_WINDOW))
+    );
+    metrics.setDetectorGauge('light', 'temporalWindow', 0);
+    metrics.setDetectorGauge('light', 'temporalWindowSize', windowSize);
+    metrics.setDetectorGauge('light', 'temporalSuppression', 0);
+    metrics.setDetectorGauge('light', 'temporalDebouncePadding', 0);
+    metrics.setDetectorGauge('light', 'temporalBackoffPadding', 0);
+    metrics.setDetectorGauge('light', 'temporalGateMultiplier', 1);
+    metrics.setDetectorGauge('light', 'temporalAdaptiveThreshold', 0);
   }
 
   private isWithinNormalHours(ts: number) {

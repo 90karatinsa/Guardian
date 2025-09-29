@@ -111,7 +111,9 @@ describe('GuardianCliHealthcheck', () => {
     const stopSpy = vi.fn();
     startGuardMock.mockResolvedValue({
       stop: stopSpy,
-      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
     });
     const startPromise = runCli(['start'], createTestIo().io);
 
@@ -157,10 +159,18 @@ describe('GuardianCliHealthcheck', () => {
     expect(payload.metricsSummary.pipelines.watchdogBackoffMs.audio).toBe(0);
     expect(payload.metricsSummary.pipelines.lastWatchdogJitterMs.video).toBeNull();
     expect(payload.metricsSummary.pipelines.lastWatchdogJitterMs.audio).toBeNull();
+    expect(payload.metricsSummary.pipelines.transportFallbacks.video.total).toBe(0);
+    expect(payload.metricsSummary.pipelines.transportFallbacks.audio.total).toBe(0);
+    expect(payload.metricsSummary.pipelines.transportFallbacks.video.last).toBeNull();
+    expect(payload.metricsSummary.pipelines.transportFallbacks.audio.last).toBeNull();
     expect(payload.metricsSummary.pipelines.channels.video).toBe(0);
     expect(payload.metricsSummary.pipelines.channels.audio).toBe(0);
     expect(payload.metricsSummary.pipelines.lastRestartAt.video).toBeNull();
     expect(payload.metricsSummary.pipelines.lastRestartAt.audio).toBeNull();
+    expect(payload.pipelines.ffmpeg.channels).toEqual({});
+    expect(payload.pipelines.audio.channels).toEqual({});
+    expect(payload.pipelines.ffmpeg.totalDegraded).toBe(0);
+    expect(payload.pipelines.audio.totalDegraded).toBe(0);
   });
 
   it('HealthcheckMetricsSnapshot includes runtime fields and degraded status', async () => {
@@ -183,6 +193,8 @@ describe('GuardianCliHealthcheck', () => {
     expect(flagPayload.metricsSummary.pipelines.channels.audio).toBe(0);
     expect(flagPayload.metricsSummary.pipelines.lastRestartAt.video).toBeNull();
     expect(flagPayload.metricsSummary.pipelines.lastRestartAt.audio).toBeNull();
+    expect(flagPayload.pipelines.ffmpeg.totalDegraded).toBe(0);
+    expect(flagPayload.pipelines.audio.totalDegraded).toBe(0);
 
     metrics.reset();
     metrics.incrementLogLevel('error', { message: 'detector failure' });
@@ -218,7 +230,9 @@ describe('GuardianCliHealthcheck', () => {
     registerShutdownHook('status-json-hook', hook);
     startGuardMock.mockResolvedValue({
       stop: stopSpy,
-      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
     });
 
     const startIo = createTestIo();
@@ -249,7 +263,13 @@ describe('GuardianCliHealthcheck', () => {
   it('CliAudioCircuitReset triggers audio circuit breaker resets and reports the channel', async () => {
     const stopSpy = vi.fn();
     const resetSpy = vi.fn().mockReturnValue(true);
-    startGuardMock.mockResolvedValue({ stop: stopSpy, resetCircuitBreaker: resetSpy });
+    const resetHealthSpy = vi.fn().mockReturnValue(false);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: resetSpy,
+      resetChannelHealth: resetHealthSpy,
+      resetTransportFallback: vi.fn().mockReturnValue(false)
+    });
 
     const startPromise = runCli(['start'], createTestIo().io);
 
@@ -294,7 +314,13 @@ describe('GuardianCliHealthcheck', () => {
   it('CliDaemonRestartChannel resets circuit breakers for the requested video channel', async () => {
     const stopSpy = vi.fn();
     const resetSpy = vi.fn().mockReturnValue(true);
-    startGuardMock.mockResolvedValue({ stop: stopSpy, resetCircuitBreaker: resetSpy });
+    const resetHealthSpy = vi.fn().mockReturnValue(false);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: resetSpy,
+      resetChannelHealth: resetHealthSpy,
+      resetTransportFallback: vi.fn().mockReturnValue(false)
+    });
 
     const startPromise = runCli(['start'], createTestIo().io);
 
@@ -321,7 +347,13 @@ describe('GuardianCliHealthcheck', () => {
   it('CliDaemonRestartUnknownChannel reports descriptive error for missing pipelines', async () => {
     const stopSpy = vi.fn();
     const resetSpy = vi.fn().mockReturnValue(false);
-    startGuardMock.mockResolvedValue({ stop: stopSpy, resetCircuitBreaker: resetSpy });
+    const resetHealthSpy = vi.fn().mockReturnValue(false);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: resetSpy,
+      resetChannelHealth: resetHealthSpy,
+      resetTransportFallback: vi.fn().mockReturnValue(false)
+    });
 
     const startPromise = runCli(['start'], createTestIo().io);
 
@@ -338,6 +370,63 @@ describe('GuardianCliHealthcheck', () => {
 
     await runCli(['stop'], createTestIo().io);
     await expect(startPromise).resolves.toBe(0);
+  });
+
+  it('CliTransportFallbackReset resets transport ladders for video channels', async () => {
+    const stopSpy = vi.fn();
+    const resetFallbackSpy = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: resetFallbackSpy
+    });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const restartIo = createTestIo();
+    const code = await runCli(['daemon', 'restart', '--transport', 'video:rtsp-main'], restartIo.io);
+
+    expect(code).toBe(0);
+    expect(resetFallbackSpy).toHaveBeenCalledWith('video:rtsp-main');
+    expect(restartIo.stdout()).toContain('transport fallback reset');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
+  it('CliDaemonPipelinesCommands expose channel health summaries and reset counters', async () => {
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:front', {
+      severity: 'warning',
+      restarts: 3,
+      backoffMs: 12000,
+      reason: 'watchdog restarts 3 ≥ 3'
+    });
+
+    const listIo = createTestIo();
+    const listCode = await runCli(['daemon', 'pipelines', 'list', '--json'], listIo.io);
+    expect(listCode).toBe(0);
+    const listPayload = JSON.parse(listIo.stdout().trim());
+    expect(listPayload.pipelines.ffmpeg.channels['video:front'].degraded).toBe(true);
+    expect(listPayload.pipelines.ffmpeg.channels['video:front'].severity).toBe('warning');
+
+    const resetIo = createTestIo();
+    const resetCode = await runCli([
+      'daemon',
+      'pipelines',
+      'reset',
+      '--channel',
+      'video:front'
+    ], resetIo.io);
+    expect(resetCode).toBe(0);
+    expect(resetIo.stdout()).toContain('video:front');
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:front'].health.severity).toBe('none');
   });
 
   it('CliSystemdIntegration reports integration manifest and matches packaged commands', async () => {
@@ -442,6 +531,7 @@ describe('GuardianCliRetention', () => {
       warnings: [],
       perCamera: {}
     });
+    const baselineDisk = dbModule.getDatabaseDiskUsage();
     const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase').mockImplementation(() => ({
       run: 'always',
       mode: 'auto',
@@ -451,7 +541,9 @@ describe('GuardianCliRetention', () => {
       optimize: false,
       pragmas: undefined,
       indexVersion: 1,
-      ensuredIndexes: []
+      ensuredIndexes: [],
+      disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
+      tables: []
     }));
     const runSpy = vi.spyOn(metrics, 'recordRetentionRun');
     const warnSpy = vi.spyOn(metrics, 'recordRetentionWarning');
@@ -469,6 +561,7 @@ describe('GuardianCliRetention', () => {
         removedEvents: 3,
         archivedSnapshots: 2,
         prunedArchives: 1,
+        diskSavingsBytes: expect.any(Number),
         perCamera: {}
       });
       expect(warnSpy).not.toHaveBeenCalled();
@@ -494,7 +587,9 @@ describe('GuardianCliShutdown', () => {
     const stopSpy = vi.fn();
     startGuardMock.mockResolvedValue({
       stop: stopSpy,
-      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
     });
 
     const startIo = createTestIo();
@@ -523,7 +618,9 @@ describe('GuardianCliShutdown', () => {
     }));
     startGuardMock.mockResolvedValue({
       stop: stopSpy,
-      resetCircuitBreaker: vi.fn().mockReturnValue(false)
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
     });
 
     const startPromise = runCli(['start'], createTestIo().io);

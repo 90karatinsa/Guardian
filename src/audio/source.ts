@@ -29,13 +29,14 @@ type AudioTimingOptions = {
   random?: () => number;
   silenceCircuitBreakerThreshold?: number;
   deviceDiscoveryTimeoutMs?: number;
+  analysisRmsWindowMs?: number;
 };
 
 export type AudioSourceOptions =
   | (AudioTimingOptions & {
       type: 'mic';
       device?: string;
-      inputFormat?: 'alsa' | 'avfoundation' | 'dshow';
+      inputFormat?: 'alsa' | 'avfoundation' | 'dshow' | 'pulse' | 'pipewire';
       sampleRate?: number;
       channels?: number;
       frameDurationMs?: number;
@@ -94,10 +95,24 @@ const DEFAULT_SILENCE_THRESHOLD = 0.0025;
 const DEFAULT_SILENCE_DURATION_MS = 2000;
 const DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS = 2000;
 const DEFAULT_SILENCE_CIRCUIT_BREAKER_THRESHOLD = 4;
+const DEFAULT_ANALYSIS_RMS_WINDOW_MS = 400;
 
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
 const DEVICE_DISCOVERY_CACHE = new Map<string, Promise<MicCandidate[]>>();
+
+type RmsWindowEntry = { value: number; durationMs: number };
+
+type AnalysisState = {
+  frames: number;
+  rms: number;
+  spectralCentroid: number;
+  rmsWindowFrames: number;
+  rmsWindowMs: number;
+  rmsTargetMs: number;
+  rmsSum: number;
+  rmsValues: RmsWindowEntry[];
+};
 
 export class AudioSource extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
@@ -128,10 +143,7 @@ export class AudioSource extends EventEmitter {
   private circuitBroken = false;
   private lastCircuitCandidateReason: AudioRecoverEvent['reason'] | null = null;
   private startSequencePromise: Promise<void> | null = null;
-  private readonly analysisByFormat = new Map<
-    string,
-    { frames: number; rms: number; spectralCentroid: number }
-  >();
+  private readonly analysisByFormat = new Map<string, AnalysisState>();
 
   constructor(private options: AudioSourceOptions) {
     super();
@@ -225,11 +237,22 @@ export class AudioSource extends EventEmitter {
       random?: () => number;
     }
   ) {
+    const previous = this.options as AudioSourceOptions;
     const next: AudioSourceOptions = {
-      ...(this.options as AudioSourceOptions),
+      ...previous,
       ...options,
       micFallbacks: options.micFallbacks ?? this.options.micFallbacks
     } as AudioSourceOptions;
+
+    const silenceThresholdChanged =
+      Object.prototype.hasOwnProperty.call(options, 'silenceThreshold') &&
+      next.silenceThreshold !== previous.silenceThreshold;
+    const silenceDurationChanged =
+      Object.prototype.hasOwnProperty.call(options, 'silenceDurationMs') &&
+      next.silenceDurationMs !== previous.silenceDurationMs;
+    const silenceCircuitThresholdChanged =
+      Object.prototype.hasOwnProperty.call(options, 'silenceCircuitBreakerThreshold') &&
+      next.silenceCircuitBreakerThreshold !== previous.silenceCircuitBreakerThreshold;
 
     this.options = next;
 
@@ -249,6 +272,10 @@ export class AudioSource extends EventEmitter {
       this.silenceRestartPending = false;
     }
 
+    if (silenceThresholdChanged || silenceDurationChanged || silenceCircuitThresholdChanged) {
+      this.resetSilenceState();
+    }
+
     if (this.process) {
       if (!this.hasReceivedChunk) {
         this.resetStartTimer();
@@ -259,9 +286,24 @@ export class AudioSource extends EventEmitter {
   }
 
   getAnalysisSnapshot() {
-    const snapshot: Record<string, { frames: number; rms: number; spectralCentroid: number }> = {};
+    const snapshot: Record<
+      string,
+      {
+        frames: number;
+        rms: number;
+        spectralCentroid: number;
+        rmsWindowMs: number;
+        rmsWindowFrames: number;
+      }
+    > = {};
     for (const [format, state] of this.analysisByFormat.entries()) {
-      snapshot[format] = { ...state };
+      snapshot[format] = {
+        frames: state.frames,
+        rms: state.rms,
+        spectralCentroid: state.spectralCentroid,
+        rmsWindowMs: state.rmsWindowMs,
+        rmsWindowFrames: state.rmsWindowFrames
+      };
     }
     return snapshot;
   }
@@ -353,6 +395,10 @@ export class AudioSource extends EventEmitter {
             const { stdout, stderr } = await execFileAsync(command, args, { timeoutMs });
             const parsed = parseDeviceList(`${stdout}\n${stderr}`);
             if (parsed.length > 0) {
+              metrics.recordAudioDeviceDiscoveryByFormat(fmt, {
+                count: parsed.length,
+                channel: options.channel
+              });
               return parsed.map(device => ({ format: fmt, device }));
             }
           } catch (error) {
@@ -1076,11 +1122,17 @@ export class AudioSource extends EventEmitter {
       }
 
       this.emit('data', samples);
-      this.analyzeFrame(samples, sampleRate, rms);
+      this.analyzeFrame(samples, sampleRate, channels, frameDurationMs, rms);
     }
   }
 
-  private analyzeFrame(samples: Int16Array, sampleRate: number, fallbackRms: number) {
+  private analyzeFrame(
+    samples: Int16Array,
+    sampleRate: number,
+    channels: number,
+    frameDurationMs: number,
+    fallbackRms: number
+  ) {
     if (!samples.length) {
       return;
     }
@@ -1116,16 +1168,75 @@ export class AudioSource extends EventEmitter {
       }
     }
 
-    const state = this.analysisByFormat.get(format) ?? {
-      frames: 0,
-      rms: 0,
-      spectralCentroid: 0
-    };
+    const resolvedFrameDurationMs = (() => {
+      if (Number.isFinite(frameDurationMs) && frameDurationMs > 0) {
+        return frameDurationMs;
+      }
+      const calculated = calculateFrameDurationMs(samples.length, sampleRate, channels);
+      if (Number.isFinite(calculated) && calculated > 0) {
+        return calculated;
+      }
+      return this.options.frameDurationMs ?? DEFAULT_FRAME_DURATION_MS;
+    })();
+
+    const targetWindowMsConfig = Math.max(
+      0,
+      this.options.analysisRmsWindowMs ?? DEFAULT_ANALYSIS_RMS_WINDOW_MS
+    );
+    const desiredWindowMs =
+      targetWindowMsConfig > 0 ? targetWindowMsConfig : resolvedFrameDurationMs;
+    const nextWindowFrames = Math.max(
+      1,
+      Math.round(
+        desiredWindowMs /
+          Math.max(resolvedFrameDurationMs, Number.EPSILON)
+      )
+    );
+
+    let state = this.analysisByFormat.get(format);
+    if (!state) {
+      state = {
+        frames: 0,
+        rms: 0,
+        spectralCentroid: 0,
+        rmsWindowFrames: nextWindowFrames,
+        rmsWindowMs: 0,
+        rmsTargetMs: desiredWindowMs,
+        rmsSum: 0,
+        rmsValues: []
+      };
+    } else {
+      state.rmsTargetMs = desiredWindowMs;
+      if (state.rmsWindowFrames !== nextWindowFrames) {
+        state.rmsWindowFrames = nextWindowFrames;
+        while (state.rmsValues.length > nextWindowFrames) {
+          const removed = state.rmsValues.shift();
+          if (removed) {
+            state.rmsSum -= removed.value;
+          }
+        }
+      }
+    }
+
+    const entry: RmsWindowEntry = { value: rms, durationMs: resolvedFrameDurationMs };
+    state.rmsValues.push(entry);
+    state.rmsSum += rms;
+    while (state.rmsValues.length > state.rmsWindowFrames) {
+      const removed = state.rmsValues.shift();
+      if (removed) {
+        state.rmsSum -= removed.value;
+      }
+    }
+
+    const divisor = state.rmsValues.length || 1;
+    state.rms = state.rmsSum / divisor;
+    state.rmsWindowMs = state.rmsValues.reduce((acc, value) => acc + value.durationMs, 0);
+
     state.frames += 1;
-    state.rms = rms;
     if (typeof spectral === 'number') {
       state.spectralCentroid = spectral;
     }
+
     this.analysisByFormat.set(format, state);
     metrics.setDetectorGauge('audio-anomaly', `analysis.${format}.rms`, state.rms);
     metrics.setDetectorGauge(
@@ -1134,11 +1245,23 @@ export class AudioSource extends EventEmitter {
       state.spectralCentroid
     );
     metrics.setDetectorGauge('audio-anomaly', `analysis.${format}.windows`, state.frames);
+    metrics.setDetectorGauge(
+      'audio-anomaly',
+      `analysis.${format}.rms-window-ms`,
+      state.rmsWindowMs
+    );
+    metrics.setDetectorGauge(
+      'audio-anomaly',
+      `analysis.${format}.rms-window-frames`,
+      state.rmsWindowFrames
+    );
     this.emit('analysis', {
       format,
       rms: state.rms,
       spectralCentroid: state.spectralCentroid,
-      frames: state.frames
+      frames: state.frames,
+      rmsWindowMs: state.rmsWindowMs,
+      rmsWindowFrames: state.rmsWindowFrames
     });
   }
 
@@ -1245,7 +1368,7 @@ function defaultMicFormat(platform: NodeJS.Platform): AudioSourceOptions['inputF
     case 'win32':
       return 'dshow';
     default:
-      return 'alsa';
+      return 'pulse';
   }
 }
 
@@ -1375,6 +1498,8 @@ function getMicFallbacks(platform: NodeJS.Platform): MicCandidate[] {
       ];
     default:
       return [
+        { format: 'pulse', device: 'default' },
+        { format: 'pipewire', device: 'default' },
         { format: 'alsa', device: 'default' },
         { format: 'alsa', device: 'hw:0' },
         { format: 'alsa', device: 'plughw:0' }
@@ -1525,7 +1650,7 @@ function resolveDeviceFormats(
     case 'darwin':
       return ['avfoundation', 'dshow', 'alsa'];
     default:
-      return ['alsa', 'dshow', 'avfoundation'];
+      return ['pulse', 'pipewire', 'alsa', 'dshow', 'avfoundation'];
   }
 }
 

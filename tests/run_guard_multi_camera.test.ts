@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigManager, GuardianConfig } from '../src/config/index.js';
+import { EventBus } from '../src/eventBus.js';
 
 let metrics: typeof import('../src/metrics/index.js').default;
 
@@ -27,6 +28,9 @@ class MockVideoSource extends EventEmitter {
     super();
     MockVideoSource.instances.push(this);
     MockVideoSource.startCounts.push(0);
+    if (!this.options.rtspTransport && this.options.file.startsWith('rtsp://')) {
+      this.options.rtspTransport = 'tcp';
+    }
   }
   public circuitBroken = false;
   public updateOptions = vi.fn(
@@ -53,6 +57,7 @@ class MockVideoSource extends EventEmitter {
     return wasBroken;
   });
   isCircuitBroken = vi.fn(() => this.circuitBroken);
+  getCurrentRtspTransport = vi.fn(() => this.options.rtspTransport ?? null);
 }
 
 class MockPersonDetector {
@@ -275,6 +280,97 @@ describe('run-guard multi camera orchestration', () => {
         () => logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied'),
         4000
       );
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardTracksRtspTransportFallbacksPerChannel', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const config: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      config
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      const pipeline = runtime.pipelines.get('video:cam-1');
+      expect(pipeline).toBeDefined();
+      const transportState = pipeline?.transport;
+      expect(transportState?.current).toBe('tcp');
+
+      const source = pipeline?.source as MockVideoSource;
+      const now = Date.now();
+
+      source.emit('transport-change', {
+        channel: 'video:cam-1',
+        from: 'tcp',
+        to: 'udp',
+        reason: 'rtsp-timeout',
+        attempt: 1,
+        stage: 1,
+        resetsBackoff: true,
+        resetsCircuitBreaker: true,
+        at: now,
+        metricsRecorded: false
+      });
+
+      await Promise.resolve();
+
+      expect(transportState?.current).toBe('udp');
+      expect(transportState?.total).toBe(1);
+      expect(transportState?.history).toHaveLength(1);
+
+      const snapshotAfterFirst = metrics.snapshot();
+      expect(snapshotAfterFirst.pipelines.ffmpeg.transportFallbacks.total).toBe(1);
+      expect(
+        snapshotAfterFirst.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.total
+      ).toBe(1);
+
+      source.emit('transport-change', {
+        channel: 'video:cam-1',
+        from: 'udp',
+        to: 'tcp',
+        reason: 'rtsp-timeout',
+        attempt: 2,
+        stage: 2,
+        resetsBackoff: true,
+        resetsCircuitBreaker: true,
+        at: now + 1,
+        metricsRecorded: false
+      });
+
+      await Promise.resolve();
+
+      expect(transportState?.current).toBe('tcp');
+      expect(transportState?.total).toBe(2);
+      expect(transportState?.history).toHaveLength(2);
+
+      const snapshotAfterSecond = metrics.snapshot();
+      expect(snapshotAfterSecond.pipelines.ffmpeg.transportFallbacks.total).toBe(2);
+      expect(
+        snapshotAfterSecond.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.history
+      ).toHaveLength(2);
     } finally {
       runtime.stop();
     }
@@ -568,6 +664,66 @@ describe('run-guard multi camera orchestration', () => {
     expect(camBSnapshot.restarts).toBe(1);
     expect(camBSnapshot.byReason['stream-error']).toBe(1);
     expect(camBSnapshot.totalRestartDelayMs).toBe(600);
+
+    runtime.stop();
+  });
+
+  it('RunGuardChannelDegradeEvents emits system events when watchdog thresholds are exceeded', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const busLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const bus = new EventBus({ store: vi.fn(), log: busLogger, metrics });
+    const events: unknown[] = [];
+    bus.on('event', event => {
+      events.push(event);
+    });
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      config: {
+        video: {
+          framesPerSecond: 5,
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream',
+              person: { score: 0.5 },
+              motion: { diffThreshold: 20, areaThreshold: 0.02 }
+            }
+          ]
+        },
+        person: { modelPath: 'model.onnx', score: 0.5 },
+        motion: { diffThreshold: 20, areaThreshold: 0.02 }
+      }
+    });
+
+    const [camera] = MockVideoSource.instances;
+    expect(camera).toBeDefined();
+
+    camera.emit('recover', { reason: 'watchdog-timeout', attempt: 1, delayMs: 5000 });
+    camera.emit('recover', { reason: 'watchdog-timeout', attempt: 2, delayMs: 6000 });
+    camera.emit('recover', { reason: 'watchdog-timeout', attempt: 3, delayMs: 7000 });
+
+    await vi.waitFor(() => {
+      expect(events.some(event => (event as { detector?: string }).detector === 'system')).toBe(true);
+    });
+
+    const systemEvent = events.find(
+      event => (event as { detector?: string }).detector === 'system'
+    ) as { severity?: string; meta?: Record<string, unknown> } | undefined;
+    expect(systemEvent?.severity).toBe('warning');
+    expect(systemEvent?.meta?.channel).toBe('video:cam-1');
+    expect(systemEvent?.meta?.severity).toBe('warning');
+
+    const snapshot = metrics.snapshot();
+    const channelSnapshot = snapshot.pipelines.ffmpeg.byChannel['video:cam-1'];
+    expect(channelSnapshot.health.severity).toBe('warning');
+    expect(channelSnapshot.health.restarts).toBeGreaterThanOrEqual(3);
+    expect(channelSnapshot.health.degradedSince).toBeTypeOf('string');
 
     runtime.stop();
   });

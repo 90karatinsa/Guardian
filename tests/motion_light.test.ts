@@ -55,6 +55,83 @@ describe('MotionDetector', () => {
     metrics.reset();
   });
 
+  it('MotionTemporalMedianSuppressesNoise', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'temporal-motion',
+        diffThreshold: 4,
+        areaThreshold: 0.05,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.12,
+        areaSmoothing: 0.18,
+        areaInflation: 1.05,
+        noiseWarmupFrames: 0,
+        temporalMedianWindow: 5,
+        temporalMedianBackoffSmoothing: 0.45
+      },
+      bus
+    );
+
+    const baseFrame = createUniformFrame(12, 12, 42);
+    detector.handleFrame(baseFrame, 0);
+
+    for (let i = 0; i < 12; i += 1) {
+      const phase = i % 3;
+      const flicker = phase < 2
+        ? createFrame(12, 12, (x, y) => (x < 6 ? 232 : 42 + ((x + y + i) % 6)))
+        : createFrame(12, 12, (x, y) => 42 + ((x * 2 + y + i) % 5 === 0 ? 4 : -3));
+      detector.handleFrame(flicker, i + 1);
+    }
+
+    const motionSnapshot = metrics.snapshot();
+    expect(events.some(event => event.detector === 'motion')).toBe(false);
+    expect(motionSnapshot.detectors.motion?.gauges?.temporalWindow ?? 0).toBeGreaterThan(0);
+    expect(motionSnapshot.detectors.motion?.gauges?.temporalSuppression ?? 0).toBeGreaterThan(0);
+    expect(motionSnapshot.detectors.motion?.gauges?.effectiveDebounceFrames ?? 0).toBeGreaterThanOrEqual(3);
+    expect(motionSnapshot.detectors.motion?.gauges?.temporalGateMultiplier ?? 1).toBeGreaterThan(1);
+  });
+
+  it('LightTemporalMedianBackoff', () => {
+    const detector = new LightDetector(
+      {
+        source: 'temporal-light',
+        deltaThreshold: 15,
+        smoothingFactor: 0.1,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 1,
+        noiseMultiplier: 1.4,
+        noiseSmoothing: 0.12,
+        noiseWarmupFrames: 0,
+        temporalMedianWindow: 6,
+        temporalMedianBackoffSmoothing: 0.4
+      },
+      bus
+    );
+
+    const baseFrame = createUniformFrame(10, 10, 60);
+    detector.handleFrame(baseFrame, 0);
+
+    for (let i = 0; i < 15; i += 1) {
+      const phase = i % 3;
+      const flicker = phase < 2
+        ? createUniformFrame(10, 10, 210 + phase * 6 + (i % 3))
+        : createFrame(10, 10, (x, y) => 60 + ((x + y + i) % 5 === 0 ? 4 : -4));
+      detector.handleFrame(flicker, i + 1);
+    }
+
+    const lightSnapshot = metrics.snapshot();
+    expect(events.some(event => event.detector === 'light')).toBe(false);
+    expect(lightSnapshot.detectors.light?.gauges?.temporalWindow ?? 0).toBeGreaterThan(0);
+    expect(lightSnapshot.detectors.light?.gauges?.temporalSuppression ?? 0).toBeGreaterThan(0);
+    expect(lightSnapshot.detectors.light?.gauges?.effectiveBackoffFrames ?? 0).toBeGreaterThanOrEqual(2);
+    expect(lightSnapshot.detectors.light?.gauges?.temporalGateMultiplier ?? 1).toBeGreaterThan(1);
+    expect(lightSnapshot.detectors.light?.gauges?.temporalAdaptiveThreshold ?? 0).toBeGreaterThan(0);
+  });
+
   it('MotionDetectorNoiseBackoffPadding adapts debounce/backoff under sustained noise', () => {
     const motion = new MotionDetector(
       {

@@ -37,6 +37,7 @@ const source = new AudioSource({
   restartJitterFactor: audioConfig?.restartJitterFactor,
   forceKillTimeoutMs: audioConfig?.forceKillTimeoutMs,
   deviceDiscoveryTimeoutMs: audioConfig?.deviceDiscoveryTimeoutMs,
+  analysisRmsWindowMs: audioConfig?.analysisRmsWindowMs,
   micFallbacks: audioConfig?.micFallbacks
 });
 

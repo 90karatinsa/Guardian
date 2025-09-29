@@ -85,6 +85,8 @@ export type MotionTuningConfig = {
   idleRebaselineMs?: number;
   noiseWarmupFrames?: number;
   noiseBackoffPadding?: number;
+  temporalMedianWindow?: number;
+  temporalMedianBackoffSmoothing?: number;
 };
 
 export type CameraMotionConfig = MotionTuningConfig & {
@@ -119,6 +121,7 @@ export type CameraFfmpegConfig = {
   restartMaxDelayMs?: number;
   restartJitterFactor?: number;
   circuitBreakerThreshold?: number;
+  transportFallbackSequence?: string[];
 };
 
 export type CameraConfig = {
@@ -200,6 +203,8 @@ export type LightTuningConfig = {
   idleRebaselineMs?: number;
   noiseWarmupFrames?: number;
   noiseBackoffPadding?: number;
+  temporalMedianWindow?: number;
+  temporalMedianBackoffSmoothing?: number;
 };
 
 export type LightConfig = LightTuningConfig & {
@@ -252,6 +257,10 @@ export type AudioConfig = {
   restartJitterFactor?: number;
   forceKillTimeoutMs?: number;
   deviceDiscoveryTimeoutMs?: number;
+  analysisRmsWindowMs?: number;
+  silenceThreshold?: number;
+  silenceDurationMs?: number;
+  silenceCircuitBreakerThreshold?: number;
   micFallbacks?: Record<string, AudioMicFallbackCandidate[]>;
   anomaly?: AudioAnomalyConfig;
 };
@@ -364,7 +373,9 @@ const cameraLightConfigSchema: JsonSchema = {
     noiseMultiplier: { type: 'number', minimum: 0 },
     noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
     noiseWarmupFrames: { type: 'number', minimum: 0 },
-    noiseBackoffPadding: { type: 'number', minimum: 0 }
+    noiseBackoffPadding: { type: 'number', minimum: 0 },
+    temporalMedianWindow: { type: 'number', minimum: 1 },
+    temporalMedianBackoffSmoothing: { type: 'number', minimum: 0, maximum: 1 }
   }
 };
 
@@ -542,7 +553,12 @@ const guardianConfigSchema: JsonSchema = {
             restartDelayMs: { type: 'number', minimum: 0 },
             restartMaxDelayMs: { type: 'number', minimum: 0 },
             restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
-            circuitBreakerThreshold: { type: 'number', minimum: 1 }
+            circuitBreakerThreshold: { type: 'number', minimum: 1 },
+            transportFallbackSequence: {
+              type: 'array',
+              minItems: 1,
+              items: { type: 'string' }
+            }
           }
         },
         channels: {
@@ -568,7 +584,12 @@ const guardianConfigSchema: JsonSchema = {
                   restartDelayMs: { type: 'number', minimum: 0 },
                   restartMaxDelayMs: { type: 'number', minimum: 0 },
                   restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
-                  circuitBreakerThreshold: { type: 'number', minimum: 1 }
+                  circuitBreakerThreshold: { type: 'number', minimum: 1 },
+                  transportFallbackSequence: {
+                    type: 'array',
+                    minItems: 1,
+                    items: { type: 'string' }
+                  }
                 }
               },
               motion: {
@@ -586,7 +607,13 @@ const guardianConfigSchema: JsonSchema = {
                   areaInflation: { type: 'number', minimum: 0 },
                   areaDeltaThreshold: { type: 'number', minimum: 0 },
                   noiseWarmupFrames: { type: 'number', minimum: 0 },
-                  noiseBackoffPadding: { type: 'number', minimum: 0 }
+                  noiseBackoffPadding: { type: 'number', minimum: 0 },
+                  temporalMedianWindow: { type: 'number', minimum: 1 },
+                  temporalMedianBackoffSmoothing: {
+                    type: 'number',
+                    minimum: 0,
+                    maximum: 1
+                  }
                 }
               },
               light: cameraLightConfigSchema,
@@ -674,7 +701,12 @@ const guardianConfigSchema: JsonSchema = {
                   restartDelayMs: { type: 'number', minimum: 0 },
                   restartMaxDelayMs: { type: 'number', minimum: 0 },
                   restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
-                  circuitBreakerThreshold: { type: 'number', minimum: 1 }
+                  circuitBreakerThreshold: { type: 'number', minimum: 1 },
+                  transportFallbackSequence: {
+                    type: 'array',
+                    minItems: 1,
+                    items: { type: 'string' }
+                  }
                 }
               },
               objects: cameraObjectsConfigSchema
@@ -717,7 +749,9 @@ const guardianConfigSchema: JsonSchema = {
         areaInflation: { type: 'number', minimum: 0 },
         areaDeltaThreshold: { type: 'number', minimum: 0 },
         noiseWarmupFrames: { type: 'number', minimum: 0 },
-        noiseBackoffPadding: { type: 'number', minimum: 0 }
+        noiseBackoffPadding: { type: 'number', minimum: 0 },
+        temporalMedianWindow: { type: 'number', minimum: 1 },
+        temporalMedianBackoffSmoothing: { type: 'number', minimum: 0, maximum: 1 }
       }
     },
     pose: {
@@ -776,7 +810,9 @@ const guardianConfigSchema: JsonSchema = {
         noiseMultiplier: { type: 'number', minimum: 0 },
         noiseSmoothing: { type: 'number', minimum: 0, maximum: 1 },
         noiseWarmupFrames: { type: 'number', minimum: 0 },
-        noiseBackoffPadding: { type: 'number', minimum: 0 }
+        noiseBackoffPadding: { type: 'number', minimum: 0 },
+        temporalMedianWindow: { type: 'number', minimum: 1 },
+        temporalMedianBackoffSmoothing: { type: 'number', minimum: 0, maximum: 1 }
       }
     },
     audio: {
@@ -792,6 +828,10 @@ const guardianConfigSchema: JsonSchema = {
         restartJitterFactor: { type: 'number', minimum: 0, maximum: 1 },
         forceKillTimeoutMs: { type: 'number', minimum: 0 },
         deviceDiscoveryTimeoutMs: { type: 'number', minimum: 0 },
+        analysisRmsWindowMs: { type: 'number', minimum: 0 },
+        silenceThreshold: { type: 'number', minimum: 0 },
+        silenceDurationMs: { type: 'number', minimum: 0 },
+        silenceCircuitBreakerThreshold: { type: 'number', minimum: 0 },
         micFallbacks: {
           type: 'object',
           additionalProperties: {
@@ -1034,6 +1074,17 @@ function validateLogicalConfig(config: GuardianConfig) {
     }
   };
 
+  const validateTransportSequence = (sequence: unknown, path: string) => {
+    if (!Array.isArray(sequence)) {
+      return;
+    }
+    sequence.forEach((value, index) => {
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        messages.push(`${path}[${index}] must be a non-empty string`);
+      }
+    });
+  };
+
   const channelDefinitions = config.video.channels ? new Set(Object.keys(config.video.channels)) : null;
   const normalizedChannelDefinitions = new Map<string, string>();
   if (config.video.channels) {
@@ -1106,12 +1157,20 @@ function validateLogicalConfig(config: GuardianConfig) {
   }
 
   validatePersonScore(config.person.score, 'config.person');
+  validateTransportSequence(
+    config.video.ffmpeg?.transportFallbackSequence,
+    'config.video.ffmpeg.transportFallbackSequence'
+  );
   validateMotionThresholds(config.motion, 'config.motion');
 
   if (config.video.channels) {
     for (const [channelId, channelConfig] of Object.entries(config.video.channels)) {
       validatePersonScore(channelConfig.person?.score, `config.video.channels.${channelId}.person`);
       validateMotionThresholds(channelConfig.motion, `config.video.channels.${channelId}.motion`);
+      validateTransportSequence(
+        channelConfig.ffmpeg?.transportFallbackSequence,
+        `config.video.channels.${channelId}.ffmpeg.transportFallbackSequence`
+      );
     }
   }
 
@@ -1123,6 +1182,12 @@ function validateLogicalConfig(config: GuardianConfig) {
       }
       if (camera.motion) {
         validateMotionThresholds(camera.motion, `config.video.cameras[${label}].motion`);
+      }
+      if (camera.ffmpeg) {
+        validateTransportSequence(
+          camera.ffmpeg.transportFallbackSequence,
+          `config.video.cameras[${label}].ffmpeg.transportFallbackSequence`
+        );
       }
     });
   }
@@ -1165,6 +1230,24 @@ function validateLogicalConfig(config: GuardianConfig) {
         }
       });
     }
+  }
+
+  const audioSilenceThreshold = config.audio?.silenceThreshold;
+  if (typeof audioSilenceThreshold !== 'undefined' && audioSilenceThreshold < 0) {
+    messages.push('config.audio.silenceThreshold must be greater than or equal to 0');
+  }
+
+  const audioSilenceDuration = config.audio?.silenceDurationMs;
+  if (typeof audioSilenceDuration !== 'undefined' && audioSilenceDuration < 0) {
+    messages.push('config.audio.silenceDurationMs must be greater than or equal to 0');
+  }
+
+  const audioSilenceCircuitThreshold = config.audio?.silenceCircuitBreakerThreshold;
+  if (
+    typeof audioSilenceCircuitThreshold !== 'undefined' &&
+    (!Number.isInteger(audioSilenceCircuitThreshold) || audioSilenceCircuitThreshold < 0)
+  ) {
+    messages.push('config.audio.silenceCircuitBreakerThreshold must be a non-negative integer');
   }
 
   const suppressionRules = config.events?.suppression?.rules ?? [];

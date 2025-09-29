@@ -11,6 +11,7 @@ type MaintenanceSummary = {
   archivedSnapshots: number;
   prunedArchives: number;
   warnings: number;
+  diskSavingsBytes: number;
 };
 
 export interface MaintenanceRunResult {
@@ -58,7 +59,8 @@ export async function runMaintenance(overrides: MaintenanceOptions = {}): Promis
     removedEvents: 0,
     archivedSnapshots: 0,
     prunedArchives: 0,
-    warnings: result.warnings.length
+    warnings: result.warnings.length,
+    diskSavingsBytes: result.disk.savingsBytes
   };
 
   activeLogger.info(
@@ -67,6 +69,7 @@ export async function runMaintenance(overrides: MaintenanceOptions = {}): Promis
       archivedSnapshots: totals.archivedSnapshots,
       prunedArchives: totals.prunedArchives,
       warnings: totals.warnings,
+      diskSavingsBytes: totals.diskSavingsBytes,
       archiveDir: retentionOptions.archiveDir,
       snapshotDirs: retentionOptions.snapshotDirs.map(dir => path.resolve(dir)),
       vacuum: result.vacuum
@@ -103,7 +106,8 @@ function normalizeOutcome(result: Awaited<ReturnType<typeof runRetentionOnce>>):
     removedEvents: outcome.removedEvents,
     archivedSnapshots: outcome.archivedSnapshots,
     prunedArchives: outcome.prunedArchives,
-    warnings: result.warnings.length
+    warnings: result.warnings.length,
+    diskSavingsBytes: result.disk.savingsBytes
   } satisfies MaintenanceSummary;
 }
 

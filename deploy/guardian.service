@@ -7,6 +7,8 @@ Type=simple
 Environment=NODE_ENV=production
 Environment=GUARDIAN_CONFIG=/etc/guardian/config.json
 Environment=GUARDIAN_DATA_DIR=/var/lib/guardian
+Environment=GUARDIAN_SIMULATE_VIDEO_RTSP_TIMEOUT=0
+Environment=GUARDIAN_SIMULATE_VIDEO_WATCHDOG=0
 Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
 ExecStartPre=/usr/bin/env pnpm exec tsx scripts/healthcheck.ts --health

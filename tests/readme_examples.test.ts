@@ -76,6 +76,9 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('vacuum=auto (run=on-change)');
     expect(readme).toContain('pose.forecast');
     expect(readme).toContain('threat.summary');
+    expect(readme).toContain('PulseAudio fallback');
+    expect(readme).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
+    expect(readme).toContain('guardian daemon restart --transport');
     expect(readme).toContain('Sorun giderme');
     expect(readme).toContain('Operasyon kılavuzu');
     expect(readme).toContain('docs/operations.md');
@@ -129,6 +132,16 @@ it('ReadmeAudioSilenceDocs documents silence circuit breaker and device discover
   expect(readme).toContain('Audio device discovery timed out after');
   expect(readme).toContain('pipelines.audio.deviceDiscovery');
   expect(readme).toContain('guardian audio devices --json');
+});
+
+it('ReadmeTransportFallbackDocs documents transport ladder metrics and warnings feed', () => {
+  const readme = readReadme();
+  expect(readme).toContain('guardian_transport_fallback_total');
+  expect(readme).toContain('streamSnapshots');
+  const operationsPath = path.resolve(__dirname, '..', 'docs', 'operations.md');
+  const operations = fs.readFileSync(operationsPath, 'utf8');
+  expect(operations).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
+  expect(operations).toContain('guardian daemon restart --transport');
 });
 
 describe('OperationsDocLinks', () => {
