@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import db, { clearEvents, storeEvent } from '../src/db.js';
+import db, { clearEvents, storeEvent, getDatabaseDiskUsage } from '../src/db.js';
 import * as dbModule from '../src/db.js';
 import { runRetentionOnce, startRetentionTask } from '../src/tasks/retention.js';
 import { __test__ as guardTestUtils } from '../src/run-guard.ts';
@@ -105,7 +105,8 @@ describe('RetentionMaintenance', () => {
         archivedSnapshots: 3,
         perCamera: {
           [cameraKey]: { archivedSnapshots: 3, prunedArchives: 0 }
-        }
+        },
+        diskSavingsBytes: expect.any(Number)
       });
 
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
@@ -113,11 +114,63 @@ describe('RetentionMaintenance', () => {
         archivedSnapshots: 3,
         perCamera: {
           [cameraKey]: { archivedSnapshots: 3, prunedArchives: 0 }
-        }
+        },
+        diskSavingsBytes: expect.any(Number)
       });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('RetentionDiskSavingsMetrics records disk usage and vacuum table stats', async () => {
+    const now = Date.now();
+    const staleTs = now - 90 * dayMs;
+    const payload = 'x'.repeat(32 * 1024);
+    for (let i = 0; i < 12; i += 1) {
+      storeEvent({
+        ts: staleTs - i * 1000,
+        source: 'video:test-camera',
+        detector: 'motion',
+        severity: 'info',
+        message: `${i}:${payload}`,
+        meta: { channel: 'video:test-camera' }
+      } as EventRecord);
+    }
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const beforeUsage = getDatabaseDiskUsage();
+
+    const result = await runRetentionOnce({
+      enabled: true,
+      retentionDays: 0,
+      intervalMs: 60000,
+      archiveDir,
+      snapshotDirs: [],
+      vacuum: { mode: 'auto', run: 'always', target: 'main', analyze: true, optimize: true },
+      logger,
+      metrics: metrics as any
+    });
+
+    expect(result.skipped).toBe(false);
+    expect(result.disk.before.totalBytes).toBe(beforeUsage.totalBytes);
+    expect(result.disk.after.totalBytes).toBeLessThan(result.disk.before.totalBytes);
+    expect(result.disk.savingsBytes).toBeGreaterThan(0);
+    expect(result.vacuum.disk?.after.totalBytes).toBe(result.disk.after.totalBytes);
+    const eventsTable = result.vacuum.tables?.find(table => table.name === 'events');
+    expect(eventsTable?.freedBytes ?? 0).toBeGreaterThan(0);
+    const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+    expect(runCall?.diskSavingsBytes).toBe(result.disk.savingsBytes);
+    const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+    expect(infoCall?.[0]).toMatchObject({ diskSavingsBytes: result.disk.savingsBytes });
   });
 
   it('RetentionSnapshotRotation prunes archives per camera and updates vacuum index version', async () => {
@@ -263,8 +316,14 @@ describe('RetentionMaintenance', () => {
 
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
       expect(runCall?.removedEvents).toBe(staleFiles.length);
+      expect(typeof runCall?.diskSavingsBytes === 'number').toBe(true);
       const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
-      expect(infoCall?.[0]).toMatchObject({ removedEvents: staleFiles.length, archivedSnapshots: 0, prunedArchives: 0 });
+      expect(infoCall?.[0]).toMatchObject({
+        removedEvents: staleFiles.length,
+        archivedSnapshots: 0,
+        prunedArchives: 0,
+        diskSavingsBytes: expect.any(Number)
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -322,10 +381,11 @@ describe('RetentionMaintenance', () => {
           reindex: true,
           optimize: false,
           target: undefined
-        }
+        },
+        diskSavingsBytes: expect.any(Number)
       });
       const firstMetrics = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
-      expect(firstMetrics).toMatchObject({ archivedSnapshots: 1 });
+      expect(firstMetrics).toMatchObject({ archivedSnapshots: 1, diskSavingsBytes: expect.any(Number) });
 
       vacuumSpy.mockClear();
       logger.info.mockClear();
@@ -338,7 +398,8 @@ describe('RetentionMaintenance', () => {
       const secondInfo = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
       expect(secondInfo?.[0]).toMatchObject({
         vacuumMode: 'skipped',
-        vacuumRunMode: 'on-change'
+        vacuumRunMode: 'on-change',
+        diskSavingsBytes: expect.any(Number)
       });
 
       task.configure({
@@ -369,7 +430,8 @@ describe('RetentionMaintenance', () => {
           reindex: true,
           optimize: false,
           target: undefined
-        }
+        },
+        diskSavingsBytes: expect.any(Number)
       });
     } finally {
       task.stop();
@@ -400,6 +462,7 @@ describe('RetentionMaintenance', () => {
         perCamera: {},
         warnings: []
       } as any);
+    const baselineDisk = getDatabaseDiskUsage();
     const vacuumSpy = vi
       .spyOn(dbModule, 'vacuumDatabase')
       .mockReturnValue({
@@ -411,7 +474,9 @@ describe('RetentionMaintenance', () => {
         target: undefined,
         pragmas: undefined,
         indexVersion: 1,
-        ensuredIndexes: []
+        ensuredIndexes: [],
+        disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
+        tables: []
       });
 
     const task = startRetentionTask({
@@ -594,7 +659,7 @@ describe('RetentionMaintenance', () => {
 
       expect(metrics.recordRetentionRun).toHaveBeenCalled();
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
-      expect(runCall).toMatchObject({ archivedSnapshots: expect.any(Number) });
+      expect(runCall).toMatchObject({ archivedSnapshots: expect.any(Number), diskSavingsBytes: expect.any(Number) });
 
       const perCamera = result.outcome?.perCamera ?? {};
       const camOneKey = path.basename(cameraOneDir);
@@ -608,7 +673,11 @@ describe('RetentionMaintenance', () => {
       expect(camTwoFiles.length).toBeLessThanOrEqual(2);
 
       const completionCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
-      expect(completionCall?.[0]).toMatchObject({ vacuumRunMode: 'always', vacuumMode: 'full' });
+      expect(completionCall?.[0]).toMatchObject({
+        vacuumRunMode: 'always',
+        vacuumMode: 'full',
+        diskSavingsBytes: expect.any(Number)
+      });
 
       vacuumSpy.mockClear();
 
@@ -726,7 +795,8 @@ describe('RetentionMaintenance', () => {
       expect(runCall).toMatchObject({
         removedEvents: 0,
         archivedSnapshots: 0,
-        prunedArchives: 0
+        prunedArchives: 0,
+        diskSavingsBytes: expect.any(Number)
       });
       expect(runCall?.perCamera).toMatchObject({
         [path.basename(cameraOneDir)]: { archivedSnapshots: 0, prunedArchives: 0 }
@@ -742,7 +812,8 @@ describe('RetentionMaintenance', () => {
           reindex: true,
           optimize: true,
           target: undefined
-        }
+        },
+        diskSavingsBytes: expect.any(Number)
       });
     } finally {
       task.stop();
@@ -828,13 +899,18 @@ describe('RetentionMaintenance', () => {
       expect(warnCall?.[0]).toMatchObject({ camera: path.basename(cameraOneDir) });
 
       const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
-      expect(infoCall?.[0]).toMatchObject({ prunedArchives: 1, archivedSnapshots: 4 });
+      expect(infoCall?.[0]).toMatchObject({
+        prunedArchives: 1,
+        archivedSnapshots: 4,
+        diskSavingsBytes: expect.any(Number)
+      });
 
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
       expect(runCall).toMatchObject({
         removedEvents: 1,
         archivedSnapshots: 4,
-        prunedArchives: 1
+        prunedArchives: 1,
+        diskSavingsBytes: expect.any(Number)
       });
       expect(runCall?.perCamera).toMatchObject({
         [path.basename(cameraOneDir)]: { archivedSnapshots: 2, prunedArchives: expect.any(Number) },
@@ -907,6 +983,7 @@ describe('RetentionMaintenance', () => {
 
       expect(vacuumSpy).toHaveBeenCalledTimes(1);
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(typeof runCall?.diskSavingsBytes === 'number').toBe(true);
       const camOneKey = path.basename(cameraOneDir);
       const camTwoKey = path.basename(cameraTwoDir);
       expect(runCall?.perCamera?.[camOneKey]).toMatchObject({
@@ -936,7 +1013,8 @@ describe('RetentionMaintenance', () => {
       expect(secondRun).toMatchObject({
         archivedSnapshots: 0,
         prunedArchives: 0,
-        removedEvents: 0
+        removedEvents: 0,
+        diskSavingsBytes: expect.any(Number)
       });
     } finally {
       task.stop();
@@ -1014,6 +1092,7 @@ describe('RetentionMaintenance', () => {
       const runCall = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
       expect(runCall?.perCamera?.[camOneKey]?.prunedArchives).toBe(camOneFiles.length - 1);
       expect(runCall?.perCamera?.[camTwoKey]?.prunedArchives).toBe(camTwoFiles.length - 2);
+      expect(typeof runCall?.diskSavingsBytes === 'number').toBe(true);
 
       const camOneArchives = collectArchiveFiles(path.join(archiveDir, camOneKey));
       const camTwoArchives = collectArchiveFiles(path.join(archiveDir, camTwoKey));

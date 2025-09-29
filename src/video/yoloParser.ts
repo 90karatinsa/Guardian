@@ -39,6 +39,27 @@ export type YoloDetection = {
   projectionIndex?: number;
   normalizedProjection?: boolean;
   priorityScore?: number;
+  fusion?: YoloDetectionFusion;
+};
+
+export type YoloDetectionFusionContributor = {
+  weight: number;
+  score: number;
+  objectness: number;
+  classProbability: number;
+  areaRatio: number;
+  projectionIndex?: number;
+  normalizedProjection?: boolean;
+  iou: number;
+  bbox: BoundingBox;
+};
+
+export type YoloDetectionFusion = {
+  confidence: number;
+  weight: number;
+  areaRatio: number;
+  normalizedSupport: number;
+  contributors: YoloDetectionFusionContributor[];
 };
 
 export interface ParseYoloDetectionsOptions {
@@ -178,62 +199,52 @@ export function parseYoloDetections(
   }
 
   const nmsThreshold = options.nmsThreshold ?? DEFAULT_NMS_IOU_THRESHOLD;
-  const perProjection = new Map<number, Map<number, YoloDetection[]>>();
-
-  for (const detection of detections) {
-    const projectionKey = detection.projectionIndex ?? -1;
-    let projectionGroup = perProjection.get(projectionKey);
-    if (!projectionGroup) {
-      projectionGroup = new Map();
-      perProjection.set(projectionKey, projectionGroup);
-    }
-    const classGroup = projectionGroup.get(detection.classId);
-    if (classGroup) {
-      classGroup.push(detection);
-    } else {
-      projectionGroup.set(detection.classId, [detection]);
-    }
-  }
-
-  const filtered: YoloDetection[] = [];
   const primaryClassId = resolvePrimaryClassId(options, classIndices, classPriority);
-  const prioritized: YoloDetection[] = [];
 
-  for (const projectionGroup of perProjection.values()) {
-    for (const [classId, candidates] of projectionGroup.entries()) {
-      if (primaryClassId !== null && classId === primaryClassId) {
-        for (const detection of candidates) {
-          detection.priorityScore = computeProjectionPriority(detection);
-          prioritized.push(detection);
-        }
-        continue;
-      }
-      filtered.push(...nonMaxSuppression(candidates, nmsThreshold));
+  const perClass = new Map<number, YoloDetection[]>();
+  for (const detection of detections) {
+    const classId = detection.classId;
+    const group = perClass.get(classId);
+    if (group) {
+      group.push(detection);
+    } else {
+      perClass.set(classId, [detection]);
     }
   }
 
-  if (prioritized.length > 0) {
-    const suppressed = nonMaxSuppression(prioritized, nmsThreshold);
-    for (const detection of suppressed) {
-      if ('priorityScore' in detection) {
-        delete detection.priorityScore;
-      }
-    }
-    filtered.push(...suppressed);
+  const fused: YoloDetection[] = [];
+  const originalWidth = Number.isFinite(meta.originalWidth) ? meta.originalWidth : 0;
+  const originalHeight = Number.isFinite(meta.originalHeight) ? meta.originalHeight : 0;
+
+  for (const [classId, group] of perClass.entries()) {
+    const prioritize = primaryClassId !== null && classId === primaryClassId;
+    const fusedGroup = weightedProjectionFusion(
+      group,
+      nmsThreshold,
+      originalWidth,
+      originalHeight,
+      prioritize
+    );
+    fused.push(...fusedGroup);
   }
 
-  filtered.sort((a, b) => {
+  fused.sort((a, b) => {
     const priorityA = classPriority.get(a.classId) ?? Number.POSITIVE_INFINITY;
     const priorityB = classPriority.get(b.classId) ?? Number.POSITIVE_INFINITY;
     if (priorityA !== priorityB) {
       return priorityA - priorityB;
     }
+    const confidenceA = resolveFusionSortScore(a);
+    const confidenceB = resolveFusionSortScore(b);
+    if (confidenceA !== confidenceB) {
+      return confidenceB - confidenceA;
+    }
     return b.score - a.score;
   });
 
-  const maxDetections = options.maxDetections ?? filtered.length;
+  const maxDetections = options.maxDetections ?? fused.length;
 
-  return filtered.slice(0, Math.max(1, maxDetections));
+  return fused.slice(0, Math.max(1, maxDetections));
 }
 
 function resolveClassIndices(options: ParseYoloDetectionsOptions, attributeCount: number): number[] {
@@ -325,6 +336,266 @@ function computeProjectionPriority(detection: YoloDetection) {
     ? Math.max(0, 1 - Math.min(detection.projectionIndex, 4) * 0.05)
     : 0;
   return clamp(base + normalizedBonus + areaWeight + projectionBias, 0, 1.5);
+}
+
+function weightedProjectionFusion(
+  detections: YoloDetection[],
+  threshold: number,
+  frameWidth: number,
+  frameHeight: number,
+  prioritize: boolean
+) {
+  if (detections.length === 0) {
+    return [] as YoloDetection[];
+  }
+
+  const sorted = [...detections].sort((a, b) => resolveFusionSortScore(b) - resolveFusionSortScore(a));
+  const results: YoloDetection[] = [];
+
+  while (sorted.length > 0) {
+    const seed = sorted.shift()!;
+    const cluster: YoloDetection[] = [seed];
+    let expanded = true;
+
+    while (expanded && sorted.length > 0) {
+      expanded = false;
+      for (let index = sorted.length - 1; index >= 0; index -= 1) {
+        const candidate = sorted[index]!;
+        let maxIoU = 0;
+        for (const existing of cluster) {
+          const iou = intersectionOverUnion(existing.bbox, candidate.bbox);
+          if (iou > maxIoU) {
+            maxIoU = iou;
+          }
+          if (maxIoU > threshold) {
+            break;
+          }
+        }
+
+        if (maxIoU > threshold) {
+          cluster.push(candidate);
+          sorted.splice(index, 1);
+          expanded = true;
+        }
+      }
+    }
+
+    results.push(fuseCluster(cluster, frameWidth, frameHeight, prioritize));
+  }
+
+  return results;
+}
+
+function resolveFusionSortScore(detection: YoloDetection) {
+  if (detection.fusion && Number.isFinite(detection.fusion.confidence)) {
+    return detection.fusion.confidence;
+  }
+  if (typeof detection.priorityScore === 'number' && Number.isFinite(detection.priorityScore)) {
+    return detection.priorityScore;
+  }
+  return clamp(detection.score, 0, 1);
+}
+
+function fuseCluster(
+  cluster: YoloDetection[],
+  frameWidth: number,
+  frameHeight: number,
+  prioritize: boolean
+) {
+  const contributions = cluster.map(candidate => {
+    const weight = computeFusionWeight(candidate, prioritize);
+    return { detection: candidate, weight };
+  });
+
+  let totalWeight = contributions.reduce((sum, entry) => sum + entry.weight, 0);
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+    totalWeight = contributions.length || 1;
+  }
+
+  const left = contributions.reduce((sum, entry) => sum + entry.detection.bbox.left * entry.weight, 0) / totalWeight;
+  const top = contributions.reduce((sum, entry) => sum + entry.detection.bbox.top * entry.weight, 0) / totalWeight;
+  const right = contributions.reduce((sum, entry) => {
+    const bbox = entry.detection.bbox;
+    return sum + (bbox.left + bbox.width) * entry.weight;
+  }, 0) / totalWeight;
+  const bottom = contributions.reduce((sum, entry) => {
+    const bbox = entry.detection.bbox;
+    return sum + (bbox.top + bbox.height) * entry.weight;
+  }, 0) / totalWeight;
+
+  const fusedBox = clampBoundingBoxToFrame(
+    {
+      left,
+      top,
+      width: Math.max(0, right - left),
+      height: Math.max(0, bottom - top)
+    },
+    frameWidth,
+    frameHeight
+  );
+
+  const fusedAreaRatio = computeAreaRatio(fusedBox, frameWidth, frameHeight);
+
+  const fusedScore = clamp(
+    contributions.reduce((sum, entry) => sum + clamp(entry.detection.score, 0, 1) * entry.weight, 0) /
+      totalWeight,
+    0,
+    1
+  );
+  const fusedObjectness = clamp(
+    contributions.reduce((sum, entry) => sum + clamp(entry.detection.objectness, 0, 1) * entry.weight, 0) /
+      totalWeight,
+    0,
+    1
+  );
+  const fusedClassProbability = clamp(
+    contributions.reduce(
+      (sum, entry) => sum + clamp(entry.detection.classProbability, 0, 1) * entry.weight,
+      0
+    ) /
+      totalWeight,
+    0,
+    1
+  );
+  const fusedCombinedLogit = contributions.reduce(
+    (sum, entry) => sum + (Number.isFinite(entry.detection.combinedLogit) ? entry.detection.combinedLogit : 0) * entry.weight,
+    0
+  ) / totalWeight;
+  const fusedThreshold = clamp(
+    contributions.reduce(
+      (sum, entry) => sum + clamp(entry.detection.appliedThreshold, 0, 1) * entry.weight,
+      0
+    ) /
+      totalWeight,
+    0,
+    1
+  );
+
+  const normalizedWeight = contributions.reduce(
+    (sum, entry) => sum + (entry.detection.normalizedProjection ? entry.weight : 0),
+    0
+  );
+  const normalizedSupport = totalWeight === 0 ? 0 : normalizedWeight / totalWeight;
+
+  const fusedConfidence = computeFusionConfidence(
+    fusedScore,
+    fusedObjectness,
+    fusedClassProbability,
+    fusedAreaRatio,
+    totalWeight,
+    contributions.length,
+    normalizedSupport
+  );
+
+  const strongest = contributions.reduce((best, current) => {
+    if (!best) {
+      return current;
+    }
+    return current.weight > best.weight ? current : best;
+  }, contributions[0]);
+
+  const fusionContributors: YoloDetectionFusionContributor[] = contributions.map(entry => ({
+    weight: entry.weight,
+    score: clamp(entry.detection.score, 0, 1),
+    objectness: clamp(entry.detection.objectness, 0, 1),
+    classProbability: clamp(entry.detection.classProbability, 0, 1),
+    areaRatio: clamp(entry.detection.areaRatio, 0, 1),
+    projectionIndex: entry.detection.projectionIndex,
+    normalizedProjection: entry.detection.normalizedProjection ?? undefined,
+    bbox: { ...entry.detection.bbox },
+    iou: intersectionOverUnion(entry.detection.bbox, fusedBox)
+  }));
+
+  const template = strongest?.detection ?? cluster[0]!;
+  const sanitizedTemplate: YoloDetection = { ...template };
+  if ('priorityScore' in sanitizedTemplate) {
+    delete sanitizedTemplate.priorityScore;
+  }
+
+  return {
+    ...sanitizedTemplate,
+    bbox: fusedBox,
+    score: fusedScore,
+    objectness: fusedObjectness,
+    classProbability: fusedClassProbability,
+    combinedLogit: fusedCombinedLogit,
+    appliedThreshold: fusedThreshold,
+    areaRatio: fusedAreaRatio,
+    projectionIndex: strongest?.detection.projectionIndex ?? template.projectionIndex,
+    normalizedProjection:
+      normalizedSupport >= 0.5
+        ? true
+        : normalizedSupport === 0
+          ? template.normalizedProjection ?? false
+          : template.normalizedProjection ?? false,
+    fusion: {
+      confidence: fusedConfidence,
+      weight: totalWeight,
+      areaRatio: fusedAreaRatio,
+      normalizedSupport,
+      contributors: fusionContributors
+    }
+  } satisfies YoloDetection;
+}
+
+function computeFusionWeight(detection: YoloDetection, prioritize: boolean) {
+  const baseScore = clamp(detection.score, 0, 1);
+  const objectness = clamp(detection.objectness, 0, 1);
+  const classProbability = clamp(detection.classProbability, 0, 1);
+  const harmonic =
+    objectness + classProbability === 0
+      ? Math.min(objectness, classProbability)
+      : (2 * objectness * classProbability) / (objectness + classProbability);
+  const area = clamp(detection.areaRatio, 0, 1);
+  const projectionBias = typeof detection.projectionIndex === 'number'
+    ? Math.max(0.55, 1 - Math.min(detection.projectionIndex, 4) * 0.08)
+    : 1;
+  const normalizedBonus = detection.normalizedProjection ? 1.05 : 1;
+  const priorityBias = prioritize ? 1 + computeProjectionPriority(detection) * 0.25 : 1;
+
+  return Math.max(
+    1e-6,
+    baseScore * (0.5 + harmonic * 0.3 + Math.sqrt(area) * 0.2) * projectionBias * normalizedBonus * priorityBias
+  );
+}
+
+function computeFusionConfidence(
+  baseScore: number,
+  objectness: number,
+  classProbability: number,
+  areaRatio: number,
+  totalWeight: number,
+  contributorCount: number,
+  normalizedSupport: number
+) {
+  const clampedScore = clamp(baseScore, 0, 1);
+  const clampedObjectness = clamp(objectness, 0, 1);
+  const clampedClassProbability = clamp(classProbability, 0, 1);
+  const harmonic =
+    clampedObjectness + clampedClassProbability === 0
+      ? Math.min(clampedObjectness, clampedClassProbability)
+      :
+        (2 * clampedObjectness * clampedClassProbability) /
+        (clampedObjectness + clampedClassProbability);
+  const fusedLogit =
+    probabilityToLogit(clampedScore) + probabilityToLogit(Math.max(harmonic, 1e-6));
+  const synergy = logistic(fusedLogit);
+  const areaBoost = Math.sqrt(Math.max(0, Math.min(1, areaRatio)));
+  const consensus = clamp(Math.log1p(Math.max(totalWeight, 0)) / Math.log(4), 0, 1);
+  const contributorBoost = clamp((contributorCount - 1) * 0.08, 0, 0.32);
+  const normalizedBoost = clamp(normalizedSupport, 0, 1) * 0.08;
+
+  return clamp(
+    clampedScore * 0.45 +
+      harmonic * 0.2 +
+      synergy * 0.15 +
+      areaBoost * 0.1 +
+      consensus * 0.06 +
+      contributorBoost * 0.024 +
+      normalizedBoost * 0.016,
+    0,
+    1
+  );
 }
 
 function createTensorAccessor(tensor: ort.OnnxValue): TensorAccessor | null {
@@ -713,6 +984,16 @@ function clamp(value: number, min: number, max: number) {
     return min;
   }
   return Math.max(min, Math.min(max, value));
+}
+
+function probabilityToLogit(probability: number) {
+  const clamped = clamp(probability, 1e-6, 1 - 1e-6);
+  return Math.log(clamped / (1 - clamped));
+}
+
+function logistic(value: number) {
+  const clamped = Math.max(-20, Math.min(20, value));
+  return 1 / (1 + Math.exp(-clamped));
 }
 
 function sigmoid(value: number) {

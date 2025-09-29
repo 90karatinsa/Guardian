@@ -33,5 +33,6 @@ export interface EventSuppressionRule {
   suppressForMs?: number;
   rateLimit?: RateLimitConfig;
   maxEvents?: number;
+  timelineTtlMs?: number;
   reason: string;
 }

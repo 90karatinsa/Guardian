@@ -3,12 +3,16 @@ import loggerModule from '../logger.js';
 import metricsModule, { MetricsRegistry, type RetentionWarningSnapshot } from '../metrics/index.js';
 import {
   applyRetentionPolicy,
+  getDatabaseDiskUsage,
+  getDatabaseTableStats,
   RetentionOutcome,
   RetentionPolicyOptions,
   vacuumDatabase,
   VacuumMode,
   VacuumOptions,
-  SnapshotRotationOptions
+  SnapshotRotationOptions,
+  type DatabaseDiskUsageSnapshot,
+  type VacuumTableStat
 } from '../db.js';
 
 type RetentionLogger = Pick<typeof loggerModule, 'info' | 'warn' | 'error'>;
@@ -51,6 +55,12 @@ export type RetentionVacuumSummary = {
   pragmas?: string[];
   indexVersion?: number;
   ensuredIndexes?: string[];
+  disk?: {
+    before: DatabaseDiskUsageSnapshot;
+    after: DatabaseDiskUsageSnapshot;
+    savingsBytes: number;
+  };
+  tables?: VacuumTableStat[];
 };
 
 export type RetentionRunResult = {
@@ -60,6 +70,11 @@ export type RetentionRunResult = {
   warnings: RetentionWarningSnapshot[];
   vacuum: RetentionVacuumSummary;
   rescheduled: boolean;
+  disk: {
+    before: DatabaseDiskUsageSnapshot;
+    after: DatabaseDiskUsageSnapshot;
+    savingsBytes: number;
+  };
 };
 
 export class RetentionTask {
@@ -374,6 +389,10 @@ async function executeRetentionRun(
   const snapshotDirs = dedupeDirectories(options.snapshotDirs);
   const archiveDir = options.archiveDir;
 
+  const diskBefore = getDatabaseDiskUsage();
+
+  const tableBaseline = getDatabaseTableStats();
+
   const outcome = runPolicy({
     retentionDays: options.retentionDays,
     archiveDir,
@@ -403,14 +422,15 @@ async function executeRetentionRun(
 
   let vacuumResult: ReturnType<typeof vacuumDatabase> | null = null;
   if (shouldVacuum) {
-    vacuumResult = vacuumDatabase(options.vacuum);
+    vacuumResult = vacuumDatabase(options.vacuum, tableBaseline);
   }
 
   metrics.recordRetentionRun({
     removedEvents: outcome.removedEvents,
     archivedSnapshots: outcome.archivedSnapshots,
     prunedArchives: outcome.prunedArchives,
-    perCamera: outcome.perCamera
+    perCamera: outcome.perCamera,
+    diskSavingsBytes: Math.max(0, diskBefore.totalBytes - (vacuumResult?.disk.after.totalBytes ?? diskBefore.totalBytes))
   });
 
   const vacuumSummary: RetentionVacuumSummary = {
@@ -426,8 +446,19 @@ async function executeRetentionRun(
     ensuredIndexes:
       shouldVacuum && vacuumResult?.ensuredIndexes && vacuumResult.ensuredIndexes.length > 0
         ? vacuumResult.ensuredIndexes
-        : undefined
+        : undefined,
+    disk: shouldVacuum && vacuumResult ? vacuumResult.disk : undefined,
+    tables: shouldVacuum && vacuumResult ? vacuumResult.tables : undefined
   };
+
+  const diskAfter = shouldVacuum
+    ? vacuumResult?.disk.after ?? getDatabaseDiskUsage()
+    : getDatabaseDiskUsage();
+  const diskSummary = {
+    before: diskBefore,
+    after: diskAfter,
+    savingsBytes: Math.max(0, diskBefore.totalBytes - diskAfter.totalBytes)
+  } satisfies RetentionRunResult['disk'];
 
   logger.info(
     {
@@ -445,10 +476,13 @@ async function executeRetentionRun(
             target: vacuumSummary.target,
             pragmas: vacuumSummary.pragmas,
             indexVersion: vacuumSummary.indexVersion,
-            ensuredIndexes: vacuumSummary.ensuredIndexes
+            ensuredIndexes: vacuumSummary.ensuredIndexes,
+            disk: vacuumSummary.disk,
+            tables: vacuumSummary.tables
           }
         : undefined,
-      perCamera: outcome.perCamera
+      perCamera: outcome.perCamera,
+      diskSavingsBytes: diskSummary.savingsBytes
     },
     'Retention task completed'
   );
@@ -458,6 +492,7 @@ async function executeRetentionRun(
     outcome,
     warnings,
     vacuum: vacuumSummary,
-    rescheduled: true
+    rescheduled: true,
+    disk: diskSummary
   };
 }

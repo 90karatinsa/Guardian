@@ -32,11 +32,19 @@ interface InternalSuppressionRule {
   timeline: SuppressionTimeline;
   timelines: Map<string, SuppressionTimeline>;
   historyLimit: number;
+  timelineTtlMs?: number;
 }
 
 type SuppressionTimeline = {
   suppressedUntil: number;
   history: number[];
+  lastUpdatedAt: number;
+  channel: string | null;
+};
+
+type TimelinePruneResult = {
+  ttlPruned: number;
+  timelineExpired: boolean;
 };
 
 type SuppressionHitType = 'window' | 'rate-limit';
@@ -333,6 +341,7 @@ class EventBus extends EventEmitter {
         const suppressUntil = normalized.ts + match.rule.suppressForMs;
         if (suppressUntil > match.timeline.suppressedUntil) {
           match.timeline.suppressedUntil = suppressUntil;
+          touchTimeline(match.timeline, normalized.ts);
         }
       }
     }
@@ -356,8 +365,18 @@ class EventBus extends EventEmitter {
       }
 
       const channel = resolveRuleChannel(rule, eventChannels);
-      const timeline = getTimelineForRule(rule, channel);
-      pruneTimeline(rule, timeline, event.ts);
+      const { timeline, key: timelineKey } = getTimelineForRule(rule, channel);
+      const pruneResult = pruneTimeline(rule, timeline, event.ts, timelineKey);
+      if (pruneResult.ttlPruned > 0) {
+        this.metrics.recordSuppressionHistoryTtlPruned({
+          ruleId: rule.id,
+          channel: timelineKey,
+          count: pruneResult.ttlPruned
+        });
+      }
+      if (pruneResult.timelineExpired && timelineKey) {
+        rule.timelines.delete(timelineKey);
+      }
 
       const windowActive = event.ts < timeline.suppressedUntil;
       const rateLimitConfig = rule.rateLimit;
@@ -397,6 +416,7 @@ class EventBus extends EventEmitter {
           windowMs > 0 ? Math.max(timeline.suppressedUntil, event.ts + windowMs) : timeline.suppressedUntil;
         if (windowExpiresAt > 0 && windowExpiresAt > timeline.suppressedUntil) {
           timeline.suppressedUntil = windowExpiresAt;
+          touchTimeline(timeline, event.ts);
         }
         const historyForMeta = dedupeAndSortHistory(historySnapshot.slice(-normalizedMaxEvents));
         hits.push({
@@ -433,6 +453,7 @@ class EventBus extends EventEmitter {
           windowUntil = Math.max(timeline.suppressedUntil, suppressUntil, cooldownUntil);
           if (windowUntil > 0) {
             timeline.suppressedUntil = windowUntil;
+            touchTimeline(timeline, event.ts);
           }
         }
         hits.push({
@@ -483,6 +504,24 @@ function normalizeTimestamp(ts?: number | Date): number {
   return ts;
 }
 
+export function emitEventPayload(bus: EventEmitter, payload: EventPayload): boolean {
+  if (bus instanceof EventBus) {
+    return bus.emitEvent(payload);
+  }
+
+  const record: EventRecord = {
+    ts: normalizeTimestamp(payload.ts),
+    source: payload.source,
+    detector: payload.detector,
+    severity: payload.severity,
+    message: payload.message,
+    meta: payload.meta
+  };
+
+  bus.emit('event', record);
+  return true;
+}
+
 const eventBus = new EventBus();
 
 export default eventBus;
@@ -494,6 +533,7 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
   const maxEvents = normalizeMaxEvents(rule.maxEvents);
   const windowMs = normalizeWindowMs(rule.suppressForMs);
   const channels = normalizeRuleChannels(asArray(rule.channel));
+  const timelineTtlMs = normalizeWindowMs(rule.timelineTtlMs);
   return {
     id: rule.id,
     detectors: asArray(rule.detector),
@@ -504,22 +544,33 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     rateLimit,
     maxEvents,
     reason: rule.reason,
-    timeline: createTimeline(),
+    timeline: createTimeline(null),
     timelines: new Map<string, SuppressionTimeline>(),
-    historyLimit: Math.max(rateLimit?.count ?? 0, maxEvents ?? 0, 10)
+    historyLimit: Math.max(rateLimit?.count ?? 0, maxEvents ?? 0, 10),
+    timelineTtlMs: timelineTtlMs > 0 ? timelineTtlMs : undefined
   };
 }
 
-function createTimeline(): SuppressionTimeline {
+function createTimeline(channel: string | null): SuppressionTimeline {
   return {
     suppressedUntil: 0,
-    history: []
+    history: [],
+    lastUpdatedAt: 0,
+    channel: channel ?? null
   };
 }
 
 function resetTimeline(timeline: SuppressionTimeline) {
   timeline.suppressedUntil = 0;
   timeline.history.length = 0;
+  timeline.lastUpdatedAt = 0;
+}
+
+function touchTimeline(timeline: SuppressionTimeline, ts: number) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) {
+    return;
+  }
+  timeline.lastUpdatedAt = Math.max(timeline.lastUpdatedAt, Math.floor(ts));
 }
 
 function asArray<T>(value: T | T[] | undefined): T[] | undefined {
@@ -560,7 +611,45 @@ function ruleMatchesEvent(
   return true;
 }
 
-function pruneTimeline(rule: InternalSuppressionRule, timeline: SuppressionTimeline, ts: number) {
+function pruneTimeline(
+  rule: InternalSuppressionRule,
+  timeline: SuppressionTimeline,
+  ts: number,
+  channelKey: string | null
+): TimelinePruneResult {
+  let ttlPruned = 0;
+  let clearedAllByTtl = false;
+  const timelineTtlMs = rule.timelineTtlMs ?? 0;
+  if (timelineTtlMs > 0) {
+    const cutoff = ts - timelineTtlMs;
+    const lastHistoryTs = timeline.history.length > 0 ? timeline.history[timeline.history.length - 1] : 0;
+    const lastUpdated = Math.max(
+      timeline.lastUpdatedAt,
+      lastHistoryTs,
+      timeline.suppressedUntil > 0 ? timeline.suppressedUntil : 0
+    );
+    if (lastUpdated > 0 && cutoff >= lastUpdated) {
+      ttlPruned = timeline.history.length;
+      if (ttlPruned > 0) {
+        timeline.history.length = 0;
+      }
+      if (timeline.suppressedUntil > 0) {
+        timeline.suppressedUntil = 0;
+      }
+      clearedAllByTtl = true;
+      touchTimeline(timeline, ts);
+    } else if (timeline.history.length > 0) {
+      let removeCount = 0;
+      while (removeCount < timeline.history.length && timeline.history[removeCount] <= cutoff) {
+        removeCount += 1;
+      }
+      if (removeCount > 0) {
+        timeline.history.splice(0, removeCount);
+        ttlPruned += removeCount;
+      }
+    }
+  }
+
   const windowMs =
     rule.rateLimit?.perMs ?? (rule.maxEvents && rule.suppressForMs ? rule.suppressForMs : 0);
   if (windowMs && windowMs > 0) {
@@ -585,6 +674,14 @@ function pruneTimeline(rule: InternalSuppressionRule, timeline: SuppressionTimel
   if (rule.historyLimit > 0 && timeline.history.length > rule.historyLimit) {
     timeline.history.splice(0, timeline.history.length - rule.historyLimit);
   }
+
+  const timelineExpired =
+    clearedAllByTtl &&
+    channelKey !== null &&
+    timeline.history.length === 0 &&
+    (timeline.suppressedUntil === 0 || timeline.suppressedUntil <= ts);
+
+  return { ttlPruned, timelineExpired };
 }
 
 function recordTimelineHistory(
@@ -595,6 +692,7 @@ function recordTimelineHistory(
   if (!Number.isFinite(ts)) {
     return;
   }
+  touchTimeline(timeline, ts);
   if (timeline.history.length === 0) {
     timeline.history.push(ts);
   } else {
@@ -631,18 +729,18 @@ function resolveRuleChannel(rule: InternalSuppressionRule, eventChannels: string
 function getTimelineForRule(
   rule: InternalSuppressionRule,
   channel: string | null
-): SuppressionTimeline {
+): { timeline: SuppressionTimeline; key: string | null } {
   const normalized = canonicalChannel(channel);
   if (!normalized) {
-    return rule.timeline;
+    return { timeline: rule.timeline, key: null };
   }
   const existing = rule.timelines.get(normalized);
   if (existing) {
-    return existing;
+    return { timeline: existing, key: normalized };
   }
-  const created = createTimeline();
+  const created = createTimeline(normalized);
   rule.timelines.set(normalized, created);
-  return created;
+  return { timeline: created, key: normalized };
 }
 
 function normalizeRateLimit(rateLimit?: RateLimitConfig): RateLimitConfig | undefined {

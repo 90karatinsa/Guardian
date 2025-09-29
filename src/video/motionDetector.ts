@@ -26,6 +26,8 @@ export interface MotionDetectorOptions {
   idleRebaselineMs?: number;
   noiseWarmupFrames?: number;
   noiseBackoffPadding?: number;
+  temporalMedianWindow?: number;
+  temporalMedianBackoffSmoothing?: number;
 }
 
 type MotionHistoryEntry = {
@@ -42,6 +44,13 @@ type MotionHistoryEntry = {
   pendingBeforeTrigger: number;
   denoiseStrategy: string;
   reason: string;
+  temporalMedian: number;
+  temporalSuppression: number;
+  temporalDebouncePadding: number;
+  temporalBackoffPadding: number;
+  temporalGateMultiplier: number;
+  temporalAreaThreshold: number;
+  temporalDeltaThreshold: number;
 };
 
 const DEFAULT_DIFF_THRESHOLD = 25;
@@ -59,6 +68,8 @@ const MAX_HISTORY_SIZE = 120;
 const NOISE_WINDOW_SIZE = 30;
 const AREA_WINDOW_SIZE = 20;
 const SUSTAINED_NOISE_THRESHOLD = 1.15;
+const DEFAULT_TEMPORAL_WINDOW = 5;
+const DEFAULT_TEMPORAL_BACKOFF_SMOOTHING = 0.35;
 
 export class MotionDetector {
   private previousFrame: GrayscaleFrame | null = null;
@@ -81,6 +92,8 @@ export class MotionDetector {
   private baseNoiseBackoffPadding: number;
   private noiseBackoffPadding: number;
   private rebaselineFramesRemaining = 0;
+  private readonly temporalWindow: number[] = [];
+  private temporalSuppression = 0;
 
   constructor(
     private options: MotionDetectorOptions,
@@ -90,6 +103,7 @@ export class MotionDetector {
     this.baseNoiseBackoffPadding = Math.max(0, this.options.noiseBackoffPadding ?? 0);
     this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
     this.updateSuppressedGauge();
+    this.resetTemporalGate();
   }
 
   updateOptions(options: Partial<Omit<MotionDetectorOptions, 'source'>>) {
@@ -114,13 +128,17 @@ export class MotionDetector {
 
     const warmupChanged = hasOptionChanged('noiseWarmupFrames');
     const backoffPaddingChanged = hasOptionChanged('noiseBackoffPadding');
+    const temporalOptionsChanged =
+      hasOptionChanged('temporalMedianWindow') ||
+      hasOptionChanged('temporalMedianBackoffSmoothing');
 
     const countersResetNeeded =
       referenceResetNeeded ||
       hasOptionChanged('debounceFrames') ||
       hasOptionChanged('backoffFrames') ||
       warmupChanged ||
-      backoffPaddingChanged;
+      backoffPaddingChanged ||
+      temporalOptionsChanged;
 
     this.options = next;
 
@@ -142,6 +160,10 @@ export class MotionDetector {
         );
       }
       this.updateSuppressedGauge();
+    }
+
+    if (temporalOptionsChanged) {
+      this.resetTemporalGate();
     }
 
     if (referenceResetNeeded) {
@@ -295,6 +317,31 @@ export class MotionDetector {
       }
 
       const areaPct = changedPixels / stats.totalPixels;
+      const temporalWindowSize = Math.min(
+        60,
+        Math.max(3, Math.round(this.options.temporalMedianWindow ?? DEFAULT_TEMPORAL_WINDOW))
+      );
+      recordWindowSample(this.temporalWindow, areaPct, temporalWindowSize);
+      const temporalMedianValue = median(this.temporalWindow);
+      const temporalBackoffSmoothing = clamp(
+        this.options.temporalMedianBackoffSmoothing ?? DEFAULT_TEMPORAL_BACKOFF_SMOOTHING,
+        0.05,
+        0.95
+      );
+      const temporalSuppression = this.updateTemporalSuppression(
+        areaPct,
+        temporalMedianValue,
+        temporalWindowSize,
+        temporalBackoffSmoothing
+      );
+      metrics.setDetectorGauge('motion', 'temporalWindow', temporalMedianValue ?? areaPct);
+      metrics.setDetectorGauge('motion', 'temporalWindowSize', temporalWindowSize);
+      metrics.setDetectorGauge('motion', 'temporalSuppression', temporalSuppression);
+      const temporalSuppressionRatio =
+        temporalWindowSize === 0 ? 0 : temporalSuppression / Math.max(1, temporalWindowSize);
+      const temporalGateMultiplier =
+        this.temporalSuppression > 0 ? 1 + Math.min(1.5, temporalSuppressionRatio) * 0.9 : 1;
+      metrics.setDetectorGauge('motion', 'temporalGateMultiplier', temporalGateMultiplier);
       const previousBaseline = this.areaBaseline;
       const areaTrend = previousBaseline === 0 ? areaPct : areaPct - previousBaseline;
       const trendSmoothing = clamp(
@@ -343,8 +390,13 @@ export class MotionDetector {
         areaDeltaThreshold *
         (noiseSuppressionFactor > 1.5 ? Math.min(noiseSuppressionFactor, 2.5) : 1);
 
+      const temporalAreaThreshold = adaptiveAreaThreshold * temporalGateMultiplier;
+      const temporalDeltaThreshold = adjustedAreaDeltaThreshold * temporalGateMultiplier;
+      metrics.setDetectorGauge('motion', 'temporalAreaThreshold', temporalAreaThreshold);
+      metrics.setDetectorGauge('motion', 'temporalDeltaThreshold', temporalDeltaThreshold);
+
       const hasSignificantArea =
-        areaPct >= adaptiveAreaThreshold || stabilizedAreaTrend >= adjustedAreaDeltaThreshold;
+        areaPct >= temporalAreaThreshold || stabilizedAreaTrend >= temporalDeltaThreshold;
 
       const debounceMultiplier = clamp(
         noiseSuppressionFactor > 1 ? 1 + (noiseSuppressionFactor - 1) * 0.7 : 1,
@@ -377,8 +429,22 @@ export class MotionDetector {
         dynamicBackoffFrames,
         baseEffectiveDebounce
       );
-      const effectiveDebounceFrames = baseEffectiveDebounce + debouncePadding;
-      const effectiveBackoffFrames = dynamicBackoffFrames + backoffPadding;
+      const noiseAdjustedDebounce = baseEffectiveDebounce + debouncePadding;
+      const noiseAdjustedBackoff = dynamicBackoffFrames + backoffPadding;
+      const temporalDebouncePadding = this.computeTemporalDebouncePadding(
+        noiseAdjustedDebounce,
+        temporalWindowSize,
+        temporalBackoffSmoothing
+      );
+      const temporalBackoffPadding = this.computeTemporalBackoffPadding(
+        noiseAdjustedBackoff,
+        temporalWindowSize,
+        temporalBackoffSmoothing
+      );
+      const effectiveDebounceFrames = noiseAdjustedDebounce + temporalDebouncePadding;
+      const effectiveBackoffFrames = noiseAdjustedBackoff + temporalBackoffPadding;
+      metrics.setDetectorGauge('motion', 'temporalDebouncePadding', temporalDebouncePadding);
+      metrics.setDetectorGauge('motion', 'temporalBackoffPadding', temporalBackoffPadding);
 
       const shouldScheduleRebaseline =
         this.noiseWarmupRemaining === 0 &&
@@ -427,7 +493,14 @@ export class MotionDetector {
         triggered: false,
         pendingBeforeTrigger: this.pendingSuppressedFramesBeforeTrigger,
         denoiseStrategy,
-        reason: hasSignificantArea ? 'candidate' : 'suppressed'
+        reason: hasSignificantArea ? 'candidate' : 'suppressed',
+        temporalMedian: temporalMedianValue ?? areaPct,
+        temporalSuppression: this.temporalSuppression,
+        temporalDebouncePadding,
+        temporalBackoffPadding,
+        temporalGateMultiplier,
+        temporalAreaThreshold,
+        temporalDeltaThreshold
       };
 
       if (this.noiseWarmupRemaining > 0) {
@@ -464,6 +537,21 @@ export class MotionDetector {
         return;
       }
 
+      const temporalGateActive =
+        temporalGateMultiplier > 1.15 && temporalSuppressionRatio > 0.3;
+
+      if (temporalGateActive) {
+        this.activationFrames = 0;
+        this.suppressedFrames += 1;
+        metrics.incrementDetectorCounter('motion', 'suppressedFrames', 1);
+        this.updateSuppressedGauge();
+        historyEntry.suppressed = true;
+        historyEntry.reason = 'temporal-gate';
+        historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
+        this.recordHistory(historyEntry);
+        return;
+      }
+
       const suppressedFramesSnapshot = this.suppressedFrames;
       this.suppressedFrames = 0;
       if (suppressedFramesSnapshot > 0) {
@@ -492,7 +580,7 @@ export class MotionDetector {
       this.activationFrames += 1;
       if (this.activationFrames < effectiveDebounceFrames) {
         historyEntry.suppressed = true;
-        historyEntry.reason = 'debouncing';
+        historyEntry.reason = temporalDebouncePadding > 0 ? 'temporal-gate' : 'debouncing';
         historyEntry.pendingBeforeTrigger = this.pendingSuppressedFramesBeforeTrigger;
         this.recordHistory(historyEntry);
         return;
@@ -570,6 +658,14 @@ export class MotionDetector {
           denoiseStrategy,
           noiseWarmupRemaining: this.noiseWarmupRemaining,
           noiseBackoffPadding: this.noiseBackoffPadding,
+          temporalMedian: temporalMedianValue ?? areaPct,
+          temporalSuppression: this.temporalSuppression,
+          temporalDebouncePadding,
+          temporalBackoffPadding,
+          temporalWindowSize,
+          temporalGateMultiplier,
+          temporalAreaThreshold,
+          temporalDeltaThreshold,
           history: historySnapshot,
           historyWindowMs
         }
@@ -625,6 +721,78 @@ export class MotionDetector {
     return { backoffPadding, debouncePadding } as const;
   }
 
+  private updateTemporalSuppression(
+    value: number,
+    medianValue: number | null,
+    windowSize: number,
+    smoothing: number
+  ) {
+    const clampedSmoothing = clamp(smoothing, 0.05, 0.95);
+    const safeWindow = Math.max(1, windowSize);
+    const baseline = medianValue ?? value;
+    if (!Number.isFinite(value) || !Number.isFinite(baseline)) {
+      this.temporalSuppression *= 1 - clampedSmoothing;
+      return this.temporalSuppression;
+    }
+    const normalizedBaseline = baseline <= 0 ? Math.max(value, 0) : baseline;
+    const ratio = normalizedBaseline === 0 ? (value > 0 ? 2 : 1) : value / normalizedBaseline;
+    const gatingMargin = 0.12;
+    let target = 0;
+    if (ratio >= 1 + gatingMargin) {
+      target = 0;
+    } else if (ratio >= 1) {
+      const shortfall = (1 + gatingMargin - ratio) / gatingMargin;
+      target = shortfall * safeWindow * 0.5;
+    } else {
+      const deficit = Math.min(1.5, Math.max(0, 1 - ratio));
+      target = deficit * safeWindow;
+    }
+    const blended = this.temporalSuppression * (1 - clampedSmoothing) + target * clampedSmoothing;
+    this.temporalSuppression = clamp(blended, 0, safeWindow);
+    return this.temporalSuppression;
+  }
+
+  private computeTemporalDebouncePadding(
+    baseDebounce: number,
+    windowSize: number,
+    smoothing: number
+  ) {
+    if (this.temporalSuppression <= 0) {
+      return 0;
+    }
+    const windowLimit = Math.max(
+      1,
+      Math.round(windowSize * Math.min(0.85, 0.4 + smoothing))
+    );
+    const baseLimit = Math.max(
+      1,
+      Math.round(baseDebounce * Math.min(1.3, 0.8 + smoothing))
+    );
+    const limit = Math.max(1, Math.min(windowLimit, Math.max(baseLimit, Math.round(windowSize * 0.5))));
+    const target = Math.round(
+      this.temporalSuppression * Math.min(2, 1 + smoothing * 0.8)
+    );
+    return Math.min(limit, Math.max(1, target));
+  }
+
+  private computeTemporalBackoffPadding(
+    baseBackoff: number,
+    windowSize: number,
+    smoothing: number
+  ) {
+    if (this.temporalSuppression <= 0) {
+      return 0;
+    }
+    const windowLimit = Math.max(
+      1,
+      Math.round(Math.max(baseBackoff, windowSize) * Math.min(1, 0.55 + smoothing))
+    );
+    const target = Math.round(
+      this.temporalSuppression * Math.min(1.6, 0.7 + smoothing)
+    );
+    return Math.min(windowLimit, Math.max(1, target));
+  }
+
   private resetAdaptiveState(
     options: {
       preserveReference?: boolean;
@@ -650,6 +818,7 @@ export class MotionDetector {
     this.backoffFrames = 0;
     this.noiseWindow.length = 0;
     this.areaWindow.length = 0;
+    this.resetTemporalGate();
     this.sustainedNoiseBoost = 1;
     if (!preserveSuppression) {
       this.suppressedFrames = 0;
@@ -679,6 +848,23 @@ export class MotionDetector {
       'pendingSuppressedFramesBeforeTrigger',
       this.pendingSuppressedFramesBeforeTrigger + this.suppressedFrames
     );
+  }
+
+  private resetTemporalGate() {
+    this.temporalWindow.length = 0;
+    this.temporalSuppression = 0;
+    const windowSize = Math.min(
+      60,
+      Math.max(3, Math.round(this.options.temporalMedianWindow ?? DEFAULT_TEMPORAL_WINDOW))
+    );
+    metrics.setDetectorGauge('motion', 'temporalWindow', 0);
+    metrics.setDetectorGauge('motion', 'temporalWindowSize', windowSize);
+    metrics.setDetectorGauge('motion', 'temporalSuppression', 0);
+    metrics.setDetectorGauge('motion', 'temporalDebouncePadding', 0);
+    metrics.setDetectorGauge('motion', 'temporalBackoffPadding', 0);
+    metrics.setDetectorGauge('motion', 'temporalGateMultiplier', 1);
+    metrics.setDetectorGauge('motion', 'temporalAreaThreshold', 0);
+    metrics.setDetectorGauge('motion', 'temporalDeltaThreshold', 0);
   }
 
   private getHistorySnapshot(limit: number) {

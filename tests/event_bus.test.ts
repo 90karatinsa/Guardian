@@ -9,6 +9,7 @@ describe('EventSuppressionRateLimit', () => {
   let metricsMock: {
     recordEvent: ReturnType<typeof vi.fn>;
     recordSuppressedEvent: ReturnType<typeof vi.fn>;
+    recordSuppressionHistoryTtlPruned: ReturnType<typeof vi.fn>;
   };
   let bus: EventBus;
 
@@ -24,7 +25,8 @@ describe('EventSuppressionRateLimit', () => {
     log = { info: vi.fn() };
     metricsMock = {
       recordEvent: vi.fn(),
-      recordSuppressedEvent: vi.fn()
+      recordSuppressedEvent: vi.fn(),
+      recordSuppressionHistoryTtlPruned: vi.fn()
     };
     bus = new EventBus({
       store: event => store(event),
@@ -564,6 +566,48 @@ describe('EventSuppressionRateLimit', () => {
     const historyHistogram = snapshot.suppression.histogram.historyCount;
     expect(historyHistogram['2-5']).toBeGreaterThanOrEqual(2);
   });
+
+  it('EventSuppressionTimelineExpiry prunes idle timelines and clears cooldown state', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'timeline-ttl',
+        detector: 'test-detector',
+        channel: 'cam:a',
+        maxEvents: 2,
+        suppressForMs: 600,
+        timelineTtlMs: 500,
+        reason: 'ttl cleanup'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 120, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(false);
+
+    // wait beyond TTL so suppression state is reclaimed before the next event
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 900, meta: { channel: 'cam:a' } })).toBe(true);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.historyTotals.historyTtlPruned).toBe(2);
+    const ruleSnapshot = snapshot.suppression.rules['timeline-ttl'];
+    expect(ruleSnapshot.history.ttlPruned).toBe(2);
+    expect(ruleSnapshot.history.lastTtlPruned).toBe(2);
+    const ttlHistogram = snapshot.suppression.histogram.historyTtlPruned;
+    expect(Object.values(ttlHistogram)).not.toHaveLength(0);
+    expect(
+      Object.values(ttlHistogram).reduce((sum, value) => sum + value, 0)
+    ).toBeGreaterThanOrEqual(1);
+    expect(snapshot.suppression.lastEvent?.channel).toBe('cam:a');
+    expect(snapshot.suppression.lastEvent?.historyCount).toBe(2);
+  });
 });
 
 describe('EventSuppressionWindowRecovery', () => {
@@ -572,6 +616,7 @@ describe('EventSuppressionWindowRecovery', () => {
   let metricsMock: {
     recordEvent: ReturnType<typeof vi.fn>;
     recordSuppressedEvent: ReturnType<typeof vi.fn>;
+    recordSuppressionHistoryTtlPruned: ReturnType<typeof vi.fn>;
   };
   let bus: EventBus;
 
@@ -587,7 +632,8 @@ describe('EventSuppressionWindowRecovery', () => {
     log = { info: vi.fn() };
     metricsMock = {
       recordEvent: vi.fn(),
-      recordSuppressedEvent: vi.fn()
+      recordSuppressedEvent: vi.fn(),
+      recordSuppressionHistoryTtlPruned: vi.fn()
     };
     bus = new EventBus({
       store: event => store(event),
@@ -669,6 +715,7 @@ describe('MetricsSuppressionSnapshot', () => {
     expect(snapshot.suppression.total).toBe(2);
     expect(snapshot.suppression.historyTotals.historyCount).toBe(5);
     expect(snapshot.suppression.historyTotals.combinedHistoryCount).toBe(5);
+    expect(snapshot.suppression.historyTotals.historyTtlPruned).toBe(0);
     expect(snapshot.suppression.lastEvent?.channel).toBe('video:lobby');
     expect(snapshot.suppression.lastEvent?.channels).toEqual(['video:lobby', 'video:alerts']);
     expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(200);
@@ -678,8 +725,10 @@ describe('MetricsSuppressionSnapshot', () => {
     expect(ruleSnapshot.total).toBe(2);
     expect(ruleSnapshot.history.total).toBe(5);
     expect(ruleSnapshot.history.combinedTotal).toBe(5);
+    expect(ruleSnapshot.history.ttlPruned).toBe(0);
     expect(ruleSnapshot.history.lastCount).toBe(3);
     expect(ruleSnapshot.history.lastCombinedCount).toBe(3);
+    expect(ruleSnapshot.history.lastTtlPruned).toBeNull();
     expect(ruleSnapshot.history.lastChannel).toBe('video:lobby');
     expect(ruleSnapshot.history.lastChannels).toEqual(['video:lobby', 'video:alerts']);
     expect(ruleSnapshot.history.lastCooldownMs).toBe(600);

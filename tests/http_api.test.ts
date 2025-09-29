@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
 import { EventEmitter } from 'node:events';
+import { PNG } from 'pngjs';
 import { clearEvents, listEvents, storeEvent } from '../src/db.js';
 import { startHttpServer, type HttpServerRuntime, type HttpServerOptions } from '../src/server/http.js';
 import metrics from '../src/metrics/index.js';
@@ -452,15 +453,141 @@ describe('RestApiEvents', () => {
       readNext();
     });
 
-    controller.abort();
+  controller.abort();
 
-    expect(messages.length).toBeGreaterThanOrEqual(1);
-    const streamed = messages.find(message => message.meta?.channel === 'video:alpha') ?? messages[0];
-    expect(streamed?.meta?.snapshotUrl).toBe(`/api/events/${expectedId}/snapshot`);
-    expect(streamed?.id).toBe(expectedId);
-    expect(metricsEvents.length).toBeGreaterThan(0);
-    expect(metricsEvents[0]?.pipelines).toBeTruthy();
-    expect(heartbeats.length).toBeGreaterThan(0);
+  expect(messages.length).toBeGreaterThanOrEqual(1);
+  const streamed = messages.find(message => message.meta?.channel === 'video:alpha') ?? messages[0];
+  expect(streamed?.meta?.snapshotUrl).toBe(`/api/events/${expectedId}/snapshot`);
+  expect(streamed?.id).toBe(expectedId);
+  expect(metricsEvents.length).toBeGreaterThan(0);
+  expect(metricsEvents[0]?.pipelines).toBeTruthy();
+  expect(heartbeats.length).toBeGreaterThan(0);
+});
+
+  it('HttpApiSnapshotDiffStream returns diff image and emits warning SSE events', async () => {
+    const makeImage = (filePath: string, color: [number, number, number]) => {
+      const png = new PNG({ width: 4, height: 4 });
+      for (let i = 0; i < png.data.length; i += 4) {
+        png.data[i] = color[0];
+        png.data[i + 1] = color[1];
+        png.data[i + 2] = color[2];
+        png.data[i + 3] = 255;
+      }
+      fs.writeFileSync(filePath, PNG.sync.write(png));
+    };
+
+    const now = Date.now();
+    const baselinePath = path.join(snapshotDir, 'baseline-diff.png');
+    const currentPath = path.join(snapshotDir, 'current-diff.png');
+    makeImage(baselinePath, [10, 20, 30]);
+    makeImage(currentPath, [200, 40, 220]);
+
+    storeEvent({
+      ts: now,
+      source: 'video:diff-camera',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Diff snapshot',
+      meta: { snapshot: currentPath, snapshotBaseline: baselinePath, channel: 'video:diff' }
+    });
+
+    const stored = listEvents({ snapshot: 'with', channel: 'video:diff', limit: 1 });
+    const eventId = stored.items[0]?.id;
+    expect(typeof eventId).toBe('number');
+
+    const { port } = await ensureServer();
+
+    const diffResponse = await fetch(`http://localhost:${port}/api/events/${eventId}/snapshot/diff`);
+    expect(diffResponse.status).toBe(200);
+    expect(diffResponse.headers.get('content-type')).toContain('image/png');
+    const diffBuffer = Buffer.from(await diffResponse.arrayBuffer());
+    const diffImage = PNG.sync.read(diffBuffer);
+    const hasDifference = diffImage.data.some((value, index) => index % 4 !== 3 && value > 0);
+    expect(hasDifference).toBe(true);
+
+    const listing = await fetch(`http://localhost:${port}/api/events?channels=video:diff&limit=1`);
+    const listingPayload = await listing.json();
+    expect(listingPayload.items[0]?.meta?.snapshotDiffUrl).toBe(`/api/events/${eventId}/snapshot/diff`);
+
+    metrics.reset();
+    const controller = new AbortController();
+    const response = await fetch(`http://localhost:${port}/api/events/stream?metrics=retention`, {
+      signal: controller.signal
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const warnings: any[] = [];
+
+    const readPromise = new Promise<void>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              resolve();
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (eventName === 'warning' && dataLines.length > 0) {
+                warnings.push(JSON.parse(dataLines.join('')));
+              }
+            }
+            if (warnings.length >= 2) {
+              resolve();
+              return;
+            }
+            readNext();
+          })
+          .catch(reject);
+      };
+      readNext();
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+    metrics.recordRetentionWarning({
+      camera: 'video:diff',
+      path: baselinePath,
+      reason: 'rotation failed'
+    });
+    metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel: 'video:diff',
+      from: 'tcp',
+      to: 'udp',
+      at: Date.now(),
+      resetsBackoff: true
+    });
+
+    await readPromise;
+    controller.abort();
+    await reader?.cancel().catch(() => undefined);
+
+    expect(warnings.length).toBeGreaterThanOrEqual(2);
+    const warningTypes = warnings.map(entry => entry?.type);
+    expect(warningTypes).toContain('retention');
+    expect(warningTypes).toContain('transport-fallback');
   });
 
   it('HttpStreamCombinedMetricsSelection streams selected metrics subsets without extras', async () => {
@@ -468,6 +595,7 @@ describe('RestApiEvents', () => {
       removedEvents: 2,
       archivedSnapshots: 1,
       prunedArchives: 0,
+      diskSavingsBytes: 0,
       perCamera: { 'video:test': { archivedSnapshots: 1, prunedArchives: 0 } }
     });
 
@@ -541,6 +669,7 @@ describe('RestApiEvents', () => {
       removedEvents: 3,
       archivedSnapshots: 0,
       prunedArchives: 0,
+      diskSavingsBytes: 0,
       perCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0 } }
     });
 
@@ -638,7 +767,7 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 },
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
         totalsByCamera: {}
       }
     };
@@ -725,7 +854,7 @@ describe('RestApiEvents', () => {
         warnings: 1,
         warningsByCamera: { 'video:test': 1 },
         lastWarning: { camera: 'video:test', path: '/snapshots/test.jpg', reason: 'Missing file' },
-        totals: { removedEvents: 5, archivedSnapshots: 0, prunedArchives: 0 },
+        totals: { removedEvents: 5, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
         totalsByCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0 } }
       }
     };
@@ -1058,6 +1187,7 @@ describe('RestApiEvents', () => {
       removedEvents: 2,
       archivedSnapshots: 3,
       prunedArchives: 1,
+      diskSavingsBytes: 0,
       perCamera: {
         lobby: { archivedSnapshots: 2, prunedArchives: 1 },
         global: { archivedSnapshots: 1, prunedArchives: 0 }
@@ -1312,7 +1442,7 @@ describe('RestApiEvents', () => {
               lastRestart: { reason: 'watchdog-timeout' }
             }
           },
-          deviceDiscovery: {},
+          deviceDiscovery: { byReason: {}, byFormat: {} },
           deviceDiscoveryByChannel: {},
           delayHistogram: {},
           attemptHistogram: {}
@@ -1324,7 +1454,7 @@ describe('RestApiEvents', () => {
           lastRestart: { reason: 'spawn-error' },
           attempts: {},
           byChannel: {},
-          deviceDiscovery: {},
+          deviceDiscovery: { byReason: {}, byFormat: {} },
           deviceDiscoveryByChannel: {},
           delayHistogram: {},
           attemptHistogram: {}
@@ -1336,7 +1466,7 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 2, prunedArchives: 0 },
+        totals: { removedEvents: 0, archivedSnapshots: 2, prunedArchives: 0, diskSavingsBytes: 0 },
         totalsByCamera: {
           lobby: { archivedSnapshots: 1, prunedArchives: 0 },
           stream: { archivedSnapshots: 1, prunedArchives: 0 }
@@ -1518,6 +1648,34 @@ describe('RestApiEvents', () => {
 
     await new Promise(resolve => setTimeout(resolve, 0));
 
+    const snapshotsBefore = Number(
+      window.document.getElementById('stream-snapshots')?.textContent ?? '0'
+    );
+    instance!.dispatch(
+      'warning',
+      JSON.stringify({
+        type: 'transport-fallback',
+        fallback: {
+          channel: 'video:stream',
+          from: 'tcp',
+          to: 'udp',
+          reason: 'rtsp-timeout',
+          at: new Date(1700000000800).toISOString(),
+          resetsBackoff: true,
+          resetsCircuitBreaker: false
+        }
+      })
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const snapshotsAfter = Number(
+      window.document.getElementById('stream-snapshots')?.textContent ?? '0'
+    );
+    expect(snapshotsAfter).toBeGreaterThanOrEqual(snapshotsBefore + 1);
+    const warningItems = window.document.querySelectorAll('#warning-list .warning-item');
+    expect(warningItems.length).toBeGreaterThan(0);
+    expect(warningItems[0].textContent).toContain('Transport fallback');
+    expect(warningItems[0].textContent).toContain('rtsp-timeout');
+
     instance?.close();
     MockEventSource.instances.length = 0;
     dom.window.close();
@@ -1601,7 +1759,7 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 },
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
         totalsByCamera: {}
       }
     };
@@ -1784,7 +1942,7 @@ describe('RestApiEvents', () => {
           lastRestart: null,
           attempts: {},
           byChannel: {},
-          deviceDiscovery: {},
+          deviceDiscovery: { byReason: {}, byFormat: {} },
           deviceDiscoveryByChannel: {},
           delayHistogram: {},
           attemptHistogram: {}
@@ -1796,7 +1954,7 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0 },
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
         totalsByCamera: {}
       }
     };

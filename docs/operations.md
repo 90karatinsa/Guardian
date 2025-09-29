@@ -11,12 +11,18 @@ nasıl yararlanacağınızı adım adım anlatır.
 - `guardian daemon ready` komutu, SSE ve HTTP API uçlarının trafik kabul etmeye hazır olup olmadığını bildirir.
 - `guardian daemon status --json` çıktısında `pipelines.ffmpeg.watchdogRestartsByChannel` ve
   `pipelines.audio.watchdogRestartsByChannel` metrikleri ile hangi kameranın yeniden başlatma döngüsüne girdiğini belirleyin.
+- Aynı sağlık çıktısındaki `metrics.pipelines.ffmpeg.transportFallbacks.total` ve `...byChannel` alanlarını inceleyerek RTSP
+  bağlantılarının TCP↔UDP fallback zincirine kaç kez başvurduğunu takip edin; artış görürseniz `guardian daemon restart --transport`
+  komutu ile kanalı sıfırlayabilirsiniz.
 - Docker ya da systemd ortamında healthcheck scriptini test etmek için `pnpm tsx scripts/healthcheck.ts --health` ve `--ready`
   seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler.
 
 ## Periyodik bakım görevleri
 - RTSP veya ffmpeg kaynaklı bağlantı sorunları için `guardian daemon hooks --reason watchdog-reset` komutunu kullanarak devre
   kesicileri elle temizleyin.
+- Bir kanal sürekli TCP↔UDP fallback döngüsüne giriyorsa `guardian daemon restart --transport video:<kanal>` komutuyla o kanalın
+  transport sıralamasını sıfırlayın; komut sonrası `guardian daemon status --json` çıktısında `transportFallbacks.byChannel`
+  sayaçlarının sıfırlandığını doğrulayın.
 - `pnpm exec tsx src/tasks/retention.ts --run now` komutu ile retention görevini elle tetikleyebilir, ardından
   `scripts/db-maintenance.ts vacuum --mode full` yardımıyla SQLite arşivini sıkıştırabilirsiniz.
 - `guardian retention run --config config/production.json` ile farklı konfigürasyon dosyaları için bakım planlayabilirsiniz;
@@ -33,6 +39,9 @@ nasıl yararlanacağınızı adım adım anlatır.
 - Pipeline geri kazanım analizinde `metrics.exportPipelineRestartHistogram('ffmpeg', 'jitter', { metricName: 'guardian_ffmpeg_restart_jitter_ms' })`
   çıktısı, jitter dağılımını histogram olarak raporlar; aynı dizide `metrics.exportDetectorCountersForPrometheus()` çağrısı
   `guardian_detector_counter_total` satırlarıyla dedektör sayaçlarını Prometheus'a hazır hale getirir.
+- Transport fallback ve retention tasarruflarını Prometheus formatında görmek için `metrics.exportTransportFallbackMetricsForPrometheus()`
+  ve `metrics.exportRetentionDiskSavingsForPrometheus()` çağrılarını kullanın; çıktı `guardian_transport_fallback_total`
+  ve `guardian_retention_disk_savings_bytes_total` satırlarını içerir.
 - `pipelines.ffmpeg.watchdogRestarts` ve `watchdogBackoffByChannel` değerleri, stream jitter'larını `detector latency histogramlarını`
   takip ederken hangi kameraların desteklenmesi gerektiğini anlamanıza yardımcı olur.
 
@@ -41,6 +50,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 | --- | --- | --- |
 | `status: "degraded"` ya da `logs.byLevel.error` artışı | Dedektör hatası veya uzun süreli devre kesici gecikmeleri | `pnpm tsx scripts/healthcheck.ts --health` ve `guardian log-level set debug` |
 | `watchdogRestartsByChannel` artıyor | RTSP jitter veya ağ kopması | `guardian daemon restart --channel video:<kanal>` ve `guardian daemon status --json` |
+| `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor | Transport fallback zinciri sürekli devrede | `guardian daemon restart --transport video:<kanal>` komutunu çalıştırın ve `transportFallbacks.byChannel` sayaçlarını kontrol edin |
 | `Audio source recovering (reason=ffmpeg-missing)` sürüyor | Mikrofon fallback zinciri başarısız | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
 
 - `guardian health --verbose` ile tüm sağlık kontrollerinin ayrıntılı sonuçlarını gözden geçirin. Özellikle `suppression` ve

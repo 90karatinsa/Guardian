@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { URL } from 'node:url';
+import { PNG } from 'pngjs';
 import {
   EventRecordWithId,
   FaceRecord,
@@ -13,7 +14,7 @@ import {
 import FaceRegistry, { IdentifyResult } from '../../video/faceRegistry.js';
 import logger from '../../logger.js';
 import { EventRecord } from '../../types.js';
-import metricsModule, { MetricsRegistry } from '../../metrics/index.js';
+import metricsModule, { MetricsRegistry, type MetricsWarningEvent } from '../../metrics/index.js';
 import { canonicalChannel, normalizeChannelId } from '../../utils/channel.js';
 
 interface EventsRouterOptions {
@@ -60,6 +61,7 @@ export class EventsRouter {
   private faceRegistryFactory?: () => Promise<FaceRegistry>;
   private faceRegistryPromise: Promise<FaceRegistry | null> | null = null;
   private readonly metrics: MetricsRegistry;
+  private readonly metricsWarningHandler: ((event: MetricsWarningEvent) => void) | null;
 
   constructor(options: EventsRouterOptions) {
     this.bus = options.bus;
@@ -69,12 +71,17 @@ export class EventsRouter {
       (req, res, url) => this.handleSnapshotList(req, res, url),
       (req, res, url) => this.handleMetrics(req, res, url),
       (req, res, url) => this.handleStream(req, res, url),
+      (req, res, url) => this.handleSnapshotDiff(req, res, url),
       (req, res, url) => this.handleSnapshot(req, res, url),
       (req, res, url) => this.handleFaces(req, res, url)
     ];
     this.faceRegistry = options.faceRegistry ?? null;
     this.faceRegistryFactory = options.createFaceRegistry;
     this.metrics = options.metrics ?? metricsModule;
+    this.metricsWarningHandler = event => {
+      this.broadcastWarning(event);
+    };
+    this.metrics.onWarning(this.metricsWarningHandler);
 
     this.bus.on('event', this.handleBusEvent);
   }
@@ -96,6 +103,9 @@ export class EventsRouter {
 
   close() {
     this.bus.off('event', this.handleBusEvent);
+    if (this.metricsWarningHandler) {
+      this.metrics.offWarning(this.metricsWarningHandler);
+    }
     for (const [client, state] of this.clients) {
       clearInterval(state.heartbeat);
       client.end();
@@ -132,6 +142,30 @@ export class EventsRouter {
       }
     }
   };
+
+  private broadcastWarning(event: MetricsWarningEvent) {
+    const payload =
+      event.type === 'retention'
+        ? { type: 'retention', warning: event.warning }
+        : { type: 'transport-fallback', fallback: event.fallback };
+
+    for (const [client, state] of this.clients) {
+      if (client.writableEnded) {
+        clearInterval(state.heartbeat);
+        this.clients.delete(client);
+        continue;
+      }
+
+      try {
+        client.write('event: warning\n');
+        client.write(`data: ${JSON.stringify(payload)}\n\n`);
+      } catch {
+        clearInterval(state.heartbeat);
+        client.end();
+        this.clients.delete(client);
+      }
+    }
+  }
 
   private handleList(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
     if (req.method !== 'GET' || url.pathname !== '/api/events') {
@@ -285,6 +319,53 @@ export class EventsRouter {
 
     req.on('close', cleanup);
     req.on('end', cleanup);
+    return true;
+  }
+
+  private handleSnapshotDiff(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+    if (req.method !== 'GET') {
+      return false;
+    }
+
+    const match = url.pathname.match(/^\/api\/events\/(\d+)\/snapshot\/diff$/);
+    if (!match) {
+      return false;
+    }
+
+    const eventId = Number(match[1]);
+    if (!Number.isInteger(eventId) || eventId < 0) {
+      sendJson(res, 400, { error: 'Invalid event id' });
+      return true;
+    }
+
+    const event = getEventById(eventId);
+    if (!event) {
+      sendJson(res, 404, { error: 'Event not found' });
+      return true;
+    }
+
+    const currentSnapshot = extractSnapshotPath(event);
+    const baselineSnapshot = extractSnapshotBaselinePath(event);
+    if (!currentSnapshot || !baselineSnapshot) {
+      sendJson(res, 404, { error: 'Snapshot diff not available' });
+      return true;
+    }
+
+    try {
+      const diffBuffer = createSnapshotDiff(currentSnapshot, baselineSnapshot);
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(diffBuffer);
+    } catch (error) {
+      logger.error(
+        { err: error, snapshot: currentSnapshot, baseline: baselineSnapshot },
+        'Failed to generate snapshot diff'
+      );
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+      }
+      res.end(JSON.stringify({ error: 'Failed to generate snapshot diff' }));
+    }
+
     return true;
   }
 
@@ -842,6 +923,54 @@ function extractFaceSnapshotPath(event: EventRecordWithId): string | null {
   return null;
 }
 
+function extractSnapshotBaselinePath(event: EventRecordWithId): string | null {
+  const meta = event.meta ?? {};
+  const candidates: Array<string | null | undefined> = [
+    (meta as Record<string, unknown>).snapshotBaseline as string | undefined,
+    (meta as Record<string, unknown>).baselineSnapshot as string | undefined
+  ];
+  const diffMeta = (meta as Record<string, unknown>).snapshotDiff;
+  if (diffMeta && typeof diffMeta === 'object') {
+    const diffRecord = diffMeta as Record<string, unknown>;
+    candidates.push(diffRecord.baseline as string | undefined);
+    candidates.push(diffRecord.previous as string | undefined);
+  }
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return path.resolve(candidate);
+    }
+  }
+  return null;
+}
+
+function createSnapshotDiff(currentPath: string, baselinePath: string): Buffer {
+  const currentBuffer = fs.readFileSync(currentPath);
+  const baselineBuffer = fs.readFileSync(baselinePath);
+  const current = PNG.sync.read(currentBuffer);
+  const baseline = PNG.sync.read(baselineBuffer);
+  if (current.width !== baseline.width || current.height !== baseline.height) {
+    throw new Error('Snapshot dimensions do not match');
+  }
+
+  const diff = new PNG({ width: current.width, height: current.height });
+  for (let y = 0; y < current.height; y += 1) {
+    for (let x = 0; x < current.width; x += 1) {
+      const idx = (current.width * y + x) << 2;
+      const r = Math.abs(current.data[idx] - baseline.data[idx]);
+      const g = Math.abs(current.data[idx + 1] - baseline.data[idx + 1]);
+      const b = Math.abs(current.data[idx + 2] - baseline.data[idx + 2]);
+      const magnitude = Math.max(r, g, b);
+      diff.data[idx] = magnitude;
+      diff.data[idx + 1] = g;
+      diff.data[idx + 2] = b;
+      diff.data[idx + 3] = magnitude > 0 ? 255 : 80;
+    }
+  }
+
+  return PNG.sync.write(diff);
+}
+
 function formatEventForClient<T extends EventRecord | EventRecordWithId>(
   event: T
 ): T & { meta?: Record<string, unknown> } {
@@ -861,6 +990,10 @@ function formatEventForClient<T extends EventRecord | EventRecordWithId>(
     }
     if (faceSnapshotPath) {
       meta.faceSnapshotUrl = `/api/events/${id}/face-snapshot`;
+    }
+    const baselineSnapshotPath = extractSnapshotBaselinePath(event as EventRecordWithId);
+    if (snapshotPath && baselineSnapshotPath) {
+      meta.snapshotDiffUrl = `/api/events/${id}/snapshot/diff`;
     }
   }
   return typed;
@@ -1468,6 +1601,26 @@ function sanitizeEventMeta(meta: Record<string, unknown> | undefined): Record<st
     } else {
       delete (clone as Record<string, unknown>).threats;
     }
+  }
+
+  delete (clone as Record<string, unknown>).snapshotBaseline;
+  delete (clone as Record<string, unknown>).baselineSnapshot;
+  const diffMeta = (clone as Record<string, unknown>).snapshotDiff;
+  if (diffMeta && typeof diffMeta === 'object') {
+    const diffRecord = diffMeta as Record<string, unknown>;
+    const sanitized: Record<string, unknown> = {};
+    if (typeof diffRecord.label === 'string') {
+      sanitized.label = diffRecord.label;
+    }
+    if (typeof diffRecord.reason === 'string') {
+      sanitized.reason = diffRecord.reason;
+    }
+    (clone as Record<string, unknown>).snapshotDiff = Object.keys(sanitized).length > 0 ? sanitized : undefined;
+    if (Object.keys(sanitized).length === 0) {
+      delete (clone as Record<string, unknown>).snapshotDiff;
+    }
+  } else {
+    delete (clone as Record<string, unknown>).snapshotDiff;
   }
 
   return clone as Record<string, unknown>;

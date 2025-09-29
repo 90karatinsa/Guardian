@@ -215,6 +215,65 @@ describe('VideoSource', () => {
     expect(snapshot.pipelines.ffmpeg.byReason['rtsp-timeout']).toBe(1);
   });
 
+  it('VideoRtspTransportFallback', async () => {
+    vi.useFakeTimers();
+
+    const transports: Array<string | null | undefined> = [];
+    const attempts: number[] = [];
+    const fallbackTransitions: Array<{ from: string | null; to: string | null; reason: string }> = [];
+
+    const source = new VideoSource({
+      file: 'rtsp://camera/fallback',
+      framesPerSecond: 1,
+      channel: 'video:cam-rtsp',
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      commandFactory: ({ rtspTransport }) => {
+        const command = new FakeCommand();
+        transports.push(rtspTransport);
+        setTimeout(() => {
+          command.emit('stderr', 'method DESCRIBE failed: timed out');
+        }, 0);
+        setTimeout(() => {
+          command.emitClose(1, null);
+        }, 1);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => {
+      attempts.push(event.attempt);
+    });
+    source.on('transport-change', event => {
+      fallbackTransitions.push({ from: event.from ?? null, to: event.to ?? null, reason: event.reason });
+    });
+
+    source.start();
+
+    for (let i = 0; i < 3; i += 1) {
+      await vi.advanceTimersByTimeAsync(20);
+      await Promise.resolve();
+    }
+
+    await waitFor(() => fallbackTransitions.length === 2, 500);
+
+    expect(transports.slice(0, 3)).toEqual(['tcp', 'udp', 'tcp']);
+    expect(fallbackTransitions).toEqual([
+      { from: 'tcp', to: 'udp', reason: 'rtsp-timeout' },
+      { from: 'udp', to: 'tcp', reason: 'rtsp-timeout' }
+    ]);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.transportFallbacks.total).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-rtsp']?.total).toBe(2);
+    expect(snapshot.pipelines.ffmpeg.transportFallbacks.last?.to).toBe('tcp');
+
+    await source.stop();
+    await vi.runOnlyPendingTimersAsync();
+    vi.useRealTimers();
+  });
+
   it('VideoSourceWatchdogRecovery records jitter metrics and watchdog restart details', async () => {
     vi.useFakeTimers();
 

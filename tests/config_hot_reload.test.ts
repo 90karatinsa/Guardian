@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { ConfigManager, loadConfigFromFile, validateConfig } from '../src/config/index.js';
+import metrics from '../src/metrics/index.js';
 import type { CameraConfig, GuardianConfig, MotionTuningConfig } from '../src/config/index.js';
 import { EventBus } from '../src/eventBus.js';
 import AudioAnomalyDetector from '../src/audio/anomaly.js';
@@ -19,6 +20,11 @@ vi.mock('meyda', () => ({
 
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
+  public updateOptions = vi.fn();
+  public resetTransportFallback = vi.fn(() => true);
+  public getCurrentRtspTransport = vi.fn(() =>
+    typeof this.options.rtspTransport === 'string' ? this.options.rtspTransport : 'tcp'
+  );
   constructor(public readonly options: Record<string, unknown>) {
     super();
     MockVideoSource.instances.push(this);
@@ -116,6 +122,7 @@ describe('ConfigHotReload', () => {
     MockMotionDetector.instances = [];
     MockAudioSource.instances = [];
     MockVideoSource.instances = [];
+    metrics.reset();
   });
 
   afterEach(() => {
@@ -1087,6 +1094,98 @@ describe('ConfigHotReload', () => {
       });
     } finally {
       anomalySpy.mockRestore();
+      runtime.stop();
+    }
+  });
+
+  it('ConfigHotReloadTransportFallback updates fallback sequence and audio noise without restarts', async () => {
+    const base = createConfig({ diffThreshold: 24 });
+    base.video.cameras = [
+      {
+        id: 'cam-1',
+        channel: 'video:cam-1',
+        input: 'rtsp://cam-1',
+        ffmpeg: { rtspTransport: 'tcp', transportFallbackSequence: ['tcp', 'udp'] },
+        person: { score: 0.5 }
+      }
+    ];
+    base.audio = {
+      channel: 'audio:microphone',
+      silenceThreshold: 0.0005,
+      silenceDurationMs: 150,
+      silenceCircuitBreakerThreshold: 3
+    };
+
+    fs.writeFileSync(configPath, JSON.stringify(base, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      await waitFor(() => MockVideoSource.instances.length === 1);
+      await waitFor(() => MockAudioSource.instances.length === 1);
+
+      const initialSnapshot = metrics.snapshot();
+      const videoSource = MockVideoSource.instances[0];
+      const audioSource = MockAudioSource.instances[0];
+
+      const updated = JSON.parse(JSON.stringify(base)) as GuardianConfig;
+      if (updated.video.cameras) {
+        updated.video.cameras[0].ffmpeg = {
+          ...(updated.video.cameras[0].ffmpeg ?? {}),
+          transportFallbackSequence: ['udp', 'tcp']
+        } as CameraConfig['ffmpeg'];
+      }
+      updated.audio = {
+        ...(updated.audio ?? {}),
+        silenceThreshold: 0.0008,
+        silenceDurationMs: 220,
+        silenceCircuitBreakerThreshold: 1
+      };
+
+      fs.writeFileSync(configPath, JSON.stringify(updated, null, 2));
+
+      await waitFor(
+        () => logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded'),
+        4000
+      );
+
+      await waitFor(() => videoSource.updateOptions.mock.calls.length > 0, 4000);
+      const videoCall = videoSource.updateOptions.mock.calls.at(-1)?.[0] as
+        | Record<string, unknown>
+        | undefined;
+      expect(videoCall).toMatchObject({ rtspTransportSequence: ['udp', 'tcp'] });
+
+      await waitFor(() => audioSource.updateOptions.mock.calls.length > 0, 4000);
+      const audioCall = audioSource.updateOptions.mock.calls.at(-1)?.[0] as
+        | Record<string, unknown>
+        | undefined;
+      expect(audioCall).toMatchObject({
+        silenceThreshold: 0.0008,
+        silenceDurationMs: 220,
+        silenceCircuitBreakerThreshold: 1
+      });
+
+      expect(MockVideoSource.instances.length).toBe(1);
+
+      const snapshotAfter = metrics.snapshot();
+      expect(snapshotAfter.pipelines.ffmpeg.restarts).toBe(
+        initialSnapshot.pipelines.ffmpeg.restarts
+      );
+    } finally {
       runtime.stop();
     }
   });

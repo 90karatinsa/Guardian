@@ -28,6 +28,8 @@ const threatSummaryContainer = document.getElementById('threat-summary');
 const threatSummaryEmpty = document.getElementById('threat-summary-empty');
 const channelStatusContainer = document.getElementById('channel-status');
 const channelStatusEmpty = document.getElementById('channel-status-empty');
+const warningList = document.getElementById('warning-list');
+const warningEmpty = document.getElementById('warning-empty');
 
 if (previewImage) {
   previewImage.addEventListener('load', () => {
@@ -85,7 +87,8 @@ const state = {
     lastForecast: null,
     lastThreat: null,
     lastUpdated: null
-  }
+  },
+  warnings: []
 };
 
 function getSelectedChannels() {
@@ -522,6 +525,126 @@ function recordStreamEvent(timestamp) {
 function recordSnapshotEvent() {
   state.stream.snapshots += 1;
   updateStreamWidget();
+}
+
+function appendWarning(entry) {
+  if (!entry) {
+    return;
+  }
+  if (!Array.isArray(state.warnings)) {
+    state.warnings = [];
+  }
+  state.warnings.unshift(entry);
+  if (state.warnings.length > 20) {
+    state.warnings.length = 20;
+  }
+  renderWarnings();
+}
+
+function normalizeWarning(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const now = Date.now();
+  if (payload.type === 'retention' && payload.warning) {
+    const warning = payload.warning as { camera?: string | null; reason?: string; path?: string };
+    const camera = warning.camera ? normalizeChannelId(warning.camera) : null;
+    const reason = typeof warning.reason === 'string' ? warning.reason : 'Retention warning';
+    const detail = typeof warning.path === 'string' ? warning.path : null;
+    return {
+      id: `retention:${now}:${Math.random().toString(36).slice(2)}`,
+      type: 'retention',
+      title: camera ? `Retention warning (${camera})` : 'Retention warning',
+      message: reason,
+      detail,
+      channel: camera,
+      at: now
+    };
+  }
+  if (payload.type === 'transport-fallback' && payload.fallback) {
+    const fallback = payload.fallback as {
+      channel?: string | null;
+      from?: string | null;
+      to?: string | null;
+      reason?: string;
+      at?: string | number | null;
+      resetsBackoff?: boolean;
+      resetsCircuitBreaker?: boolean;
+    };
+    const channel = fallback.channel ? normalizeChannelId(fallback.channel) : null;
+    const from = fallback.from || 'unknown';
+    const to = fallback.to || 'unknown';
+    const reason = fallback.reason || 'fallback';
+    const atValue =
+      typeof fallback.at === 'number'
+        ? fallback.at
+        : typeof fallback.at === 'string'
+        ? Date.parse(fallback.at)
+        : now;
+    const detailParts: string[] = [];
+    if (fallback.resetsBackoff) {
+      detailParts.push('backoff reset');
+    }
+    if (fallback.resetsCircuitBreaker) {
+      detailParts.push('circuit breaker reset');
+    }
+    return {
+      id: `transport:${now}:${Math.random().toString(36).slice(2)}`,
+      type: 'transport-fallback',
+      title: channel ? `Transport fallback (${channel})` : 'Transport fallback',
+      message: `${from} → ${to} (${reason})`,
+      detail: detailParts.length > 0 ? detailParts.join(', ') : null,
+      channel,
+      at: Number.isFinite(atValue) ? atValue : now
+    };
+  }
+  return null;
+}
+
+function renderWarnings() {
+  if (!warningList || !warningEmpty) {
+    return;
+  }
+
+  warningList.replaceChildren();
+  const warnings = Array.isArray(state.warnings) ? state.warnings : [];
+  if (warnings.length === 0) {
+    warningEmpty.hidden = false;
+    warningList.hidden = true;
+    return;
+  }
+
+  warningEmpty.hidden = true;
+  warningList.hidden = false;
+  const fragment = document.createDocumentFragment();
+  warnings.forEach(entry => {
+    if (!entry) {
+      return;
+    }
+    const item = document.createElement('li');
+    item.className = 'warning-item';
+    const title = document.createElement('strong');
+    title.textContent = entry.title ?? 'Warning';
+    item.appendChild(title);
+    if (entry.message) {
+      const message = document.createElement('span');
+      message.textContent = entry.message;
+      item.appendChild(message);
+    }
+    if (entry.detail) {
+      const detail = document.createElement('span');
+      detail.textContent = entry.detail;
+      item.appendChild(detail);
+    }
+    const metaLine = document.createElement('span');
+    metaLine.className = 'warning-meta';
+    const relative = formatRelativeTime(entry.at ?? Date.now());
+    const channelText = entry.channel ? ` • ${entry.channel}` : '';
+    metaLine.textContent = `${relative}${channelText}`;
+    item.appendChild(metaLine);
+    fragment.appendChild(item);
+  });
+  warningList.appendChild(fragment);
 }
 
 async function loadInitial() {
@@ -1612,6 +1735,19 @@ function subscribe() {
     }
   });
 
+  source.addEventListener('warning', event => {
+    try {
+      const payload = JSON.parse(event.data);
+      const warning = normalizeWarning(payload);
+      if (warning) {
+        appendWarning(warning);
+        recordSnapshotEvent();
+      }
+    } catch (error) {
+      console.debug('Failed to parse warning payload', error);
+    }
+  });
+
   source.onmessage = event => {
     try {
       const payload = JSON.parse(event.data);
@@ -1684,6 +1820,7 @@ resetButton.addEventListener('click', () => {
 });
 
 updateStreamWidget();
+renderWarnings();
 const METRICS_REFRESH_INTERVAL = 30_000;
 refreshPipelineMetrics();
 setInterval(() => {
@@ -1692,6 +1829,7 @@ setInterval(() => {
 
 loadInitial().then(() => {
   renderEvents();
+  renderWarnings();
 });
 subscribe();
 

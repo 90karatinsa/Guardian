@@ -1,6 +1,8 @@
 FROM node:20-bookworm-slim AS base
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    GUARDIAN_SIMULATE_VIDEO_RTSP_TIMEOUT=0 \
+    GUARDIAN_SIMULATE_VIDEO_WATCHDOG=0
 WORKDIR /app
 
 RUN apt-get update \

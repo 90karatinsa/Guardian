@@ -203,7 +203,7 @@ describe('AudioSource resilience', () => {
     });
 
     const samples = new Int16Array([0, 1000, -500, 200, -300, 50, -75, 0]);
-    (source as any).analyzeFrame(samples, 16000, 0.05);
+    (source as any).analyzeFrame(samples, 16000, 1, 50, 0.05);
 
     const analysis = source.getAnalysisSnapshot();
     expect(analysis.ffmpeg).toBeDefined();
@@ -217,6 +217,8 @@ describe('AudioSource resilience', () => {
       6
     );
     expect(gauges['analysis.ffmpeg.windows']).toBe(analysis.ffmpeg.frames);
+    expect(gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(50, 6);
+    expect(gauges['analysis.ffmpeg.rms-window-frames']).toBe(1);
 
     source.stop();
   });
@@ -412,6 +414,110 @@ describe('AudioSource resilience', () => {
     platformSpy.mockRestore();
   });
 
+  it('AudioPulseFallbackChain prefers pulse and pipewire while recalibrating RMS windows', async () => {
+    vi.useFakeTimers();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const outputs: Record<string, string> = {
+      pulse: `"default"\n"monitor"`,
+      pipewire: `"default"`,
+      alsa: `[0] hw:1,0`
+    };
+
+    execFileMock.mockImplementation((_cmd: string, args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      const formatIndex = args.indexOf('-f');
+      const format = formatIndex >= 0 ? args[formatIndex + 1] : 'alsa';
+      const output = outputs[format] ?? '';
+      callback(null, output, '');
+      return child;
+    });
+
+    const encountered: Array<{ format?: string; device?: string }> = [];
+    const seen = new Set<string>();
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      const formatIndex = args.indexOf('-f');
+      const deviceIndex = args.indexOf('-i');
+      const format = formatIndex >= 0 ? args[formatIndex + 1] : undefined;
+      const device = deviceIndex >= 0 ? args[deviceIndex + 1] : undefined;
+      const key = `${format ?? 'none'}|${device ?? ''}`;
+      if (seen.has(key) === false) {
+        seen.add(key);
+        encountered.push({ format, device });
+      }
+      const error = new Error('missing') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      throw error;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:pulse',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 40,
+      restartDelayMs: 25,
+      restartMaxDelayMs: 25,
+      restartJitterFactor: 0,
+      analysisRmsWindowMs: 120,
+      random: () => 0.5
+    });
+
+    const recoverSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', () => {});
+    source.start();
+
+    await waitForCondition(() => recoverSpy.mock.calls.length > 0, 1000);
+
+    expect(encountered).toEqual([
+      { format: 'pulse', device: 'default' },
+      { format: 'pulse', device: 'monitor' },
+      { format: 'pipewire', device: 'default' },
+      { format: 'alsa', device: 'default' },
+      { format: 'alsa', device: 'hw:0' },
+      { format: 'alsa', device: 'plughw:0' }
+    ]);
+
+    const discoverySnapshot = metrics.snapshot();
+    expect(discoverySnapshot.pipelines.audio.deviceDiscovery.byFormat.pulse).toBe(2);
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+
+    const smoothingSource = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      frameDurationMs: 40,
+      sampleRate: 16000,
+      channels: 1,
+      analysisRmsWindowMs: 120
+    });
+
+    const makeSamples = (rate: number, durationMs: number) =>
+      new Int16Array(Math.round((rate * durationMs) / 1000)).fill(500);
+
+    for (let i = 0; i < 3; i += 1) {
+      (smoothingSource as any).analyzeFrame(makeSamples(16000, 40), 16000, 1, 40, 0.02);
+    }
+
+    let snapshot = metrics.snapshot();
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(120, 6);
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-frames']).toBe(3);
+
+    for (let i = 0; i < 6; i += 1) {
+      (smoothingSource as any).analyzeFrame(makeSamples(48000, 20), 48000, 1, 20, 0.02);
+    }
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(120, 6);
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-frames']).toBe(6);
+
+    smoothingSource.stop();
+    platformSpy.mockRestore();
+  });
+
   it('AudioSourceDeviceDiscoveryTimeout recovers and records metrics', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -454,8 +560,8 @@ describe('AudioSource resilience', () => {
     expect(snapshot.pipelines.audio.byReason['device-discovery-timeout']).toBeGreaterThanOrEqual(1);
 
     const sampleFrame = new Int16Array([0, 1200, -600, 400, -200, 50, -75, 25]);
-    (source as any).analyzeFrame(sampleFrame, 16000, 0.05);
-    (source as any).analyzeFrame(sampleFrame, 16000, 0.05);
+    (source as any).analyzeFrame(sampleFrame, 16000, 1, 50, 0.05);
+    (source as any).analyzeFrame(sampleFrame, 16000, 1, 50, 0.05);
 
     const analysis = source.getAnalysisSnapshot();
     expect(analysis.alsa).toBeDefined();
@@ -465,6 +571,8 @@ describe('AudioSource resilience', () => {
     const detectorSnapshot = analysisSnapshot.detectors['audio-anomaly'];
     expect(detectorSnapshot).toBeDefined();
     expect(detectorSnapshot.gauges['analysis.alsa.windows']).toBe(2);
+    expect(detectorSnapshot.gauges['analysis.alsa.rms-window-ms']).toBeCloseTo(100, 6);
+    expect(detectorSnapshot.gauges['analysis.alsa.rms-window-frames']).toBe(2);
 
     source.stop();
     clearSpy.mockRestore();
@@ -1271,7 +1379,9 @@ describe('AudioSource resilience', () => {
     expect(hangingChild.kill).toHaveBeenCalled();
 
     const snapshot = metrics.snapshot();
-    expect(snapshot.pipelines.audio.deviceDiscovery['device-discovery-timeout']).toBe(1);
+    expect(
+      snapshot.pipelines.audio.deviceDiscovery.byReason['device-discovery-timeout']
+    ).toBe(1);
   });
 
   it('AudioWindowing enforces alignment for pipe inputs', async () => {

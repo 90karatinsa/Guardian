@@ -212,6 +212,33 @@ h1 {
   color: #52606d;
 }
 
+.warning-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.warning-item {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.6rem;
+  border: 1px solid #f3d2ce;
+  background: #fff6f5;
+  color: #7f1d1d;
+}
+
+.warning-item strong {
+  color: #b91c1c;
+}
+
+.warning-meta {
+  font-size: 0.8rem;
+  color: #9b2c2c;
+}
+
 .stream-widget dt {
   font-weight: 600;
   font-size: 0.8rem;

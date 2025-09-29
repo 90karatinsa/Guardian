@@ -7,6 +7,7 @@ import PersonDetector from '../src/video/personDetector.js';
 import { YOLO_CLASS_START_INDEX, parseYoloDetections } from '../src/video/yoloParser.js';
 
 const runMocks = new Map<string, ReturnType<typeof vi.fn>>();
+const OBJECTNESS_INDEX = 4;
 
 vi.mock('onnxruntime-node', () => {
   class Tensor<T> {
@@ -80,6 +81,110 @@ const ort = await import('onnxruntime-node');
 const setRunMock = (ort as unknown as { __setRunMock: (modelPath: string, run: ReturnType<typeof vi.fn>) => void }).__setRunMock;
 const Tensor = ort.Tensor as typeof import('onnxruntime-node').Tensor;
 const { PNG } = await import('pngjs');
+
+describe('YoloFusionHeuristics', () => {
+  const logit = (probability: number) => Math.log(probability / (1 - probability));
+
+  it('YoloProjectionWeightedFusion merges overlapping projections with fusion metrics', () => {
+    const classCount = 1;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: { cx: number; cy: number; width: number; height: number; objectness: number; classProbability: number }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      data[YOLO_CLASS_START_INDEX * detections + index] = logit(values.classProbability);
+    };
+
+    assign(0, { cx: 0.5, cy: 0.5, width: 0.32, height: 0.46, objectness: 0.9, classProbability: 0.86 });
+    assign(1, { cx: 0.52, cy: 0.48, width: 0.34, height: 0.44, objectness: 0.88, classProbability: 0.83 });
+    assign(2, { cx: 320, cy: 236, width: 176, height: 208, objectness: 0.87, classProbability: 0.81 });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 1,
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 1,
+      scaleY: 640 / 480,
+      variants: [
+        {
+          padX: 16,
+          padY: 8,
+          originalWidth: 640,
+          originalHeight: 480,
+          resizedWidth: 672,
+          resizedHeight: 672,
+          scaleX: 672 / 640,
+          scaleY: 672 / 480,
+          normalized: true
+        },
+        {
+          padX: 0,
+          padY: 0,
+          originalWidth: 640,
+          originalHeight: 480,
+          resizedWidth: 640,
+          resizedHeight: 480,
+          scaleX: 1,
+          scaleY: 1,
+          normalized: false
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const [fused] = parseYoloDetections(tensor, meta, {
+      classIndices: [0],
+      scoreThreshold: 0.3,
+      nmsThreshold: 0.6
+    });
+
+    expect(fused).toBeDefined();
+    expect(fused.fusion).toBeDefined();
+    const fusion = fused.fusion!;
+    expect(fusion.contributors.length).toBe(3);
+    expect(fusion.confidence).toBeGreaterThan(fused.score * 0.9);
+    expect(fusion.weight).toBeGreaterThan(0);
+    const totalWeight = fusion.contributors.reduce((sum, contributor) => sum + contributor.weight, 0);
+    expect(totalWeight).toBeGreaterThan(0);
+    expect(fusion.weight).toBeCloseTo(totalWeight, 6);
+
+    const weightedLeft = fusion.contributors.reduce((sum, contributor) => sum + contributor.weight * contributor.bbox.left, 0) /
+      totalWeight;
+    const weightedTop = fusion.contributors.reduce((sum, contributor) => sum + contributor.weight * contributor.bbox.top, 0) /
+      totalWeight;
+    const weightedRight = fusion.contributors.reduce(
+      (sum, contributor) => sum + contributor.weight * (contributor.bbox.left + contributor.bbox.width),
+      0
+    ) / totalWeight;
+    const weightedBottom = fusion.contributors.reduce(
+      (sum, contributor) => sum + contributor.weight * (contributor.bbox.top + contributor.bbox.height),
+      0
+    ) / totalWeight;
+
+    expect(fused.bbox.left).toBeCloseTo(weightedLeft, 3);
+    expect(fused.bbox.top).toBeCloseTo(weightedTop, 3);
+    expect(fused.bbox.width).toBeCloseTo(weightedRight - weightedLeft, 3);
+    expect(fused.bbox.height).toBeCloseTo(weightedBottom - weightedTop, 3);
+    expect(fused.areaRatio).toBeCloseTo(fusion.areaRatio, 5);
+    expect(fusion.contributors.some(contributor => contributor.projectionIndex !== fusion.contributors[0]?.projectionIndex)).toBe(
+      true
+    );
+    expect(fusion.contributors.every(contributor => contributor.iou > 0)).toBe(true);
+  });
+});
 
 describe('ObjectClassifierThreatScoring', () => {
   const snapshotsDir = path.resolve('snapshots');

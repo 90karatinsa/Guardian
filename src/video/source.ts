@@ -44,6 +44,7 @@ export type VideoSourceOptions = {
   }) => ffmpeg.FfmpegCommand;
   random?: () => number;
   circuitBreakerThreshold?: number;
+  rtspTransportSequence?: string[];
 };
 
 export type RecoverEventMeta = {
@@ -78,6 +79,19 @@ export type FatalEvent = {
   };
 };
 
+export type TransportFallbackEvent = {
+  channel: string | null;
+  from: string | null;
+  to: string | null;
+  reason: string;
+  attempt: number;
+  stage: number | null;
+  resetsBackoff: boolean;
+  resetsCircuitBreaker: boolean;
+  at: number;
+  metricsRecorded: boolean;
+};
+
 type RecoveryContext = {
   errorCode?: string | number | null;
   exitCode?: number | null;
@@ -98,6 +112,16 @@ type PendingRestartContext = {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   reportedReasons: Set<string>;
+};
+
+type RtspFallbackState = {
+  base: string;
+  sequence: string[];
+  index: number;
+  current: string;
+  lastReason: string | null;
+  lastChangeAt: number | null;
+  totalChanges: number;
 };
 
 export class VideoSource extends EventEmitter {
@@ -126,11 +150,17 @@ export class VideoSource extends EventEmitter {
   private commandGeneration = 0;
   private readonly channel: string | null;
   private pendingRestartContext: PendingRestartContext | null = null;
+  private readonly isRtspInput: boolean;
+  private rtspFallbackState: RtspFallbackState | null = null;
 
   constructor(private options: VideoSourceOptions) {
     super();
     const normalizedChannel = normalizeChannelId(options.channel);
     this.channel = normalizedChannel || null;
+    this.isRtspInput = isRtspInputSource(options.file);
+    if (this.isRtspInput) {
+      this.initializeRtspFallbackState();
+    }
   }
 
   updateOptions(
@@ -146,6 +176,7 @@ export class VideoSource extends EventEmitter {
         | 'restartJitterFactor'
         | 'forceKillTimeoutMs'
         | 'circuitBreakerThreshold'
+        | 'rtspTransportSequence'
       >
     >
   ) {
@@ -160,8 +191,31 @@ export class VideoSource extends EventEmitter {
     const startTimeoutChanged =
       Object.prototype.hasOwnProperty.call(options, 'startTimeoutMs') &&
       next.startTimeoutMs !== previous.startTimeoutMs;
+    const fallbackChanged = Object.prototype.hasOwnProperty.call(
+      options,
+      'rtspTransportSequence'
+    );
 
     this.options = next;
+
+    if (fallbackChanged && this.rtspFallbackState) {
+      const normalizedCurrent = normalizeRtspTransport(this.rtspFallbackState.current);
+      const sequence = buildRtspFallbackSequence(
+        this.options.rtspTransport ?? this.rtspFallbackState.base,
+        this.options.rtspTransportSequence
+      );
+      this.rtspFallbackState.base = sequence[0] ?? DEFAULT_RTSP_TRANSPORT;
+      this.rtspFallbackState.sequence = sequence;
+      const index = normalizedCurrent ? sequence.indexOf(normalizedCurrent) : -1;
+      if (index >= 0) {
+        this.rtspFallbackState.index = index;
+        this.rtspFallbackState.current = sequence[index];
+      } else {
+        this.rtspFallbackState.index = 0;
+        this.rtspFallbackState.current = sequence[0];
+      }
+      this.options.rtspTransport = this.rtspFallbackState.current;
+    }
 
     if (idleChanged && this.streamIdleTimer) {
       this.resetStreamIdleTimer();
@@ -185,6 +239,7 @@ export class VideoSource extends EventEmitter {
     this.resetCommandClassifications();
     this.lastCircuitCandidateReason = null;
     this.pendingRestartContext = null;
+    this.syncRtspFallbackState();
     this.clearAllTimers();
     this.startCommand();
   }
@@ -199,10 +254,39 @@ export class VideoSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.lastCircuitCandidateReason = null;
     this.shouldStop = false;
+    if (this.rtspFallbackState) {
+      if (wasBroken) {
+        this.resetRtspFallbackState({
+          reason: 'rtsp-transport-reset',
+          record: true,
+          resetsCircuitBreaker: true
+        });
+      } else {
+        this.syncRtspFallbackState();
+      }
+    }
     if (options.restart !== false && wasBroken) {
       this.start();
     }
     return wasBroken;
+  }
+
+  resetTransportFallback(options: {
+    reason?: string;
+    record?: boolean;
+    resetsCircuitBreaker?: boolean;
+  } = {}) {
+    if (!this.rtspFallbackState) {
+      return false;
+    }
+
+    this.resetRtspFallbackState({
+      reason: options.reason ?? 'rtsp-transport-reset',
+      record: options.record,
+      resetsCircuitBreaker: options.resetsCircuitBreaker
+    });
+
+    return true;
   }
 
   async stop(): Promise<void> {
@@ -265,6 +349,7 @@ export class VideoSource extends EventEmitter {
         this.clearPersistentCommandClassifications();
         this.clearStartTimer();
         this.restartCount = 0;
+        this.markRtspFallbackSuccess();
       }
 
       this.resetStreamIdleTimer();
@@ -503,10 +588,7 @@ export class VideoSource extends EventEmitter {
       return;
     }
 
-    this.recovering = true;
-    this.restartCount += 1;
-    const attempt = this.restartCount;
-
+    const attemptPreview = this.restartCount + 1;
     const resolvedContext: RecoveryContext = {
       errorCode:
         typeof context.errorCode === 'string' || typeof context.errorCode === 'number'
@@ -517,6 +599,11 @@ export class VideoSource extends EventEmitter {
       exitCode: typeof context.exitCode === 'number' ? context.exitCode : null,
       signal: context.signal ?? null
     };
+    this.maybeApplyRtspTransportFallback(reason, resolvedContext, attemptPreview);
+
+    this.recovering = true;
+    this.restartCount += 1;
+    const attempt = this.restartCount;
 
     const channel = this.channel;
     const errorCode =
@@ -910,6 +997,199 @@ export class VideoSource extends EventEmitter {
     };
   }
 
+  private initializeRtspFallbackState() {
+    const state = createRtspFallbackState(
+      normalizeRtspTransport(this.options.rtspTransport),
+      this.options.rtspTransportSequence
+    );
+    this.rtspFallbackState = state;
+    this.options.rtspTransport = state.current;
+  }
+
+  private syncRtspFallbackState() {
+    const state = this.rtspFallbackState;
+    if (!state) {
+      return;
+    }
+
+    const sequence = buildRtspFallbackSequence(
+      this.options.rtspTransport ?? state.base,
+      this.options.rtspTransportSequence
+    );
+    state.sequence = sequence;
+    state.base = sequence[0] ?? DEFAULT_RTSP_TRANSPORT;
+    const normalized = normalizeRtspTransport(this.options.rtspTransport) ?? state.sequence[0];
+    const index = state.sequence.indexOf(normalized);
+    if (index >= 0) {
+      state.index = index;
+      state.current = state.sequence[index];
+      this.options.rtspTransport = state.current;
+      return;
+    }
+
+    state.index = 0;
+    state.current = state.sequence[0];
+    this.options.rtspTransport = state.current;
+  }
+
+  private maybeApplyRtspTransportFallback(
+    reason: string,
+    context: RecoveryContext,
+    attempt: number
+  ) {
+    const state = this.rtspFallbackState;
+    if (!state || !isRtspFallbackReason(reason)) {
+      return;
+    }
+
+    const current = state.current;
+    let nextIndex = state.index;
+    let nextTransport = current;
+
+    for (let i = state.index + 1; i < state.sequence.length; i += 1) {
+      const candidate = state.sequence[i];
+      if (candidate !== current) {
+        nextIndex = i;
+        nextTransport = candidate;
+        break;
+      }
+    }
+
+    if (nextIndex === state.index || nextTransport === current) {
+      return;
+    }
+
+    const now = Date.now();
+    const previousTransport = current;
+    state.index = nextIndex;
+    state.current = nextTransport;
+    state.lastReason = reason;
+    state.lastChangeAt = now;
+    state.totalChanges += 1;
+
+    this.options.rtspTransport = nextTransport;
+    this.clearPersistentCommandClassifications();
+    this.resetRestartBackoffForFallback();
+    this.resetCircuitBreakerForFallback();
+
+    const channel = this.channel ?? null;
+
+    metrics.recordTransportFallback('ffmpeg', reason, {
+      channel: channel ?? undefined,
+      from: previousTransport,
+      to: nextTransport,
+      attempt,
+      stage: nextIndex,
+      resetsBackoff: true,
+      resetsCircuitBreaker: true,
+      sequence: [...state.sequence],
+      errorCode: context.errorCode ?? null,
+      exitCode: context.exitCode ?? null,
+      signal: context.signal ?? null,
+      at: now
+    });
+
+    this.emit(
+      'transport-change',
+      {
+        channel,
+        from: previousTransport,
+        to: nextTransport,
+        reason,
+        attempt,
+        stage: nextIndex,
+        resetsBackoff: true,
+        resetsCircuitBreaker: true,
+        at: now,
+        metricsRecorded: true
+      } satisfies TransportFallbackEvent
+    );
+  }
+
+  private resetRtspFallbackState(options: {
+    reason: string;
+    record?: boolean;
+    resetsCircuitBreaker?: boolean;
+  }) {
+    const state = this.rtspFallbackState;
+    if (!state) {
+      return;
+    }
+
+    const target = state.sequence[0];
+    const previous = state.current;
+    state.index = 0;
+    state.current = target;
+    state.lastReason = options.reason;
+    state.lastChangeAt = Date.now();
+    this.options.rtspTransport = target;
+    this.clearPersistentCommandClassifications();
+    this.resetRestartBackoffForFallback();
+    this.resetCircuitBreakerForFallback();
+
+    if (previous === target) {
+      return;
+    }
+
+    const channel = this.channel ?? null;
+    const shouldRecord = options.record ?? false;
+
+    if (shouldRecord) {
+      metrics.recordTransportFallback('ffmpeg', options.reason, {
+        channel: channel ?? undefined,
+        from: previous,
+        to: target,
+        attempt: 0,
+        stage: state.index,
+        resetsBackoff: true,
+        resetsCircuitBreaker: options.resetsCircuitBreaker ?? false,
+        sequence: [...state.sequence],
+        at: state.lastChangeAt
+      });
+    }
+
+    this.emit(
+      'transport-change',
+      {
+        channel,
+        from: previous,
+        to: target,
+        reason: options.reason,
+        attempt: 0,
+        stage: state.index,
+        resetsBackoff: true,
+        resetsCircuitBreaker: options.resetsCircuitBreaker ?? false,
+        at: state.lastChangeAt,
+        metricsRecorded: shouldRecord
+      } satisfies TransportFallbackEvent
+    );
+  }
+
+  private resetRestartBackoffForFallback() {
+    this.restartCount = 0;
+    this.pendingRestartContext = null;
+  }
+
+  private resetCircuitBreakerForFallback() {
+    this.circuitBreakerFailures = 0;
+    this.lastCircuitCandidateReason = null;
+  }
+
+  private markRtspFallbackSuccess() {
+    if (!this.rtspFallbackState) {
+      return;
+    }
+
+    this.rtspFallbackState.lastReason = null;
+  }
+
+  getCurrentRtspTransport() {
+    if (!this.rtspFallbackState) {
+      return this.options.rtspTransport ?? null;
+    }
+    return this.rtspFallbackState.current ?? null;
+  }
+
   private normalizeErrno(error: unknown): RecoveryContext {
     if (!error || typeof error !== 'object') {
       return { errorCode: null, exitCode: null, signal: null };
@@ -1001,6 +1281,84 @@ type FfmpegClassification = {
   signal?: NodeJS.Signals | null;
   breakAfter?: boolean;
 };
+
+const DEFAULT_RTSP_TRANSPORT = 'tcp';
+const DEFAULT_RTSP_SEQUENCE = ['tcp', 'udp', 'tcp'];
+
+function createRtspFallbackState(
+  initial: string | null,
+  override?: string[]
+): RtspFallbackState {
+  const base = initial ?? DEFAULT_RTSP_TRANSPORT;
+  const sequence = buildRtspFallbackSequence(base, override);
+  const index = Math.max(0, sequence.indexOf(base));
+  const current = sequence[index] ?? sequence[0] ?? DEFAULT_RTSP_TRANSPORT;
+  return {
+    base: sequence[0] ?? DEFAULT_RTSP_TRANSPORT,
+    sequence,
+    index,
+    current,
+    lastReason: null,
+    lastChangeAt: null,
+    totalChanges: 0
+  };
+}
+
+function buildRtspFallbackSequence(initial: string, override?: string[]): string[] {
+  const normalizedInitial = normalizeRtspTransport(initial) ?? DEFAULT_RTSP_TRANSPORT;
+  const sequence: string[] = [];
+  const seen = new Set<string>();
+  const push = (value: string | null) => {
+    if (!value) {
+      return;
+    }
+    if (seen.has(value)) {
+      return;
+    }
+    sequence.push(value);
+    seen.add(value);
+  };
+
+  const normalizedOverride = Array.isArray(override)
+    ? override
+        .map(value => normalizeRtspTransport(value))
+        .filter((value): value is string => typeof value === 'string')
+    : [];
+
+  if (normalizedOverride.length > 0) {
+    push(normalizedOverride[0]);
+    if (normalizedOverride[0] !== normalizedInitial) {
+      push(normalizedInitial);
+    }
+    for (let i = 1; i < normalizedOverride.length; i += 1) {
+      push(normalizedOverride[i]);
+    }
+  } else {
+    push(normalizedInitial);
+  }
+
+  for (const transport of DEFAULT_RTSP_SEQUENCE) {
+    push(transport);
+  }
+
+  return sequence;
+}
+
+function normalizeRtspTransport(value?: string | null): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isRtspInputSource(file: string): boolean {
+  return /^rtsps?:\/\//i.test(file);
+}
+
+function isRtspFallbackReason(reason: string) {
+  return reason === 'rtsp-timeout' || reason === 'rtsp-connection-failure';
+}
 
 function isPersistentClassification(reason: string) {
   return reason.startsWith('rtsp-');

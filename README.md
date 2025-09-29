@@ -253,7 +253,8 @@ Guardian, mikrofon fallback zincirlerini ve anomaly dedektör eşiklerini çalı
 - `audio.anomaly` blokları içinde `rmsWindowMs`, `centroidWindowMs`, `minTriggerDurationMs` veya `thresholds` alanlarını değiştirmeniz halinde dedektör tamponları sıfırlanır ve yeni pencereler hemen uygulanır. `nightHours` aralığı güncellendiğinde profil geçişi bir sonraki karede tetiklenir.
 - Fallback ve eşik değişikliklerinin etkisini `guardian daemon status --json` komutuyla veya `/api/metrics/pipelines` uç noktasından alınan metriklerle doğrulayabilirsiniz.
 - `audio.silenceCircuitBreakerThreshold`, sessizlik pencereleri art arda bu eşiği aştığında devre kesiciyi tetikler. `0` değeri devre kesiciyi devre dışı bırakır; tetiklemeler sırasında `Audio source recovering (reason=silence-circuit-breaker)` satırlarını ve `guardian daemon status --json` çıktısındaki `pipelines.audio.byReason` sayaç artışlarını bekleyebilirsiniz.
-- `audio.deviceDiscoveryTimeoutMs`, fallback listesi taramasının kaç milisaniye sonra zaman aşımına uğrayacağını belirler. Süre dolduğunda loglar `Audio device discovery timed out after 2000ms` benzeri bir mesaj yazar, `pipelines.audio.deviceDiscovery` metriği denenen platformları sayar ve `guardian audio devices --json` çıktısı aynı zaman aşımı değerini `timeoutMs` alanı altında raporlar.
+- `audio.deviceDiscoveryTimeoutMs`, fallback listesi taramasının kaç milisaniye sonra zaman aşımına uğrayacağını belirler. Süre dolduğunda loglar `Audio device discovery timed out after 2000ms` benzeri bir mesaj yazar, `pipelines.audio.deviceDiscovery.byReason` metriği denenen platformları sayar ve `guardian audio devices --json` çıktısı aynı zaman aşımı değerini `timeoutMs` alanı altında raporlar.
+- Linux ve PipeWire kurulumlarında `PulseAudio fallback` zinciri varsayılan olarak ilk denenir; `pulse` formatı başarısız olursa otomatik olarak ALSA adaylarına geçilir. Loglardaki `PulseAudio fallback activated` satırları ile `metrics.pipelines.audio.deviceDiscovery.byFormat.pulse` ve `pipelines.audio.deviceDiscovery.byReason.pulse` sayaçları bu geçişleri doğrular.
 
 ### Retention ve arşiv döngüsü
 Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir retention görevine sahiptir:
@@ -364,7 +365,7 @@ kanallar için kaç yeniden deneme yaşandığını, `watchdogBackoffByChannel` 
 daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
 
 ## Dashboard
-`pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir.
+`pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir. Retention diski tasarruf uyarıları ve RTSP transport fallback bildirimleri de aynı SSE akışında `warnings` kategorisi altında yayınlanır; dashboard sağ panelindeki uyarı kronolojisi her olayda `streamSnapshots` sayaçlarını artırır.
 
 Yalnızca belirli metrik bölümlerini tüketmek için `metrics` sorgu parametresiyle SSE'yi daraltabilirsiniz. Örneğin sadece ses ve retention metriklerini dinlemek için aşağıdaki komutu çalıştırabilirsiniz; ffmpeg istatistikleri bu akışta gönderilmez:
 
@@ -380,7 +381,9 @@ Dashboard filtreleri ve REST uç noktaları, kanalları case-insensitive olarak 
 - `metrics.logs.byLevel.warn`, `metrics.logs.byLevel.error`: Pino log seviyelerine göre sayaçlar. `metrics.logs.histogram.error` değeri, hata loglarının kaç kez üretildiğini gösterir.
 - `metrics.suppression.histogram.historyCount`: Bastırılan olayların tarihçe sayısına göre histogram; `cooldownMs`, `cooldownRemainingMs` ve `windowRemainingMs` alt anahtarları suppression pencerelerinin süre dağılımını raporlar.
 - `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.audio.restartHistogram.attempt`: Watchdog yeniden denemeleri için gecikme ve deneme histogramları. `pipelines.ffmpeg.jitterHistogram` değerleri RTSP geri çekilme jitter'ını raporlar.
-- `pipelines.audio.deviceDiscovery` ve `pipelines.audio.deviceDiscoveryByChannel`: Mikrofon fallback zincirlerinin hangi platformlarda denendiğini gösterir.
+- `pipelines.audio.deviceDiscovery.byReason`, `pipelines.audio.deviceDiscovery.byFormat` ve `pipelines.audio.deviceDiscoveryByChannel`: Mikrofon fallback zincirlerinin hangi platformlarda denendiğini ve hangi formatların keşfedildiğini gösterir.
+- `metrics.pipelines.ffmpeg.transportFallbacks.total`, `metrics.pipelines.ffmpeg.transportFallbacks.byReason` ve `metrics.pipelines.ffmpeg.transportFallbacks.byChannel`: RTSP transport ladder'ının hangi kanallarda TCP↔UDP geçiş yaptığını ve toplam kaç kez denendiğini gösterir; Prometheus çıktısında aynı sayaçlar `guardian_transport_fallback_total` metric adıyla yer alır.
+- `metrics.retention.totals.diskSavingsBytes`: Son retention çalışmasında raporlanan disk tasarrufunu bayt cinsinden bildirir ve Prometheus üzerinden `guardian_retention_disk_savings_bytes_total` olarak dışa aktarılır.
 - `detectors.motion.counters.backoffActivations`, `detectors.light.counters.backoffSuppressedFrames`: Debounce/backoff sayaçları.
 
 `registerHealthIndicator` ile özel health check ekleyebilir, `collectHealthChecks` çağrısında `metrics.logs.byLevel.error` veya `metrics.suppression.lastEvent` gibi alanlara erişebilirsiniz.
@@ -411,7 +414,7 @@ console.log(metrics.exportDetectorCountersForPrometheus({ labels: { instance: 'l
 satırı, son hata logunun Unix zaman damgasını bildirir.
 
 ## Video ve ses boru hatları
-Video için ffmpeg süreçleri, `src/video/source.ts` altında watchdog tarafından izlenir. `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırlarını loglarda görüyorsanız, fallback listesi üzerinde iterasyon yapıldığını bilirsiniz. Her yeniden başlatma `pipelines.ffmpeg.byReason`, `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.jitterHistogram` alanlarını artırır.
+Video için ffmpeg süreçleri, `src/video/source.ts` altında watchdog tarafından izlenir. RTSP bağlantıları `tcp→udp→tcp` sıralı transport fallback zincirini uygular; `transport-change` logları ve `metrics.pipelines.ffmpeg.transportFallbacks.total` alanı kaç kez geri düşüş yaşandığını gösterir. `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırlarını loglarda görüyorsanız, fallback listesi üzerinde iterasyon yapıldığını bilirsiniz. Her yeniden başlatma `pipelines.ffmpeg.byReason`, `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.jitterHistogram` alanlarını artırır.
 
 Ses tarafında anomaly dedektörü, RMS ve spectral centroid ölçümlerini `audio.anomaly` konfigürasyonu doğrultusunda toplar. `metrics.detectors['audio-anomaly'].latencyHistogram` değeri, pencere hizasının doğruluğunu teyit eder. Sustained sessizlikte devre kesici tetiklendiğinde `pipelines.audio.watchdogBackoffByChannel` ve `pipelines.audio.restartHistogram.delay` artışları görülebilir.
 
@@ -446,6 +449,7 @@ operasyonel rehber ile birlikte okunmalıdır.
 | --- | --- | --- |
 | `status: "degraded"` veya artan `metrics.logs.byLevel.error` değerleri | Dedektörler hata üretiyor veya log seviyesi çok düşük | `pnpm tsx scripts/healthcheck.ts --health` çıktısını ve `guardian log-level set debug` komutunu kontrol edin |
 | `pipelines.ffmpeg.watchdogRestartsByChannel` hızla artıyor | RTSP bağlantısı kopuyor ya da jitter yüksek | `guardian daemon restart --channel video:lobby` ve `pnpm exec tsx src/cli.ts daemon status --json` |
+| `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor veya `transport-change` logları sıklaşıyor | TCP↔UDP transport zinciri sürekli geri düşüyor | `guardian daemon restart --transport video:lobby` ile kanalın taşıyıcı sırasını sıfırlayın ve `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.transportFallbacks.byChannel` alanını izleyin |
 | `Audio source recovering (reason=ffmpeg-missing)` mesajları | Mikrofon fallback listesi tükeniyor veya cihaz keşfi zaman aşımına düşüyor | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
 
 - `guardian daemon status --json` veya `pnpm exec tsx src/cli.ts --health` çıktısında `metrics.logs.byLevel.error` hızla artıyorsa log seviyesini `guardian log-level set debug` ile yükseltip detaylı inceleme yapın.

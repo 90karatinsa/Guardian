@@ -175,7 +175,11 @@ export class ObjectClassifier {
         }
       }
 
-      const detectionConfidence = clamp(detection.score, 0, 1);
+      const detectionConfidence = clamp(
+        typeof detection.fusion?.confidence === 'number' ? detection.fusion.confidence : detection.score,
+        0,
+        1
+      );
       const threatProbability = this.resolveThreatProbability(
         bestLabel,
         resolvedProbabilities,
@@ -261,7 +265,9 @@ function buildFeatureTensor(detections: YoloDetection[]) {
   for (let i = 0; i < detections.length; i += 1) {
     const detection = detections[i];
     const base = i * featureCount;
-    data[base] = detection.score;
+    const featureScore =
+      typeof detection.fusion?.confidence === 'number' ? detection.fusion.confidence : detection.score;
+    data[base] = featureScore;
     data[base + 1] = detection.areaRatio;
     data[base + 2] = detection.bbox.width;
     data[base + 3] = detection.bbox.height;

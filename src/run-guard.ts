@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import loggerModule, { setLogLevel } from './logger.js';
-import defaultBus, { EventBus } from './eventBus.js';
+import defaultBus, { EventBus, emitEventPayload } from './eventBus.js';
 import configManager, {
   CameraConfig,
   ConfigManager,
@@ -28,7 +28,7 @@ import PoseEstimator from './video/poseEstimator.js';
 import ObjectClassifier from './video/objectClassifier.js';
 import { ensureSampleVideo } from './video/sampleVideo.js';
 import { VideoSource } from './video/source.js';
-import type { FatalEvent, RecoverEventMeta } from './video/source.js';
+import type { FatalEvent, RecoverEventMeta, TransportFallbackEvent } from './video/source.js';
 import MotionDetector from './video/motionDetector.js';
 import PersonDetector, { normalizeClassScoreThresholds } from './video/personDetector.js';
 import LightDetector from './video/lightDetector.js';
@@ -37,6 +37,12 @@ import metrics from './metrics/index.js';
 import { AudioSource, type AudioFatalEvent } from './audio/source.js';
 import AudioAnomalyDetector from './audio/anomaly.js';
 import { canonicalChannel, normalizeChannelId } from './utils/channel.js';
+import {
+  DEFAULT_RESTART_SEVERITY_THRESHOLDS,
+  evaluateRestartSeverity,
+  formatRestartSeverityReason,
+  type RestartSeverityLevel
+} from './pipeline/channelHealth.js';
 
 type CameraPipelineState = {
   channel: string;
@@ -90,6 +96,30 @@ type CameraRestartStats = {
   historyLimit: number;
   droppedHistory: number;
   lastFatal: (FatalEvent & { at: number }) | null;
+  watchdogRestarts: number;
+  health: {
+    severity: RestartSeverityLevel;
+    reason: string | null;
+    degradedSince: number | null;
+  };
+};
+
+type CameraTransportHistoryEvent = {
+  from: string | null;
+  to: string | null;
+  reason: string;
+  at: number;
+  stage: number | null;
+};
+
+type CameraTransportState = {
+  current: string | null;
+  total: number;
+  lastChangeAt: number | null;
+  lastReason: string | null;
+  history: CameraTransportHistoryEvent[];
+  historyLimit: number;
+  droppedHistory: number;
 };
 
 type CameraRuntime = {
@@ -107,6 +137,7 @@ type CameraRuntime = {
   maxDetections: number;
   pipelineState: CameraPipelineState;
   restartStats: CameraRestartStats;
+  transport: CameraTransportState;
   cleanup: Array<() => void>;
 };
 
@@ -145,6 +176,8 @@ export type GuardRuntime = {
   pipelines: Map<string, CameraRuntime>;
   retention?: RetentionTask | null;
   resetCircuitBreaker: (identifier: string) => boolean;
+  resetChannelHealth: (identifier: string) => boolean;
+  resetTransportFallback: (identifier: string) => boolean;
 };
 
 const DEFAULT_CHECK_EVERY = 3;
@@ -260,7 +293,12 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       restartMaxDelayMs: audioConfig.restartMaxDelayMs,
       restartJitterFactor: audioConfig.restartJitterFactor,
       forceKillTimeoutMs: audioConfig.forceKillTimeoutMs,
-      micFallbacks: audioConfig.micFallbacks
+      micFallbacks: audioConfig.micFallbacks,
+      silenceThreshold: audioConfig.silenceThreshold,
+      silenceDurationMs: audioConfig.silenceDurationMs,
+      silenceCircuitBreakerThreshold: audioConfig.silenceCircuitBreakerThreshold,
+      analysisRmsWindowMs: audioConfig.analysisRmsWindowMs,
+      deviceDiscoveryTimeoutMs: audioConfig.deviceDiscoveryTimeoutMs
     });
 
     const runtime: AudioRuntime = {
@@ -366,7 +404,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         restartMaxDelayMs: config.restartMaxDelayMs,
         restartJitterFactor: config.restartJitterFactor,
         forceKillTimeoutMs: config.forceKillTimeoutMs,
-        micFallbacks: config.micFallbacks
+        micFallbacks: config.micFallbacks,
+        silenceThreshold: config.silenceThreshold,
+        silenceDurationMs: config.silenceDurationMs,
+        silenceCircuitBreakerThreshold: config.silenceCircuitBreakerThreshold
       });
       configureAnomaly(config.anomaly);
     };
@@ -427,7 +468,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       restartDelayMs: context.pipelineState.ffmpeg.restartDelayMs,
       restartMaxDelayMs: context.pipelineState.ffmpeg.restartMaxDelayMs,
       restartJitterFactor: context.pipelineState.ffmpeg.restartJitterFactor,
-      circuitBreakerThreshold: context.pipelineState.ffmpeg.circuitBreakerThreshold
+      circuitBreakerThreshold: context.pipelineState.ffmpeg.circuitBreakerThreshold,
+      rtspTransportSequence: context.pipelineState.ffmpeg.transportFallbackSequence
     });
 
     const motionDetector = new MotionDetector({
@@ -499,6 +541,16 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
     const cleanup: Array<() => void> = [];
 
+    const transportState: CameraTransportState = {
+      current: source.getCurrentRtspTransport(),
+      total: 0,
+      lastChangeAt: null,
+      lastReason: null,
+      history: [],
+      historyLimit: 20,
+      droppedHistory: 0
+    };
+
     const runtime: CameraRuntime = {
       id: camera.id,
       channel: context.pipelineState.channel,
@@ -522,10 +574,23 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         totalDelayMs: 0,
         historyLimit: CAMERA_RESTART_HISTORY_LIMIT,
         droppedHistory: 0,
-        lastFatal: null
+        lastFatal: null,
+        watchdogRestarts: 0,
+        health: {
+          severity: 'none',
+          reason: null,
+          degradedSince: null
+        }
       },
+      transport: transportState,
       cleanup
     };
+
+    metrics.setPipelineChannelHealth('ffmpeg', runtime.channel, {
+      severity: 'none',
+      restarts: 0,
+      backoffMs: 0
+    });
 
     if (poseEstimator) {
       const motionListener = async (payload: { detector?: string; source?: string; meta?: Record<string, unknown>; ts?: number }) => {
@@ -548,7 +613,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     pipelines.set(context.pipelineState.channel, runtime);
     pipelinesById.set(camera.id, runtime);
 
-    setupSourceHandlers(logger, runtime);
+    setupSourceHandlers(logger, runtime, bus);
     source.start();
 
     logger.info(
@@ -668,7 +733,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         restartMaxDelayMs: context.pipelineState.ffmpeg.restartMaxDelayMs,
         restartJitterFactor: context.pipelineState.ffmpeg.restartJitterFactor,
         forceKillTimeoutMs: context.pipelineState.ffmpeg.forceKillTimeoutMs,
-        circuitBreakerThreshold: context.pipelineState.ffmpeg.circuitBreakerThreshold
+        circuitBreakerThreshold: context.pipelineState.ffmpeg.circuitBreakerThreshold,
+        rtspTransportSequence: context.pipelineState.ffmpeg.transportFallbackSequence
       });
       existing.motionDetector.updateOptions({
         diffThreshold: context.motion.diffThreshold,
@@ -888,6 +954,75 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     return true;
   };
 
+  const resetPipelineTransportFallback = (identifier: string) => {
+    const trimmed = typeof identifier === 'string' ? identifier.trim() : '';
+    if (!trimmed) {
+      return false;
+    }
+
+    const canonicalVideo = canonicalChannel(trimmed);
+    const runtime =
+      pipelines.get(trimmed) ??
+      (canonicalVideo ? pipelines.get(canonicalVideo) : null) ??
+      pipelinesById.get(trimmed) ??
+      pipelinesById.get(trimmed.replace(/^video:/i, '')) ??
+      null;
+
+    if (!runtime) {
+      return false;
+    }
+
+    const resetFn = (runtime.source as VideoSource).resetTransportFallback;
+    if (typeof resetFn !== 'function') {
+      return false;
+    }
+
+    const reset = resetFn.call(runtime.source, {
+      reason: 'manual-cli-reset',
+      record: true,
+      resetsCircuitBreaker: true
+    });
+
+    if (!reset) {
+      return false;
+    }
+
+    logger.info({ camera: runtime.id, channel: runtime.channel }, 'Resetting video transport fallback sequence');
+    return true;
+  };
+
+  const resetPipelineHealth = (identifier: string) => {
+    const trimmed = typeof identifier === 'string' ? identifier.trim() : '';
+    if (!trimmed) {
+      return false;
+    }
+
+    const canonicalVideo = canonicalChannel(trimmed);
+    const runtime =
+      pipelines.get(trimmed) ??
+      (canonicalVideo ? pipelines.get(canonicalVideo) : null) ??
+      pipelinesById.get(trimmed) ??
+      pipelinesById.get(trimmed.replace(/^video:/i, '')) ??
+      null;
+
+    if (!runtime) {
+      return false;
+    }
+
+    runtime.restartStats.watchdogRestarts = 0;
+    runtime.restartStats.watchdogBackoffMs = 0;
+    runtime.restartStats.health.severity = 'none';
+    runtime.restartStats.health.reason = null;
+    runtime.restartStats.health.degradedSince = null;
+    metrics.setPipelineChannelHealth('ffmpeg', runtime.channel, {
+      severity: 'none',
+      restarts: 0,
+      backoffMs: 0
+    });
+    logger.info({ camera: runtime.id, channel: runtime.channel }, 'Resetting video pipeline health counters');
+    return true;
+  };
+
   const stop = () => {
     bus.off('event', eventHandler);
     if (!injectedConfig) {
@@ -916,7 +1051,14 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     retentionTask?.stop();
   };
 
-  return { stop, pipelines, retention: retentionTask, resetCircuitBreaker: resetPipelineCircuitBreaker };
+  return {
+    stop,
+    pipelines,
+    retention: retentionTask,
+    resetCircuitBreaker: resetPipelineCircuitBreaker,
+    resetChannelHealth: resetPipelineHealth,
+    resetTransportFallback: resetPipelineTransportFallback
+  };
 }
 
 function buildCameraList(videoConfig: VideoConfig) {
@@ -1001,7 +1143,9 @@ function resolveCameraFfmpeg(
     restartMaxDelayMs: camera?.restartMaxDelayMs ?? defaults?.restartMaxDelayMs,
     restartJitterFactor: camera?.restartJitterFactor ?? defaults?.restartJitterFactor,
     circuitBreakerThreshold:
-      camera?.circuitBreakerThreshold ?? defaults?.circuitBreakerThreshold
+      camera?.circuitBreakerThreshold ?? defaults?.circuitBreakerThreshold,
+    transportFallbackSequence:
+      camera?.transportFallbackSequence ?? defaults?.transportFallbackSequence
   };
 }
 
@@ -2007,7 +2151,7 @@ export const __test__ = {
 
 export { buildRetentionOptions };
 
-function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
+function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: EventEmitter) {
   const { source } = runtime;
   const personDetector = runtime.personDetector;
 
@@ -2080,6 +2224,7 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
       stats.totalDelayMs += event.delayMs;
       if (event.reason === 'watchdog-timeout') {
         stats.watchdogBackoffMs += event.delayMs;
+        stats.watchdogRestarts += 1;
         metrics.observeLatency('pipeline.ffmpeg.watchdog.delay', event.delayMs);
         metrics.observeHistogram('pipeline.ffmpeg.watchdog.delay', event.delayMs);
       }
@@ -2112,7 +2257,158 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime) {
       },
       `Video source reconnecting (reason=${event.reason})`
     );
+
+    if (event.reason === 'watchdog-timeout') {
+      const evaluation = evaluateRestartSeverity(
+        {
+          watchdogRestarts: stats.watchdogRestarts,
+          watchdogBackoffMs: stats.watchdogBackoffMs
+        },
+        DEFAULT_RESTART_SEVERITY_THRESHOLDS
+      );
+      const previousSeverity = stats.health.severity;
+      const reason = formatRestartSeverityReason(evaluation);
+      const severityOrder: Record<RestartSeverityLevel, number> = {
+        none: 0,
+        warning: 1,
+        critical: 2
+      };
+
+      if (evaluation.severity === 'none') {
+        if (previousSeverity !== 'none') {
+          logger.info(
+            {
+              camera: runtime.id,
+              channel: restartChannel,
+              restarts: stats.watchdogRestarts,
+              watchdogBackoffMs: stats.watchdogBackoffMs
+            },
+            'Video pipeline watchdog recovered below severity thresholds'
+          );
+        }
+        stats.health.severity = 'none';
+        stats.health.reason = null;
+        stats.health.degradedSince = null;
+        metrics.setPipelineChannelHealth('ffmpeg', restartChannel, {
+          severity: 'none',
+          restarts: stats.watchdogRestarts,
+          backoffMs: stats.watchdogBackoffMs
+        });
+        return;
+      }
+
+      if (stats.health.severity === 'none') {
+        stats.health.degradedSince = now;
+      }
+      stats.health.severity = evaluation.severity;
+      stats.health.reason = reason;
+      metrics.setPipelineChannelHealth('ffmpeg', restartChannel, {
+        severity: evaluation.severity,
+        reason,
+        degradedSince: stats.health.degradedSince ?? now,
+        restarts: stats.watchdogRestarts,
+        backoffMs: stats.watchdogBackoffMs
+      });
+
+      if (severityOrder[evaluation.severity] > severityOrder[previousSeverity]) {
+        const eventSeverity = evaluation.severity === 'critical' ? 'critical' : 'warning';
+        const message =
+          evaluation.triggeredBy === 'watchdog-restarts'
+            ? `Video pipeline watchdog restarts exceeded ${evaluation.severity} threshold`
+            : `Video pipeline watchdog backoff exceeded ${evaluation.severity} threshold`;
+        emitEventPayload(bus, {
+          source: restartChannel,
+          detector: 'system',
+          severity: eventSeverity,
+          message,
+          meta: {
+            pipeline: 'ffmpeg',
+            channel: restartChannel,
+            camera: runtime.id,
+            severity: evaluation.severity,
+            triggeredBy: evaluation.triggeredBy,
+            threshold: evaluation.threshold,
+            actual: evaluation.actual,
+            restarts: stats.watchdogRestarts,
+            watchdogBackoffMs: stats.watchdogBackoffMs,
+            degradedSince: stats.health.degradedSince ?? now
+          }
+        });
+        logger.warn(
+          {
+            camera: runtime.id,
+            channel: restartChannel,
+            severity: evaluation.severity,
+            triggeredBy: evaluation.triggeredBy,
+            threshold: evaluation.threshold,
+            restarts: stats.watchdogRestarts,
+            watchdogBackoffMs: stats.watchdogBackoffMs
+          },
+          'Video pipeline watchdog severity threshold exceeded'
+        );
+      }
+    } else {
+      metrics.setPipelineChannelHealth('ffmpeg', restartChannel, {
+        severity: stats.health.severity,
+        reason: stats.health.reason ?? undefined,
+        degradedSince: stats.health.degradedSince ?? undefined,
+        restarts: stats.watchdogRestarts,
+        backoffMs: stats.watchdogBackoffMs
+      });
+    }
   });
+
+  const handleTransportChange = (event: TransportFallbackEvent) => {
+    const state = runtime.transport;
+    const channel = event.channel ?? runtime.channel;
+    const historyEntry: CameraTransportHistoryEvent = {
+      from: event.from ?? null,
+      to: event.to ?? null,
+      reason: event.reason,
+      at: event.at,
+      stage: event.stage ?? null
+    };
+
+    state.current = event.to ?? null;
+    state.lastReason = event.reason;
+    state.lastChangeAt = event.at;
+    state.total += 1;
+    state.history.push(historyEntry);
+    if (state.history.length > state.historyLimit) {
+      const overflow = state.history.length - state.historyLimit;
+      state.history.splice(0, overflow);
+      state.droppedHistory += overflow;
+    }
+
+    if (!event.metricsRecorded) {
+      metrics.recordTransportFallback('ffmpeg', event.reason, {
+        channel,
+        from: event.from ?? null,
+        to: event.to ?? null,
+        attempt: event.attempt,
+        stage: event.stage ?? undefined,
+        resetsBackoff: event.resetsBackoff,
+        resetsCircuitBreaker: event.resetsCircuitBreaker,
+        at: event.at
+      });
+    }
+
+    logger.warn(
+      {
+        camera: runtime.id,
+        channel,
+        from: event.from ?? null,
+        to: event.to ?? null,
+        reason: event.reason,
+        stage: event.stage ?? undefined,
+        attempt: event.attempt
+      },
+      'Video source RTSP transport fallback applied'
+    );
+  };
+
+  source.on('transport-change', handleTransportChange);
+  runtime.cleanup.push(() => source.off('transport-change', handleTransportChange));
 
   source.on('fatal', (event: FatalEvent) => {
     const now = Date.now();
