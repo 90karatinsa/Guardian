@@ -937,6 +937,98 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioCircuitBreakerReuseLastMic retries using last successful mic before advancing', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const attemptedDevices: string[] = [];
+    const processes: ReturnType<typeof createFakeProcess>[] = [];
+    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
+      const deviceIndex = args.indexOf('-i');
+      attemptedDevices.push(deviceIndex >= 0 ? args[deviceIndex + 1] : 'unknown');
+      const proc = createFakeProcess();
+      processes.push(proc);
+      return proc as unknown as ChildProcessWithoutNullStreams;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:circuit',
+      sampleRate: 8000,
+      frameDurationMs: 20,
+      silenceCircuitBreakerThreshold: 2,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      deviceDiscoveryTimeoutMs: 0,
+      micFallbacks: {
+        linux: [{ format: 'alsa', device: 'hw:1' }]
+      },
+      random: () => 0.5
+    });
+
+    source.on('error', () => {});
+    source.start();
+
+    await flushTimers();
+    await Promise.resolve();
+
+    const frameBytes = Math.round((8000 * 20) / 1000) * 2;
+    expect(processes.length).toBeGreaterThanOrEqual(1);
+    const firstProc = processes[0];
+    expect(firstProc).toBeDefined();
+
+    const noisyFrame = Buffer.alloc(frameBytes);
+    for (let offset = 0; offset < frameBytes; offset += 2) {
+      noisyFrame.writeInt16LE(2000, offset);
+    }
+    firstProc.stdout.emit('data', noisyFrame);
+
+    await Promise.resolve();
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+
+    (source as any).micCandidateIndex = 1;
+    (source as any).activeMicCandidateIndex = 1;
+    (source as any).circuitBroken = true;
+    (source as any).shouldStop = true;
+    (source as any).circuitBreakerFailures = 2;
+    (source as any).lastCircuitCandidateReason = 'stream-silence';
+
+    const wasBroken = source.resetCircuitBreaker({ restart: false });
+    expect(wasBroken).toBe(true);
+    expect(source.isCircuitBroken()).toBe(false);
+    expect((source as any).micCandidateIndex).toBe((source as any).lastSuccessfulMicIndex);
+
+    (source as any).startPipeline();
+    await Promise.resolve();
+    await flushTimers();
+    expect(processes.length).toBeGreaterThanOrEqual(2);
+    expect(attemptedDevices[1]).toContain('default');
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+
+    (source as any).shouldStop = false;
+    (source as any).circuitBroken = false;
+    (source as any).micCandidateIndex = 1;
+    (source as any).activeMicCandidateIndex = null;
+
+    (source as any).startPipeline();
+    await Promise.resolve();
+    await flushTimers();
+    expect(processes.length).toBeGreaterThanOrEqual(3);
+    expect(attemptedDevices[2]).toContain('hw:1');
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+    platformSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
   it('AudioDeviceDiscoveryCircuitBreaker emits fatal event after repeated timeouts', async () => {
     vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');

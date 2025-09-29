@@ -23,6 +23,7 @@ export interface PersonDetectorOptions {
   snapshotDir?: string;
   minIntervalMs?: number;
   maxDetections?: number;
+  nmsThreshold?: number;
   classIndices?: number[];
   objectClassifier?: ObjectClassifier;
   classScoreThresholds?: Record<number, number>;
@@ -100,12 +101,14 @@ export class PersonDetector {
         return;
       }
 
+      const nmsThreshold = this.options.nmsThreshold ?? DEFAULT_NMS_IOU_THRESHOLD;
+
       const detections = parseYoloDetections(outputTensors, meta, {
         classIndex: PERSON_CLASS_INDEX,
         classIndices: this.classIndices,
         scoreThreshold: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
         classScoreThresholds: this.classScoreThresholds,
-        nmsThreshold: DEFAULT_NMS_IOU_THRESHOLD,
+        nmsThreshold,
         maxDetections: this.options.maxDetections
       });
 
@@ -154,7 +157,7 @@ export class PersonDetector {
           fusion: serializeFusion(primaryDetection),
           thresholds: {
             score: this.options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
-            nms: DEFAULT_NMS_IOU_THRESHOLD,
+            nms: nmsThreshold,
             classScoreThresholds: this.classScoreThresholds
               ? { ...this.classScoreThresholds }
               : undefined,

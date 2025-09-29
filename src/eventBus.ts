@@ -40,6 +40,7 @@ type SuppressionTimeline = {
   history: number[];
   lastUpdatedAt: number;
   channel: string | null;
+  timelineTtlMs?: number;
 };
 
 type TimelinePruneResult = {
@@ -563,6 +564,12 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
   const windowMs = normalizeWindowMs(rule.suppressForMs);
   const channels = normalizeRuleChannels(asArray(rule.channel));
   const timelineTtlMs = normalizeWindowMs(rule.timelineTtlMs);
+  const effectiveTimelineTtlMs =
+    typeof rule.timelineTtlMs === 'number' && rule.timelineTtlMs === 0
+      ? 0
+      : timelineTtlMs > 0
+      ? timelineTtlMs
+      : undefined;
   return {
     id: rule.id,
     detectors: asArray(rule.detector),
@@ -573,19 +580,20 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     rateLimit,
     maxEvents,
     reason: rule.reason,
-    timeline: createTimeline(null),
+    timeline: createTimeline(null, effectiveTimelineTtlMs),
     timelines: new Map<string, SuppressionTimeline>(),
     historyLimit: Math.max(rateLimit?.count ?? 0, maxEvents ?? 0, 10),
-    timelineTtlMs: timelineTtlMs > 0 ? timelineTtlMs : undefined
+    timelineTtlMs: effectiveTimelineTtlMs
   };
 }
 
-function createTimeline(channel: string | null): SuppressionTimeline {
+function createTimeline(channel: string | null, timelineTtlMs?: number): SuppressionTimeline {
   return {
     suppressedUntil: 0,
     history: [],
     lastUpdatedAt: 0,
-    channel: channel ?? null
+    channel: channel ?? null,
+    timelineTtlMs: typeof timelineTtlMs === 'number' ? timelineTtlMs : undefined
   };
 }
 
@@ -648,7 +656,8 @@ function pruneTimeline(
 ): TimelinePruneResult {
   let ttlPruned = 0;
   let clearedAllByTtl = false;
-  const timelineTtlMs = rule.timelineTtlMs ?? 0;
+  const timelineTtlMs =
+    rule.timelineTtlMs ?? (typeof timeline.timelineTtlMs === 'number' ? timeline.timelineTtlMs : 0);
   if (timelineTtlMs > 0) {
     const cutoff = ts - timelineTtlMs;
     const lastHistoryTs = timeline.history.length > 0 ? timeline.history[timeline.history.length - 1] : 0;
@@ -767,7 +776,7 @@ function getTimelineForRule(
   if (existing) {
     return { timeline: existing, key: normalized };
   }
-  const created = createTimeline(normalized);
+  const created = createTimeline(normalized, rule.timelineTtlMs);
   rule.timelines.set(normalized, created);
   return { timeline: created, key: normalized };
 }

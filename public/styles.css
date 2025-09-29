@@ -212,6 +212,30 @@ h1 {
   color: #52606d;
 }
 
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: #e4ebf2;
+  color: #364152;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.status-badge.severity-warning {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.status-badge.severity-critical {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
 .warning-list {
   list-style: none;
   margin: 0;

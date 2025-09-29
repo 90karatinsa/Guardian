@@ -441,8 +441,8 @@ export class MotionDetector {
         dynamicBackoffFrames,
         baseEffectiveDebounce
       );
-      const noiseAdjustedDebounce = baseEffectiveDebounce + debouncePadding;
-      const noiseAdjustedBackoff = dynamicBackoffFrames + backoffPadding;
+      const noiseAdjustedDebounce = Math.max(0, baseEffectiveDebounce + debouncePadding);
+      const noiseAdjustedBackoff = Math.max(0, dynamicBackoffFrames + backoffPadding);
       const temporalDebouncePadding = this.computeTemporalDebouncePadding(
         noiseAdjustedDebounce,
         temporalWindowSize,
@@ -453,8 +453,14 @@ export class MotionDetector {
         temporalWindowSize,
         temporalBackoffSmoothing
       );
-      const effectiveDebounceFrames = noiseAdjustedDebounce + temporalDebouncePadding;
-      const effectiveBackoffFrames = noiseAdjustedBackoff + temporalBackoffPadding;
+      const effectiveDebounceFrames = Math.max(
+        0,
+        noiseAdjustedDebounce + temporalDebouncePadding
+      );
+      const effectiveBackoffFrames = Math.max(
+        0,
+        noiseAdjustedBackoff + temporalBackoffPadding
+      );
       metrics.setDetectorGauge('motion', 'temporalDebouncePadding', temporalDebouncePadding);
       metrics.setDetectorGauge('motion', 'temporalBackoffPadding', temporalBackoffPadding);
 
@@ -487,7 +493,11 @@ export class MotionDetector {
 
       metrics.setDetectorGauge('motion', 'effectiveDebounceFrames', effectiveDebounceFrames);
       metrics.setDetectorGauge('motion', 'effectiveBackoffFrames', effectiveBackoffFrames);
-      metrics.setDetectorGauge('motion', 'noiseBackoffPadding', this.noiseBackoffPadding);
+      metrics.setDetectorGauge(
+        'motion',
+        'noiseBackoffPadding',
+        Math.max(0, this.noiseBackoffPadding)
+      );
 
       this.areaBaseline = nextBaseline;
       this.baselineFrame = smoothed;
@@ -769,7 +779,7 @@ export class MotionDetector {
     windowSize: number,
     smoothing: number
   ) {
-    if (this.temporalSuppression <= 0) {
+    if (this.temporalSuppression <= 0 || baseDebounce <= 0) {
       return 0;
     }
     const windowLimit = Math.max(
@@ -792,7 +802,7 @@ export class MotionDetector {
     windowSize: number,
     smoothing: number
   ) {
-    if (this.temporalSuppression <= 0) {
+    if (this.temporalSuppression <= 0 || baseBackoff <= 0) {
       return 0;
     }
     const windowLimit = Math.max(

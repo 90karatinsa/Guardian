@@ -720,11 +720,28 @@ function renderMetricsMessage(message) {
   pipelineMetricsContainer.appendChild(note);
 }
 
-function createMetricsRow(label, detail) {
+function createMetricsRow(label, detail, options = {}) {
   const item = document.createElement('div');
   item.className = 'metrics-channel';
+  if (options.tooltip) {
+    item.title = options.tooltip;
+  }
   const name = document.createElement('span');
   name.textContent = label;
+  if (options.badge) {
+    const badge = document.createElement('span');
+    const badgeClasses = ['status-badge'];
+    if (options.badge.className) {
+      badgeClasses.push(options.badge.className);
+    }
+    badge.className = badgeClasses.join(' ');
+    badge.textContent = options.badge.label;
+    if (options.badge.tooltip) {
+      badge.title = options.badge.tooltip;
+    }
+    name.append(' ');
+    name.append(badge);
+  }
   const text = document.createElement('small');
   text.textContent = detail;
   item.append(name, text);
@@ -886,7 +903,10 @@ function renderChannelStatus() {
         restarts: 0,
         lastRestartAt: null,
         lastRestartReason: null,
-        watchdogBackoffMs: null
+        watchdogBackoffMs: null,
+        healthSeverity: 'none',
+        healthReason: null,
+        healthDegradedSince: null
       });
     });
   }
@@ -905,12 +925,18 @@ function renderChannelStatus() {
       restarts: 0,
       lastRestartAt: null,
       lastRestartReason: null,
-      watchdogBackoffMs: null
+      watchdogBackoffMs: null,
+      healthSeverity: 'none',
+      healthReason: null,
+      healthDegradedSince: null
     };
     existing.restarts = entry.restarts ?? 0;
     existing.lastRestartAt = entry.lastRestartAt ?? null;
     existing.lastRestartReason = entry.lastRestart?.reason ?? null;
     existing.watchdogBackoffMs = entry.watchdogBackoffMs ?? null;
+    existing.healthSeverity = entry.health?.severity ?? existing.healthSeverity ?? 'none';
+    existing.healthReason = entry.health?.reason ?? existing.healthReason ?? null;
+    existing.healthDegradedSince = entry.health?.degradedSince ?? existing.healthDegradedSince ?? null;
     channelMap.set(channelId, existing);
   });
 
@@ -952,8 +978,45 @@ function renderChannelStatus() {
     if (typeof entry.watchdogBackoffMs === 'number' && entry.watchdogBackoffMs > 0) {
       parts.push(`${Math.round(entry.watchdogBackoffMs)}ms watchdog delay`);
     }
+    const severity = entry.healthSeverity ?? 'none';
+    let tooltip;
+    const rowOptions = {};
+    if (severity && severity !== 'none') {
+      const label = severity.charAt(0).toUpperCase() + severity.slice(1);
+      const sinceText = entry.healthDegradedSince ? formatRelativeTime(entry.healthDegradedSince) : null;
+      const healthDetail = [`health ${severity}`];
+      if (sinceText) {
+        healthDetail.push(`since ${sinceText}`);
+      }
+      parts.push(healthDetail.join(' '));
+      const badge = {
+        label,
+        className: `severity-${severity}`
+      };
+      const tooltipParts = [];
+      if (entry.healthReason) {
+        tooltipParts.push(entry.healthReason);
+      }
+      if (entry.healthDegradedSince) {
+        const degradedTs = Date.parse(entry.healthDegradedSince);
+        if (Number.isFinite(degradedTs)) {
+          tooltipParts.push(`Degraded since ${new Date(degradedTs).toLocaleString()}`);
+        }
+      }
+      if (tooltipParts.length > 0) {
+        tooltip = tooltipParts.join(' • ');
+      }
+      rowOptions.badge = badge;
+    }
+    if (tooltip) {
+      rowOptions.tooltip = tooltip;
+    }
     const detail = parts.join(' · ');
-    list.appendChild(createMetricsRow(entry.id, detail));
+    if (Object.keys(rowOptions).length > 0) {
+      list.appendChild(createMetricsRow(entry.id, detail, rowOptions));
+    } else {
+      list.appendChild(createMetricsRow(entry.id, detail));
+    }
   });
   channelStatusContainer.appendChild(list);
 }

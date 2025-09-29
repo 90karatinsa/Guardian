@@ -463,7 +463,11 @@ describe('ConfigHotReload', () => {
       error: vi.fn()
     };
 
-    const metricsMock = { recordEvent: vi.fn(), recordSuppressedEvent: vi.fn() };
+    const metricsMock = {
+      recordEvent: vi.fn(),
+      recordSuppressedEvent: vi.fn(),
+      recordSuppressionHistoryTtlPruned: vi.fn()
+    };
     const bus = new EventBus({ store: vi.fn(), log: busLogger as any, metrics: metricsMock as any });
 
     const runtime = await startGuard({ bus, logger, configManager: manager });
@@ -570,6 +574,130 @@ describe('ConfigHotReload', () => {
         logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
       ).toBe(false);
       expect(MockVideoSource.instances).toHaveLength(1);
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('ConfigHotReloadSuppressionTimelineTtl updates TTL without restart', async () => {
+    const initialConfig = createConfig({
+      diffThreshold: 24,
+      suppressionRules: [
+        {
+          id: 'ttl-rule',
+          detector: 'motion',
+          source: 'video:cam-1',
+          maxEvents: 2,
+          suppressForMs: 600,
+          timelineTtlMs: 1000,
+          reason: 'initial timeline ttl'
+        }
+      ]
+    });
+    fs.writeFileSync(configPath, JSON.stringify(initialConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const busLogger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const metricsMock = {
+      recordEvent: vi.fn(),
+      recordSuppressedEvent: vi.fn(),
+      recordSuppressionHistoryTtlPruned: vi.fn()
+    };
+
+    const bus = new EventBus({ store: vi.fn(), log: busLogger as any, metrics: metricsMock as any });
+
+    const runtime = await startGuard({ bus, logger, configManager: manager });
+
+    try {
+      const initialRule = (bus as any).suppressionRules.find((rule: any) => rule.id === 'ttl-rule');
+      expect(initialRule.timelineTtlMs).toBe(1000);
+      expect(initialRule.timeline.timelineTtlMs).toBe(1000);
+
+      const updatedConfig = createConfig({
+        diffThreshold: 24,
+        suppressionRules: [
+          {
+            id: 'ttl-rule',
+            detector: 'motion',
+            source: 'video:cam-1',
+            maxEvents: 2,
+            suppressForMs: 600,
+            timelineTtlMs: 250,
+            reason: 'updated timeline ttl'
+          }
+        ]
+      });
+
+      fs.writeFileSync(configPath, JSON.stringify(updatedConfig, null, 2));
+
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
+      );
+
+      const reloadCall = logger.info.mock.calls.find(([, message]) => message === 'configuration reloaded');
+      expect(reloadCall?.[0]).toMatchObject({ cameras: 1, channels: 0, audioFallbacks: 0 });
+
+      const updatedRule = (bus as any).suppressionRules.find((rule: any) => rule.id === 'ttl-rule');
+      expect(updatedRule.timelineTtlMs).toBe(250);
+      expect(updatedRule.timeline.timelineTtlMs).toBe(250);
+
+      metricsMock.recordSuppressionHistoryTtlPruned.mockClear();
+
+      expect(bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 0,
+        meta: { channel: 'video:cam-1' }
+      })).toBe(true);
+      expect(bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 80,
+        meta: { channel: 'video:cam-1' }
+      })).toBe(true);
+      expect(bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 140,
+        meta: { channel: 'video:cam-1' }
+      })).toBe(false);
+
+      const channelTimeline = Array.from(updatedRule.timelines.values())[0];
+      expect(channelTimeline?.timelineTtlMs).toBe(250);
+
+      expect(metricsMock.recordSuppressionHistoryTtlPruned).not.toHaveBeenCalled();
+
+      expect(bus.emitEvent({
+        source: 'video:cam-1',
+        detector: 'motion',
+        severity: 'warning',
+        message: 'motion detected',
+        ts: 950,
+        meta: { channel: 'video:cam-1' }
+      })).toBe(true);
+
+      expect(metricsMock.recordSuppressionHistoryTtlPruned).toHaveBeenCalledWith(
+        expect.objectContaining({ ruleId: 'ttl-rule', count: expect.any(Number) })
+      );
     } finally {
       runtime.stop();
     }

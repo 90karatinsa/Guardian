@@ -24,6 +24,7 @@ class MockVideoSource extends EventEmitter {
       restartMaxDelayMs?: number;
       restartJitterFactor?: number;
       circuitBreakerThreshold?: number;
+      rtspTransportSequence?: string[];
     }
   ) {
     super();
@@ -501,6 +502,198 @@ describe('run-guard multi camera orchestration', () => {
       expect(source.resetTransportFallback).toHaveBeenCalled();
     } finally {
       __test__.reset();
+      runtime.stop();
+    }
+  });
+
+  it('VideoTransportFallbackSequenceReload restarts pipelines when fallback sequence changes', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        ffmpeg: { transportFallbackSequence: ['tcp', 'udp'] },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://cam-2/stream',
+            ffmpeg: { transportFallbackSequence: ['udp', 'tcp'] },
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2);
+      await waitFor(() => MockVideoSource.instances.length === 2);
+
+      const [initialCam1, initialCam2] = MockVideoSource.instances;
+
+      expect(initialCam1.options.rtspTransportSequence).toEqual(['tcp', 'udp']);
+      expect(initialCam2.options.rtspTransportSequence).toEqual(['udp', 'tcp']);
+
+      const cam1Stop = vi.spyOn(initialCam1, 'stop');
+      const cam2Stop = vi.spyOn(initialCam2, 'stop');
+
+      metrics.recordPipelineRestart('ffmpeg', 'synthetic', { channel: 'video:cam-1' });
+      metrics.recordPipelineRestart('ffmpeg', 'synthetic', { channel: 'video:cam-2' });
+
+      const beforeSnapshot = metrics.snapshot();
+      expect(beforeSnapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBeGreaterThan(0);
+      expect(beforeSnapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.restarts).toBeGreaterThan(0);
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          ffmpeg: {
+            ...(initialConfig.video?.ffmpeg ?? {}),
+            transportFallbackSequence: ['udp', 'tcp']
+          },
+          cameras: initialConfig.video?.cameras?.map(camera => {
+            if (!camera) {
+              return camera;
+            }
+            if (camera.id === 'cam-2') {
+              return {
+                ...camera,
+                ffmpeg: {
+                  ...(camera.ffmpeg ?? {}),
+                  transportFallbackSequence: ['tcp', 'udp']
+                }
+              };
+            }
+            if (camera.id === 'cam-1') {
+              return {
+                ...camera,
+                ffmpeg: camera.ffmpeg ? { ...camera.ffmpeg } : undefined
+              };
+            }
+            return { ...camera };
+          })
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => MockVideoSource.instances.length === 4);
+
+      const cam1Sources = MockVideoSource.instances.filter(source => source.options.channel === 'video:cam-1');
+      const cam2Sources = MockVideoSource.instances.filter(source => source.options.channel === 'video:cam-2');
+
+      expect(cam1Sources).toHaveLength(2);
+      expect(cam2Sources).toHaveLength(2);
+
+      const newCam1 = cam1Sources.at(-1)!;
+      const newCam2 = cam2Sources.at(-1)!;
+
+      await waitFor(() => runtime.pipelines.get('video:cam-1')?.source === newCam1);
+      await waitFor(() => runtime.pipelines.get('video:cam-2')?.source === newCam2);
+
+      expect(newCam1).not.toBe(initialCam1);
+      expect(newCam2).not.toBe(initialCam2);
+
+      expect(cam1Stop).toHaveBeenCalledTimes(1);
+      expect(cam2Stop).toHaveBeenCalledTimes(1);
+
+      expect(newCam1.options.rtspTransportSequence).toEqual(['udp', 'tcp']);
+      expect(newCam2.options.rtspTransportSequence).toEqual(['tcp', 'udp']);
+
+      const afterSnapshot = metrics.snapshot();
+      expect(afterSnapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBe(0);
+      expect(afterSnapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.restarts).toBe(0);
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('TransportResetCanonicalChannel resets transport fallback using canonical identifiers', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const config: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            ffmpeg: { rtspTransport: 'tcp' },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 },
+            person: { score: 0.5 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      config
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      const pipeline = runtime.pipelines.get('video:cam-1');
+      expect(pipeline).toBeDefined();
+
+      const source = pipeline?.source as MockVideoSource;
+      const transportEvents: Array<Record<string, unknown>> = [];
+
+      source.on('transport-change', payload => {
+        transportEvents.push(payload as Record<string, unknown>);
+      });
+
+      source.options.rtspTransport = 'udp';
+      const mixedCaseResult = runtime.resetTransportFallback('VIDEO:CAM-1');
+      expect(mixedCaseResult).toBe(true);
+
+      await waitFor(() => transportEvents.length === 1);
+      const firstEvent = transportEvents[transportEvents.length - 1];
+      expect(firstEvent).toMatchObject({
+        channel: 'video:cam-1',
+        from: 'udp',
+        to: 'tcp',
+        reason: 'manual-cli-reset'
+      });
+
+      source.options.rtspTransport = 'udp';
+      const bareResult = runtime.resetTransportFallback('cam-1');
+      expect(bareResult).toBe(true);
+
+      await waitFor(() => transportEvents.length === 2);
+      const secondEvent = transportEvents[transportEvents.length - 1];
+      expect(secondEvent).toMatchObject({
+        channel: 'video:cam-1',
+        from: 'udp',
+        to: 'tcp',
+        reason: 'manual-cli-reset'
+      });
+    } finally {
       runtime.stop();
     }
   });
@@ -1203,8 +1396,11 @@ describe('run-guard multi camera orchestration', () => {
       });
 
       const stopListener = vi.fn();
-      const instance = MockVideoSource.instances[0];
-      instance.once('stopped', stopListener);
+      const instance = MockVideoSource.instances.find(
+        source => source.options.channel === 'video:cam-1'
+      );
+      expect(instance).toBeDefined();
+      instance!.once('stopped', stopListener);
 
       manager.setConfig({
         ...initialConfig,
@@ -1219,6 +1415,90 @@ describe('run-guard multi camera orchestration', () => {
       expect(
         snapshot.histograms['pipeline.ffmpeg.restart.jitter.channel.video:cam-1']
       ).toBeUndefined();
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardRemovesStoppedCameraMetrics clears metrics and cleanup hooks for removed cameras', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://camera-2/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const bus = new EventEmitter();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus,
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2);
+
+      const pipeline1 = runtime.pipelines.get('video:cam-1');
+      const pipeline2 = runtime.pipelines.get('video:cam-2');
+      expect(pipeline1).toBeDefined();
+      expect(pipeline2).toBeDefined();
+
+      const cleanupSpy = vi.fn();
+      pipeline1!.cleanup.push(cleanupSpy);
+
+      metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+        channel: 'video:cam-1',
+        jitterMs: 180
+      });
+      metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+        channel: 'video:cam-2',
+        jitterMs: 220
+      });
+
+      const stopListener = vi.fn();
+      const instance = MockVideoSource.instances.find(
+        source => source.options.channel === 'video:cam-1'
+      );
+      expect(instance).toBeDefined();
+      instance!.once('stopped', stopListener);
+
+      manager.setConfig({
+        ...initialConfig,
+        video: {
+          framesPerSecond: 5,
+          cameras: [initialConfig.video!.cameras![1]!]
+        }
+      } as GuardianConfig);
+
+      await waitFor(() => runtime.pipelines.size === 1);
+      await waitFor(() => cleanupSpy.mock.calls.length === 1);
+      await waitFor(() => stopListener.mock.calls.length === 1);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']).toBeUndefined();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']).toBeDefined();
     } finally {
       runtime.stop();
     }
@@ -1725,12 +2005,14 @@ describe('run-guard multi camera orchestration', () => {
           channels: {
             'video:cam-1': {
               person: {
-                classScoreThresholds: { 0: 0.6, 1: 0.7 }
+                classScoreThresholds: { 0: 0.6, 1: 0.7 },
+                nmsThreshold: 0.55
               }
             },
             'video:cam-2': {
               person: {
-                classScoreThresholds: { 0: 0.4 }
+                classScoreThresholds: { 0: 0.4 },
+                nmsThreshold: 0.6
               }
             }
           },
@@ -1740,7 +2022,8 @@ describe('run-guard multi camera orchestration', () => {
               channel: 'video:cam-1',
               input: 'rtsp://camera-1/stream',
               person: {
-                classScoreThresholds: { 0: 0.75 }
+                classScoreThresholds: { 0: 0.75 },
+                nmsThreshold: 0.7
               }
             },
             {
@@ -1753,7 +2036,8 @@ describe('run-guard multi camera orchestration', () => {
         person: {
           modelPath: 'model.onnx',
           score: 0.5,
-          classScoreThresholds: { 0: 0.3, 2: 0.9 }
+          classScoreThresholds: { 0: 0.3, 2: 0.9 },
+          nmsThreshold: 0.45
         },
         motion: {
           diffThreshold: 20,
@@ -1772,6 +2056,8 @@ describe('run-guard multi camera orchestration', () => {
       const [cam1Detector, cam2Detector] = MockPersonDetector.instances;
       expect(cam1Detector.options.classScoreThresholds).toEqual({ 0: 0.75, 1: 0.7, 2: 0.9 });
       expect(cam2Detector.options.classScoreThresholds).toEqual({ 0: 0.4, 2: 0.9 });
+      expect(cam1Detector.options.nmsThreshold).toBe(0.7);
+      expect(cam2Detector.options.nmsThreshold).toBe(0.6);
 
       expect(MockVideoSource.instances).toHaveLength(2);
       const [cam1Source, cam2Source] = MockVideoSource.instances;

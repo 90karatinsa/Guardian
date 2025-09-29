@@ -94,6 +94,53 @@ describe('MotionDetector', () => {
     expect(motionSnapshot.detectors.motion?.gauges?.temporalGateMultiplier ?? 1).toBeGreaterThan(1);
   });
 
+  it('MotionZeroBackoffRespected', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'zero-backoff-motion',
+        diffThreshold: 4,
+        areaThreshold: 0.05,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 0,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.12,
+        areaSmoothing: 0.18,
+        areaInflation: 1.05,
+        noiseWarmupFrames: 0,
+        temporalMedianWindow: 5,
+        temporalMedianBackoffSmoothing: 0.45
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(12, 12, 42);
+    detector.handleFrame(baseline, 0);
+
+    for (let i = 0; i < 18; i += 1) {
+      const phase = i % 3;
+      const noisy =
+        phase < 2
+          ? createFrame(12, 12, (x, y) => (x < 6 ? 232 : 42 + ((x + y + i) % 6)))
+          : createFrame(12, 12, (x, y) => 42 + ((x * 2 + y + i) % 5 === 0 ? 4 : -3));
+      detector.handleFrame(noisy, i + 1);
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(events.some(event => event.detector === 'motion')).toBe(false);
+    const effectiveBackoff = snapshot.detectors.motion?.gauges?.effectiveBackoffFrames ?? -1;
+    expect(effectiveBackoff).toBe(0);
+    expect(snapshot.detectors.motion?.gauges?.noiseBackoffPadding ?? 0).toBeGreaterThanOrEqual(0);
+    expect(snapshot.detectors.motion?.counters?.backoffSuppressedFrames ?? 0).toBe(0);
+
+    const history = (
+      detector as unknown as {
+        getHistorySnapshot(limit: number): Array<{ backoff: boolean; reason: string }>;
+      }
+    ).getHistorySnapshot(32);
+    expect(history.some(entry => entry.backoff || entry.reason === 'backoff')).toBe(false);
+  });
+
   it('MotionFrameResizeRecovery resumes detection after frame size changes', () => {
     const detector = new MotionDetector(
       {
