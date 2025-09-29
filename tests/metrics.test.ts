@@ -347,6 +347,8 @@ describe('MetricsCounters', () => {
     expect(exported.currentLevel).toBe('info');
     expect(exported.lastLevelChangeAt).toBeNull();
     expect(exported.levelChanges).toEqual({});
+    expect(exported.levelIndex.debug).toBe(1);
+    expect(exported.histogramIndex.error).toBe(4);
   });
 
   it('MetricsHistogramBuckets exports pipeline watchdog counters and detector latency histograms', () => {
@@ -455,6 +457,41 @@ describe('MetricsCounters', () => {
     expect(detectorProm).toMatch(
       /guardian_detector_gauge\{detector="motion",gauge="backoffFactor",instance="lab-node"\} 0.5/
     );
+  });
+
+  it('MetricsLogLevelPrometheusExport orders log level gauges by Pino index', () => {
+    const registry = new MetricsRegistry();
+
+    registry.incrementLogLevel('warn');
+    registry.incrementLogLevel('debug');
+    registry.incrementLogLevel('trace');
+    registry.incrementLogLevel('error');
+
+    registry.recordLogLevelChange('warn', 'info');
+    registry.recordLogLevelChange('debug', 'warn');
+
+    const prom = registry.exportLogLevelCountersForPrometheus();
+
+    const totalLevels = prom
+      .split('\n')
+      .filter(line => line.startsWith('guardian_log_level_total{'))
+      .map(line => line.match(/level="([^"]+)"/)?.[1])
+      .filter((level): level is string => Boolean(level));
+    expect(totalLevels).toEqual(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+
+    const changeLevels = prom
+      .split('\n')
+      .filter(line => line.startsWith('guardian_log_level_change_total{'))
+      .map(line => line.match(/level="([^"]+)"/)?.[1])
+      .filter((level): level is string => Boolean(level));
+    expect(changeLevels).toEqual(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+
+    const metrics = registry.exportLogLevelMetrics();
+    expect(metrics.levelIndex.warn).toBe(3);
+    expect(metrics.histogramIndex.debug).toBe(1);
+
+    const snapshot = registry.snapshot();
+    expect(snapshot.logs.levelIndex.info).toBe(2);
   });
 
   it('MetricsChannelJitterHistogram exports per-channel jitter histograms', () => {
@@ -586,6 +623,8 @@ describe('MetricsSnapshotEnrichment', () => {
     expect(snapshot.logs.histogram.info).toBe(1);
     expect(snapshot.logs.histogram.error).toBe(1);
     expect(snapshot.logs.histogram.warn).toBe(0);
+    expect(snapshot.logs.levelIndex.trace).toBe(0);
+    expect(snapshot.logs.histogramIndex.fatal).toBe(5);
     expect(snapshot.suppression.byType.window).toBe(2);
     expect(snapshot.suppression.byType['rate-limit']).toBe(1);
     expect(snapshot.suppression.historyTotals.historyCount).toBe(9);

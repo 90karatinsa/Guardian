@@ -46,6 +46,8 @@ type SuppressionTimeline = {
 type TimelinePruneResult = {
   ttlPruned: number;
   timelineExpired: boolean;
+  timelineTtlMs?: number;
+  timelineClearedByTtl: boolean;
 };
 
 type SuppressionHitType = 'window' | 'rate-limit';
@@ -59,6 +61,9 @@ interface SuppressionHit {
   rateLimit?: RateLimitConfig;
   cooldownMs?: number;
   channel: string | null;
+  timelineTtlMs?: number;
+  timelineHistoryTtlPruned?: number;
+  timelineHistoryTtlExpired?: boolean;
 }
 
 type ChannelSuppressionState = {
@@ -216,7 +221,10 @@ class EventBus extends EventEmitter {
           cooldownRemainingMs,
           cooldownExpiresAt,
           combinedHistory,
-          combinedHistoryCount: combinedHistory.length
+          combinedHistoryCount: combinedHistory.length,
+          timelineTtlMs: hit.timelineTtlMs,
+          timelineHistoryTtlPruned: hit.timelineHistoryTtlPruned,
+          timelineHistoryTtlExpired: hit.timelineHistoryTtlExpired
         };
       });
       suppressedBy.forEach((suppressedMeta, index) => {
@@ -304,6 +312,9 @@ class EventBus extends EventEmitter {
         suppressionChannel: primaryChannel,
         suppressionChannels: [...eventChannels],
         suppressionWindowRemainingMs: primaryWindowRemainingMs,
+        suppressionTimelineTtlMs: primary?.timelineTtlMs,
+        suppressionTimelineHistoryTtlPruned: primary?.timelineHistoryTtlPruned ?? 0,
+        suppressionTimelineHistoryTtlExpired: primary?.timelineHistoryTtlExpired ?? false,
         suppressionChannelStates: Object.fromEntries(
           Array.from(channelStates.entries()).map(([channel, state]) => [
             channel,
@@ -350,7 +361,10 @@ class EventBus extends EventEmitter {
           windowRemainingMs: suppressedMeta.windowRemainingMs,
           cooldownRemainingMs: suppressedMeta.cooldownRemainingMs,
           cooldownExpiresAt: suppressedMeta.cooldownExpiresAt,
-          channelStates: meta.suppressionChannelStates
+          channelStates: meta.suppressionChannelStates,
+          timelineTtlMs: hit.timelineTtlMs,
+          timelineHistoryTtlPruned: hit.timelineHistoryTtlPruned,
+          timelineHistoryTtlExpired: hit.timelineHistoryTtlExpired
         };
         this.metrics.recordSuppressedEvent(detail);
       });
@@ -401,7 +415,9 @@ class EventBus extends EventEmitter {
         this.metrics.recordSuppressionHistoryTtlPruned({
           ruleId: rule.id,
           channel: timelineKey,
-          count: pruneResult.ttlPruned
+          count: pruneResult.ttlPruned,
+          timelineTtlMs: pruneResult.timelineTtlMs,
+          timelineExpired: pruneResult.timelineClearedByTtl
         });
       }
       if (pruneResult.timelineExpired && timelineKey) {
@@ -435,7 +451,10 @@ class EventBus extends EventEmitter {
           windowExpiresAt: timeline.suppressedUntil,
           rateLimit: rule.rateLimit,
           cooldownMs: windowCooldown > 0 ? windowCooldown : undefined,
-          channel
+          channel,
+          timelineTtlMs: pruneResult.timelineTtlMs,
+          timelineHistoryTtlPruned: pruneResult.ttlPruned,
+          timelineHistoryTtlExpired: pruneResult.timelineClearedByTtl
         });
         continue;
       }
@@ -457,7 +476,10 @@ class EventBus extends EventEmitter {
           windowExpiresAt: windowExpiresAt > 0 ? windowExpiresAt : undefined,
           rateLimit: rule.rateLimit,
           cooldownMs: undefined,
-          channel
+          channel,
+          timelineTtlMs: pruneResult.timelineTtlMs,
+          timelineHistoryTtlPruned: pruneResult.ttlPruned,
+          timelineHistoryTtlExpired: pruneResult.timelineClearedByTtl
         });
         continue;
       }
@@ -494,7 +516,10 @@ class EventBus extends EventEmitter {
           windowExpiresAt: windowUntil,
           rateLimit: rateLimitConfig,
           cooldownMs: cooldownMs > 0 ? cooldownMs : undefined,
-          channel
+          channel,
+          timelineTtlMs: pruneResult.timelineTtlMs,
+          timelineHistoryTtlPruned: pruneResult.ttlPruned,
+          timelineHistoryTtlExpired: pruneResult.timelineClearedByTtl
         });
         continue;
       }
@@ -719,7 +744,12 @@ function pruneTimeline(
     timeline.history.length === 0 &&
     (timeline.suppressedUntil === 0 || timeline.suppressedUntil <= ts);
 
-  return { ttlPruned, timelineExpired };
+  return {
+    ttlPruned,
+    timelineExpired,
+    timelineTtlMs: timelineTtlMs > 0 ? timelineTtlMs : undefined,
+    timelineClearedByTtl: clearedAllByTtl
+  };
 }
 
 function recordTimelineHistory(

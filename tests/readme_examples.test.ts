@@ -69,6 +69,9 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('pipelines.ffmpeg.restartHistogram.delay');
     expect(readme).toContain('metrics.suppression.histogram.historyCount');
     expect(readme).toContain('metrics.logs.byLevel.error');
+    expect(readme).toContain('Reset pipeline health, circuit breaker, and transport fallback');
+    expect(readme).toContain('config.video.channels.video:unused-channel does not match any configured camera channel');
+    expect(readme).toContain('HttpSseResponseErrorCleanup');
     expect(readme).toContain('metrics.exportLogLevelCountersForPrometheus');
     expect(readme).toContain('guardian_log_level_total');
     expect(readme).toContain('guardian_log_last_error_timestamp_seconds');
@@ -154,6 +157,20 @@ it('ReadmeTransportFallbackDocs documents transport ladder metrics and warnings 
   expect(operations).toContain('metricsSummary.retention.runs');
 });
 
+it('ReadmeExamplesSnapshots stays in sync with SSE cleanup notes', () => {
+  const readme = readReadme();
+  expect(readme).toContain('streamSnapshots');
+  expect(readme).toContain('HttpSseResponseErrorCleanup');
+  expect(readme).toContain('metrics=audio,retention');
+});
+
+it('ReadmeExamples install section documents pipeline reset side effects', () => {
+  const readme = readReadme();
+  expect(readme).toContain('pnpm install');
+  expect(readme).toContain('guardian daemon pipelines reset --channel');
+  expect(readme).toContain('Reset pipeline health, circuit breaker, and transport fallback');
+});
+
 describe('OperationsDocLinks', () => {
   it('OperationsDocLinks ensures README links to operations manual and sections are present', () => {
     const readme = readReadme();
@@ -169,5 +186,8 @@ describe('OperationsDocLinks', () => {
     expect(operations).toContain('guardian_log_level_total');
     expect(operations).toContain('guardian_ffmpeg_restart_jitter_ms');
     expect(operations).toContain('guardian_detector_counter_total');
+    expect(operations).toContain('Reset pipeline health, circuit breaker, and transport fallback');
+    expect(operations).toContain('HttpSseResponseErrorCleanup');
+    expect(operations).toContain('config.video.channels.<kanal>');
   });
 });

@@ -82,8 +82,8 @@ describe('AudioSource resilience', () => {
     expect(event.meta.baseDelayMs).toBe(500);
     expect(event.meta.minDelayMs).toBe(500);
     expect(errorSpy).toHaveBeenCalled();
-
     vi.advanceTimersByTime(500);
+    await vi.runOnlyPendingTimersAsync();
     expect(spawnMock).toHaveBeenCalledTimes(4);
 
     source.stop();
@@ -218,7 +218,9 @@ describe('AudioSource resilience', () => {
 
     const frameSizeSamples = (8000 * 50) / 1000;
     const hopSizeSamples = (8000 * 25) / 1000;
-    const expectedWindows = 1 + (framesEmitted - 1) * (frameSizeSamples / hopSizeSamples);
+    const expectedWindows = Math.ceil(
+      (framesEmitted * frameSizeSamples) / hopSizeSamples
+    );
     expect(meydaExtractMock).toHaveBeenCalledTimes(expectedWindows);
     expect(meydaExtractMock.mock.calls[0]?.[1]).toBeInstanceOf(Float32Array);
     source.stop();
@@ -869,6 +871,101 @@ describe('AudioSource resilience', () => {
     platformSpy.mockRestore();
   });
 
+  it('AudioSourceMicFallbackIndexReset resets candidate order and analysis after discovery timeout', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const discoverySequence = [true, false, true];
+    const listDevicesSpy = vi
+      .spyOn(AudioSource, 'listDevices')
+      .mockImplementation(async () => {
+        const next = discoverySequence.shift();
+        if (next === false) {
+          const error = new Error('timeout') as ExecFileException & {
+            code?: string;
+            timedOut?: boolean;
+          };
+          error.code = 'ETIME';
+          error.timedOut = true;
+          throw error;
+        }
+        return [
+          { format: 'pulse', device: 'hw:primary' },
+          { format: 'pulse', device: 'hw:fallback' }
+        ];
+      });
+
+    const processes: ReturnType<typeof createFakeProcess>[] = [];
+    spawnMock.mockImplementation((_cmd: string) => {
+      const proc = createFakeProcess();
+      (proc as any).stdin = new PassThrough();
+      processes.push(proc);
+      return proc as unknown as ChildProcessWithoutNullStreams;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:mic',
+      device: 'hw:primary',
+      sampleRate: 8000,
+      channels: 1,
+      frameDurationMs: 50,
+      restartDelayMs: 10,
+      restartMaxDelayMs: 10,
+      restartJitterFactor: 0,
+      analysisRmsWindowMs: 100,
+      random: () => 0.5
+    });
+
+    const recoverReasons: string[] = [];
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      await waitForCondition(() => spawnMock.mock.calls.length >= 1, 200);
+
+      const firstProc = processes[0];
+      const frameBytes = (8000 * 50) / 1000 * 2;
+      firstProc.stdout.emit('data', Buffer.alloc(frameBytes, 4));
+      await Promise.resolve();
+
+      const snapshotBefore = source.getAnalysisSnapshot();
+      expect(Object.keys(snapshotBefore)).not.toHaveLength(0);
+
+      firstProc.emit('close', 1);
+      await Promise.resolve();
+
+      expect((source as any).micCandidateIndex).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+
+      expect(recoverReasons).toContain('device-discovery-timeout');
+      expect((source as any).micCandidateIndex).toBe(0);
+
+      expect(source.getAnalysisSnapshot()).toEqual({});
+
+      await vi.advanceTimersByTimeAsync(10);
+      await waitForCondition(() => spawnMock.mock.calls.length >= 2, 200);
+
+      const secondArgs = spawnMock.mock.calls[1][1] as string[];
+      expect(secondArgs).toContain('hw:primary');
+
+      const secondProc = processes[1];
+      secondProc.stdout.emit('data', Buffer.alloc(frameBytes, 6));
+      await Promise.resolve();
+
+      const snapshotAfter = source.getAnalysisSnapshot();
+      const formats = Object.keys(snapshotAfter);
+      expect(formats).toHaveLength(1);
+      expect(snapshotAfter[formats[0]].frames).toBe(1);
+    } finally {
+      source.stop();
+      await vi.runOnlyPendingTimersAsync();
+      listDevicesSpy.mockRestore();
+    }
+  });
+
   it('AudioWatchdogSilenceReset recovers from silence and restarts on watchdog timeout', async () => {
     vi.useFakeTimers();
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
@@ -1436,6 +1533,8 @@ describe('AudioSource resilience', () => {
   it('AudioSourceFallback parses device list output with fallback chain', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
     const output = `
 [dshow @ 000002] DirectShow audio devices
 [dshow @ 000002]  "Microphone (USB)"
@@ -1454,18 +1553,24 @@ describe('AudioSource resilience', () => {
       return {} as ChildProcess;
     });
 
-    const devices = await AudioSource.listDevices('auto');
+    AudioSource.clearDeviceCache();
 
-    expect(execFileMock).toHaveBeenCalled();
-    expect(devices).toEqual([
-      { format: 'dshow', device: 'Microphone (USB)' },
-      { format: 'dshow', device: 'Line In (High Definition)' }
-    ]);
+    try {
+      const devices = await AudioSource.listDevices('auto');
 
-    execFileMock.mockClear();
-    const cachedDevices = await AudioSource.listDevices('auto');
-    expect(execFileMock).not.toHaveBeenCalled();
-    expect(cachedDevices).toEqual(devices);
+      expect(execFileMock).toHaveBeenCalled();
+      expect(devices).toEqual([
+        { format: 'dshow', device: 'Line In (High Definition)' },
+        { format: 'dshow', device: 'Microphone (USB)' }
+      ]);
+
+      execFileMock.mockClear();
+      const cachedDevices = await AudioSource.listDevices('auto');
+      expect(execFileMock).not.toHaveBeenCalled();
+      expect(cachedDevices).toEqual(devices);
+    } finally {
+      platformSpy.mockRestore();
+    }
   });
 
   it('AudioDeviceDiscoveryTimeout records timeouts and falls back to alternate probes', async () => {

@@ -1146,20 +1146,32 @@ async function runDaemonPipelinesCommand(args: string[], io: CliIo): Promise<num
       return 1;
     }
 
+    metrics.resetPipelineChannel('ffmpeg', targetChannel);
     metrics.setPipelineChannelHealth('ffmpeg', targetChannel, {
       severity: 'none',
       restarts: 0,
       backoffMs: 0
     });
 
-    let runtimeReset = false;
-    if (state.status === 'running' && state.runtime && typeof state.runtime.resetChannelHealth === 'function') {
-      runtimeReset = state.runtime.resetChannelHealth(targetChannel);
+    let runtimePipelineReset = false;
+    let runtimeCircuitReset = false;
+    let runtimeFallbackReset = false;
+    if (state.status === 'running' && state.runtime) {
+      if (typeof state.runtime.resetChannelHealth === 'function') {
+        runtimePipelineReset = state.runtime.resetChannelHealth(targetChannel);
+      }
+      if (typeof state.runtime.resetCircuitBreaker === 'function') {
+        runtimeCircuitReset = state.runtime.resetCircuitBreaker(targetChannel);
+      }
+      if (typeof state.runtime.resetTransportFallback === 'function') {
+        runtimeFallbackReset = state.runtime.resetTransportFallback(targetChannel);
+      }
     }
 
-    const actionLabel = runtimeReset
-      ? 'Reset pipeline health counters for video channel'
-      : 'Cleared recorded pipeline health for video channel';
+    const actionLabel =
+      runtimePipelineReset || runtimeCircuitReset || runtimeFallbackReset
+        ? 'Reset pipeline health, circuit breaker, and transport fallback for video channel'
+        : 'Cleared recorded pipeline health, circuit breaker, and transport fallback for video channel';
     io.stdout.write(`${actionLabel} ${targetChannel}\n`);
     return 0;
   }

@@ -1354,6 +1354,265 @@ describe('run-guard multi camera orchestration', () => {
     }
   }, 10000);
 
+  it('RunGuardChannelCircuitOverrides updates restart overrides per channel and isolates manual resets', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 6,
+        ffmpeg: {
+          restartDelayMs: 200,
+          restartMaxDelayMs: 900,
+          restartJitterFactor: 0.05,
+          circuitBreakerThreshold: 5
+        },
+        channels: {
+          'video:cam-1': {
+            ffmpeg: { restartDelayMs: 330, circuitBreakerThreshold: 4 }
+          },
+          'video:cam-2': {
+            ffmpeg: { restartDelayMs: 400, circuitBreakerThreshold: 6 }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 18, areaThreshold: 0.02 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://cam-2/stream',
+            person: { score: 0.55 },
+            motion: { diffThreshold: 20, areaThreshold: 0.018 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 },
+      events: { thresholds: { info: 0, warning: 5, critical: 10 } }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2, 4000);
+
+      const pipeline1 = runtime.pipelines.get('video:cam-1');
+      const pipeline2 = runtime.pipelines.get('video:cam-2');
+      expect(pipeline1).toBeDefined();
+      expect(pipeline2).toBeDefined();
+
+      const source1 = pipeline1!.source as MockVideoSource;
+      const source2 = pipeline2!.source as MockVideoSource;
+
+      expect(source1.options.restartDelayMs).toBe(330);
+      expect(source1.options.circuitBreakerThreshold).toBe(4);
+      expect(source2.options.restartDelayMs).toBe(400);
+      expect(source2.options.circuitBreakerThreshold).toBe(6);
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          channels: {
+            'video:cam-1': {
+              ffmpeg: { restartDelayMs: 225, circuitBreakerThreshold: 3 }
+            },
+            'video:cam-2': {
+              ffmpeg: { restartDelayMs: 310, circuitBreakerThreshold: 7 }
+            }
+          }
+        }
+      } as GuardianConfig;
+
+      source1.updateOptions.mockClear();
+      source2.updateOptions.mockClear();
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(
+        () =>
+          source1.updateOptions.mock.calls.length === 1 &&
+          source2.updateOptions.mock.calls.length === 1,
+        4000
+      );
+
+      expect(source1.options.restartDelayMs).toBe(225);
+      expect(source1.options.circuitBreakerThreshold).toBe(3);
+      expect(source2.options.restartDelayMs).toBe(310);
+      expect(source2.options.circuitBreakerThreshold).toBe(7);
+
+      const refreshedPipeline1 = runtime.pipelines.get('video:cam-1');
+      const refreshedPipeline2 = runtime.pipelines.get('video:cam-2');
+      expect(refreshedPipeline1?.pipelineState.ffmpeg.restartDelayMs).toBe(225);
+      expect(refreshedPipeline1?.pipelineState.ffmpeg.circuitBreakerThreshold).toBe(3);
+      expect(refreshedPipeline2?.pipelineState.ffmpeg.restartDelayMs).toBe(310);
+      expect(refreshedPipeline2?.pipelineState.ffmpeg.circuitBreakerThreshold).toBe(7);
+
+      metrics.reset();
+
+      const index1 = MockVideoSource.instances.indexOf(source1);
+      const index2 = MockVideoSource.instances.indexOf(source2);
+      const startBefore1 = MockVideoSource.startCounts[index1];
+      const startBefore2 = MockVideoSource.startCounts[index2];
+
+      source1.circuitBroken = true;
+      source2.circuitBroken = true;
+
+      const resetResult = runtime.resetCircuitBreaker('cam-1');
+      expect(resetResult).toBe(true);
+
+      await Promise.resolve();
+
+      expect(MockVideoSource.startCounts[index1]).toBeGreaterThan(startBefore1);
+      expect(MockVideoSource.startCounts[index2]).toBe(startBefore2);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']).toBeUndefined();
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardHotReloadRollsBack restores channel overrides after reload errors', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 6,
+        ffmpeg: {
+          restartDelayMs: 240,
+          restartMaxDelayMs: 800,
+          restartJitterFactor: 0.05,
+          circuitBreakerThreshold: 4
+        },
+        channels: {
+          'video:cam-1': {
+            ffmpeg: { restartDelayMs: 360, circuitBreakerThreshold: 3 }
+          },
+          'video:cam-2': {
+            ffmpeg: { restartDelayMs: 420, circuitBreakerThreshold: 6 }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 18, areaThreshold: 0.02 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://cam-2/stream',
+            person: { score: 0.55 },
+            motion: { diffThreshold: 20, areaThreshold: 0.018 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 },
+      events: { thresholds: { info: 0, warning: 5, critical: 10 } }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2, 4000);
+
+      const initialPipeline1 = runtime.pipelines.get('video:cam-1');
+      const initialPipeline2 = runtime.pipelines.get('video:cam-2');
+      expect(initialPipeline1).toBeDefined();
+      expect(initialPipeline2).toBeDefined();
+
+      const initialDelay1 = initialPipeline1!.pipelineState.ffmpeg.restartDelayMs;
+      const initialCircuit1 = initialPipeline1!.pipelineState.ffmpeg.circuitBreakerThreshold;
+      const initialDelay2 = initialPipeline2!.pipelineState.ffmpeg.restartDelayMs;
+      const initialCircuit2 = initialPipeline2!.pipelineState.ffmpeg.circuitBreakerThreshold;
+
+      const originalInstanceCount = MockVideoSource.instances.length;
+
+      const failureConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          channels: {
+            'video:cam-1': {
+              ffmpeg: { restartDelayMs: 900, circuitBreakerThreshold: 9 }
+            },
+            'video:cam-2': {
+              ffmpeg: { restartDelayMs: 520, circuitBreakerThreshold: 8 }
+            }
+          }
+        }
+      } as GuardianConfig;
+
+      const source1 = initialPipeline1!.source as MockVideoSource;
+      source1.updateOptions.mockClear();
+
+      manager.setConfig(failureConfig);
+
+      await waitFor(
+        () =>
+          source1.updateOptions.mock.calls.length > 0 ||
+          MockVideoSource.instances.length > originalInstanceCount,
+        4000
+      );
+
+      manager.emit('error', new Error('synthetic reload failure'));
+
+      await waitFor(
+        () => {
+          const candidate = runtime.pipelines.get('video:cam-1');
+          return (
+            candidate?.pipelineState.ffmpeg.restartDelayMs === initialDelay1 &&
+            candidate?.pipelineState.ffmpeg.circuitBreakerThreshold === initialCircuit1
+          );
+        },
+        12000
+      );
+
+      const revertedPipeline1 = runtime.pipelines.get('video:cam-1');
+      const revertedPipeline2 = runtime.pipelines.get('video:cam-2');
+
+      expect(revertedPipeline1?.pipelineState.ffmpeg.restartDelayMs).toBe(initialDelay1);
+      expect(revertedPipeline1?.pipelineState.ffmpeg.circuitBreakerThreshold).toBe(initialCircuit1);
+      expect(revertedPipeline2?.pipelineState.ffmpeg.restartDelayMs).toBe(initialDelay2);
+      expect(revertedPipeline2?.pipelineState.ffmpeg.circuitBreakerThreshold).toBe(initialCircuit2);
+
+      const revertedSource1 = revertedPipeline1!.source as MockVideoSource;
+      const revertedSource2 = revertedPipeline2!.source as MockVideoSource;
+      expect(revertedSource1.options.restartDelayMs).toBe(initialDelay1);
+      expect(revertedSource1.options.circuitBreakerThreshold).toBe(initialCircuit1);
+      expect(revertedSource2.options.restartDelayMs).toBe(initialDelay2);
+      expect(revertedSource2.options.circuitBreakerThreshold).toBe(initialCircuit2);
+
+      expect(MockVideoSource.instances.length).toBeGreaterThan(originalInstanceCount);
+    } finally {
+      runtime.stop();
+    }
+  }, 12000);
+
   it('RunGuardRemovesCameraPipeline clears channel state and metrics when cameras disappear', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 

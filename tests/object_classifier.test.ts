@@ -184,6 +184,46 @@ describe('YoloFusionHeuristics', () => {
     );
     expect(fusion.contributors.every(contributor => contributor.iou > 0)).toBe(true);
   });
+
+  it('YoloParserResolvesMissingDimensions retains detections when original size is unavailable', () => {
+    const classCount = 1;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 1;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    data[0 * detections + 0] = 0.5; // cx
+    data[1 * detections + 0] = 0.5; // cy
+    data[2 * detections + 0] = 0.25; // width
+    data[3 * detections + 0] = 0.25; // height
+    data[OBJECTNESS_INDEX * detections + 0] = logit(0.92);
+    data[YOLO_CLASS_START_INDEX * detections + 0] = logit(0.88);
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 1,
+      padX: 0,
+      padY: 0,
+      originalWidth: 0,
+      originalHeight: 0,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 1,
+      scaleY: 1
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const [detection] = parseYoloDetections(tensor, meta, {
+      classIndices: [0],
+      scoreThreshold: 0.2
+    });
+
+    expect(detection).toBeDefined();
+    expect(detection.bbox.width).toBeGreaterThan(0);
+    expect(detection.bbox.height).toBeGreaterThan(0);
+    expect(detection.areaRatio).toBeCloseTo(0.0625, 5);
+    expect(detection.bbox.left).toBeCloseTo(240, 3);
+    expect(detection.bbox.top).toBeCloseTo(240, 3);
+  });
 });
 
 describe('ObjectClassifierThreatScoring', () => {

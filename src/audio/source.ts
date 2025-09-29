@@ -351,6 +351,7 @@ export class AudioSource extends EventEmitter {
       this.activeMicCandidateIndex = null;
       this.lastSuccessfulMicIndex = null;
     }
+    this.analysisByFormat.clear();
     metrics.recordAudioDeviceDiscovery('device-discovery-timeout', {
       channel: this.options.channel
     });

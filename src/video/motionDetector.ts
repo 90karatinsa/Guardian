@@ -694,9 +694,26 @@ export class MotionDetector {
       };
 
       this.bus.emit('event', payload);
+    } catch (error) {
+      this.handleFrameProcessingError(error);
     } finally {
       metrics.observeDetectorLatency('motion', performance.now() - start);
     }
+  }
+
+  private handleFrameProcessingError(error: unknown) {
+    void error; // Swallow frame processing errors while resetting state
+    this.resetAdaptiveState();
+    metrics.resetDetectorCounters('motion', [
+      'suppressedFrames',
+      'suppressedFramesBeforeTrigger',
+      'backoffSuppressedFrames',
+      'backoffActivations'
+    ]);
+    metrics.incrementDetectorCounter('motion', 'errors', 1);
+    metrics.setDetectorGauge('motion', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+    metrics.setDetectorGauge('motion', 'noiseBackoffPadding', Math.max(0, this.noiseBackoffPadding));
+    metrics.setDetectorGauge('motion', 'noiseWindowBoost', this.sustainedNoiseBoost);
   }
 
   private adjustNoiseBackoffPadding(

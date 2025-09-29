@@ -6,7 +6,41 @@ import { EventEmitter } from 'node:events';
 import { PNG } from 'pngjs';
 import { clearEvents, listEvents, storeEvent } from '../src/db.js';
 import { startHttpServer, type HttpServerRuntime, type HttpServerOptions } from '../src/server/http.js';
-import metrics from '../src/metrics/index.js';
+import metrics, { MetricsRegistry } from '../src/metrics/index.js';
+import { createEventsRouter } from '../src/server/routes/events.js';
+
+class StubIncomingMessage extends EventEmitter {
+  method = 'GET';
+  url: string;
+  headers: Record<string, string> = {};
+
+  constructor(url: string) {
+    super();
+    this.url = url;
+  }
+}
+
+class StubServerResponse extends EventEmitter {
+  statusCode = 200;
+  headersSent = false;
+  writableEnded = false;
+  headers: Record<string, string> = {};
+
+  writeHead(statusCode: number, headers: Record<string, string>) {
+    this.statusCode = statusCode;
+    this.headersSent = true;
+    this.headers = { ...headers };
+  }
+
+  write(_chunk: any) {
+    return true;
+  }
+
+  end(_chunk?: any) {
+    this.writableEnded = true;
+    this.emit('finish');
+  }
+}
 
 type StubFace = {
   id: number;
@@ -430,6 +464,40 @@ describe('RestApiEvents', () => {
     const chunkText = decoder.decode(firstChunk.value ?? new Uint8Array());
     expect(chunkText.includes('event: metrics')).toBe(false);
     noneController.abort();
+  });
+
+  it('HttpSseResponseErrorCleanup clears clients when streams error', async () => {
+    const router = createEventsRouter({
+      bus: new EventEmitter(),
+      metrics: new MetricsRegistry(),
+      snapshotDirs: []
+    });
+
+    const clients = (router as unknown as { clients: Map<any, any> }).clients;
+    expect(clients.size).toBe(0);
+
+    const createStream = () => {
+      const request = new StubIncomingMessage('/api/events/stream?metrics=none');
+      const response = new StubServerResponse();
+      const handled = router.handle(
+        request as unknown as import('node:http').IncomingMessage,
+        response as unknown as import('node:http').ServerResponse
+      );
+      expect(handled).toBe(true);
+      return { request, response };
+    };
+
+    const first = createStream();
+    expect(clients.size).toBe(1);
+    first.response.emit('error', new Error('stream failure'));
+    expect(clients.size).toBe(0);
+
+    const second = createStream();
+    expect(clients.size).toBe(1);
+    second.request.emit('error', new Error('request failure'));
+    expect(clients.size).toBe(0);
+
+    router.close();
   });
 
   it('HttpApiSnapshotStream delivers snapshot history with heartbeat and metrics', async () => {

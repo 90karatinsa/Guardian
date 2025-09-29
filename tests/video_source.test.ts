@@ -161,6 +161,42 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoSourceDoubleStartNoop', async () => {
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:double-start',
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        queueMicrotask(() => {
+          command.emit('start');
+          command.pushFrame(SAMPLE_PNG);
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      source.start();
+
+      await Promise.resolve();
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(commands).toHaveLength(1);
+      expect(commands[0]?.pipeCalls).toBe(1);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel?.['video:double-start']).toBeUndefined();
+    } finally {
+      await source.stop();
+    }
+  });
+
   it('VideoSourceRtspErrorDedupes', async () => {
     vi.useFakeTimers();
 

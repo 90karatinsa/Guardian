@@ -229,6 +229,16 @@ export class VideoSource extends EventEmitter {
   }
 
   start() {
+    if (
+      this.command ||
+      this.terminatingCommand ||
+      this.commandExitPromise ||
+      this.recovering ||
+      this.restartTimer
+    ) {
+      return;
+    }
+
     this.shouldStop = false;
     this.recovering = false;
     this.restartCount = 0;

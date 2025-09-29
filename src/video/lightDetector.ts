@@ -543,9 +543,28 @@ export class LightDetector {
       };
 
       this.bus.emit('event', payload);
+    } catch (error) {
+      this.handleFrameProcessingError(error);
     } finally {
       metrics.observeDetectorLatency('light', performance.now() - start);
     }
+  }
+
+  private handleFrameProcessingError(error: unknown) {
+    void error;
+    this.resetAdaptiveState();
+    metrics.resetDetectorCounters('light', [
+      'suppressedFrames',
+      'suppressedFramesBeforeTrigger',
+      'backoffFrames',
+      'backoffSuppressedFrames',
+      'backoffActivations',
+      'backoffFrameBudget'
+    ]);
+    metrics.incrementDetectorCounter('light', 'errors', 1);
+    metrics.setDetectorGauge('light', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+    metrics.setDetectorGauge('light', 'noiseBackoffPadding', this.noiseBackoffPadding);
+    metrics.setDetectorGauge('light', 'noiseWindowBoost', this.sustainedNoiseBoost);
   }
 
   private adjustNoiseBackoffPadding(

@@ -195,16 +195,21 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     : pickGuardConfig(manager.getConfig());
 
   let activeConfig = baseConfig;
+  let lastStableConfig = activeConfig;
   const videoConfig = activeConfig.video;
-  const eventsConfig = activeConfig.events;
   if (!activeConfig.motion) {
     throw new Error('Motion configuration is required');
   }
 
-  if (bus instanceof EventBus) {
-    const suppressionRules = eventsConfig?.suppression?.rules ?? [];
+  const applySuppressionRules = (config: GuardConfig) => {
+    if (!(bus instanceof EventBus)) {
+      return;
+    }
+    const suppressionRules = config.events?.suppression?.rules ?? [];
     bus.configureSuppression(suppressionRules);
-  }
+  };
+
+  applySuppressionRules(activeConfig);
 
   const cameras = buildCameraList(videoConfig);
 
@@ -220,22 +225,30 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   let handleConfigError: ((error: unknown) => void) | null = null;
   let handleManagerError: ((error: unknown) => void) | null = null;
   let audioRuntime: AudioRuntime | null = null;
+  let activeLoggingLevel: string | undefined = undefined;
+  let lastStableLoggingLevel: string | undefined = undefined;
+  let pendingRollbackConfig: GuardConfig | null = null;
+  let pendingRollbackLoggingLevel: string | undefined = undefined;
 
   const applyConfiguredLogLevel = (value: unknown) => {
-    if (typeof value !== 'string') {
+    if (typeof value === 'string') {
+      activeLoggingLevel = value;
+      try {
+        setLogLevel(value);
+      } catch (error) {
+        logger.warn(
+          { err: error, level: value },
+          'Failed to apply configured log level'
+        );
+      }
       return;
     }
-    try {
-      setLogLevel(value);
-    } catch (error) {
-      logger.warn(
-        { err: error, level: value },
-        'Failed to apply configured log level'
-      );
-    }
+
+    activeLoggingLevel = undefined;
   };
 
   applyConfiguredLogLevel(manager.getConfig().logging?.level);
+  lastStableLoggingLevel = activeLoggingLevel;
 
   const configureRetention = (config: GuardConfig) => {
     const retentionOptions = buildRetentionOptions({
@@ -802,6 +815,12 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   const runSync = (config: GuardConfig, options: { forceRestart?: boolean } = {}) => {
     syncPromise = syncPromise
       .then(() => syncPipelines(config, options))
+      .then(() => {
+        if (config === activeConfig) {
+          lastStableConfig = config;
+          lastStableLoggingLevel = activeLoggingLevel;
+        }
+      })
       .catch(error => {
         logger.error({ err: error }, 'Failed to apply camera configuration');
       });
@@ -810,14 +829,13 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
   };
 
   const handleReload = ({ previous, next }: ConfigReloadEvent) => {
+    pendingRollbackConfig = lastStableConfig;
+    pendingRollbackLoggingLevel = lastStableLoggingLevel;
     const overrideDiff = diffGuardOverrides(previous, next);
     activeConfig = pickGuardConfig(next);
     runSync(activeConfig);
 
-    if (bus instanceof EventBus) {
-      const suppressionRules = activeConfig.events?.suppression?.rules ?? [];
-      bus.configureSuppression(suppressionRules);
-    }
+    applySuppressionRules(activeConfig);
 
     configureRetention(activeConfig);
     syncAudioRuntime(activeConfig);
@@ -869,6 +887,15 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         { err, configPath: manager.getPath(), action: 'reload' },
         'configuration reload failed'
       );
+      const rollbackConfig = pendingRollbackConfig ?? lastStableConfig;
+      const rollbackLoggingLevel = pendingRollbackLoggingLevel ?? lastStableLoggingLevel;
+      activeConfig = rollbackConfig;
+      pendingRollbackConfig = null;
+      pendingRollbackLoggingLevel = undefined;
+      applySuppressionRules(activeConfig);
+      configureRetention(activeConfig);
+      syncAudioRuntime(activeConfig);
+      applyConfiguredLogLevel(rollbackLoggingLevel);
       handleConfigError?.(error);
       runSync(activeConfig, { forceRestart: true });
     };

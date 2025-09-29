@@ -13,6 +13,10 @@ nasıl yararlanacağınızı adım adım anlatır.
   `pipelines.audio.watchdogRestartsByChannel` metrikleri ile hangi kameranın yeniden başlatma döngüsüne girdiğini belirleyin.
 - Aynı sağlık çıktısındaki `metrics.pipelines.ffmpeg.transportFallbacks.total`, `...byChannel` ve `metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason` alanlarını inceleyerek RTSP bağlantılarının TCP↔UDP fallback zincirine kaç kez ve hangi gerekçeyle başvurduğunu takip edin; artış görürseniz `guardian daemon restart --transport`
   komutu ile kanalı sıfırlayabilirsiniz.
+- `guardian daemon pipelines reset --channel video:<kanal>` komutu çalıştırıldığında stdout üzerindeki
+  "Reset pipeline health, circuit breaker, and transport fallback" mesajını ve `guardian daemon health --json`
+  çıktısındaki `pipelines.ffmpeg.channels[kanal].severity === 'none'` ile `metricsSummary.pipelines.transportFallbacks.video.byChannel`
+  listesindeki ilgili kaydın `total === 0` olduğunu kontrol ederek hem devre kesici hem de fallback sayaçlarının temizlendiğini doğrulayın.
 - Docker ya da systemd ortamında healthcheck scriptini test etmek için `pnpm tsx scripts/healthcheck.ts --health` ve `--ready`
   seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler.
 
@@ -53,6 +57,8 @@ nasıl yararlanacağınızı adım adım anlatır.
 | `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor | Transport fallback zinciri sürekli devrede | `guardian daemon restart --transport video:<kanal>` komutunu çalıştırın ve `transportFallbacks.byChannel` sayaçlarını kontrol edin |
 | `Audio source recovering (reason=ffmpeg-missing)` sürüyor | Mikrofon fallback zinciri başarısız | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
 
+- SSE dashboard bağlantısı hatayla kapandığında Guardian `req.on('error')` ve `res.on('error')` dinleyicileriyle istemciyi hemen listeden düşer; loglarda "stream-status" olayından sonra `clients.size` artmaz ve `HttpSseResponseErrorCleanup` testi bu davranışı doğrular.
+- Hot reload sırasında `config.video.channels.<kanal>` için karşılık gelen bir kamera bulunmazsa Guardian reload'u `config.video.channels.video:unused-channel does not match any configured camera channel` hatasıyla reddeder; dosyayı düzeltip tekrar denemeden önce son bilinen yapılandırma kullanılmaya devam eder.
 - `guardian health --verbose` ile tüm sağlık kontrollerinin ayrıntılı sonuçlarını gözden geçirin. Özellikle `suppression` ve
   `retention` bölümlerindeki uyarılar yanlış pozitifleri azaltmak veya disk kullanımını kontrol etmek için kritik ipuçları
   sağlar.
