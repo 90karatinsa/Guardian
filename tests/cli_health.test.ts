@@ -173,6 +173,35 @@ describe('GuardianCliHealthcheck', () => {
     expect(payload.pipelines.audio.totalDegraded).toBe(0);
   });
 
+  it('CliAudioDevicesListsDiscovered outputs fallback-ordered device inventory', async () => {
+    const capture = createTestIo();
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const discovered = [
+      { format: 'pulse', device: 'default' },
+      { format: 'pipewire', device: 'monitor' },
+      { format: 'alsa', device: 'hw:1,0' },
+      { format: 'dshow', device: 'audio="default"' }
+    ];
+    const listSpy = vi.spyOn(AudioSource, 'listDevices').mockResolvedValue(discovered);
+
+    const code = await runCli(['audio', 'devices', '--json'], capture.io);
+
+    expect(code).toBe(0);
+    const payload = JSON.parse(capture.stdout().trim());
+    expect(payload.format).toBe('auto');
+    expect(payload.devices).toEqual(discovered);
+    expect(payload.devices.map((entry: { format: string }) => entry.format)).toEqual([
+      'pulse',
+      'pipewire',
+      'alsa',
+      'dshow'
+    ]);
+    expect(listSpy).toHaveBeenCalledWith('auto', { channel: 'cli:audio-devices' });
+
+    platformSpy.mockRestore();
+    listSpy.mockRestore();
+  });
+
   it('HealthcheckMetricsSnapshot includes runtime fields and degraded status', async () => {
     const capture = createTestIo();
     const flagCode = await runCli(['--health'], capture.io);
@@ -595,6 +624,82 @@ describe('GuardianCliHealthcheck', () => {
     expect(resetChannelHealth).toHaveBeenCalledWith('video:front');
     const snapshot = metrics.snapshot();
     expect(snapshot.pipelines.ffmpeg.byChannel['video:front'].health.severity).toBe('none');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
+  it('CliPipelineResetNoRestartKeepsOffline', async () => {
+    const stopSpy = vi.fn();
+    const resetCircuitBreaker = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker,
+      resetChannelHealth: vi.fn().mockReturnValue(true),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
+    });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:offline', {
+      severity: 'critical',
+      restarts: 5,
+      backoffMs: 60000,
+      reason: 'manual test'
+    });
+
+    const resetIo = createTestIo();
+    const resetCode = await runCli(
+      ['daemon', 'pipelines', 'reset', '--channel', 'video:offline', '--no-restart'],
+      resetIo.io
+    );
+
+    expect(resetCode).toBe(0);
+    expect(resetCircuitBreaker).toHaveBeenCalledWith('video:offline', { restart: false });
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byChannel['video:offline'].health.severity).toBe('none');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
+  it('CliPipelineResetAudioResetsCounters', async () => {
+    const stopSpy = vi.fn();
+    const resetCircuitBreaker = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker,
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
+    });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    metrics.setPipelineChannelHealth('audio', 'audio:lobby', {
+      severity: 'warning',
+      restarts: 2,
+      backoffMs: 5000,
+      reason: 'manual test'
+    });
+
+    const resetIo = createTestIo();
+    const resetCode = await runCli(
+      ['daemon', 'pipelines', 'reset', '--channel', 'audio:lobby'],
+      resetIo.io
+    );
+
+    expect(resetCode).toBe(0);
+    expect(resetCircuitBreaker).toHaveBeenCalledWith('audio:lobby', { restart: true });
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.audio.byChannel['audio:lobby'].health.severity).toBe('none');
 
     await runCli(['stop'], createTestIo().io);
     await expect(startPromise).resolves.toBe(0);

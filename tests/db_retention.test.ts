@@ -1344,6 +1344,129 @@ describe('RetentionMaintenance', () => {
   });
 });
 
+describe('DbMaintenance', () => {
+  afterEach(() => {
+    vi.resetModules();
+    vi.restoreAllMocks();
+  });
+
+  it('DbMaintenanceSkipWhenDisabled', async () => {
+    vi.resetModules();
+    const buildRetentionOptions = vi.fn().mockReturnValue(null);
+    const runRetentionOnce = vi.fn();
+
+    vi.doMock('../src/run-guard.js', () => ({ buildRetentionOptions }));
+    vi.doMock('../src/tasks/retention.js', () => ({ runRetentionOnce }));
+
+    const { runMaintenance } = await import('../scripts/db-maintenance.ts');
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const result = await runMaintenance({
+      config: { events: {}, video: {}, person: {} } as any,
+      logger
+    });
+
+    expect(result).toEqual({ skipped: true, options: null, result: null });
+    expect(buildRetentionOptions).toHaveBeenCalledTimes(1);
+    expect(runRetentionOnce).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith('Guardian maintenance starting');
+    expect(logger.info).toHaveBeenCalledWith('Retention maintenance skipped (retention disabled)');
+  });
+
+  it('DbMaintenanceRunSummarizesOutcome', async () => {
+    vi.resetModules();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const retentionOptions = {
+      enabled: true,
+      retentionDays: 7,
+      intervalMs: 60000,
+      archiveDir: '/tmp/archive',
+      snapshotDirs: ['./snapshots'],
+      vacuum: 'auto',
+      snapshot: { mode: 'archive', retentionDays: 3 },
+      logger
+    } as any;
+    const buildRetentionOptions = vi.fn().mockReturnValue(retentionOptions);
+    const retentionResult = {
+      skipped: false,
+      warnings: [{ path: '/tmp/archive/file', error: new Error('warn'), camera: 'snap' }],
+      outcome: {
+        removedEvents: 2,
+        archivedSnapshots: 3,
+        prunedArchives: 1,
+        warnings: [],
+        perCamera: { snap: { archivedSnapshots: 2, prunedArchives: 1 } }
+      },
+      vacuum: {
+        ran: true,
+        runMode: 'on-change',
+        mode: 'auto',
+        analyze: true,
+        reindex: false,
+        optimize: true,
+        target: 'events',
+        pragmas: ['auto_vacuum'],
+        disk: {
+          before: { pages: 10, pageSize: 4096, sizeBytes: 40960 },
+          after: { pages: 9, pageSize: 4096, sizeBytes: 36864 },
+          savingsBytes: 4096
+        }
+      },
+      rescheduled: false,
+      disk: {
+        before: { pages: 10, pageSize: 4096, sizeBytes: 40960 },
+        after: { pages: 9, pageSize: 4096, sizeBytes: 36864 },
+        savingsBytes: 4096
+      }
+    } as any;
+    const runRetentionOnce = vi.fn().mockResolvedValue(retentionResult);
+
+    vi.doMock('../src/run-guard.js', () => ({ buildRetentionOptions }));
+    vi.doMock('../src/tasks/retention.js', () => ({ runRetentionOnce }));
+
+    const { runMaintenance } = await import('../scripts/db-maintenance.ts');
+
+    const result = await runMaintenance({
+      config: {
+        events: { retention: { enabled: true } },
+        video: { channels: {} },
+        person: {}
+      } as any,
+      logger
+    });
+
+    expect(result.skipped).toBe(false);
+    expect(result.options).toBe(retentionOptions);
+    expect(result.result).toBe(retentionResult);
+    expect(buildRetentionOptions).toHaveBeenCalledWith(
+      expect.objectContaining({ retention: expect.anything(), video: expect.anything(), person: expect.anything() })
+    );
+    expect(runRetentionOnce).toHaveBeenCalledWith(
+      expect.objectContaining({
+        archiveDir: '/tmp/archive',
+        snapshotDirs: retentionOptions.snapshotDirs,
+        metrics: expect.any(Object)
+      })
+    );
+
+    expect(logger.info).toHaveBeenCalledWith('Guardian maintenance starting');
+
+    const summaryCall = logger.info.mock.calls.find(([, message]) => message === 'Database retention completed');
+    expect(summaryCall?.[0]).toMatchObject({
+      removedEvents: 2,
+      archivedSnapshots: 3,
+      prunedArchives: 1,
+      warnings: 1,
+      diskSavingsBytes: 4096,
+      snapshotDirs: [path.resolve('./snapshots')]
+    });
+
+    const vacuumCall = logger.info.mock.calls.find(([, message]) => message === 'VACUUM completed');
+    expect(vacuumCall?.[0]).toMatchObject({ vacuum: retentionResult.vacuum });
+    expect(logger.warn).toHaveBeenCalledWith({ warning: retentionResult.warnings[0] }, 'Retention maintenance warning');
+  });
+});
+
 function collectArchiveFiles(root: string): string[] {
   if (!fs.existsSync(root)) {
     return [];

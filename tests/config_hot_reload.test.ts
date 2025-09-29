@@ -1250,6 +1250,64 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigHotReloadAudioAnalysisWindowUpdates propagates audio discovery and analysis windows', async () => {
+    const initialConfig = createConfig({ diffThreshold: 18 });
+    initialConfig.audio = {
+      channel: 'audio:test',
+      analysisRmsWindowMs: 180,
+      deviceDiscoveryTimeoutMs: 350
+    };
+
+    const manager = new InMemoryConfigManager(initialConfig);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => MockAudioSource.instances.length === 1);
+      const audioSource = MockAudioSource.instances[0];
+      expect(audioSource.options.analysisRmsWindowMs).toBe(180);
+      expect(audioSource.options.deviceDiscoveryTimeoutMs).toBe(350);
+
+      (audioSource.updateOptions as vi.Mock).mockClear();
+
+      const updatedConfig = JSON.parse(JSON.stringify(initialConfig)) as GuardianConfig;
+      updatedConfig.audio = {
+        channel: 'audio:test',
+        analysisRmsWindowMs: 420,
+        deviceDiscoveryTimeoutMs: 950
+      };
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded'),
+        4000
+      );
+
+      await waitFor(() => (audioSource.updateOptions as vi.Mock).mock.calls.length > 0, 4000);
+      const latest = (audioSource.updateOptions as vi.Mock).mock.calls.at(-1)?.[0] as
+        | Record<string, unknown>
+        | undefined;
+      expect(latest).toMatchObject({
+        analysisRmsWindowMs: 420,
+        deviceDiscoveryTimeoutMs: 950
+      });
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigHotReloadTransportFallback updates fallback sequence and audio noise without restarts', async () => {
     const base = createConfig({ diffThreshold: 24 });
     base.video.cameras = [

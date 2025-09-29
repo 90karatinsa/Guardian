@@ -2202,7 +2202,7 @@ describe('run-guard multi camera orchestration', () => {
       const initialOptions = MockObjectClassifier.instances[0]?.options as Record<string, unknown>;
       expect(initialOptions?.threatThreshold).toBe(0.6);
       expect(initialOptions?.labels).toEqual(['person', 'vehicle']);
-      expect(initialOptions?.labelMap).toEqual({ vehicle: 'vehicle' });
+      expect(initialOptions?.labelMap).toEqual({ vehicle: 'vehicle', package: 'delivery' });
 
       const updatedConfig: GuardianConfig = {
         ...initialConfig,
@@ -2237,6 +2237,63 @@ describe('run-guard multi camera orchestration', () => {
       expect(latest?.threatThreshold).toBe(0.75);
       expect(latest?.labels).toEqual(['person', 'vehicle', 'package']);
       expect(latest?.labelMap).toEqual({ vehicle: 'threat', package: 'delivery' });
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardMergesObjectLabelMaps merges layered object label aliases', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 8,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            objects: {
+              labelMap: { package: 'priority', drone: 'intruder' }
+            }
+          }
+        ],
+        channels: {
+          'video:cam-1': {
+            objects: {
+              labelMap: { cat: 'pet', vehicle: 'vehicle' }
+            }
+          }
+        }
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 10, areaThreshold: 0.02 },
+      objects: {
+        modelPath: 'objects.onnx',
+        labels: ['person', 'package', 'cat', 'drone', 'vehicle'],
+        threatLabels: ['drone'],
+        labelMap: { package: 'parcel', cat: 'animal', drone: 'threat' }
+      }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      expect(MockObjectClassifier.instances).toHaveLength(1);
+      const options = MockObjectClassifier.instances[0]?.options as Record<string, unknown>;
+      expect(options?.labelMap).toEqual({
+        package: 'priority',
+        cat: 'pet',
+        drone: 'intruder',
+        vehicle: 'vehicle'
+      });
     } finally {
       runtime.stop();
     }

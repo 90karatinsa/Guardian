@@ -13,10 +13,13 @@ nasıl yararlanacağınızı adım adım anlatır.
   `pipelines.audio.watchdogRestartsByChannel` metrikleri ile hangi kameranın yeniden başlatma döngüsüne girdiğini belirleyin.
 - Aynı sağlık çıktısındaki `metrics.pipelines.ffmpeg.transportFallbacks.total`, `...byChannel` ve `metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason` alanlarını inceleyerek RTSP bağlantılarının TCP↔UDP fallback zincirine kaç kez ve hangi gerekçeyle başvurduğunu takip edin; artış görürseniz `guardian daemon restart --transport`
   komutu ile kanalı sıfırlayabilirsiniz.
-- `guardian daemon pipelines reset --channel video:<kanal>` komutu çalıştırıldığında stdout üzerindeki
+- `guardian daemon pipelines reset --channel video:<kanal> --no-restart` komutu çalıştırıldığında stdout üzerindeki
   "Reset pipeline health, circuit breaker, and transport fallback" mesajını ve `guardian daemon health --json`
   çıktısındaki `pipelines.ffmpeg.channels[kanal].severity === 'none'` ile `metricsSummary.pipelines.transportFallbacks.video.byChannel`
-  listesindeki ilgili kaydın `total === 0` olduğunu kontrol ederek hem devre kesici hem de fallback sayaçlarının temizlendiğini doğrulayın.
+  listesindeki ilgili kaydın `total === 0` olduğunu kontrol ederek hem devre kesici hem de fallback sayaçlarının temizlendiğini doğrulayın; `--no-restart` bayrağı bekleyen yeniden başlatma zamanlayıcılarını iptal eder.
+- Ses kanalları için `guardian daemon pipelines reset --channel audio:<kanal> --no-restart` komutunu kullanarak hem
+  `metrics.pipelines.audio.byChannel[kanal].restarts` hem de `metrics.pipelines.audio.byChannel[kanal].health.severity`
+  değerlerinin anında sıfırlandığını doğrulayın; bu işlem audio devre kesicisi yeniden başlatılmadan sayaçları temizler.
 - Docker ya da systemd ortamında healthcheck scriptini test etmek için `pnpm tsx scripts/healthcheck.ts --health` ve `--ready`
   seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler.
 
@@ -53,7 +56,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 | Belirti | Muhtemel neden | Önerilen komut |
 | --- | --- | --- |
 | `status: "degraded"` ya da `logs.byLevel.error` artışı | Dedektör hatası veya uzun süreli devre kesici gecikmeleri | `pnpm tsx scripts/healthcheck.ts --health` ve `guardian log-level set debug` |
-| `watchdogRestartsByChannel` artıyor | RTSP jitter veya ağ kopması | `guardian daemon restart --channel video:<kanal>` ve `guardian daemon status --json` |
+| `watchdogRestartsByChannel` artıyor | RTSP jitter veya ağ kopması | `guardian daemon pipelines reset --channel video:<kanal> --no-restart`, `guardian daemon pipelines reset --channel audio:<kanal> --no-restart` ve `guardian daemon status --json` |
 | `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor | Transport fallback zinciri sürekli devrede | `guardian daemon restart --transport video:<kanal>` komutunu çalıştırın ve `transportFallbacks.byChannel` sayaçlarını kontrol edin |
 | `Audio source recovering (reason=ffmpeg-missing)` sürüyor | Mikrofon fallback zinciri başarısız | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
 

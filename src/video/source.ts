@@ -263,7 +263,18 @@ export class VideoSource extends EventEmitter {
     this.circuitBroken = false;
     this.circuitBreakerFailures = 0;
     this.lastCircuitCandidateReason = null;
-    this.shouldStop = false;
+    const restartRequested = options.restart !== false;
+
+    if (!restartRequested) {
+      this.clearAllTimers();
+      this.recovering = false;
+      this.pendingRestartContext = null;
+      if (wasBroken) {
+        this.shouldStop = true;
+      }
+    } else {
+      this.shouldStop = false;
+    }
     if (this.rtspFallbackState) {
       if (wasBroken) {
         this.resetRtspFallbackState({
@@ -275,7 +286,7 @@ export class VideoSource extends EventEmitter {
         this.syncRtspFallbackState();
       }
     }
-    if (options.restart !== false && wasBroken) {
+    if (restartRequested && wasBroken) {
       this.start();
     }
     return wasBroken;

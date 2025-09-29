@@ -230,6 +230,44 @@ describe('MetricsCounters', () => {
     expect(snapshot.detectors.light.counters.backoffSuppressedFrames).toBe(4);
   });
 
+  it('MetricsTransportFallbackHistoryLimit enforces per-channel history bounds and resets on pipeline clear', () => {
+    const registry = new MetricsRegistry();
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      registry.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+        channel: 'video:lobby',
+        attempt,
+        to: attempt % 2 === 0 ? 'tcp' : 'udp',
+        at: 1710000000000 + attempt
+      });
+    }
+
+    const initial = registry.snapshot();
+    const channelState = initial.pipelines.ffmpeg.transportFallbacks.byChannel['video:lobby'];
+
+    expect(initial.pipelines.ffmpeg.transportFallbacks.total).toBe(30);
+    expect(channelState.historyLimit).toBe(25);
+    expect(channelState.history).toHaveLength(25);
+    expect(channelState.droppedHistory).toBe(5);
+    expect(channelState.history[0]?.attempt).toBe(5);
+    expect(channelState.history[channelState.history.length - 1]?.attempt).toBe(29);
+
+    registry.resetPipelineChannel('ffmpeg', 'video:lobby');
+
+    const cleared = registry.snapshot();
+    const clearedChannel = cleared.pipelines.ffmpeg.transportFallbacks.byChannel['video:lobby'];
+
+    expect(cleared.pipelines.ffmpeg.transportFallbacks.total).toBe(0);
+    expect(cleared.pipelines.ffmpeg.transportFallbacks.byReason).toEqual({});
+    expect(cleared.pipelines.ffmpeg.transportFallbacks.byTarget).toEqual({});
+    expect(cleared.pipelines.ffmpeg.transportFallbacks.last).toBeNull();
+    expect(clearedChannel.total).toBe(0);
+    expect(clearedChannel.history).toHaveLength(0);
+    expect(clearedChannel.droppedHistory).toBe(0);
+    expect(clearedChannel.byReason).toEqual({});
+    expect(clearedChannel.byTarget).toEqual({});
+  });
+
   it('MetricsDetectorCounters exposes pipeline and detector histograms', () => {
     const registry = new MetricsRegistry();
 

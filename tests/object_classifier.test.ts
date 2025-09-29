@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import ObjectClassifier from '../src/video/objectClassifier.js';
+import ObjectClassifier, { summarizeThreatMetadata } from '../src/video/objectClassifier.js';
 import PersonDetector from '../src/video/personDetector.js';
 import { YOLO_CLASS_START_INDEX, parseYoloDetections } from '../src/video/yoloParser.js';
 
@@ -185,6 +185,103 @@ describe('YoloFusionHeuristics', () => {
     expect(fusion.contributors.every(contributor => contributor.iou > 0)).toBe(true);
   });
 
+  it('YoloMaxDetectionsPrioritizesPrimaryClass retains fusion metrics for preferred classes', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 3;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assign = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectness: number;
+        class0: number;
+        class1: number;
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = logit(values.objectness);
+      data[(YOLO_CLASS_START_INDEX + 0) * detections + index] = logit(values.class0);
+      data[(YOLO_CLASS_START_INDEX + 1) * detections + index] = logit(values.class1);
+    };
+
+    assign(0, {
+      cx: 0.52,
+      cy: 0.48,
+      width: 0.42,
+      height: 0.36,
+      objectness: 0.9,
+      class0: 0.1,
+      class1: 0.84
+    });
+    assign(1, {
+      cx: 0.5,
+      cy: 0.5,
+      width: 0.4,
+      height: 0.34,
+      objectness: 0.88,
+      class0: 0.12,
+      class1: 0.82
+    });
+    assign(2, {
+      cx: 0.28,
+      cy: 0.3,
+      width: 0.36,
+      height: 0.42,
+      objectness: 0.97,
+      class0: 0.92,
+      class1: 0.05
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 1,
+      padX: 0,
+      padY: 0,
+      originalWidth: 640,
+      originalHeight: 480,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scaleX: 1,
+      scaleY: 1
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const unlimited = parseYoloDetections(tensor, meta, {
+      classIndices: [1, 0],
+      classIndex: 1,
+      scoreThreshold: 0.25,
+      nmsThreshold: 0.5
+    });
+
+    const limited = parseYoloDetections(tensor, meta, {
+      classIndices: [1, 0],
+      classIndex: 1,
+      scoreThreshold: 0.25,
+      nmsThreshold: 0.5,
+      maxDetections: 1
+    });
+
+    expect(limited).toHaveLength(1);
+    const primary = unlimited.find(result => result.classId === 1);
+    const secondary = unlimited.find(result => result.classId === 0);
+    expect(primary).toBeDefined();
+    expect(secondary).toBeDefined();
+    expect(secondary!.score).toBeGreaterThan(primary!.score);
+    expect(limited[0]?.classId).toBe(1);
+    expect(limited[0]?.fusion).toBeDefined();
+    expect(limited[0]?.fusion?.confidence ?? 0).toBeCloseTo(primary!.fusion?.confidence ?? 0, 6);
+    expect(limited[0]?.combinedLogit).toBeCloseTo(primary!.combinedLogit, 6);
+    expect(limited[0]?.score).toBeCloseTo(primary!.score, 6);
+  });
+
   it('YoloParserResolvesMissingDimensions retains detections when original size is unavailable', () => {
     const classCount = 1;
     const attributes = YOLO_CLASS_START_INDEX + classCount;
@@ -364,6 +461,63 @@ describe('ObjectClassifierThreatScoring', () => {
     expect(petProbabilities?.pet).toBeGreaterThan(0);
     const petRawProbabilities = petEntry?.rawProbabilities as Record<string, number> | undefined;
     expect(petRawProbabilities?.dog ?? 0).toBeGreaterThan(0);
+  });
+
+  it('ObjectClassifierResolvesLabelAliases maps threat summaries to alias labels', async () => {
+    const classifierRun = vi.fn(async () => ({
+      logits: new Tensor('float32', new Float32Array([0.1, 2.6, -0.4]), [1, 3])
+    }));
+
+    setRunMock('models/object-alias.onnx', classifierRun);
+
+    const classifier = await ObjectClassifier.create({
+      modelPath: 'models/object-alias.onnx',
+      labels: ['box', 'car', 'drone'],
+      labelMap: { box: 'package', car: 'vehicle' },
+      threatLabels: ['vehicle'],
+      threatThreshold: 0.3
+    });
+
+    const objectnessLogit = Math.log(0.9 / (1 - 0.9));
+    const classLogit = Math.log(0.88 / (1 - 0.88));
+
+    const detection = {
+      score: 0.82,
+      classId: 1,
+      bbox: { left: 120, top: 140, width: 180, height: 140 },
+      objectness: 0.9,
+      classProbability: 0.88,
+      areaRatio: 0.045,
+      combinedLogit: objectnessLogit + classLogit,
+      appliedThreshold: 0.2
+    } satisfies import('../src/video/yoloParser.js').YoloDetection;
+
+    const results = await classifier.classify([detection]);
+    expect(results).toHaveLength(1);
+    const [object] = results;
+    expect(object.label).toBe('vehicle');
+    expect(object.rawLabel).toBe('car');
+
+    const summary = summarizeThreatMetadata({
+      objects: [
+        {
+          alias: object.label,
+          rawLabel: object.rawLabel,
+          threatScore: object.threatScore,
+          threat: object.isThreat
+        }
+      ],
+      threat: {
+        alias: object.label,
+        rawLabel: object.rawLabel,
+        threatScore: object.threatScore,
+        threat: object.isThreat
+      }
+    });
+
+    expect(summary).not.toBeNull();
+    expect(summary?.maxThreatLabel).toBe('vehicle');
+    expect(summary?.objects[0]?.label).toBe('vehicle');
   });
 
   it('ObjectClassifierThreatScoring clamps fused threat score within detection confidence', async () => {

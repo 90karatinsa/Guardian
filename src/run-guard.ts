@@ -176,7 +176,7 @@ export type GuardRuntime = {
   stop: () => void;
   pipelines: Map<string, CameraRuntime>;
   retention?: RetentionTask | null;
-  resetCircuitBreaker: (identifier: string) => boolean;
+  resetCircuitBreaker: (identifier: string, options?: { restart?: boolean }) => boolean;
   resetChannelHealth: (identifier: string) => boolean;
   resetTransportFallback: (identifier: string) => boolean;
 };
@@ -421,7 +421,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         micFallbacks: config.micFallbacks,
         silenceThreshold: config.silenceThreshold,
         silenceDurationMs: config.silenceDurationMs,
-        silenceCircuitBreakerThreshold: config.silenceCircuitBreakerThreshold
+        silenceCircuitBreakerThreshold: config.silenceCircuitBreakerThreshold,
+        analysisRmsWindowMs: config.analysisRmsWindowMs,
+        deviceDiscoveryTimeoutMs: config.deviceDiscoveryTimeoutMs
       });
       configureAnomaly(config.anomaly);
     };
@@ -920,7 +922,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
 
   await runSync(activeConfig);
 
-  const resetPipelineCircuitBreaker = (identifier: string) => {
+  const resetPipelineCircuitBreaker = (
+    identifier: string,
+    options: { restart?: boolean } = {}
+  ) => {
     const trimmed = typeof identifier === 'string' ? identifier.trim() : '';
     if (!trimmed) {
       return false;
@@ -949,7 +954,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         return false;
       }
 
-      const wasBroken = target.source.resetCircuitBreaker();
+      const wasBroken = target.source.resetCircuitBreaker(options);
       if (!wasBroken) {
         return false;
       }
@@ -984,7 +989,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       return false;
     }
 
-    const wasBroken = audioRuntime.source.resetCircuitBreaker();
+    const wasBroken = audioRuntime.source.resetCircuitBreaker(options);
     if (!wasBroken) {
       return false;
     }
@@ -1320,6 +1325,39 @@ function resolvePoseConfig(
   };
 }
 
+function mergeLabelMaps(
+  ...labelMaps: Array<Record<string, string> | null | undefined>
+): Record<string, string> | null {
+  const merged = new Map<string, string>();
+
+  for (const current of labelMaps) {
+    if (!current) {
+      continue;
+    }
+
+    for (const [rawKey, rawValue] of Object.entries(current)) {
+      if (typeof rawKey !== 'string' || typeof rawValue !== 'string') {
+        continue;
+      }
+
+      const key = rawKey.trim();
+      const value = rawValue.trim();
+
+      if (!key || !value) {
+        continue;
+      }
+
+      merged.set(key, value);
+    }
+  }
+
+  if (merged.size === 0) {
+    return null;
+  }
+
+  return Object.fromEntries(merged);
+}
+
 function resolveObjectsConfig(
   globalObjects: ObjectsConfig | undefined,
   channelObjects: ObjectsOverrideConfig | undefined,
@@ -1334,7 +1372,11 @@ function resolveObjectsConfig(
 
   const threatLabels = cameraObjects?.threatLabels ?? channelObjects?.threatLabels ?? globalObjects?.threatLabels;
   const classIndices = cameraObjects?.classIndices ?? channelObjects?.classIndices ?? globalObjects?.classIndices;
-  const labelMap = cameraObjects?.labelMap ?? channelObjects?.labelMap ?? globalObjects?.labelMap;
+  const labelMap = mergeLabelMaps(
+    globalObjects?.labelMap,
+    channelObjects?.labelMap,
+    cameraObjects?.labelMap
+  );
 
   return {
     modelPath,

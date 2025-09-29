@@ -1,8 +1,16 @@
+import path from 'node:path';
 import process from 'node:process';
 import { buildHealthPayload, buildReadinessPayload, resolveHealthExitCode } from '../src/cli.js';
 
-function printUsage() {
-  process.stdout.write(
+type Writable = Pick<NodeJS.WritableStream, 'write'>;
+
+type IoStreams = {
+  stdout: Writable;
+  stderr: Writable;
+};
+
+function printUsage(target: Writable) {
+  target.write(
     [
       'Guardian healthcheck helper',
       '',
@@ -62,44 +70,50 @@ function parseArgs(argv: string[]): ParsedArgs {
   return parsed;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+export async function runHealthcheck(argv: string[], streams: IoStreams = {
+  stdout: process.stdout,
+  stderr: process.stderr
+}): Promise<number> {
+  const args = parseArgs(argv);
   if (args.help) {
     if (args.errors.length > 0) {
       args.errors.forEach(error => {
-        process.stderr.write(`${error}\n`);
+        streams.stderr.write(`${error}\n`);
       });
-      process.exitCode = 1;
-      return;
+      return 1;
     }
-    printUsage();
-    return;
+    printUsage(streams.stdout);
+    return 0;
   }
 
   if (args.errors.length > 0) {
     args.errors.forEach(error => {
-      process.stderr.write(`${error}\n`);
+      streams.stderr.write(`${error}\n`);
     });
-    printUsage();
-    process.exitCode = 1;
-    return;
+    printUsage(streams.stdout);
+    return 1;
   }
 
   const health = await buildHealthPayload();
   if (args.mode === 'ready') {
     const readiness = buildReadinessPayload(health);
     const output = args.pretty ? JSON.stringify(readiness, null, 2) : JSON.stringify(readiness);
-    process.stdout.write(`${output}\n`);
-    process.exitCode = readiness.ready ? 0 : 1;
-    return;
+    streams.stdout.write(`${output}\n`);
+    return readiness.ready ? 0 : 1;
   }
 
   const output = args.pretty ? JSON.stringify(health, null, 2) : JSON.stringify(health);
-  process.stdout.write(`${output}\n`);
-  process.exitCode = resolveHealthExitCode(health.status);
+  streams.stdout.write(`${output}\n`);
+  return resolveHealthExitCode(health.status);
 }
 
-main().catch(error => {
-  process.stderr.write(`Healthcheck failed: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+const scriptName = path.basename(process.argv[1] ?? '');
+
+if (scriptName === 'healthcheck.ts' || scriptName === 'healthcheck.js') {
+  runHealthcheck(process.argv.slice(2)).then(code => {
+    process.exitCode = code;
+  }).catch(error => {
+    process.stderr.write(`Healthcheck failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

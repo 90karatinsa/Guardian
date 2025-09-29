@@ -55,6 +55,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('guardian daemon status --json');
     expect(readme).toContain('guardian daemon pipelines list --json');
     expect(readme).toContain('guardian daemon pipelines reset --channel');
+    expect(readme).toContain('guardian daemon pipelines reset --channel video:test-camera --no-restart');
+    expect(readme).toContain('guardian daemon pipelines reset --channel audio:mic-lobby --no-restart');
     expect(readme).toContain('guardian daemon health');
     expect(readme).toContain('guardian daemon ready');
     expect(readme).toContain('guardian daemon hooks --reason');
@@ -87,6 +89,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
     expect(readme).toContain('metricsSummary.pipelines.transportFallbacks.video.byChannel');
     expect(readme).toContain('transportFallbacks.byChannel[].lastReason');
+    expect(readme).toContain("metrics.pipelines.audio.byChannel['audio:mic-lobby'].restarts === 0");
+    expect(readme).toContain("metrics.pipelines.audio.byChannel['audio:mic-lobby'].health.severity === 'none'");
     expect(readme).toContain('metricsSummary.retention');
     expect(readme).toContain('health.severity');
     expect(readme).toContain('guardian daemon restart --transport');
@@ -171,6 +175,19 @@ it('ReadmeExamples install section documents pipeline reset side effects', () =>
   expect(readme).toContain('Reset pipeline health, circuit breaker, and transport fallback');
 });
 
+it('ReadmePipelineNoRestartDoc documents --no-restart usage for video and audio pipelines', () => {
+  const readme = readReadme();
+  expect(readme).toContain('guardian daemon pipelines reset --channel video:test-camera --no-restart');
+  expect(readme).toContain('guardian daemon pipelines reset --channel audio:mic-lobby --no-restart');
+  expect(readme).toContain("metrics.pipelines.audio.byChannel['audio:mic-lobby'].restarts === 0");
+  expect(readme).toContain("metrics.pipelines.audio.byChannel['audio:mic-lobby'].health.severity === 'none'");
+
+  const operationsPath = path.resolve(__dirname, '..', 'docs', 'operations.md');
+  const operations = fs.readFileSync(operationsPath, 'utf8');
+  expect(operations).toContain('guardian daemon pipelines reset --channel video:<kanal> --no-restart');
+  expect(operations).toContain('guardian daemon pipelines reset --channel audio:<kanal> --no-restart');
+});
+
 describe('OperationsDocLinks', () => {
   it('OperationsDocLinks ensures README links to operations manual and sections are present', () => {
     const readme = readReadme();
@@ -189,5 +206,7 @@ describe('OperationsDocLinks', () => {
     expect(operations).toContain('Reset pipeline health, circuit breaker, and transport fallback');
     expect(operations).toContain('HttpSseResponseErrorCleanup');
     expect(operations).toContain('config.video.channels.<kanal>');
+    expect(operations).toContain('guardian daemon pipelines reset --channel video:<kanal> --no-restart');
+    expect(operations).toContain('guardian daemon pipelines reset --channel audio:<kanal> --no-restart');
   });
 });

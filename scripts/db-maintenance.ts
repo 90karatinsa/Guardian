@@ -111,7 +111,11 @@ function normalizeOutcome(result: Awaited<ReturnType<typeof runRetentionOnce>>):
   } satisfies MaintenanceSummary;
 }
 
-main().catch(error => {
-  logger.error({ err: error }, 'Guardian maintenance failed');
-  process.exitCode = 1;
-});
+const scriptEntry = path.basename(process.argv[1] ?? '');
+
+if (scriptEntry === 'db-maintenance.ts' || scriptEntry === 'db-maintenance.js') {
+  main().catch(error => {
+    logger.error({ err: error }, 'Guardian maintenance failed');
+    process.exitCode = 1;
+  });
+}

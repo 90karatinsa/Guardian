@@ -920,15 +920,29 @@ function extractStreamFilters(url: URL): StreamFilters {
 }
 
 function resolveRetryInterval(params: URLSearchParams): number {
-  const value = params.get('retry') ?? params.get('retryMs');
-  if (!value) {
+  const clamp = (value: number) => Math.max(1000, Math.min(Math.floor(value), 60000));
+
+  const retryMs = params.get('retryMs');
+  if (retryMs) {
+    const parsed = Number(retryMs);
+    if (Number.isFinite(parsed)) {
+      return clamp(parsed);
+    }
     return 5000;
   }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
+
+  const retrySeconds = params.get('retry');
+  if (!retrySeconds) {
     return 5000;
   }
-  return Math.max(1000, Math.min(Math.floor(parsed), 60000));
+
+  const normalized = retrySeconds.trim().toLowerCase();
+  const numeric = Number(normalized.endsWith('s') ? normalized.slice(0, -1) : normalized);
+  if (!Number.isFinite(numeric)) {
+    return 5000;
+  }
+
+  return clamp(numeric * 1000);
 }
 
 function resolveDateParam(value: string | null): number | undefined {
