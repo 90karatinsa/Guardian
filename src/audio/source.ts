@@ -192,6 +192,18 @@ export class AudioSource extends EventEmitter {
     this.circuitBreakerFailures = 0;
     this.lastCircuitCandidateReason = null;
     this.shouldStop = false;
+    this.currentBinaryIndex = this.lastSuccessfulIndex;
+    if (this.options.type === 'mic') {
+      if (this.lastSuccessfulMicIndex !== null) {
+        if (this.micInputArgs.length > 0) {
+          this.micCandidateIndex =
+            this.lastSuccessfulMicIndex % this.micInputArgs.length;
+        } else {
+          this.micCandidateIndex = this.lastSuccessfulMicIndex;
+        }
+      }
+      this.activeMicCandidateIndex = null;
+    }
     if (options.restart !== false && wasBroken) {
       this.startPipeline();
     }

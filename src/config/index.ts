@@ -71,6 +71,7 @@ export type CameraPersonConfig = {
   maxDetections?: number;
   snapshotDir?: string;
   minIntervalMs?: number;
+  nmsThreshold?: number;
   classScoreThresholds?: Record<number, number>;
 };
 
@@ -152,6 +153,7 @@ export type PersonConfig = {
   maxDetections?: number;
   snapshotDir?: string;
   minIntervalMs?: number;
+  nmsThreshold?: number;
   classIndices?: number[];
   classScoreThresholds?: Record<number, number>;
 };
@@ -522,7 +524,8 @@ const guardianConfigSchema: JsonSchema = {
                       count: { type: 'number', minimum: 1 },
                       perMs: { type: 'number', minimum: 1 }
                     }
-                  }
+                  },
+                  timelineTtlMs: { type: 'number', minimum: 0 }
                 }
               }
             }
@@ -627,6 +630,7 @@ const guardianConfigSchema: JsonSchema = {
                   maxDetections: { type: 'number', minimum: 1 },
                   snapshotDir: { type: 'string' },
                   minIntervalMs: { type: 'number', minimum: 0 },
+                  nmsThreshold: { type: 'number', minimum: 0, maximum: 1 },
                   classIndices: {
                     type: 'array',
                     items: { type: 'number', minimum: 0 }
@@ -658,6 +662,7 @@ const guardianConfigSchema: JsonSchema = {
                   maxDetections: { type: 'number', minimum: 1 },
                   snapshotDir: { type: 'string' },
                   minIntervalMs: { type: 'number', minimum: 0 },
+                  nmsThreshold: { type: 'number', minimum: 0, maximum: 1 },
                   classIndices: {
                     type: 'array',
                     items: { type: 'number', minimum: 0 }
@@ -726,6 +731,7 @@ const guardianConfigSchema: JsonSchema = {
         maxDetections: { type: 'number', minimum: 1 },
         snapshotDir: { type: 'string' },
         minIntervalMs: { type: 'number', minimum: 0 },
+        nmsThreshold: { type: 'number', minimum: 0, maximum: 1 },
         classIndices: {
           type: 'array',
           items: { type: 'number', minimum: 0 }
@@ -1256,6 +1262,13 @@ function validateLogicalConfig(config: GuardianConfig) {
       if (!Number.isInteger(rule.suppressForMs) || rule.suppressForMs <= 0) {
         messages.push(
           `config.events.suppression.rules[${index}].suppressForMs must be a positive integer`
+        );
+      }
+    }
+    if (typeof rule.timelineTtlMs !== 'undefined') {
+      if (!Number.isInteger(rule.timelineTtlMs) || rule.timelineTtlMs < 0) {
+        messages.push(
+          `config.events.suppression.rules[${index}].timelineTtlMs must be a non-negative integer`
         );
       }
     }

@@ -85,13 +85,16 @@ type HealthPayload = {
         video: {
           total: number;
           last: MetricsSnapshot['pipelines']['ffmpeg']['transportFallbacks']['last'];
+          byChannel: TransportFallbackChannelSummary[];
         };
         audio: {
           total: number;
           last: MetricsSnapshot['pipelines']['audio']['transportFallbacks']['last'];
+          byChannel: TransportFallbackChannelSummary[];
         };
       };
     };
+    retention: RetentionSummary;
   };
   runtime: {
     pipelines: {
@@ -135,6 +138,23 @@ type PipelineHealthSummary = {
   degraded: string[];
   totalDegraded: number;
 };
+
+type TransportFallbackChannelSummary = {
+  channel: string;
+  total: number;
+  lastReason: string | null;
+  lastAt: string | null;
+};
+
+type RetentionSummary = {
+  runs: number;
+  warnings: number;
+  totals: MetricsSnapshot['retention']['totals'];
+  totalsByCamera: MetricsSnapshot['retention']['totalsByCamera'];
+};
+
+type TransportFallbackChannelSnapshots =
+  MetricsSnapshot['pipelines']['ffmpeg']['transportFallbacks']['byChannel'];
 
 function buildPipelineHealthSummary(
   channels: Record<
@@ -188,6 +208,23 @@ function buildPipelineHealthSummary(
 
   result.totalDegraded = result.degraded.length;
   return result;
+}
+
+function summarizeTransportFallbackChannels(
+  channels: TransportFallbackChannelSnapshots | undefined
+): TransportFallbackChannelSummary[] {
+  if (!channels) {
+    return [];
+  }
+
+  return Object.entries(channels)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([channel, snapshot]) => ({
+      channel,
+      total: snapshot.total,
+      lastReason: snapshot.last?.reason ?? null,
+      lastAt: snapshot.last?.at ?? null
+    }));
 }
 
 type ReadinessPayload = {
@@ -396,6 +433,12 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const fatalCount = snapshot.logs.byLevel.fatal ?? 0;
   const ffmpegHealth = buildPipelineHealthSummary(snapshot.pipelines.ffmpeg.byChannel ?? {});
   const audioHealth = buildPipelineHealthSummary(snapshot.pipelines.audio.byChannel ?? {});
+  const ffmpegFallbackChannels = summarizeTransportFallbackChannels(
+    snapshot.pipelines.ffmpeg.transportFallbacks.byChannel
+  );
+  const audioFallbackChannels = summarizeTransportFallbackChannels(
+    snapshot.pipelines.audio.transportFallbacks.byChannel
+  );
   const pipelinesDegraded =
     ffmpegHealth.totalDegraded > 0 || audioHealth.totalDegraded > 0;
   const degraded = errorCount > 0 || fatalCount > 0 || pipelinesDegraded;
@@ -411,6 +454,20 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const lastVideoWatchdogJitter = snapshot.pipelines.ffmpeg.lastWatchdogJitterMs ?? null;
   const lastAudioWatchdogJitter = snapshot.pipelines.audio.lastWatchdogJitterMs ?? null;
   const metricsCapturedAt = snapshot.createdAt;
+
+  const retentionTotals = { ...snapshot.retention.totals };
+  const retentionTotalsByCamera = Object.fromEntries(
+    Object.entries(snapshot.retention.totalsByCamera ?? {}).map(([camera, totals]) => [
+      camera,
+      { ...totals }
+    ])
+  ) as MetricsSnapshot['retention']['totalsByCamera'];
+  const retentionSummary: RetentionSummary = {
+    runs: snapshot.retention.runs,
+    warnings: snapshot.retention.warnings,
+    totals: retentionTotals,
+    totalsByCamera: retentionTotalsByCamera
+  };
 
   let status: HealthStatus = 'ok';
   if (state.status === 'starting') {
@@ -480,14 +537,17 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
         transportFallbacks: {
           video: {
             total: snapshot.pipelines.ffmpeg.transportFallbacks.total,
-            last: snapshot.pipelines.ffmpeg.transportFallbacks.last
+            last: snapshot.pipelines.ffmpeg.transportFallbacks.last,
+            byChannel: ffmpegFallbackChannels
           },
           audio: {
             total: snapshot.pipelines.audio.transportFallbacks.total,
-            last: snapshot.pipelines.audio.transportFallbacks.last
+            last: snapshot.pipelines.audio.transportFallbacks.last,
+            byChannel: audioFallbackChannels
           }
         }
-      }
+      },
+      retention: retentionSummary
     },
     application: {
       name: packageJson.name ?? 'guardian',

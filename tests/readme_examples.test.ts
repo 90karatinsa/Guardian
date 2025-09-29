@@ -49,6 +49,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('watchdogBackoffByChannel');
     expect(readme).toContain('pipelines.ffmpeg.watchdogRestartsByChannel');
     expect(readme).toContain('pipelines.ffmpeg.watchdogRestarts');
+    expect(readme).toContain('"nmsThreshold"');
+    expect(readme).toContain('timelineTtlMs');
     expect(readme).toContain('guardian daemon start');
     expect(readme).toContain('guardian daemon status --json');
     expect(readme).toContain('guardian daemon pipelines list --json');
@@ -80,6 +82,10 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('threat.summary');
     expect(readme).toContain('PulseAudio fallback');
     expect(readme).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
+    expect(readme).toContain('metricsSummary.pipelines.transportFallbacks.video.byChannel');
+    expect(readme).toContain('transportFallbacks.byChannel[].lastReason');
+    expect(readme).toContain('metricsSummary.retention');
+    expect(readme).toContain('health.severity');
     expect(readme).toContain('guardian daemon restart --transport');
     expect(readme).toContain('Sorun giderme');
     expect(readme).toContain('Operasyon kılavuzu');
@@ -144,6 +150,8 @@ it('ReadmeTransportFallbackDocs documents transport ladder metrics and warnings 
   const operations = fs.readFileSync(operationsPath, 'utf8');
   expect(operations).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
   expect(operations).toContain('guardian daemon restart --transport');
+  expect(operations).toContain('metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason');
+  expect(operations).toContain('metricsSummary.retention.runs');
 });
 
 describe('OperationsDocLinks', () => {

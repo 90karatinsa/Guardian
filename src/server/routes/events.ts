@@ -1192,7 +1192,12 @@ function createMetricsDigest(
         watchdogBackoffMs: data.watchdogBackoffMs,
         totalWatchdogBackoffMs: data.totalWatchdogBackoffMs,
         totalDelayMs: data.totalRestartDelayMs,
-        lastRestart: data.lastRestart
+        lastRestart: data.lastRestart,
+        health: {
+          severity: data.health?.severity ?? 'none',
+          reason: data.health?.reason ?? null,
+          degradedSince: data.health?.degradedSince ?? null
+        }
       })
     );
     pipelinePayload.ffmpeg = {
@@ -1209,7 +1214,12 @@ function createMetricsDigest(
         restarts: data.restarts,
         watchdogBackoffMs: data.watchdogBackoffMs,
         lastRestartAt: data.lastRestartAt,
-        lastRestart: data.lastRestart
+        lastRestart: data.lastRestart,
+        health: {
+          severity: data.health?.severity ?? 'none',
+          reason: data.health?.reason ?? null,
+          degradedSince: data.health?.degradedSince ?? null
+        }
       })
     );
     pipelinePayload.audio = {

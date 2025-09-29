@@ -1263,6 +1263,47 @@ describe('PersonDetector', () => {
     expect(fs.existsSync(snapshotPath)).toBe(true);
   });
 
+  it('PersonDetectorCustomNmsThreshold surfaces metadata value', async () => {
+    const detections = 1;
+    const attributes = 6;
+    const detectionData = new Float32Array(attributes * detections);
+
+    setChannelFirstDetection(detectionData, detections, 0, {
+      cx: 320,
+      cy: 320,
+      width: 220,
+      height: 200,
+      objectnessLogit: 2.3,
+      classLogit: 2.2
+    });
+
+    runMock.mockResolvedValueOnce({
+      output0: {
+        data: detectionData,
+        dims: [1, attributes, detections]
+      }
+    });
+
+    const detector = await PersonDetector.create(
+      {
+        source: 'video:custom-nms',
+        modelPath: 'models/yolov8n.onnx',
+        scoreThreshold: 0.5,
+        snapshotDir: 'snapshots',
+        minIntervalMs: 0,
+        nmsThreshold: 0.33
+      },
+      bus
+    );
+
+    const frame = createUniformFrame(1280, 720, 30);
+    await detector.handleFrame(frame, 1234);
+
+    expect(events).toHaveLength(1);
+    const meta = events[0]?.meta as Record<string, unknown>;
+    expect(meta?.thresholds?.nms).toBeCloseTo(0.33, 5);
+  });
+
   it('PersonTensorShapes handles layout variations and retains candidates', async () => {
     const attributes = 6;
     const detections = 1;

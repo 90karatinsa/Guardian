@@ -66,6 +66,7 @@ type CameraPipelineState = {
     score: number;
     snapshotDir?: string;
     minIntervalMs?: number;
+    nmsThreshold?: number;
     classIndices?: number[];
     classScoreThresholds?: Record<number, number>;
   };
@@ -520,6 +521,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         snapshotDir: context.pipelineState.person.snapshotDir,
         minIntervalMs:
           context.pipelineState.person.minIntervalMs ?? config.person.minIntervalMs ?? 2000,
+        nmsThreshold: context.pipelineState.person.nmsThreshold,
         classIndices: context.pipelineState.person.classIndices,
         classScoreThresholds: context.pipelineState.person.classScoreThresholds,
         objectClassifier: objectClassifier ?? undefined
@@ -687,11 +689,20 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         continue;
       }
 
-      const restartRequested = forceRestart || needsPipelineRestart(existing.pipelineState, context.pipelineState);
+      const transportSequenceChanged = !arrayEqual(
+        existing.pipelineState.ffmpeg.transportFallbackSequence,
+        context.pipelineState.ffmpeg.transportFallbackSequence
+      );
+
+      const restartRequested =
+        forceRestart || needsPipelineRestart(existing.pipelineState, context.pipelineState);
 
       if (restartRequested) {
         pipelines.delete(existing.channel);
         pipelinesById.delete(existing.id);
+        if (transportSequenceChanged) {
+          metrics.clearPipelineChannel('ffmpeg', existing.channel);
+        }
         existing.cleanup.forEach(fn => {
           try {
             fn();
@@ -853,6 +864,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       );
     };
     handleManagerError = error => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.warn(
+        { err, configPath: manager.getPath(), action: 'reload' },
+        'configuration reload failed'
+      );
       handleConfigError?.(error);
       runSync(activeConfig, { forceRestart: true });
     };
@@ -884,11 +900,13 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     }
 
     const canonicalVideo = canonicalChannel(trimmed);
+    const canonicalId = canonicalVideo ? canonicalVideo.replace(/^video:/, '') : '';
     const runtime =
       pipelines.get(trimmed) ??
       (canonicalVideo ? pipelines.get(canonicalVideo) : null) ??
       pipelinesById.get(trimmed) ??
       pipelinesById.get(trimmed.replace(/^video:/i, '')) ??
+      (canonicalId ? pipelinesById.get(canonicalId) : null) ??
       null;
 
     const target = runtime ?? Array.from(pipelines.values()).find(candidate => {
@@ -1325,6 +1343,10 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
     channelConfig?.person?.minIntervalMs ??
     config.person.minIntervalMs ??
     2000;
+  const nmsThreshold =
+    camera.person?.nmsThreshold ??
+    channelConfig?.person?.nmsThreshold ??
+    config.person.nmsThreshold;
   const classScoreThresholds = normalizeClassScoreThresholds(
     mergeClassScoreThresholds(
       config.person.classScoreThresholds,
@@ -1384,6 +1406,7 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
         channelConfig?.person?.snapshotDir ??
         config.person.snapshotDir,
       minIntervalMs,
+      nmsThreshold,
       classIndices:
         camera.person?.classIndices ??
         channelConfig?.person?.classIndices ??
@@ -1457,6 +1480,10 @@ function needsPipelineRestart(previous: CameraPipelineState, next: CameraPipelin
   }
 
   if (previous.person.minIntervalMs !== next.person.minIntervalMs) {
+    return true;
+  }
+
+  if (previous.person.nmsThreshold !== next.person.nmsThreshold) {
     return true;
   }
 
@@ -1537,7 +1564,11 @@ function classScoreThresholdsEqual(
 }
 
 function ffmpegOptionsEqual(a: CameraFfmpegConfig, b: CameraFfmpegConfig) {
-  return arrayEqual(a.inputArgs, b.inputArgs) && a.rtspTransport === b.rtspTransport;
+  return (
+    arrayEqual(a.inputArgs, b.inputArgs) &&
+    a.rtspTransport === b.rtspTransport &&
+    arrayEqual(a.transportFallbackSequence, b.transportFallbackSequence)
+  );
 }
 
 function poseConfigsEqual(a?: PoseConfig | null, b?: PoseConfig | null) {
@@ -1640,13 +1671,20 @@ function summarizePipelineUpdates(
     updates.motion = motionChanges;
   }
 
-  const detectionChanges = collectNumericChanges(
+  const personChanges = collectNumericChanges(
     { checkEvery: runtime.checkEvery, maxDetections: runtime.maxDetections },
     { checkEvery: next.checkEvery, maxDetections: next.maxDetections },
     ['checkEvery', 'maxDetections']
   );
-  if (Object.keys(detectionChanges).length > 0) {
-    updates.person = detectionChanges;
+
+  const previousNms = normalizeNumber(runtime.pipelineState.person.nmsThreshold);
+  const nextNms = normalizeNumber(next.pipelineState.person.nmsThreshold);
+  if (previousNms !== nextNms) {
+    personChanges.nmsThreshold = { previous: previousNms, next: nextNms };
+  }
+
+  if (Object.keys(personChanges).length > 0) {
+    updates.person = personChanges;
   }
 
   const ffmpegChanges = collectNumericChanges(
@@ -1681,6 +1719,17 @@ function summarizePipelineUpdates(
       'circuitBreakerThreshold'
     ]
   );
+  if (
+    !arrayEqual(
+      runtime.pipelineState.ffmpeg.transportFallbackSequence,
+      next.pipelineState.ffmpeg.transportFallbackSequence
+    )
+  ) {
+    (ffmpegChanges as Record<string, unknown>).transportFallbackSequence = {
+      previous: runtime.pipelineState.ffmpeg.transportFallbackSequence ?? null,
+      next: next.pipelineState.ffmpeg.transportFallbackSequence ?? null
+    };
+  }
   if (Object.keys(ffmpegChanges).length > 0) {
     updates.ffmpeg = ffmpegChanges;
   }

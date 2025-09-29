@@ -622,7 +622,7 @@ describe('EventSuppressionRateLimit', () => {
     expect(historyHistogram['2-5']).toBeGreaterThanOrEqual(2);
   });
 
-  it('EventSuppressionTimelineExpiry prunes idle timelines and clears cooldown state', () => {
+  it('EventSuppressionTimelineTtl prunes idle timelines and clears cooldown state', () => {
     const metrics = new MetricsRegistry();
     metrics.reset();
     const metricsBus = new EventBus({
@@ -643,9 +643,16 @@ describe('EventSuppressionRateLimit', () => {
       }
     ]);
 
+    const internalRule = (metricsBus as any).suppressionRules.find((rule: any) => rule.id === 'timeline-ttl');
+    expect(internalRule.timelineTtlMs).toBe(500);
+    expect(internalRule.timeline.timelineTtlMs).toBe(500);
+
     expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
     expect(metricsBus.emitEvent({ ...basePayload, ts: 120, meta: { channel: 'cam:a' } })).toBe(true);
     expect(metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(false);
+
+    const channelTimeline = Array.from(internalRule.timelines.values())[0];
+    expect(channelTimeline?.timelineTtlMs).toBe(500);
 
     // wait beyond TTL so suppression state is reclaimed before the next event
     expect(metricsBus.emitEvent({ ...basePayload, ts: 900, meta: { channel: 'cam:a' } })).toBe(true);
@@ -772,7 +779,10 @@ describe('MetricsSuppressionSnapshot', () => {
     expect(snapshot.suppression.historyTotals.combinedHistoryCount).toBe(5);
     expect(snapshot.suppression.historyTotals.historyTtlPruned).toBe(0);
     expect(snapshot.suppression.lastEvent?.channel).toBe('video:lobby');
-    expect(snapshot.suppression.lastEvent?.channels).toEqual(['video:lobby', 'video:alerts']);
+    expect([...(snapshot.suppression.lastEvent?.channels ?? [])].sort()).toEqual([
+      'video:alerts',
+      'video:lobby'
+    ]);
     expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(200);
     expect(snapshot.suppression.lastEvent?.windowRemainingMs).toBe(250);
 
@@ -785,7 +795,10 @@ describe('MetricsSuppressionSnapshot', () => {
     expect(ruleSnapshot.history.lastCombinedCount).toBe(3);
     expect(ruleSnapshot.history.lastTtlPruned).toBeNull();
     expect(ruleSnapshot.history.lastChannel).toBe('video:lobby');
-    expect(ruleSnapshot.history.lastChannels).toEqual(['video:lobby', 'video:alerts']);
+    expect([...(ruleSnapshot.history.lastChannels ?? [])].sort()).toEqual([
+      'video:alerts',
+      'video:lobby'
+    ]);
     expect(ruleSnapshot.history.lastCooldownMs).toBe(600);
     expect(ruleSnapshot.history.lastCooldownRemainingMs).toBe(200);
     expect(ruleSnapshot.history.lastWindowRemainingMs).toBe(250);

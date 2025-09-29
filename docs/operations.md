@@ -11,8 +11,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 - `guardian daemon ready` komutu, SSE ve HTTP API uçlarının trafik kabul etmeye hazır olup olmadığını bildirir.
 - `guardian daemon status --json` çıktısında `pipelines.ffmpeg.watchdogRestartsByChannel` ve
   `pipelines.audio.watchdogRestartsByChannel` metrikleri ile hangi kameranın yeniden başlatma döngüsüne girdiğini belirleyin.
-- Aynı sağlık çıktısındaki `metrics.pipelines.ffmpeg.transportFallbacks.total` ve `...byChannel` alanlarını inceleyerek RTSP
-  bağlantılarının TCP↔UDP fallback zincirine kaç kez başvurduğunu takip edin; artış görürseniz `guardian daemon restart --transport`
+- Aynı sağlık çıktısındaki `metrics.pipelines.ffmpeg.transportFallbacks.total`, `...byChannel` ve `metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason` alanlarını inceleyerek RTSP bağlantılarının TCP↔UDP fallback zincirine kaç kez ve hangi gerekçeyle başvurduğunu takip edin; artış görürseniz `guardian daemon restart --transport`
   komutu ile kanalı sıfırlayabilirsiniz.
 - Docker ya da systemd ortamında healthcheck scriptini test etmek için `pnpm tsx scripts/healthcheck.ts --health` ve `--ready`
   seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler.
@@ -25,6 +24,7 @@ nasıl yararlanacağınızı adım adım anlatır.
   sayaçlarının sıfırlandığını doğrulayın.
 - `pnpm exec tsx src/tasks/retention.ts --run now` komutu ile retention görevini elle tetikleyebilir, ardından
   `scripts/db-maintenance.ts vacuum --mode full` yardımıyla SQLite arşivini sıkıştırabilirsiniz.
+- Çalıştırma sonrasında `guardian daemon status --json` çıktısındaki `metricsSummary.retention.runs`, `warnings`, `totals` ve `totalsByCamera` alanlarını inceleyerek bakım görevlerinin ne kadar veri temizlediğini doğrulayın; `totals.diskSavingsBytes` değeri son çalışmada kazanılan alanı gösterir.
 - `guardian retention run --config config/production.json` ile farklı konfigürasyon dosyaları için bakım planlayabilirsiniz;
   `pnpm tsx src/cli.ts retention --help` çıktısı güncel seçenekleri listeler.
 

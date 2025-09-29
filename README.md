@@ -107,7 +107,7 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
         "id": "test-camera",
         "channel": "video:test-camera",
         "input": "assets/test-video.mp4",
-        "person": { "score": 0.5 },
+        "person": { "score": 0.5, "nmsThreshold": 0.45 },
         "motion": {
           "diffThreshold": 20,
           "areaThreshold": 0.02,
@@ -131,6 +131,7 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
           "detector": "motion",
           "source": "video:test-camera",
           "suppressForMs": 2000,
+          "timelineTtlMs": 10000,
           "reason": "Suppress repeated motion events"
         }
       ]
@@ -201,9 +202,9 @@ Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kam
 ### RTSP ve çoklu kamera
 - `video.cameras` dizisine her kamera için benzersiz bir nesne ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
 - `channel` değeri, olayların EventBus üzerinde yayınlanacağı kanalı belirler (`video:lobby`, `video:parking` gibi). Guardian bu değerleri `normalizeChannelId` yardımcı fonksiyonuyla normalize eder; `video:lobby` ve `lobby` girişleri aynı video kanalına, `audio:microphone` ve sadece `microphone` girişleri ise aynı ses kanalına eşlenir. Dashboard filtreleri, HTTP API ve metriklerdeki `pipelines.ffmpeg.byChannel` ile `pipelines.audio.byChannel` haritaları bu normalleştirilmiş değerleri kullanır.
-- Prefixsiz girişler video kanalları için `video:` önekiyle, ses kanalları için ise `audio:` önekiyle saklanır. Örneğin `events.suppression.rules` altında `channel: "MICROPHONE"` tanımı yaparsanız Guardian bunu `audio:microphone` olarak kaydeder; CLI ve dashboard filtreleri aynı kimlikle eşleşir.
+- Prefixsiz girişler video kanalları için `video:` önekiyle, ses kanalları için ise `audio:` önekiyle saklanır. Örneğin `events.suppression.rules` altında `channel: "MICROPHONE"` tanımı yaparsanız Guardian bunu `audio:microphone` olarak kaydeder; CLI ve dashboard filtreleri aynı kimlikle eşleşir. Her kural opsiyonel `timelineTtlMs` değeriyle geçmiş event kimliklerinin ne kadar süre tutulacağını belirler; süre dolduğunda suppress edilmiş kayıtlar otomatik temizlenir.
 - `ffmpeg` altındaki `idleTimeoutMs`, `watchdogTimeoutMs`, `startTimeoutMs`, `forceKillTimeoutMs`, `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` seçenekleri boru hattının yeniden deneme davranışını ve watchdog zamanlamalarını kontrol eder. RTSP hataları art arda yaşandığında, exponential backoff ve jitter uygulaması `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.watchdogBackoffByChannel` alanlarına işlenir; maksimum gecikmeye ulaşıldığında devre kesici tetiklenir ve hata logu üretir.
-- Kamera bazlı `motion` ve `person` blokları debounce/backoff gibi gürültü bastırma katsayılarını içerir; aynı dosyada birden fazla kamera tanımlayarak her kanal için farklı eşikler uygulayabilirsiniz.
+- Kamera bazlı `motion` ve `person` blokları debounce/backoff gibi gürültü bastırma katsayılarını içerir; aynı dosyada birden fazla kamera tanımlayarak her kanal için farklı eşikler uygulayabilirsiniz. `person.nmsThreshold` değeri globalde, kanal altında veya kamera tanımında girildiğinde non-max suppression filtresini sıkılaştırır; yalnızca değer değiştiğinde dedektör yeniden başlatılır.
 - Her kamera için tanımlanan `channel` değerinin `video.channels` altında karşılığı bulunmalıdır. Ayrıca `audio.micFallbacks` dizilerindeki `device` alanları boş bırakılamaz ve oran sınırlayıcı (`rateLimit`) tanımlarında `perMs` değeri `count` değerinden küçük olamaz; aksi halde konfigürasyon yüklenmez.
 - Opsiyonel `audio.channel` alanını tanımlayarak ses mikserinin hangi EventBus kanalına bağlanacağını belirleyebilirsiniz. Aynı kanalın birden fazla kamera ile paylaşılması engellenir; yapılandırma yeniden yüklendiğinde çakışmalar uyarı olarak CLI ve loglarda görünür.
 
@@ -255,7 +256,7 @@ ve `pipelines.ffmpeg.watchdogBackoffByChannel` metrikleri, her kanalın ne kadar
 
 ### Ses fallback ve anomaly ayarları
 Guardian, mikrofon fallback zincirlerini ve anomaly dedektör eşiklerini çalışma anında güncelleyebilir:
-- `audio.micFallbacks`, platform anahtarları altında `format` ve `device` bilgilerini içeren fallback listeleri kabul eder. Bir cihaz başarısız olduğunda sonraki aday denenir; yapılandırma dosyası kaydedildiğinde aktif boru hattı durdurulmadan yeni liste devreye girer.
+- `audio.micFallbacks`, platform anahtarları altında `format` ve `device` bilgilerini içeren fallback listeleri kabul eder. Bir cihaz başarısız olduğunda sonraki aday denenir; yapılandırma dosyası kaydedildiğinde aktif boru hattı durdurulmadan yeni liste devreye girer. `events.suppression.rules[].timelineTtlMs` değerini değiştirirseniz guard, sıcak durumda timeline TTL'lerini günceller ve geçmiş event kimliklerini yeni süreye göre prune eder.
 - `audio.channel` alanı tanımlanmamışsa varsayılan `audio:microphone` kanalı kullanılır. Birden fazla örneği aynı kanala bağlamak istiyorsanız farklı değerler atayın.
 - `audio.anomaly` blokları içinde `rmsWindowMs`, `centroidWindowMs`, `minTriggerDurationMs` veya `thresholds` alanlarını değiştirmeniz halinde dedektör tamponları sıfırlanır ve yeni pencereler hemen uygulanır. `nightHours` aralığı güncellendiğinde profil geçişi bir sonraki karede tetiklenir.
 - Fallback ve eşik değişikliklerinin etkisini `guardian daemon status --json` komutuyla veya `/api/metrics/pipelines` uç noktasından alınan metriklerle doğrulayabilirsiniz.
@@ -365,14 +366,10 @@ guardian status
 ```
 
 `guardian daemon status --json` çıktısı `"status":"ok"`, `metrics.logs.byLevel.error`, `metrics.logs.histogram.error`,
-`pipelines.ffmpeg.watchdogRestartsByChannel` ve `pipelines.ffmpeg.byChannel` gibi alanları içerir. Watchdog sayaçları tek tek
-kanallar için kaç yeniden deneme yaşandığını, `watchdogBackoffByChannel` ise toplam gecikme süresini gösterir. Komut
-çalıştırıldıktan sonra isterseniz `guardian log-level set info` ile varsayılan seviyeye geri dönebilir, `guardian log-level get`
-çıkışını `metrics.logs.byLevel` ile karşılaştırabilirsiniz. Geliştirme sırasında `pnpm start` komutu HTTP sunucusunu ve guardian
-daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
+`pipelines.ffmpeg.watchdogRestartsByChannel` ve `pipelines.ffmpeg.byChannel` gibi alanları içerir. `metricsSummary.pipelines.transportFallbacks.video.byChannel` dizisindeki her kayıt `channel`, `total`, `lastReason` ve `lastAt` alanlarını taşıyarak TCP↔UDP ladder değişimlerini ayrıntılandırır; `metricsSummary.retention` bloğu ise `runs`, `warnings`, `totals` ve `totalsByCamera` anahtarlarıyla son retention görevlerinin özetini paylaşır. Watchdog sayaçları tek tek kanallar için kaç yeniden deneme yaşandığını, `watchdogBackoffByChannel` ise toplam gecikme süresini gösterir. Komut çalıştırıldıktan sonra isterseniz `guardian log-level set info` ile varsayılan seviyeye geri dönebilir, `guardian log-level get` çıkışını `metrics.logs.byLevel` ile karşılaştırabilirsiniz. Geliştirme sırasında `pnpm start` komutu HTTP sunucusunu ve guardian daemon'unu aynı anda başlatan bir kısayol olarak kullanılabilir.
 
 ## Dashboard
-`pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir. Retention diski tasarruf uyarıları ve RTSP transport fallback bildirimleri de aynı SSE akışında `warnings` kategorisi altında yayınlanır; dashboard sağ panelindeki uyarı kronolojisi her olayda `streamSnapshots` sayaçlarını artırır.
+`pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir. Retention diski tasarruf uyarıları ve RTSP transport fallback bildirimleri de aynı SSE akışında `warnings` kategorisi altında yayınlanır; dashboard sağ panelindeki uyarı kronolojisi her olayda `streamSnapshots` sayaçlarını artırır. `pipelines.ffmpeg.byChannel` girdilerindeki `health.severity`, `health.reason` ve `health.degradedSince` alanları, kanal kartlarındaki badge/tooltip metinlerini güncellerken `transportFallbacks.byChannel[].lastReason` değeri en son TCP↔UDP geçişinin nedenini belirtir.
 
 Yalnızca belirli metrik bölümlerini tüketmek için `metrics` sorgu parametresiyle SSE'yi daraltabilirsiniz. Örneğin sadece ses ve retention metriklerini dinlemek için aşağıdaki komutu çalıştırabilirsiniz; ffmpeg istatistikleri bu akışta gönderilmez:
 
@@ -456,7 +453,7 @@ operasyonel rehber ile birlikte okunmalıdır.
 | --- | --- | --- |
 | `status: "degraded"` veya artan `metrics.logs.byLevel.error` değerleri | Dedektörler hata üretiyor veya log seviyesi çok düşük | `pnpm tsx scripts/healthcheck.ts --health` çıktısını ve `guardian log-level set debug` komutunu kontrol edin |
 | `pipelines.ffmpeg.watchdogRestartsByChannel` hızla artıyor | RTSP bağlantısı kopuyor ya da jitter yüksek | `guardian daemon restart --channel video:lobby` ve `pnpm exec tsx src/cli.ts daemon status --json` |
-| `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor veya `transport-change` logları sıklaşıyor | TCP↔UDP transport zinciri sürekli geri düşüyor | `guardian daemon restart --transport video:lobby` ile kanalın taşıyıcı sırasını sıfırlayın ve `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.transportFallbacks.byChannel` alanını izleyin |
+| `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor veya `transport-change` logları sıklaşıyor | TCP↔UDP transport zinciri sürekli geri düşüyor | `guardian daemon restart --transport video:lobby` ile kanalın taşıyıcı sırasını sıfırlayın ve `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.transportFallbacks.byChannel` ile `metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason` alanlarını izleyin |
 | `Audio source recovering (reason=ffmpeg-missing)` mesajları | Mikrofon fallback listesi tükeniyor veya cihaz keşfi zaman aşımına düşüyor | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
 
 - `guardian daemon status --json` veya `pnpm exec tsx src/cli.ts --health` çıktısında `metrics.logs.byLevel.error` hızla artıyorsa log seviyesini `guardian log-level set debug` ile yükseltip detaylı inceleme yapın.
@@ -464,7 +461,7 @@ operasyonel rehber ile birlikte okunmalıdır.
 - `pipelines.ffmpeg.watchdogBackoffByChannel` veya `pipelines.ffmpeg.restartHistogram.delay` değerleri sürekli yükseliyorsa RTSP bağlantılarını kontrol edin; `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` parametrelerini düşürmek backoff süresini azaltır.
 - `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırları kesintisiz devam ediyorsa `audio.micFallbacks` listesinde çalışan bir cihaz kalmamış olabilir.
 - `Audio source recovering (reason=ffmpeg-missing)` hataları devre kesiciyi tetiklemişse `guardian daemon restart --channel audio:microphone` komutunu çalıştırarak `audio:microphone` kanalının devre kesicisini sıfırlayın. Komut başarılı olduğunda loglar manuel devre sıfırlamasını, metrikler ise `pipelines.audio.byReason['manual-circuit-reset']` artışını rapor eder; ardından ffmpeg ikililerinin PATH'te erişilebilir olduğunu `ffmpeg -version` ile doğrulayın.
-- `metrics.suppression.histogram.cooldownRemainingMs` ve `metrics.suppression.histogram.windowRemainingMs` değerleri yüksekse `events.suppression.rules` altındaki `suppressForMs` veya `rateLimit.cooldownMs` değerlerini gözden geçirin.
+- `metrics.suppression.histogram.cooldownRemainingMs` ve `metrics.suppression.histogram.windowRemainingMs` değerleri yüksekse `events.suppression.rules` altındaki `suppressForMs`, `timelineTtlMs` veya `rateLimit.cooldownMs` değerlerini gözden geçirin; TTL ne kadar kısa olursa geçmiş event kimlikleri o kadar hızlı temizlenir.
 - CLI komutları beklenen çıktıyı vermiyorsa `guardian daemon status --json` ve `pnpm exec tsx src/cli.ts status --json` komutlarının exit kodunun 0 olduğundan emin olun; farklı bir config dosyasını `--config` parametresiyle doğrulayabilirsiniz. `guardian daemon ready` çıktısı `"status":"ready"` değilse bir shutdown hook'u blokluyor olabilir.
 - `pipelines.ffmpeg.watchdogRestarts` veya `pipelines.ffmpeg.watchdogRestartsByChannel` değerleri artıyorsa [Operasyon kılavuzu](docs/operations.md)
   içindeki devre kesici sıfırlama adımlarını uygulayın ve `guardian daemon hooks --reason watchdog-reset` komutuyla manuel toparlanmayı deneyin.

@@ -399,6 +399,78 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('CliHealthPipelineDiagnostics includes transport fallback and retention summaries', async () => {
+    const baseTime = Date.now();
+    metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel: 'front-door',
+      to: 'tcp',
+      at: baseTime - 2500
+    });
+    metrics.recordTransportFallback('ffmpeg', 'connect-error', {
+      channel: 'rear-lot',
+      to: 'udp',
+      at: baseTime - 1500
+    });
+    metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel: 'front-door',
+      to: 'udp',
+      at: baseTime - 500
+    });
+
+    metrics.recordRetentionRun({
+      removedEvents: 5,
+      archivedSnapshots: 2,
+      prunedArchives: 1,
+      diskSavingsBytes: 4096,
+      perCamera: {
+        'front-door': { archivedSnapshots: 1, prunedArchives: 1 },
+        'rear-lot': { archivedSnapshots: 1, prunedArchives: 0 }
+      }
+    });
+    metrics.recordRetentionWarning({
+      camera: 'front-door',
+      path: '/data/front',
+      reason: 'disk-low'
+    });
+    metrics.recordRetentionWarning({
+      camera: null,
+      path: '/data/global',
+      reason: 'fs-readonly'
+    });
+
+    const payload = await buildHealthPayload();
+
+    expect(payload.metricsSummary.pipelines.transportFallbacks.video.byChannel).toEqual([
+      {
+        channel: 'front-door',
+        total: 2,
+        lastReason: 'rtsp-timeout',
+        lastAt: expect.any(String)
+      },
+      {
+        channel: 'rear-lot',
+        total: 1,
+        lastReason: 'connect-error',
+        lastAt: expect.any(String)
+      }
+    ]);
+    expect(payload.metricsSummary.pipelines.transportFallbacks.audio.byChannel).toEqual([]);
+    expect(payload.metricsSummary.retention).toMatchObject({
+      runs: 1,
+      warnings: 2,
+      totals: {
+        removedEvents: 5,
+        archivedSnapshots: 2,
+        prunedArchives: 1,
+        diskSavingsBytes: 4096
+      }
+    });
+    expect(payload.metricsSummary.retention.totalsByCamera).toEqual({
+      'front-door': { archivedSnapshots: 1, prunedArchives: 1 },
+      'rear-lot': { archivedSnapshots: 1, prunedArchives: 0 }
+    });
+  });
+
   it('CliPipelinesListJson mirrors summary output and orders degraded channels by severity', async () => {
     metrics.setPipelineChannelHealth('ffmpeg', 'video:beta', {
       severity: 'critical',

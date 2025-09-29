@@ -1282,6 +1282,94 @@ describe('RestApiEvents', () => {
     expect(payload.retention.totalsByCamera.lobby.archivedSnapshots).toBe(2);
   });
 
+  it('HttpSseChannelHealthDigest surfaces channel severity metadata', async () => {
+    metrics.reset();
+    const now = Date.now();
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:lobby', {
+      severity: 'critical',
+      reason: 'no-signal',
+      degradedSince: now - 90_000
+    });
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:loading', {
+      severity: 'warning',
+      reason: 'packet-loss',
+      degradedSince: now - 45_000
+    });
+
+    const { port } = await ensureServer();
+
+    const controller = new AbortController();
+    const response = await fetch(`http://localhost:${port}/api/events/stream?metrics=all`, {
+      signal: controller.signal
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const digest = await new Promise<any>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              reject(new Error('stream ended before metrics digest'));
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (eventName === 'metrics' && dataLines.length > 0) {
+                try {
+                  resolve(JSON.parse(dataLines.join('')));
+                } catch (error) {
+                  reject(error);
+                }
+                return;
+              }
+            }
+            readNext();
+          })
+          .catch(reject);
+      };
+      readNext();
+    });
+
+    controller.abort();
+
+    expect(digest?.pipelines?.ffmpeg?.channels).toBeDefined();
+    const channels = Array.isArray(digest?.pipelines?.ffmpeg?.channels)
+      ? digest.pipelines.ffmpeg.channels
+      : [];
+    const lobby = channels.find((entry: any) => entry.channel === 'video:lobby');
+    const loadingDock = channels.find((entry: any) => entry.channel === 'video:loading');
+    expect(lobby?.health?.severity).toBe('critical');
+    expect(lobby?.health?.reason).toBe('no-signal');
+    expect(typeof lobby?.health?.degradedSince === 'string').toBe(true);
+    expect(Number.isFinite(Date.parse(lobby?.health?.degradedSince ?? ''))).toBe(true);
+    expect(loadingDock?.health?.severity).toBe('warning');
+    expect(loadingDock?.health?.reason).toBe('packet-loss');
+    expect(typeof loadingDock?.health?.degradedSince === 'string').toBe(true);
+  });
+
   it('HttpApiAudioPipelineDigest surfaces audio channel restart metadata', async () => {
     metrics.reset();
     metrics.recordPipelineRestart('audio', 'watchdog-timeout', {
