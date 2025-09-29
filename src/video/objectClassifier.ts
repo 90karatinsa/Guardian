@@ -371,9 +371,34 @@ function normalizeThreatEntry(value: unknown): ThreatSummaryEntry | null {
   if (threatScore === null) {
     return null;
   }
-  const label = typeof record.label === 'string' ? record.label : null;
+  const label = resolveThreatEntryLabel(record);
   const isThreat = typeof record.threat === 'boolean' ? record.threat : threatScore >= 0.5;
   return { label, threatScore, isThreat };
+}
+
+function resolveThreatEntryLabel(record: Record<string, unknown>) {
+  const candidates: unknown[] = [
+    record.label,
+    (record as { alias?: unknown }).alias,
+    (record as { mappedLabel?: unknown }).mappedLabel,
+    (record as { resolvedLabel?: unknown }).resolvedLabel,
+    (record as { rawLabel?: unknown }).rawLabel
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') {
+      continue;
+    }
+
+    const trimmed = candidate.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    return trimmed;
+  }
+
+  return null;
 }
 
 export default ObjectClassifier;

@@ -231,6 +231,46 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
   });
 
+  it('HttpApiStreamRetryBounds clamps retry seconds to 1-60 and emits retry line', async () => {
+    const router = createEventsRouter({ bus: new EventEmitter() });
+    const decoder = new TextDecoder();
+
+    class RecordingResponse extends StubServerResponse {
+      chunks: string[] = [];
+
+      write(chunk: any) {
+        const value = typeof chunk === 'string' ? chunk : decoder.decode(chunk);
+        this.chunks.push(value);
+        return true;
+      }
+    }
+
+    const collectRetryLine = (query: string) => {
+      const request = new StubIncomingMessage(`/api/events/stream${query}`);
+      const response = new RecordingResponse();
+
+      const handled = router.handle(
+        request as unknown as import('node:http').IncomingMessage,
+        response as unknown as import('node:http').ServerResponse
+      );
+      expect(handled).toBe(true);
+      expect(response.headers['Content-Type']).toBe('text/event-stream');
+
+      const retryLine = response.chunks.find(chunk => chunk.startsWith('retry:')) ?? '';
+
+      request.emit('close');
+      response.emit('close');
+      return retryLine.trim();
+    };
+
+    expect(collectRetryLine('?retry=0.5')).toBe('retry: 1000');
+    expect(collectRetryLine('?retry=90')).toBe('retry: 60000');
+    expect(collectRetryLine('?retry=15')).toBe('retry: 15000');
+    expect(collectRetryLine('?retryMs=2500')).toBe('retry: 2500');
+
+    router.close();
+  });
+
   it('HttpApiSnapshotAllowlist denies ../etc/passwd style inputs', async () => {
     const now = Date.now();
     storeEvent({

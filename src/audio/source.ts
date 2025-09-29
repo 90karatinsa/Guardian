@@ -191,7 +191,16 @@ export class AudioSource extends EventEmitter {
     this.circuitBroken = false;
     this.circuitBreakerFailures = 0;
     this.lastCircuitCandidateReason = null;
-    this.shouldStop = false;
+    const restartRequested = options.restart !== false;
+
+    if (!restartRequested) {
+      this.clearAllTimers();
+      if (wasBroken) {
+        this.shouldStop = true;
+      }
+    } else {
+      this.shouldStop = false;
+    }
     this.currentBinaryIndex = this.lastSuccessfulIndex;
     if (this.options.type === 'mic') {
       if (this.lastSuccessfulMicIndex !== null) {
@@ -204,7 +213,7 @@ export class AudioSource extends EventEmitter {
       }
       this.activeMicCandidateIndex = null;
     }
-    if (options.restart !== false && wasBroken) {
+    if (restartRequested && wasBroken) {
       this.startPipeline();
     }
     return wasBroken;

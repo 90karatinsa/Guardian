@@ -27,7 +27,7 @@ type CliIo = {
 
 type GuardRuntime = {
   stop: () => void | Promise<void>;
-  resetCircuitBreaker: (identifier: string) => boolean;
+  resetCircuitBreaker: (identifier: string, options?: { restart?: boolean }) => boolean;
   resetChannelHealth: (identifier: string) => boolean;
   resetTransportFallback?: (identifier: string) => boolean;
 };
@@ -312,14 +312,15 @@ const DAEMON_PIPELINES_USAGE = [
   '',
   'Usage:',
   '  guardian daemon pipelines list [--json]  List pipeline channel health state',
-  '  guardian daemon pipelines reset --channel <id>  Reset video watchdog health counters',
+  '  guardian daemon pipelines reset --channel <id> [--no-restart]  Reset pipeline watchdog health counters',
   '',
   'Options for "list":',
   '  -j, --json           Output JSON',
   '  -h, --help           Show this help message',
   '',
   'Options for "reset":',
-  '  -c, --channel <id>   Video channel identifier (e.g., video:front)',
+  '  -c, --channel <id>   Pipeline channel identifier (e.g., video:front or audio:lobby)',
+  '      --no-restart     Reset the circuit breaker without restarting the pipeline',
   '  -h, --help           Show this help message'
 ].join('\n');
 
@@ -812,6 +813,7 @@ type DaemonPipelineListArgs = {
 
 type DaemonPipelineResetArgs = {
   channel?: string;
+  restart?: boolean;
   help: boolean;
   errors: string[];
 };
@@ -837,7 +839,7 @@ function parseDaemonPipelineListArgs(args: string[]): DaemonPipelineListArgs {
 }
 
 function parseDaemonPipelineResetArgs(args: string[]): DaemonPipelineResetArgs {
-  const result: DaemonPipelineResetArgs = { errors: [], help: false };
+  const result: DaemonPipelineResetArgs = { errors: [], help: false, restart: true };
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index];
     if (!token) {
@@ -855,6 +857,10 @@ function parseDaemonPipelineResetArgs(args: string[]): DaemonPipelineResetArgs {
         result.channel = value;
         index += 1;
       }
+      continue;
+    }
+    if (token === '--no-restart') {
+      result.restart = false;
       continue;
     }
     result.errors.push(`Unknown option: ${token}`);
@@ -1093,61 +1099,105 @@ async function runDaemonPipelinesCommand(args: string[], io: CliIo): Promise<num
 
     const snapshot = metrics.snapshot();
     const ffmpegChannels = snapshot.pipelines.ffmpeg.byChannel ?? {};
-    const known = new Map<string, string>();
+    const audioChannels = snapshot.pipelines.audio.byChannel ?? {};
+    type KnownChannel = { channel: string; pipeline: 'ffmpeg' | 'audio' };
+    const known = new Map<string, KnownChannel>();
 
-    const registerChannel = (value: string) => {
+    const registerChannel = (value: string, pipeline: 'ffmpeg' | 'audio') => {
       const trimmed = value.trim();
       if (!trimmed) {
         return;
       }
+
+      const info: KnownChannel = { channel: trimmed, pipeline };
+      const addKey = (key: string) => {
+        if (!key) {
+          return;
+        }
+        known.set(key, info);
+      };
+
       const lower = trimmed.toLowerCase();
-      known.set(lower, trimmed);
+      addKey(lower);
+
       if (lower.startsWith('video:')) {
-        const withoutPrefix = lower.slice('video:'.length);
-        known.set(withoutPrefix, trimmed);
+        addKey(lower.slice('video:'.length));
       }
-      const canonical = canonicalChannel(trimmed);
-      if (canonical) {
-        known.set(canonical.toLowerCase(), trimmed);
-        if (canonical.toLowerCase().startsWith('video:')) {
-          known.set(canonical.toLowerCase().slice('video:'.length), trimmed);
+      if (lower.startsWith('audio:')) {
+        addKey(lower.slice('audio:'.length));
+      }
+
+      const canonicalVideo = canonicalChannel(trimmed);
+      if (canonicalVideo) {
+        const canonicalLower = canonicalVideo.toLowerCase();
+        addKey(canonicalLower);
+        if (canonicalLower.startsWith('video:')) {
+          addKey(canonicalLower.slice('video:'.length));
+        }
+      }
+
+      const canonicalAudio = canonicalChannel(trimmed, { defaultType: 'audio' });
+      if (canonicalAudio) {
+        const canonicalAudioLower = canonicalAudio.toLowerCase();
+        addKey(canonicalAudioLower);
+        if (canonicalAudioLower.startsWith('audio:')) {
+          addKey(canonicalAudioLower.slice('audio:'.length));
         }
       }
     };
 
     for (const key of Object.keys(ffmpegChannels)) {
-      registerChannel(key);
+      registerChannel(key, 'ffmpeg');
+    }
+    for (const key of Object.keys(audioChannels)) {
+      registerChannel(key, 'audio');
     }
 
     const candidateKeys = new Set<string>();
-    candidateKeys.add(channel.toLowerCase());
-    const canonicalVideo = canonicalChannel(channel);
-    if (canonicalVideo) {
-      candidateKeys.add(canonicalVideo.toLowerCase());
-      if (canonicalVideo.toLowerCase().startsWith('video:')) {
-        candidateKeys.add(canonicalVideo.toLowerCase().slice('video:'.length));
-      }
+    const lowerChannel = channel.toLowerCase();
+    candidateKeys.add(lowerChannel);
+    if (lowerChannel.startsWith('video:')) {
+      candidateKeys.add(lowerChannel.slice('video:'.length));
     }
-    if (channel.toLowerCase().startsWith('video:')) {
-      candidateKeys.add(channel.toLowerCase().slice('video:'.length));
+    if (lowerChannel.startsWith('audio:')) {
+      candidateKeys.add(lowerChannel.slice('audio:'.length));
     }
 
-    let targetChannel: string | null = null;
+    const canonicalVideo = canonicalChannel(channel);
+    if (canonicalVideo) {
+      const canonicalLower = canonicalVideo.toLowerCase();
+      candidateKeys.add(canonicalLower);
+      if (canonicalLower.startsWith('video:')) {
+        candidateKeys.add(canonicalLower.slice('video:'.length));
+      }
+    }
+
+    const canonicalAudio = canonicalChannel(channel, { defaultType: 'audio' });
+    if (canonicalAudio) {
+      const canonicalAudioLower = canonicalAudio.toLowerCase();
+      candidateKeys.add(canonicalAudioLower);
+      if (canonicalAudioLower.startsWith('audio:')) {
+        candidateKeys.add(canonicalAudioLower.slice('audio:'.length));
+      }
+    }
+
+    let target: KnownChannel | null = null;
     for (const key of candidateKeys) {
       const resolved = known.get(key);
       if (resolved) {
-        targetChannel = resolved;
+        target = resolved;
         break;
       }
     }
 
-    if (!targetChannel) {
+    if (!target) {
       io.stderr.write(`channel not found: ${channel}\n`);
       return 1;
     }
 
-    metrics.resetPipelineChannel('ffmpeg', targetChannel);
-    metrics.setPipelineChannelHealth('ffmpeg', targetChannel, {
+    const restartRequested = parsed.restart !== false;
+    metrics.resetPipelineChannel(target.pipeline, target.channel);
+    metrics.setPipelineChannelHealth(target.pipeline, target.channel, {
       severity: 'none',
       restarts: 0,
       backoffMs: 0
@@ -1157,22 +1207,29 @@ async function runDaemonPipelinesCommand(args: string[], io: CliIo): Promise<num
     let runtimeCircuitReset = false;
     let runtimeFallbackReset = false;
     if (state.status === 'running' && state.runtime) {
-      if (typeof state.runtime.resetChannelHealth === 'function') {
-        runtimePipelineReset = state.runtime.resetChannelHealth(targetChannel);
+      if (target.pipeline === 'ffmpeg' && typeof state.runtime.resetChannelHealth === 'function') {
+        runtimePipelineReset = state.runtime.resetChannelHealth(target.channel);
       }
       if (typeof state.runtime.resetCircuitBreaker === 'function') {
-        runtimeCircuitReset = state.runtime.resetCircuitBreaker(targetChannel);
+        runtimeCircuitReset = state.runtime.resetCircuitBreaker(target.channel, {
+          restart: restartRequested
+        });
       }
-      if (typeof state.runtime.resetTransportFallback === 'function') {
-        runtimeFallbackReset = state.runtime.resetTransportFallback(targetChannel);
+      if (target.pipeline === 'ffmpeg' && typeof state.runtime.resetTransportFallback === 'function') {
+        runtimeFallbackReset = state.runtime.resetTransportFallback(target.channel);
       }
     }
 
+    const pipelineLabel = target.pipeline === 'ffmpeg' ? 'video' : 'audio';
+    const actionTarget =
+      target.pipeline === 'ffmpeg'
+        ? 'pipeline health, circuit breaker, and transport fallback'
+        : 'pipeline health and circuit breaker';
     const actionLabel =
       runtimePipelineReset || runtimeCircuitReset || runtimeFallbackReset
-        ? 'Reset pipeline health, circuit breaker, and transport fallback for video channel'
-        : 'Cleared recorded pipeline health, circuit breaker, and transport fallback for video channel';
-    io.stdout.write(`${actionLabel} ${targetChannel}\n`);
+        ? `Reset ${actionTarget} for ${pipelineLabel} channel`
+        : `Cleared recorded ${actionTarget} for ${pipelineLabel} channel`;
+    io.stdout.write(`${actionLabel} ${target.channel}\n`);
     return 0;
   }
 

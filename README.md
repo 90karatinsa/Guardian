@@ -66,14 +66,19 @@ Kurulum sonrası hızlı doğrulama için aşağıdaki adımları takip edin:
 3. `guardian daemon pipelines list --json` komutuyla `pipelines.ffmpeg.degraded` ve `pipelines.audio.degraded`
    dizilerinin severity önceliğine göre sıralandığını doğrulayın; JSON içinde her kanal için `severity`, `restarts`
    ve `backoffMs` alanları `buildPipelineHealthSummary` ile birebir eşleşir.
-4. Watchdog sayaçlarını manuel olarak sıfırlamak için `guardian daemon pipelines reset --channel video:test-camera`
+4. Watchdog sayaçlarını manuel olarak sıfırlamak için `guardian daemon pipelines reset --channel video:test-camera --no-restart`
    komutunu çalıştırın; stdout üzerindeki "Reset pipeline health, circuit breaker, and transport fallback"
-   mesajı devre kesici ve fallback sayaçlarının da sıfırlandığını gösterir.
+   mesajı devre kesici ve fallback sayaçlarının da sıfırlandığını gösterir ve `--no-restart` bayrağı bekleyen
+   yeniden başlatma zamanlayıcılarını iptal eder.
    `guardian daemon health --json` çıktısında
    `metrics.pipelines.ffmpeg.byChannel['video:test-camera'].health.severity === 'none'` ve
    `metricsSummary.pipelines.transportFallbacks.video.byChannel`
    listesinde `video:test-camera` girdisinin `total` alanı 0 olduğunda,
    komutun hem sağlık durumunu hem de RTSP fallback geçmişini temizlediği doğrulanır.
+   Aynı işlemi mikrofon devre kesicileri için `guardian daemon pipelines reset --channel audio:mic-lobby --no-restart`
+   komutuyla uygulayabilir, `metrics.pipelines.audio.byChannel['audio:mic-lobby'].health.severity === 'none'`
+   ve `metrics.pipelines.audio.byChannel['audio:mic-lobby'].restarts === 0` çıktılarıyla ses kanallarının da
+   yeniden başlatma zamanlayıcıları olmadan temizlendiğini doğrulayabilirsiniz.
 5. `guardian log-level set debug` ile seviyeyi yükseltip `guardian log-level get` komutuyla geri okuma yapın; metrikler
    `metrics.logs.byLevel.debug` alanına yeni bir artış yazacaktır.
 6. Dedektör gecikme dağılımını gözlemlemek için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';

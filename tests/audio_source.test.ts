@@ -552,6 +552,44 @@ describe('AudioSource resilience', () => {
     platformSpy.mockRestore();
   });
 
+  it('AudioAnalysisWindowReconfigures updates device discovery timeouts and RMS metrics', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      frameDurationMs: 40,
+      sampleRate: 16000,
+      channels: 1,
+      analysisRmsWindowMs: 120
+    });
+
+    const makeSamples = (rate: number, durationMs: number) =>
+      new Int16Array(Math.round((rate * durationMs) / 1000)).fill(600);
+
+    for (let i = 0; i < 3; i += 1) {
+      (source as any).analyzeFrame(makeSamples(16000, 40), 16000, 1, 40, 0.02);
+    }
+
+    let snapshot = metrics.snapshot();
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(120, 6);
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-frames']).toBe(3);
+
+    source.updateOptions({ analysisRmsWindowMs: 360, deviceDiscoveryTimeoutMs: 450 });
+    expect((source as any).options.analysisRmsWindowMs).toBe(360);
+    expect((source as any).options.deviceDiscoveryTimeoutMs).toBe(450);
+
+    for (let i = 0; i < 6; i += 1) {
+      (source as any).analyzeFrame(makeSamples(16000, 40), 16000, 1, 40, 0.02);
+    }
+
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(360, 6);
+    expect(snapshot.detectors['audio-anomaly'].gauges['analysis.ffmpeg.rms-window-frames']).toBe(9);
+
+    source.stop();
+  });
+
   it('AudioSourceDeviceDiscoveryTimeout recovers and records metrics', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -1123,6 +1161,34 @@ describe('AudioSource resilience', () => {
     source.stop();
     await vi.runOnlyPendingTimersAsync();
     platformSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('AudioCircuitResetNoRestartStopsRestart', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'noop',
+      channel: 'audio:reset-no-restart'
+    });
+
+    const startPipelineSpy = vi.spyOn(source as any, 'startPipeline');
+
+    (source as any).circuitBroken = true;
+    (source as any).shouldStop = true;
+    (source as any).restartTimer = setTimeout(() => {}, 5000);
+
+    const result = source.resetCircuitBreaker({ restart: false });
+
+    expect(result).toBe(true);
+    expect(startPipelineSpy).not.toHaveBeenCalled();
+    expect((source as any).restartTimer).toBeNull();
+    expect((source as any).shouldStop).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+
+    startPipelineSpy.mockRestore();
+    vi.runOnlyPendingTimers();
     vi.useRealTimers();
   });
 

@@ -197,6 +197,45 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoCircuitResetNoRestartStopsRestart', () => {
+    vi.useFakeTimers();
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:reset-no-restart'
+    });
+
+    const startSpy = vi.spyOn(source, 'start');
+
+    (source as any).circuitBroken = true;
+    (source as any).shouldStop = true;
+    (source as any).recovering = true;
+    (source as any).pendingRestartContext = {
+      attempt: 1,
+      delayMs: 1000,
+      meta: { minDelayMs: 0, maxDelayMs: 0, baseDelayMs: 0, appliedJitterMs: 0 },
+      channel: 'video:reset-no-restart',
+      errorCode: null,
+      exitCode: null,
+      signal: null,
+      reportedReasons: new Set<string>()
+    };
+    (source as any).restartTimer = setTimeout(() => {}, 1000);
+
+    const result = source.resetCircuitBreaker({ restart: false });
+
+    expect(result).toBe(true);
+    expect(startSpy).not.toHaveBeenCalled();
+    expect((source as any).restartTimer).toBeNull();
+    expect((source as any).pendingRestartContext).toBeNull();
+    expect((source as any).recovering).toBe(false);
+    expect((source as any).shouldStop).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+
+    vi.useRealTimers();
+  });
+
   it('VideoSourceRtspErrorDedupes', async () => {
     vi.useFakeTimers();
 
