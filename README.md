@@ -67,9 +67,13 @@ Kurulum sonrası hızlı doğrulama için aşağıdaki adımları takip edin:
    dizilerinin severity önceliğine göre sıralandığını doğrulayın; JSON içinde her kanal için `severity`, `restarts`
    ve `backoffMs` alanları `buildPipelineHealthSummary` ile birebir eşleşir.
 4. Watchdog sayaçlarını manuel olarak sıfırlamak için `guardian daemon pipelines reset --channel video:test-camera`
-   komutunu çalıştırın; başarılı olduğunda stdout üzerindeki "Reset pipeline health counters" mesajı ve
-   `metrics.pipelines.ffmpeg.byChannel['video:test-camera'].health.severity === 'none'` kontrolü devre sağlığının
-   sıfırlandığını gösterir.
+   komutunu çalıştırın; stdout üzerindeki "Reset pipeline health, circuit breaker, and transport fallback"
+   mesajı devre kesici ve fallback sayaçlarının da sıfırlandığını gösterir.
+   `guardian daemon health --json` çıktısında
+   `metrics.pipelines.ffmpeg.byChannel['video:test-camera'].health.severity === 'none'` ve
+   `metricsSummary.pipelines.transportFallbacks.video.byChannel`
+   listesinde `video:test-camera` girdisinin `total` alanı 0 olduğunda,
+   komutun hem sağlık durumunu hem de RTSP fallback geçmişini temizlediği doğrulanır.
 5. `guardian log-level set debug` ile seviyeyi yükseltip `guardian log-level get` komutuyla geri okuma yapın; metrikler
    `metrics.logs.byLevel.debug` alanına yeni bir artış yazacaktır.
 6. Dedektör gecikme dağılımını gözlemlemek için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
@@ -198,6 +202,11 @@ Guardian, `config/default.json` dosyasını okuyarak video, ses, dedektör ve re
 ```
 
 Varsayılan dosya, örnek video akışını PNG karelere dönüştüren test kamerasını içerir. Üretimde kendi kameralarınızı tanımlamak için aşağıdaki bölümlere göz atın.
+
+> ⚠️ Hot reload sırasında `video.channels` altında tanımlanan her kanalın
+> `video.cameras[].channel` listesinde birebir karşılığı olmalıdır.
+> Eşleşmeyen tanımlar `config.video.channels.video:unused-channel does not match any configured camera channel`
+> hatasıyla reddedilir ve Guardian son bilinen geçerli konfigürasyonu kullanmaya devam eder.
 
 ### RTSP ve çoklu kamera
 - `video.cameras` dizisine her kamera için benzersiz bir nesne ekleyin. `input` alanı RTSP, HTTP MJPEG, yerel dosya veya `pipe:` önekiyle bir ffmpeg komutunu destekler.
@@ -370,6 +379,8 @@ guardian status
 
 ## Dashboard
 `pnpm start` komutu HTTP sunucusunu da başlattığından, `http://localhost:3000/` adresinden dashboard'a erişebilirsiniz. SSE feed'i `text/event-stream` başlığıyla metrikleri, yüz eşleşmelerini, pose forecast bilgilerini ve threat özetlerini yayınlar. Filtreler `channel`, `detector` ve `severity` alanlarını temel alır; poz tahminleri `pose.forecast` bloklarıyla, tehdit değerlendirmeleri ise `threat.summary` alanıyla güncellenir. Retention diski tasarruf uyarıları ve RTSP transport fallback bildirimleri de aynı SSE akışında `warnings` kategorisi altında yayınlanır; dashboard sağ panelindeki uyarı kronolojisi her olayda `streamSnapshots` sayaçlarını artırır. `pipelines.ffmpeg.byChannel` girdilerindeki `health.severity`, `health.reason` ve `health.degradedSince` alanları, kanal kartlarındaki badge/tooltip metinlerini güncellerken `transportFallbacks.byChannel[].lastReason` değeri en son TCP↔UDP geçişinin nedenini belirtir.
+
+Guardian, SSE istemcileri hata aldığında `req.on('error')` ve `res.on('error')` dinleyicileriyle bağlantıyı sonlandırıp heartbeat zamanlayıcısını temizler; böylece ağ kesintilerinde `clients.size` büyümez ve `HttpSseResponseErrorCleanup` senaryosu `clients.size === 0` beklentisini doğrular.
 
 Yalnızca belirli metrik bölümlerini tüketmek için `metrics` sorgu parametresiyle SSE'yi daraltabilirsiniz. Örneğin sadece ses ve retention metriklerini dinlemek için aşağıdaki komutu çalıştırabilirsiniz; ffmpeg istatistikleri bu akışta gönderilmez:
 

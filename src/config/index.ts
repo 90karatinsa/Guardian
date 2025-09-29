@@ -1162,6 +1162,20 @@ function validateLogicalConfig(config: GuardianConfig) {
     });
   }
 
+  if (config.video.channels) {
+    for (const [normalized, original] of normalizedChannelDefinitions.entries()) {
+      if (!normalized) {
+        continue;
+      }
+      if (!cameraChannelNormalized.has(normalized)) {
+        const channelLabel = typeof original === 'string' && original.trim().length > 0 ? original : normalized;
+        messages.push(
+          `config.video.channels.${channelLabel} does not match any configured camera channel`
+        );
+      }
+    }
+  }
+
   validatePersonScore(config.person.score, 'config.person');
   validateTransportSequence(
     config.video.ffmpeg?.transportFallbackSequence,

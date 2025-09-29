@@ -181,6 +181,7 @@ describe('ConfigHotReload', () => {
 
       const broken = JSON.parse(JSON.stringify(base)) as GuardianConfig;
       broken.video.channels!['video:cam-1']!.person = { score: 2 };
+      broken.video.channels!['video:unused'] = {};
       if (broken.video.cameras) {
         broken.video.cameras[0].motion = {
           ...(broken.video.cameras[0].motion ?? {}),
@@ -196,6 +197,17 @@ describe('ConfigHotReload', () => {
             return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
           }),
         4000
+      );
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
+      const warnPayload = warnCall?.[0] as { err?: unknown } | undefined;
+      const errorMessage =
+        warnPayload?.err instanceof Error
+          ? warnPayload.err.message
+          : typeof warnPayload?.err === 'object' && warnPayload?.err && 'message' in warnPayload.err
+          ? String((warnPayload.err as { message?: unknown }).message)
+          : '';
+      expect(errorMessage).toContain(
+        'config.video.channels.video:unused does not match any configured camera channel'
       );
       await waitFor(
         () => logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied'),
@@ -218,6 +230,18 @@ describe('ConfigHotReload', () => {
     } finally {
       runtime.stop();
     }
+  });
+
+  it('ConfigRejectUnknownChannelCamera rejects channel definitions without camera assignments', () => {
+    const config = JSON.parse(JSON.stringify(createConfig({ diffThreshold: 24 }))) as GuardianConfig;
+    config.video.channels = {
+      'video:cam-1': {},
+      'video:unused-channel': {}
+    };
+
+    expect(() => validateConfig(config)).toThrowErrorMatchingInlineSnapshot(
+      "[Error: config.video.channels.video:unused-channel does not match any configured camera channel]"
+    );
   });
 
   it('ConfigSchemaValidationErrors enforces channel, fallback, and rate limit rules', () => {

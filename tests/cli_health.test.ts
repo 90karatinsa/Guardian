@@ -399,7 +399,58 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
-  it('CliHealthPipelineDiagnostics includes transport fallback and retention summaries', async () => {
+  it('CliDaemonPipelineResetHealth clears pipeline health severity and fallback totals', async () => {
+    metrics.reset();
+    metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      channel: 'video:cam-1',
+      at: Date.now() - 1_000,
+      delayMs: 2_500
+    });
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:cam-1', {
+      severity: 'warning',
+      reason: 'watchdog restarts exceeded',
+      restarts: 1,
+      backoffMs: 2_500
+    });
+    metrics.recordTransportFallback('ffmpeg', 'manual-cli-reset', {
+      channel: 'video:cam-1',
+      from: 'tcp',
+      to: 'udp',
+      attempt: 1,
+      stage: 0,
+      at: Date.now() - 500,
+      resetsCircuitBreaker: true
+    });
+
+    const resetIo = createTestIo();
+    const resetCode = await runCli(['daemon', 'pipelines', 'reset', '--channel', 'video:cam-1'], resetIo.io);
+
+    expect(resetCode).toBe(0);
+    expect(resetIo.stdout()).toContain('transport fallback');
+    expect(resetIo.stdout()).toContain('circuit breaker');
+
+    const healthIo = createTestIo();
+    const healthCode = await runCli(['daemon', 'health', '--json'], healthIo.io);
+    expect(healthCode).toBe(0);
+    const payload = JSON.parse(healthIo.stdout().trim());
+
+    const channelSummary = payload.pipelines.ffmpeg.channels['video:cam-1'];
+    expect(channelSummary).toBeDefined();
+    expect(channelSummary.severity).toBe('none');
+    expect(channelSummary.restarts).toBe(0);
+    expect(channelSummary.backoffMs).toBe(0);
+    expect(channelSummary.watchdogRestarts).toBe(0);
+    expect(channelSummary.watchdogBackoffMs).toBe(0);
+
+    const fallbackSummary = payload.metricsSummary.pipelines.transportFallbacks.video.byChannel.find(
+      (entry: { channel: string }) => entry.channel === 'video:cam-1'
+    );
+    expect(fallbackSummary).toBeDefined();
+    expect(fallbackSummary.total).toBe(0);
+    expect(fallbackSummary.lastReason).toBeNull();
+  });
+
+  it('CliHealthSummarySnapshot includes transport fallback and retention summaries', async () => {
     const baseTime = Date.now();
     metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
       channel: 'front-door',

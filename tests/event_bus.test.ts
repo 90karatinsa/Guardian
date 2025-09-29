@@ -39,7 +39,7 @@ describe('EventSuppressionRateLimit', () => {
     });
   });
 
-  it('SuppressionRateLimitCooldown merges history and cooldown metadata', () => {
+  it('EventSuppressionRateLimitCooldown merges history and cooldown metadata', () => {
     bus.configureSuppression([
       {
         id: 'channel-limit',
@@ -669,6 +669,56 @@ describe('EventSuppressionRateLimit', () => {
     ).toBeGreaterThanOrEqual(1);
     expect(snapshot.suppression.lastEvent?.channel).toBe('cam:a');
     expect(snapshot.suppression.lastEvent?.historyCount).toBe(2);
+  });
+
+  it('EventSuppressionTtlPruneMetrics records TTL prunes per channel and surfaces suppression TTL metadata', () => {
+    bus.configureSuppression([
+      {
+        id: 'timeline-ttl',
+        detector: 'test-detector',
+        channel: 'cam:a',
+        maxEvents: 2,
+        suppressForMs: 600,
+        timelineTtlMs: 500,
+        reason: 'ttl cleanup'
+      }
+    ]);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 120, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(false);
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressedMeta).toHaveLength(1);
+    const firstSuppression = suppressedMeta[0];
+    expect(firstSuppression.suppressionTimelineTtlMs).toBe(500);
+    expect(firstSuppression.suppressionTimelineHistoryTtlPruned).toBe(0);
+    expect(firstSuppression.suppressedBy?.[0]?.timelineTtlMs).toBe(500);
+    expect(firstSuppression.suppressedBy?.[0]?.timelineHistoryTtlExpired).toBe(false);
+
+    const suppressionDetail = metricsMock.recordSuppressedEvent.mock.calls[0]?.[0];
+    expect(suppressionDetail).toMatchObject({
+      ruleId: 'timeline-ttl',
+      timelineTtlMs: 500,
+      timelineHistoryTtlPruned: 0,
+      timelineHistoryTtlExpired: false
+    });
+
+    metricsMock.recordSuppressionHistoryTtlPruned.mockClear();
+
+    expect(bus.emitEvent({ ...basePayload, ts: 1500, meta: { channel: 'cam:a' } })).toBe(true);
+
+    expect(metricsMock.recordSuppressionHistoryTtlPruned).toHaveBeenCalledTimes(1);
+    const ttlCall = metricsMock.recordSuppressionHistoryTtlPruned.mock.calls[0]?.[0];
+    expect(ttlCall).toMatchObject({
+      ruleId: 'timeline-ttl',
+      channel: 'cam:a',
+      count: 2,
+      timelineTtlMs: 500,
+      timelineExpired: true
+    });
   });
 });
 

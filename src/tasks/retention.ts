@@ -84,6 +84,7 @@ export class RetentionTask {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private stopped = false;
+  private pendingSkip = false;
 
   constructor(options: RetentionTaskOptions) {
     this.options = normalizeOptions(options);
@@ -105,6 +106,7 @@ export class RetentionTask {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.pendingSkip = false;
   }
 
   configure(options: RetentionTaskOptions) {
@@ -117,6 +119,21 @@ export class RetentionTask {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+
+    if (!this.options.enabled) {
+      if (this.running) {
+        this.pendingSkip = true;
+      } else {
+        this.scheduleNext(0);
+      }
+      return;
+    }
+
+    this.pendingSkip = false;
+
+    if (this.running) {
+      return;
     }
 
     this.scheduleNext(0);
@@ -156,10 +173,17 @@ export class RetentionTask {
           (result?.rescheduled ?? latestOptions.enabled) && latestOptions.enabled;
 
         if (shouldReschedule) {
+          this.pendingSkip = false;
           this.scheduleNext(latestOptions.intervalMs);
+        } else if (this.pendingSkip && !this.timer) {
+          this.pendingSkip = false;
+          this.scheduleNext(0);
         } else if (this.timer) {
           clearTimeout(this.timer);
           this.timer = null;
+          this.pendingSkip = false;
+        } else {
+          this.pendingSkip = false;
         }
       }
     }

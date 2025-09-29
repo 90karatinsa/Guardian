@@ -317,7 +317,19 @@ export class EventsRouter {
       void this.pushSnapshotHistory(res, filters, snapshotRequest);
     }
 
+    let cleanedUp = false;
     const cleanup = () => {
+      if (cleanedUp) {
+        return;
+      }
+      cleanedUp = true;
+
+      req.off('close', cleanup);
+      req.off('end', cleanup);
+      req.off('error', cleanup);
+      res.off('error', cleanup);
+      res.off('close', cleanup);
+
       const client = this.clients.get(res);
       if (client) {
         clearInterval(client.heartbeat);
@@ -327,6 +339,9 @@ export class EventsRouter {
 
     req.on('close', cleanup);
     req.on('end', cleanup);
+    req.on('error', cleanup);
+    res.on('error', cleanup);
+    res.on('close', cleanup);
     return true;
   }
 

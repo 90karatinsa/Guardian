@@ -204,6 +204,9 @@ type SuppressionSnapshot = {
         combinedHistoryCount?: number | null;
       }
     > | null;
+    timelineTtlMs?: number | null;
+    timelineHistoryTtlPruned?: number | null;
+    timelineHistoryTtlExpired?: boolean | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
   histogram: {
@@ -243,6 +246,10 @@ type SuppressionRuleSnapshot = {
     lastWindowRemainingMs: number | null;
     lastCooldownRemainingMs: number | null;
     lastCooldownEndsAt: string | null;
+    lastTimelineTtlMs: number | null;
+    lastTimelineHistoryTtlPruned: number | null;
+    lastTimelineTtlExpired: boolean | null;
+    lastTtlPrunedChannel: string | null;
   };
 };
 
@@ -279,6 +286,9 @@ type SuppressedEventMetric = {
       combinedHistory?: number[];
     }
   >;
+  timelineTtlMs?: number;
+  timelineHistoryTtlPruned?: number;
+  timelineHistoryTtlExpired?: boolean;
 };
 
 type RetentionTotals = {
@@ -357,6 +367,8 @@ type MetricsSnapshot = {
     lastErrorAt: string | null;
     lastErrorMessage: string | null;
     histogram: CounterMap;
+    levelIndex: CounterMap;
+    histogramIndex: CounterMap;
     currentLevel: string;
     lastLevelChangeAt: string | null;
     levelChanges: CounterMap;
@@ -387,6 +399,12 @@ type PrometheusGaugeOptions = {
   metricName?: string;
   help?: string;
   labels?: Record<string, string>;
+};
+
+type PrometheusGaugeSample = {
+  value: number;
+  labels?: Record<string, string>;
+  sortKey?: number | string;
 };
 
 type PrometheusLogLevelOptions = {
@@ -545,6 +563,9 @@ class MetricsRegistry {
     cooldownRemainingMs?: number | null;
     cooldownEndsAt?: number | null;
     channelStates?: SuppressedEventMetric['channelStates'];
+    timelineTtlMs?: number | null;
+    timelineHistoryTtlPruned?: number | null;
+    timelineHistoryTtlExpired?: boolean | null;
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -809,7 +830,11 @@ class MetricsRegistry {
       lastWindowExpiresAt: null,
       lastWindowRemainingMs: null,
       lastCooldownRemainingMs: null,
-      lastCooldownEndsAt: null
+      lastCooldownEndsAt: null,
+      lastTimelineTtlMs: null,
+      lastTimelineHistoryTtlPruned: null,
+      lastTimelineTtlExpired: null,
+      lastTtlPrunedChannel: null
     };
     this.suppressionRules.set(ruleId, state);
     return state;
@@ -1040,7 +1065,20 @@ class MetricsRegistry {
       windowRemainingMs: windowRemainingValue,
       cooldownRemainingMs: cooldownRemainingValue,
       windowEndsAt: windowExpiresAtValue,
-      cooldownEndsAt: effectiveCooldownEndsAt
+      cooldownEndsAt: effectiveCooldownEndsAt,
+      timelineTtlMs:
+        typeof normalizedDetail.timelineTtlMs === 'number' && Number.isFinite(normalizedDetail.timelineTtlMs)
+          ? normalizedDetail.timelineTtlMs
+          : null,
+      timelineHistoryTtlPruned:
+        typeof normalizedDetail.timelineHistoryTtlPruned === 'number' &&
+        Number.isFinite(normalizedDetail.timelineHistoryTtlPruned)
+          ? normalizedDetail.timelineHistoryTtlPruned
+          : null,
+      timelineHistoryTtlExpired:
+        typeof normalizedDetail.timelineHistoryTtlExpired === 'boolean'
+          ? normalizedDetail.timelineHistoryTtlExpired
+          : null
     };
     if (ruleId) {
       this.suppressionByRule.set(ruleId, (this.suppressionByRule.get(ruleId) ?? 0) + 1);
@@ -1077,6 +1115,18 @@ class MetricsRegistry {
       if (typeof normalizedDetail.maxEvents === 'number' && Number.isFinite(normalizedDetail.maxEvents)) {
         ruleState.lastMaxEvents = normalizedDetail.maxEvents;
       }
+      if (typeof normalizedDetail.timelineTtlMs === 'number' && Number.isFinite(normalizedDetail.timelineTtlMs)) {
+        ruleState.lastTimelineTtlMs = normalizedDetail.timelineTtlMs;
+      }
+      if (
+        typeof normalizedDetail.timelineHistoryTtlPruned === 'number' &&
+        Number.isFinite(normalizedDetail.timelineHistoryTtlPruned)
+      ) {
+        ruleState.lastTimelineHistoryTtlPruned = normalizedDetail.timelineHistoryTtlPruned;
+      }
+      if (typeof normalizedDetail.timelineHistoryTtlExpired === 'boolean') {
+        ruleState.lastTimelineTtlExpired = normalizedDetail.timelineHistoryTtlExpired;
+      }
       ruleState.lastChannel = primaryChannel;
       ruleState.lastChannels = channelList.length > 0 ? [...channelList] : null;
       ruleState.lastWindowExpiresAt = windowExpiresAtValue;
@@ -1090,6 +1140,8 @@ class MetricsRegistry {
     count: number;
     ruleId?: string | null;
     channel?: string | null;
+    timelineTtlMs?: number | null;
+    timelineExpired?: boolean | null;
   }) {
     const rawCount = context?.count ?? 0;
     if (!Number.isFinite(rawCount)) {
@@ -1105,6 +1157,18 @@ class MetricsRegistry {
       const state = this.ensureSuppressionRuleState(context.ruleId);
       state.ttlPruned += normalized;
       state.lastTtlPruned = normalized;
+      if (typeof context.channel === 'string') {
+        state.lastTtlPrunedChannel = context.channel;
+      } else if (context.channel === null) {
+        state.lastTtlPrunedChannel = null;
+      }
+      if (typeof context.timelineTtlMs === 'number' && Number.isFinite(context.timelineTtlMs)) {
+        state.lastTimelineTtlMs = context.timelineTtlMs;
+      }
+      state.lastTimelineHistoryTtlPruned = normalized;
+      if (typeof context.timelineExpired === 'boolean') {
+        state.lastTimelineTtlExpired = context.timelineExpired;
+      }
     }
   }
 
@@ -1465,6 +1529,66 @@ class MetricsRegistry {
     }
   }
 
+  resetPipelineChannel(pipeline: PipelineType, channel: string) {
+    const registry = pipeline === 'ffmpeg' ? this.ffmpegRestartsByChannel : this.audioRestartsByChannel;
+    const state = registry.get(channel);
+    if (state) {
+      resetPipelineChannelState(state);
+    }
+
+    if (pipeline !== 'ffmpeg') {
+      return;
+    }
+
+    const fallback = this.transportFallbackByChannel.get(channel);
+    const recomputeLast = this.transportFallbackLast?.channel === channel;
+    if (fallback) {
+      this.transportFallbackTotal = Math.max(0, this.transportFallbackTotal - fallback.total);
+
+      for (const [reason, count] of fallback.byReason.entries()) {
+        const existing = this.transportFallbackByReason.get(reason) ?? 0;
+        const remaining = existing - count;
+        if (remaining > 0) {
+          this.transportFallbackByReason.set(reason, remaining);
+        } else {
+          this.transportFallbackByReason.delete(reason);
+        }
+      }
+
+      for (const [target, count] of fallback.byTarget.entries()) {
+        const existing = this.transportFallbackByTarget.get(target) ?? 0;
+        const remaining = existing - count;
+        if (remaining > 0) {
+          this.transportFallbackByTarget.set(target, remaining);
+        } else {
+          this.transportFallbackByTarget.delete(target);
+        }
+      }
+
+      fallback.total = 0;
+      fallback.last = null;
+      fallback.history.length = 0;
+      fallback.droppedHistory = 0;
+      fallback.byReason.clear();
+      fallback.byTarget.clear();
+    }
+
+    if (recomputeLast) {
+      let latest: TransportFallbackRecord | null = null;
+      for (const state of this.transportFallbackByChannel.values()) {
+        if (state.last && (!latest || (state.last.at ?? 0) > latest.at)) {
+          latest = state.last;
+        }
+        for (const entry of state.history) {
+          if (!latest || entry.at > latest.at) {
+            latest = entry;
+          }
+        }
+      }
+      this.transportFallbackLast = latest;
+    }
+  }
+
   recordAudioDeviceDiscoveryByFormat(
     format: string,
     meta: { count?: number; channel?: string } = {}
@@ -1535,10 +1659,14 @@ class MetricsRegistry {
   }
 
   exportLogLevelMetrics() {
+    const levelSnapshot = mapLogLevelCounters(this.logLevelCounters);
+    const histogramSnapshot = mapLogLevelCounters(this.logLevelHistogram);
     return {
-      byLevel: mapLogLevelCounters(this.logLevelCounters),
+      byLevel: levelSnapshot,
       byDetector: mapFromNested(this.logLevelByDetector),
-      histogram: mapLogLevelCounters(this.logLevelHistogram),
+      histogram: histogramSnapshot,
+      levelIndex: mapLogLevelIndex(this.logLevelCounters),
+      histogramIndex: mapLogLevelIndex(this.logLevelHistogram),
       lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
       lastErrorMessage: this.lastErrorMessage,
       currentLevel: this.currentLogLevel,
@@ -1554,9 +1682,11 @@ class MetricsRegistry {
     const lines: string[] = [];
 
     const levelCounters = mapLogLevelCounters(this.logLevelCounters);
+    const levelIndex = mapLogLevelIndex(this.logLevelCounters);
     const levelSamples = Object.entries(levelCounters).map(([level, value]) => ({
       value,
-      labels: { level }
+      labels: { level },
+      sortKey: levelIndex[level]
     }));
     const levelMetric = formatPrometheusGauge(
       'logs.level.total',
@@ -1589,12 +1719,13 @@ class MetricsRegistry {
       lines.push(stateMetric);
     }
 
-    const changeSamples = Array.from(this.logLevelChangeCounters.entries()).map(
-      ([level, value]) => ({
-        value,
-        labels: { level }
-      })
-    );
+    const changeCounters = mapLogLevelCounters(this.logLevelChangeCounters);
+    const changeIndex = mapLogLevelIndex(this.logLevelChangeCounters);
+    const changeSamples = Object.entries(changeCounters).map(([level, value]) => ({
+      value,
+      labels: { level },
+      sortKey: changeIndex[level]
+    }));
     const changeMetric = formatPrometheusGauge('logs.level.change.total', changeSamples, {
       metricName: options.changeMetricName ?? 'guardian_log_level_change_total',
       help: options.changeHelp ?? 'Total log level changes grouped by target level',
@@ -1977,11 +2108,25 @@ class MetricsRegistry {
             typeof this.lastSuppressedEvent.cooldownEndsAt === 'number'
               ? new Date(this.lastSuppressedEvent.cooldownEndsAt).toISOString()
               : null,
+          timelineTtlMs:
+            typeof this.lastSuppressedEvent.timelineTtlMs === 'number'
+              ? this.lastSuppressedEvent.timelineTtlMs
+              : null,
+          timelineHistoryTtlPruned:
+            typeof this.lastSuppressedEvent.timelineHistoryTtlPruned === 'number'
+              ? this.lastSuppressedEvent.timelineHistoryTtlPruned
+              : null,
+          timelineHistoryTtlExpired:
+            typeof this.lastSuppressedEvent.timelineHistoryTtlExpired === 'boolean'
+              ? this.lastSuppressedEvent.timelineHistoryTtlExpired
+              : null,
           channelStates: mapSuppressionChannelStates(this.lastSuppressedEvent.channelStates)
         }
       : null;
     const logLevelSnapshot = mapLogLevelCounters(this.logLevelCounters);
     const logHistogramSnapshot = mapLogLevelCounters(this.logLevelHistogram);
+    const logLevelIndex = mapLogLevelIndex(this.logLevelCounters);
+    const logHistogramIndex = mapLogLevelIndex(this.logLevelHistogram);
     const suppressionChannelHistogramSnapshot = {
       cooldownMs: mapSuppressionChannelHistograms(this.suppressionChannelCooldownHistogram),
       cooldownRemainingMs: mapSuppressionChannelHistograms(
@@ -2038,6 +2183,8 @@ class MetricsRegistry {
         lastErrorAt: this.lastErrorAt ? new Date(this.lastErrorAt).toISOString() : null,
         lastErrorMessage: this.lastErrorMessage,
         histogram: logHistogramSnapshot,
+        levelIndex: logLevelIndex,
+        histogramIndex: logHistogramIndex,
         currentLevel: this.currentLogLevel,
         lastLevelChangeAt: this.lastLogLevelChangeAt
           ? new Date(this.lastLogLevelChangeAt).toISOString()
@@ -2224,6 +2371,10 @@ type SuppressionRuleState = {
   lastWindowRemainingMs: number | null;
   lastCooldownRemainingMs: number | null;
   lastCooldownEndsAt: number | null;
+  lastTimelineTtlMs: number | null;
+  lastTimelineHistoryTtlPruned: number | null;
+  lastTimelineTtlExpired: boolean | null;
+  lastTtlPrunedChannel: string | null;
 };
 
 type DetectorMetricState = {
@@ -2236,21 +2387,41 @@ type DetectorMetricState = {
   latencyHistogram: Map<string, number> | null;
 };
 
-function mapLogLevelCounters(source: Map<string, number>): CounterMap {
+function orderedLogLevelEntries(source: Map<string, number>): Array<[string, number]> {
   const normalized = new Map<string, number>();
   for (const [key, value] of source.entries()) {
-    normalized.set(key.toLowerCase(), value);
+    const lower = key.toLowerCase();
+    normalized.set(lower, (normalized.get(lower) ?? 0) + value);
   }
-  const result: CounterMap = {};
+
+  const ordered: Array<[string, number]> = [];
   for (const level of PINO_LEVEL_ORDER) {
-    result[level] = normalized.get(level) ?? 0;
-  }
-  for (const [key, value] of normalized.entries()) {
-    if (!(key in result)) {
-      result[key] = value;
+    const value = normalized.get(level);
+    ordered.push([level, value ?? 0]);
+    if (normalized.has(level)) {
+      normalized.delete(level);
     }
   }
+
+  const extras = Array.from(normalized.entries()).sort(([a], [b]) => a.localeCompare(b));
+  return ordered.concat(extras);
+}
+
+function mapLogLevelCounters(source: Map<string, number>): CounterMap {
+  const result: CounterMap = {};
+  for (const [level, value] of orderedLogLevelEntries(source)) {
+    result[level] = value;
+  }
   return result;
+}
+
+function mapLogLevelIndex(source: Map<string, number>): CounterMap {
+  const index: CounterMap = {};
+  const entries = orderedLogLevelEntries(source);
+  entries.forEach(([level], position) => {
+    index[level] = position;
+  });
+  return index;
 }
 
 function mapFrom(source: Map<string, number>): CounterMap {
@@ -2526,7 +2697,7 @@ function formatPrometheusHistogram(
 
 function formatPrometheusGauge(
   metricKey: string,
-  samples: Array<{ value: number; labels?: Record<string, string> }>,
+  samples: PrometheusGaugeSample[],
   options: PrometheusGaugeOptions
 ): string {
   const filtered = samples.filter(sample => Number.isFinite(sample.value));
@@ -2545,11 +2716,16 @@ function formatPrometheusGauge(
     return {
       value: sample.value,
       labels: mergedLabels,
-      labelString
+      labelString,
+      sortKey: sample.sortKey
     };
   });
 
   normalized.sort((a, b) => {
+    const sortOrder = compareGaugeSortKey(a.sortKey, b.sortKey);
+    if (sortOrder !== 0) {
+      return sortOrder;
+    }
     if (a.labelString === b.labelString) {
       return a.value - b.value;
     }
@@ -2567,6 +2743,32 @@ function formatPrometheusGauge(
   }
 
   return lines.join('\n');
+}
+
+function compareGaugeSortKey(a: unknown, b: unknown): number {
+  const hasA = typeof a === 'number' || typeof a === 'string';
+  const hasB = typeof b === 'number' || typeof b === 'string';
+
+  if (!hasA && !hasB) {
+    return 0;
+  }
+  if (hasA && !hasB) {
+    return -1;
+  }
+  if (!hasA && hasB) {
+    return 1;
+  }
+
+  if (typeof a === 'number' && typeof b === 'number') {
+    return a - b;
+  }
+
+  const aStr = String(a);
+  const bStr = String(b);
+  if (aStr === bStr) {
+    return 0;
+  }
+  return aStr < bStr ? -1 : 1;
 }
 
 function sanitizePrometheusMetricName(name: string): string {
@@ -2682,12 +2884,20 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
         lastWindowRemainingMs:
           typeof state.lastWindowRemainingMs === 'number' ? state.lastWindowRemainingMs : null,
         lastCooldownRemainingMs:
-          typeof state.lastCooldownRemainingMs === 'number' ? state.lastCooldownRemainingMs : null
-        ,
+          typeof state.lastCooldownRemainingMs === 'number' ? state.lastCooldownRemainingMs : null,
         lastCooldownEndsAt:
           typeof state.lastCooldownEndsAt === 'number'
             ? new Date(state.lastCooldownEndsAt).toISOString()
-            : null
+            : null,
+        lastTimelineTtlMs:
+          typeof state.lastTimelineTtlMs === 'number' ? state.lastTimelineTtlMs : null,
+        lastTimelineHistoryTtlPruned:
+          typeof state.lastTimelineHistoryTtlPruned === 'number'
+            ? state.lastTimelineHistoryTtlPruned
+            : null,
+        lastTimelineTtlExpired:
+          typeof state.lastTimelineTtlExpired === 'boolean' ? state.lastTimelineTtlExpired : null,
+        lastTtlPrunedChannel: state.lastTtlPrunedChannel ?? null
       }
     };
   }

@@ -213,8 +213,10 @@ export function parseYoloDetections(
   }
 
   const fused: YoloDetection[] = [];
-  const originalWidth = Number.isFinite(meta.originalWidth) ? meta.originalWidth : 0;
-  const originalHeight = Number.isFinite(meta.originalHeight) ? meta.originalHeight : 0;
+  const metaScaleX = resolveScale(meta.scaleX, meta.scale);
+  const metaScaleY = resolveScale(meta.scaleY, meta.scale);
+  const originalWidth = resolveProjectionDimension(meta.originalWidth, meta.resizedWidth, metaScaleX);
+  const originalHeight = resolveProjectionDimension(meta.originalHeight, meta.resizedHeight, metaScaleY);
 
   for (const [classId, group] of perClass.entries()) {
     const prioritize = primaryClassId !== null && classId === primaryClassId;
@@ -701,6 +703,16 @@ type ProjectedBoundingBox = {
   score: number;
 };
 
+type ProjectionContext = {
+  projection: ProjectionMeta;
+  frameWidth: number;
+  frameHeight: number;
+  resizedWidth: number;
+  resizedHeight: number;
+  scaleX: number;
+  scaleY: number;
+};
+
 function projectBoundingBox(
   cx: number,
   cy: number,
@@ -709,22 +721,24 @@ function projectBoundingBox(
   meta: PreprocessMeta
 ): ProjectedBoundingBox {
   const projections = buildProjectionCandidates(meta);
+  const contexts = projections.map(projection => createProjectionContext(projection));
 
   const candidates: ProjectedBoundingBox[] = [];
 
-  projections.forEach((projection, projectionIndex) => {
-    const likelihoodNormalized = isLikelyNormalized(cx, cy, width, height, projection.resizedWidth, projection.resizedHeight);
-      const assumptions = projection.normalized === true
-        ? [true]
-        : projection.normalized === false
-          ? [false]
-          : likelihoodNormalized
-            ? [true, false]
-            : [false, true];
+  contexts.forEach((context, projectionIndex) => {
+    const { projection, resizedWidth, resizedHeight, frameWidth, frameHeight } = context;
+    const likelihoodNormalized = isLikelyNormalized(cx, cy, width, height, resizedWidth, resizedHeight);
+    const assumptions = projection.normalized === true
+      ? [true]
+      : projection.normalized === false
+        ? [false]
+        : likelihoodNormalized
+          ? [true, false]
+          : [false, true];
 
     for (const assumeNormalized of assumptions) {
-      const box = projectWithProjection(cx, cy, width, height, projection, assumeNormalized);
-      const areaRatio = computeAreaRatio(box, projection.originalWidth, projection.originalHeight);
+      const box = projectWithProjection(cx, cy, width, height, context, assumeNormalized);
+      const areaRatio = computeAreaRatio(box, frameWidth, frameHeight);
 
       if (areaRatio <= 0) {
         continue;
@@ -732,14 +746,16 @@ function projectBoundingBox(
 
       const centerX = box.left + box.width / 2;
       const centerY = box.top + box.height / 2;
-      const exceedsWidth = centerX < -projection.originalWidth * 0.15 || centerX > projection.originalWidth * 1.15;
-      const exceedsHeight = centerY < -projection.originalHeight * 0.15 || centerY > projection.originalHeight * 1.15;
+      const exceedsWidth =
+        frameWidth > 0 && (centerX < -frameWidth * 0.15 || centerX > frameWidth * 1.15);
+      const exceedsHeight =
+        frameHeight > 0 && (centerY < -frameHeight * 0.15 || centerY > frameHeight * 1.15);
       if (exceedsWidth || exceedsHeight) {
         continue;
       }
 
-      const maxWidth = projection.originalWidth * 1.1;
-      const maxHeight = projection.originalHeight * 1.1;
+      const maxWidth = frameWidth > 0 ? frameWidth * 1.1 : Number.POSITIVE_INFINITY;
+      const maxHeight = frameHeight > 0 ? frameHeight * 1.1 : Number.POSITIVE_INFINITY;
       if (box.width <= 0 || box.height <= 0 || box.width > maxWidth || box.height > maxHeight) {
         continue;
       }
@@ -761,28 +777,35 @@ function projectBoundingBox(
   });
 
   if (candidates.length === 0) {
-    const fallback = projectWithProjection(cx, cy, width, height, projections[0], projections[0].normalized ?? false);
+    const fallbackContext = contexts[0] ?? createProjectionContext(projections[0]!);
+    const fallbackProjection = fallbackContext.projection;
+    const fallbackNormalized = fallbackProjection.normalized ?? false;
+    const fallback = projectWithProjection(cx, cy, width, height, fallbackContext, fallbackNormalized);
     const clampedFallback = clampBoundingBoxToFrame(
       fallback,
-      projections[0].originalWidth,
-      projections[0].originalHeight
+      fallbackContext.frameWidth,
+      fallbackContext.frameHeight
     );
     return {
       box: clampedFallback,
-      areaRatio: computeAreaRatio(clampedFallback, projections[0].originalWidth, projections[0].originalHeight),
+      areaRatio: computeAreaRatio(
+        clampedFallback,
+        fallbackContext.frameWidth,
+        fallbackContext.frameHeight
+      ),
       projectionIndex: 0,
-      normalized: projections[0].normalized ?? false,
+      normalized: fallbackNormalized,
       score: 0
     };
   }
 
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
-  const projection = projections[best.projectionIndex ?? 0] ?? projections[0];
-  const clamped = clampBoundingBoxToFrame(best.box, projection.originalWidth, projection.originalHeight);
+  const context = contexts[best.projectionIndex ?? 0] ?? contexts[0];
+  const clamped = clampBoundingBoxToFrame(best.box, context.frameWidth, context.frameHeight);
   return {
     box: clamped,
-    areaRatio: computeAreaRatio(clamped, projection.originalWidth, projection.originalHeight),
+    areaRatio: computeAreaRatio(clamped, context.frameWidth, context.frameHeight),
     projectionIndex: best.projectionIndex,
     normalized: best.normalized,
     score: best.score
@@ -794,20 +817,38 @@ function buildProjectionCandidates(meta: PreprocessMeta): ProjectionMeta[] {
   return [meta, ...variants];
 }
 
+function createProjectionContext(projection: ProjectionMeta): ProjectionContext {
+  const scaleX = resolveScale(projection.scaleX, projection.scale);
+  const scaleY = resolveScale(projection.scaleY, projection.scale);
+  const frameWidth = resolveProjectionDimension(projection.originalWidth, projection.resizedWidth, scaleX);
+  const frameHeight = resolveProjectionDimension(
+    projection.originalHeight,
+    projection.resizedHeight,
+    scaleY
+  );
+  const resizedWidth = resolveResizedDimension(projection.resizedWidth, frameWidth, scaleX);
+  const resizedHeight = resolveResizedDimension(projection.resizedHeight, frameHeight, scaleY);
+
+  return {
+    projection,
+    frameWidth,
+    frameHeight,
+    resizedWidth,
+    resizedHeight,
+    scaleX,
+    scaleY
+  };
+}
+
 function projectWithProjection(
   cx: number,
   cy: number,
   width: number,
   height: number,
-  projection: ProjectionMeta,
+  context: ProjectionContext,
   assumeNormalized: boolean
 ): BoundingBox {
-  const scaleX = resolveScale(projection.scaleX, projection.scale);
-  const scaleY = resolveScale(projection.scaleY, projection.scale);
-
-  const resizedWidth = projection.resizedWidth || projection.originalWidth * scaleX;
-  const resizedHeight = projection.resizedHeight || projection.originalHeight * scaleY;
-
+  const { projection, scaleX, scaleY, resizedWidth, resizedHeight, frameWidth, frameHeight } = context;
   const normalized = assumeNormalized;
   const normalizedCx = normalized ? cx * resizedWidth : cx;
   const normalizedCy = normalized ? cy * resizedHeight : cy;
@@ -824,10 +865,10 @@ function projectWithProjection(
   const mappedRight = (right - projection.padX) / scaleX;
   const mappedBottom = (bottom - projection.padY) / scaleY;
 
-  const clampedLeft = clamp(mappedLeft, 0, projection.originalWidth);
-  const clampedTop = clamp(mappedTop, 0, projection.originalHeight);
-  const clampedRight = clamp(mappedRight, 0, projection.originalWidth);
-  const clampedBottom = clamp(mappedBottom, 0, projection.originalHeight);
+  const clampedLeft = frameWidth > 0 ? clamp(mappedLeft, 0, frameWidth) : mappedLeft;
+  const clampedTop = frameHeight > 0 ? clamp(mappedTop, 0, frameHeight) : mappedTop;
+  const clampedRight = frameWidth > 0 ? clamp(mappedRight, 0, frameWidth) : mappedRight;
+  const clampedBottom = frameHeight > 0 ? clamp(mappedBottom, 0, frameHeight) : mappedBottom;
 
   return {
     left: clampedLeft,
@@ -857,7 +898,9 @@ function isLikelyNormalized(
 }
 
 function computeAreaRatio(bbox: BoundingBox, originalWidth: number, originalHeight: number) {
-  const totalArea = originalWidth * originalHeight;
+  const width = Number.isFinite(originalWidth) && originalWidth > 0 ? originalWidth : 0;
+  const height = Number.isFinite(originalHeight) && originalHeight > 0 ? originalHeight : 0;
+  const totalArea = width * height;
 
   if (totalArea <= 0) {
     return 0;
@@ -865,6 +908,48 @@ function computeAreaRatio(bbox: BoundingBox, originalWidth: number, originalHeig
 
   const area = Math.max(0, bbox.width) * Math.max(0, bbox.height);
   return clamp(area / totalArea, 0, 1);
+}
+
+function resolveProjectionDimension(
+  original: number | undefined,
+  resized: number | undefined,
+  scale: number
+) {
+  if (typeof original === 'number' && Number.isFinite(original) && original > 0) {
+    return original;
+  }
+
+  if (typeof resized === 'number' && Number.isFinite(resized) && resized > 0) {
+    const effectiveScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    if (effectiveScale !== 1) {
+      const derived = resized / effectiveScale;
+      if (Number.isFinite(derived) && derived > 0) {
+        return derived;
+      }
+    }
+    return resized;
+  }
+
+  return 0;
+}
+
+function resolveResizedDimension(
+  resized: number | undefined,
+  frame: number | undefined,
+  scale: number
+) {
+  if (typeof resized === 'number' && Number.isFinite(resized) && resized > 0) {
+    return resized;
+  }
+
+  const frameSize = typeof frame === 'number' && Number.isFinite(frame) && frame > 0 ? frame : 0;
+  if (frameSize <= 0) {
+    return 0;
+  }
+
+  const effectiveScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const derived = frameSize * effectiveScale;
+  return Number.isFinite(derived) && derived > 0 ? derived : frameSize;
 }
 
 function createThresholdResolver(options: ParseYoloDetectionsOptions) {

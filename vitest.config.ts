@@ -13,6 +13,9 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     globals: true,
     environment: 'node',
+    pool: 'forks',
+    minThreads: 1,
+    maxThreads: 1,
     deps: {
       optimizer: {
         ssr: {
