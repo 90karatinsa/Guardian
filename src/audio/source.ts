@@ -533,6 +533,17 @@ export class AudioSource extends EventEmitter {
     this.clearWatchdogTimer();
     this.clearKillTimer();
 
+    if (this.options.type === 'ffmpeg') {
+      const input = typeof this.options.input === 'string' ? this.options.input.trim() : '';
+      if (!input) {
+        const error = new Error('Audio ffmpeg input is required');
+        this.emit('error', error);
+        this.scheduleRetry('stream-error', error);
+        return;
+      }
+      this.options.input = input;
+    }
+
     const sampleRate = this.options.sampleRate ?? DEFAULT_SAMPLE_RATE;
     const channels = this.options.channels ?? DEFAULT_CHANNELS;
     this.expectedSampleBytes = channels * 2;

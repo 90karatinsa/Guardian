@@ -63,9 +63,16 @@ Kurulum sonrası hızlı doğrulama için aşağıdaki adımları takip edin:
    `pipelines.ffmpeg.watchdogRestarts` alanının 0 kaldığını doğrulayın.
 2. `guardian daemon health --json` çıktısında `metrics.logs.histogram.error` ve `pipelines.ffmpeg.watchdogRestartsByChannel`
    anahtarlarını kontrol ederek log seviyelerinin doğru sayıldığından emin olun.
-3. `guardian log-level set debug` ile seviyeyi yükseltip `guardian log-level get` komutuyla geri okuma yapın; metrikler
+3. `guardian daemon pipelines list --json` komutuyla `pipelines.ffmpeg.degraded` ve `pipelines.audio.degraded`
+   dizilerinin severity önceliğine göre sıralandığını doğrulayın; JSON içinde her kanal için `severity`, `restarts`
+   ve `backoffMs` alanları `buildPipelineHealthSummary` ile birebir eşleşir.
+4. Watchdog sayaçlarını manuel olarak sıfırlamak için `guardian daemon pipelines reset --channel video:test-camera`
+   komutunu çalıştırın; başarılı olduğunda stdout üzerindeki "Reset pipeline health counters" mesajı ve
+   `metrics.pipelines.ffmpeg.byChannel['video:test-camera'].health.severity === 'none'` kontrolü devre sağlığının
+   sıfırlandığını gösterir.
+5. `guardian log-level set debug` ile seviyeyi yükseltip `guardian log-level get` komutuyla geri okuma yapın; metrikler
    `metrics.logs.byLevel.debug` alanına yeni bir artış yazacaktır.
-4. Dedektör gecikme dağılımını gözlemlemek için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
+6. Dedektör gecikme dağılımını gözlemlemek için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';
    console.log(metrics.exportDetectorLatencyHistogram('motion'))"` örneğini çalıştırarak Prometheus uyumlu histogram çıktısını
    inceleyin.
 
@@ -453,6 +460,7 @@ operasyonel rehber ile birlikte okunmalıdır.
 | `Audio source recovering (reason=ffmpeg-missing)` mesajları | Mikrofon fallback listesi tükeniyor veya cihaz keşfi zaman aşımına düşüyor | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
 
 - `guardian daemon status --json` veya `pnpm exec tsx src/cli.ts --health` çıktısında `metrics.logs.byLevel.error` hızla artıyorsa log seviyesini `guardian log-level set debug` ile yükseltip detaylı inceleme yapın.
+- `guardian daemon pipelines list --json` çıktısındaki `pipelines.ffmpeg.channels`, `pipelines.ffmpeg.degraded` ve `pipelines.audio.degraded` alanlarını takip ederek hangi kanalların watchdog tarafından sınırlandığını görün; bir kanal manuel temizlik gerektirdiğinde `guardian daemon pipelines reset --channel video:lobby` komutu çalışan guard runtime'ına watchdog sıfırlaması gönderir ve `metrics.pipelines.ffmpeg.byChannel['video:lobby'].health.severity` değerini `none` seviyesine çeker.
 - `pipelines.ffmpeg.watchdogBackoffByChannel` veya `pipelines.ffmpeg.restartHistogram.delay` değerleri sürekli yükseliyorsa RTSP bağlantılarını kontrol edin; `restartDelayMs`, `restartMaxDelayMs` ve `restartJitterFactor` parametrelerini düşürmek backoff süresini azaltır.
 - `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırları kesintisiz devam ediyorsa `audio.micFallbacks` listesinde çalışan bir cihaz kalmamış olabilir.
 - `Audio source recovering (reason=ffmpeg-missing)` hataları devre kesiciyi tetiklemişse `guardian daemon restart --channel audio:microphone` komutunu çalıştırarak `audio:microphone` kanalının devre kesicisini sıfırlayın. Komut başarılı olduğunda loglar manuel devre sıfırlamasını, metrikler ise `pipelines.audio.byReason['manual-circuit-reset']` artışını rapor eder; ardından ffmpeg ikililerinin PATH'te erişilebilir olduğunu `ffmpeg -version` ile doğrulayın.

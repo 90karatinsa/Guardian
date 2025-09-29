@@ -224,6 +224,18 @@ export class MotionDetector {
         this.options.areaDeltaThreshold ?? DEFAULT_AREA_DELTA_THRESHOLD;
 
       const referenceFrame = this.baselineFrame ?? this.previousFrame;
+      const dimensionChanged =
+        this.previousFrame.width !== smoothed.width ||
+        this.previousFrame.height !== smoothed.height ||
+        (this.baselineFrame !== null &&
+          (this.baselineFrame.width !== smoothed.width ||
+            this.baselineFrame.height !== smoothed.height));
+
+      if (dimensionChanged) {
+        this.handleFrameResize(smoothed, ts);
+        return;
+      }
+
       let stats = frameDiffStats(referenceFrame, smoothed);
       const evaluateNoise = (candidate: typeof stats) => {
         const prior = this.noiseLevel === 0 ? candidate.meanDelta : this.noiseLevel;
@@ -791,6 +803,13 @@ export class MotionDetector {
       this.temporalSuppression * Math.min(1.6, 0.7 + smoothing)
     );
     return Math.min(windowLimit, Math.max(1, target));
+  }
+
+  private handleFrameResize(frame: GrayscaleFrame, ts: number) {
+    this.resetAdaptiveState({ preserveWarmup: true });
+    this.previousFrame = frame;
+    this.baselineFrame = frame;
+    this.lastFrameTs = ts;
   }
 
   private resetAdaptiveState(

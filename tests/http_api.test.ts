@@ -83,7 +83,13 @@ describe('RestApiEvents', () => {
 
   async function ensureServer(overrides: Partial<HttpServerOptions> = {}) {
     if (!runtime) {
-      runtime = await startHttpServer({ port: 0, bus, ...overrides });
+      const { snapshotDirs: overrideSnapshotDirs, ...rest } = overrides;
+      runtime = await startHttpServer({
+        port: 0,
+        bus,
+        snapshotDirs: overrideSnapshotDirs ?? [snapshotDir],
+        ...rest
+      });
     }
     return runtime;
   }
@@ -189,6 +195,77 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items).toHaveLength(1);
     expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
     expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
+  });
+
+  it('HttpApiSnapshotAllowlist denies ../etc/passwd style inputs', async () => {
+    const now = Date.now();
+    storeEvent({
+      ts: now,
+      source: 'video:test-camera',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Traversal attempt',
+      meta: { snapshot: '../etc/passwd' }
+    });
+    const firstId = listEvents({ limit: 1 }).items[0].id;
+
+    storeEvent({
+      ts: now + 1,
+      source: 'video:test-camera',
+      detector: 'person',
+      severity: 'warning',
+      message: 'Traversal face attempt',
+      meta: { faceSnapshot: '../../etc/shadow' }
+    });
+    const secondId = listEvents({ limit: 1 }).items[0].id;
+
+    const { port } = await ensureServer();
+
+    const snapshotResponse = await fetch(
+      `http://localhost:${port}/api/events/${firstId}/snapshot`
+    );
+    expect(snapshotResponse.status).toBe(403);
+    const snapshotPayload = await snapshotResponse.json();
+    expect(snapshotPayload.error).toContain('not authorized');
+
+    const faceResponse = await fetch(
+      `http://localhost:${port}/api/events/${secondId}/face-snapshot`
+    );
+    expect(faceResponse.status).toBe(403);
+    const facePayload = await faceResponse.json();
+    expect(facePayload.error).toContain('not authorized');
+  });
+
+  it('HttpSnapshotDiffDimensionMismatch returns a conflict response with explanation', async () => {
+    const now = Date.now();
+    const baseline = new PNG({ width: 2, height: 2 });
+    baseline.data.fill(10);
+    const baselinePath = path.join(snapshotDir, 'baseline.png');
+    fs.writeFileSync(baselinePath, PNG.sync.write(baseline));
+
+    const current = new PNG({ width: 3, height: 2 });
+    current.data.fill(20);
+    const currentPath = path.join(snapshotDir, 'current.png');
+    fs.writeFileSync(currentPath, PNG.sync.write(current));
+
+    storeEvent({
+      ts: now,
+      source: 'video:test-camera',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Mismatch diff test',
+      meta: { snapshot: currentPath, snapshotBaseline: baselinePath }
+    });
+    const eventId = listEvents({ limit: 1 }).items[0].id;
+
+    const { port } = await ensureServer();
+
+    const response = await fetch(
+      `http://localhost:${port}/api/events/${eventId}/snapshot/diff`
+    );
+    expect(response.status).toBe(409);
+    const payload = await response.json();
+    expect(payload.error).toBe('Snapshot dimensions do not match');
   });
 
   it('HttpApiChannelNormalizationSupportsAudio', async () => {

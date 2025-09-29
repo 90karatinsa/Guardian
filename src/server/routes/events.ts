@@ -16,12 +16,14 @@ import logger from '../../logger.js';
 import { EventRecord } from '../../types.js';
 import metricsModule, { MetricsRegistry, type MetricsWarningEvent } from '../../metrics/index.js';
 import { canonicalChannel, normalizeChannelId } from '../../utils/channel.js';
+import configManager from '../../config/index.js';
 
 interface EventsRouterOptions {
   bus: EventEmitter;
   faceRegistry?: FaceRegistry | null;
   createFaceRegistry?: () => Promise<FaceRegistry>;
   metrics?: MetricsRegistry;
+  snapshotDirs?: string[];
 }
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
@@ -62,6 +64,7 @@ export class EventsRouter {
   private faceRegistryPromise: Promise<FaceRegistry | null> | null = null;
   private readonly metrics: MetricsRegistry;
   private readonly metricsWarningHandler: ((event: MetricsWarningEvent) => void) | null;
+  private readonly snapshotAllowlist: Set<string>;
 
   constructor(options: EventsRouterOptions) {
     this.bus = options.bus;
@@ -81,6 +84,7 @@ export class EventsRouter {
     this.metricsWarningHandler = event => {
       this.broadcastWarning(event);
     };
+    this.snapshotAllowlist = buildSnapshotAllowlist(options.snapshotDirs ?? []);
     this.metrics.onWarning(this.metricsWarningHandler);
 
     this.bus.on('event', this.handleBusEvent);
@@ -165,6 +169,10 @@ export class EventsRouter {
         this.clients.delete(client);
       }
     }
+  }
+
+  private isSnapshotAllowed(filePath: string): boolean {
+    return isPathInAllowedDirectories(filePath, this.snapshotAllowlist);
   }
 
   private handleList(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
@@ -351,19 +359,30 @@ export class EventsRouter {
       return true;
     }
 
+    if (!this.isSnapshotAllowed(currentSnapshot) || !this.isSnapshotAllowed(baselineSnapshot)) {
+      sendJson(res, 403, { error: 'Snapshot path not authorized' });
+      return true;
+    }
+
     try {
       const diffBuffer = createSnapshotDiff(currentSnapshot, baselineSnapshot);
       res.writeHead(200, { 'Content-Type': 'image/png' });
       res.end(diffBuffer);
     } catch (error) {
-      logger.error(
-        { err: error, snapshot: currentSnapshot, baseline: baselineSnapshot },
-        'Failed to generate snapshot diff'
-      );
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === 'Snapshot dimensions do not match') {
+        logger.debug(
+          { snapshot: currentSnapshot, baseline: baselineSnapshot },
+          'Snapshot diff dimensions mismatch'
+        );
+        sendJson(res, 409, { error: 'Snapshot dimensions do not match' });
+      } else {
+        logger.error(
+          { err: error, snapshot: currentSnapshot, baseline: baselineSnapshot },
+          'Failed to generate snapshot diff'
+        );
+        sendJson(res, 500, { error: 'Failed to generate snapshot diff' });
       }
-      res.end(JSON.stringify({ error: 'Failed to generate snapshot diff' }));
     }
 
     return true;
@@ -398,7 +417,7 @@ export class EventsRouter {
       sendJson(res, 404, { error: 'Snapshot not available' });
       return true;
     }
-    return serveSnapshotFile(req, res, snapshotPath);
+    return serveSnapshotFile(req, res, snapshotPath, this.snapshotAllowlist);
   }
 
   private handleFaces(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
@@ -721,6 +740,61 @@ export class EventsRouter {
 
 export function createEventsRouter(options: EventsRouterOptions) {
   return new EventsRouter(options);
+}
+
+function buildSnapshotAllowlist(additional: string[]): Set<string> {
+  const allowlist = new Set<string>();
+
+  const register = (value: string | undefined | null) => {
+    if (!value) {
+      return;
+    }
+    allowlist.add(path.resolve(value));
+  };
+
+  try {
+    const config = configManager.getConfig();
+    register(config.person?.snapshotDir);
+
+    const video = config.video ?? {};
+    for (const channelConfig of Object.values(video.channels ?? {})) {
+      register(channelConfig.person?.snapshotDir);
+    }
+    for (const camera of video.cameras ?? []) {
+      register(camera.person?.snapshotDir);
+    }
+  } catch (error) {
+    logger.debug({ err: error }, 'Failed to load snapshot directories from config');
+  }
+
+  for (const directory of additional) {
+    register(directory);
+  }
+
+  return allowlist;
+}
+
+function isPathInAllowedDirectories(filePath: string, directories: Set<string>): boolean {
+  if (!filePath || directories.size === 0) {
+    return false;
+  }
+
+  const resolvedTarget = path.resolve(filePath);
+  for (const directory of directories) {
+    const resolvedDirectory = path.resolve(directory);
+    if (resolvedTarget === resolvedDirectory) {
+      return true;
+    }
+
+    const prefix = resolvedDirectory.endsWith(path.sep)
+      ? resolvedDirectory
+      : `${resolvedDirectory}${path.sep}`;
+    if (resolvedTarget.startsWith(prefix)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function parseListOptions(url: URL): ListEventsOptions {
@@ -1877,10 +1951,21 @@ function toFiniteNumber(value: unknown): number | null {
   return null;
 }
 
-function serveSnapshotFile(req: IncomingMessage, res: ServerResponse, snapshotPath: string): boolean {
+function serveSnapshotFile(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotPath: string,
+  allowlist: Set<string>
+): boolean {
+  const resolvedPath = path.resolve(snapshotPath);
+  if (!isPathInAllowedDirectories(resolvedPath, allowlist)) {
+    sendJson(res, 403, { error: 'Snapshot path not authorized' });
+    return true;
+  }
+
   let stats: fs.Stats;
   try {
-    stats = fs.statSync(snapshotPath);
+    stats = fs.statSync(resolvedPath);
   } catch {
     sendJson(res, 404, { error: 'Snapshot missing' });
     return true;
@@ -1903,7 +1988,7 @@ function serveSnapshotFile(req: IncomingMessage, res: ServerResponse, snapshotPa
     return true;
   }
 
-  const stream = fs.createReadStream(snapshotPath);
+  const stream = fs.createReadStream(resolvedPath);
   stream.on('error', () => {
     if (!res.headersSent) {
       sendJson(res, 500, { error: 'Failed to read snapshot' });
@@ -1913,7 +1998,7 @@ function serveSnapshotFile(req: IncomingMessage, res: ServerResponse, snapshotPa
   });
 
   res.writeHead(200, {
-    'Content-Type': guessMimeType(snapshotPath),
+    'Content-Type': guessMimeType(resolvedPath),
     'Content-Length': stats.size,
     'Cache-Control': 'private, max-age=60',
     'Last-Modified': lastModified,

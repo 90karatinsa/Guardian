@@ -94,6 +94,52 @@ describe('MotionDetector', () => {
     expect(motionSnapshot.detectors.motion?.gauges?.temporalGateMultiplier ?? 1).toBeGreaterThan(1);
   });
 
+  it('MotionFrameResizeRecovery resumes detection after frame size changes', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'resize-motion',
+        diffThreshold: 1,
+        areaThreshold: 0.05,
+        minIntervalMs: 0,
+        debounceFrames: 1,
+        backoffFrames: 0,
+        noiseMultiplier: 1,
+        noiseSmoothing: 0.08,
+        areaSmoothing: 0.1,
+        areaInflation: 1.05,
+        areaDeltaThreshold: 0.02,
+        noiseWarmupFrames: 0,
+        temporalMedianWindow: 3,
+        temporalMedianBackoffSmoothing: 0.2
+      },
+      bus
+    );
+
+    const smallBaseline = createUniformFrame(6, 6, 32);
+    detector.handleFrame(smallBaseline, 0);
+
+    const smallMotion = createFrame(6, 6, (x, y) => (x < 3 ? 240 : 32 + ((x + y) % 3)));
+    detector.handleFrame(smallMotion, 1);
+    detector.handleFrame(smallMotion, 2);
+
+    const initialEvents = events.filter(event => event.detector === 'motion');
+    expect(initialEvents.length).toBeGreaterThanOrEqual(1);
+
+    const largeBaseline = createUniformFrame(10, 10, 28);
+    detector.handleFrame(largeBaseline, 3);
+
+    const largeMotion = createFrame(10, 10, (x, y) => (x < 5 ? 250 : 28 + ((x + y) % 5)));
+    detector.handleFrame(largeMotion, 4);
+    detector.handleFrame(largeMotion, 5);
+
+    const motionEvents = events.filter(event => event.detector === 'motion');
+    expect(motionEvents.length).toBeGreaterThanOrEqual(2);
+    const lastEvent = motionEvents.at(-1);
+    expect(lastEvent?.meta).toBeDefined();
+    const lastMeta = lastEvent?.meta as Record<string, unknown>;
+    expect(typeof lastMeta.areaThreshold).toBe('number');
+  });
+
   it('LightTemporalMedianBackoff', () => {
     const detector = new LightDetector(
       {

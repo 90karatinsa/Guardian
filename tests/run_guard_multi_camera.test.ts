@@ -8,6 +8,7 @@ let metrics: typeof import('../src/metrics/index.js').default;
 class MockVideoSource extends EventEmitter {
   static instances: MockVideoSource[] = [];
   static startCounts: number[] = [];
+  private baseTransport: string | null = null;
   constructor(
     public options: {
       file: string;
@@ -31,11 +32,15 @@ class MockVideoSource extends EventEmitter {
     if (!this.options.rtspTransport && this.options.file.startsWith('rtsp://')) {
       this.options.rtspTransport = 'tcp';
     }
+    this.baseTransport = this.options.rtspTransport ?? null;
   }
   public circuitBroken = false;
   public updateOptions = vi.fn(
     (options: Partial<MockVideoSource['options']>) => {
       Object.assign(this.options, options);
+      if (typeof options.rtspTransport === 'string') {
+        this.baseTransport = options.rtspTransport;
+      }
     }
   );
   start() {
@@ -58,6 +63,43 @@ class MockVideoSource extends EventEmitter {
   });
   isCircuitBroken = vi.fn(() => this.circuitBroken);
   getCurrentRtspTransport = vi.fn(() => this.options.rtspTransport ?? null);
+  resetTransportFallback = vi.fn(
+    (options: { reason?: string; record?: boolean; resetsCircuitBreaker?: boolean } = {}) => {
+      if (!this.baseTransport) {
+        return false;
+      }
+      const previous = this.options.rtspTransport ?? null;
+      this.options.rtspTransport = this.baseTransport;
+      const at = Date.now();
+      if (previous !== this.baseTransport) {
+        this.emit('transport-change', {
+          channel: this.options.channel ?? null,
+          from: previous,
+          to: this.baseTransport,
+          reason: options.reason ?? 'manual-cli-reset',
+          attempt: 0,
+          stage: 0,
+          resetsBackoff: true,
+          resetsCircuitBreaker: options.resetsCircuitBreaker ?? false,
+          at,
+          metricsRecorded: options.record ?? false
+        });
+      }
+      if (options.record) {
+        metrics.recordTransportFallback('ffmpeg', options.reason ?? 'manual-cli-reset', {
+          channel: this.options.channel ?? null,
+          from: previous,
+          to: this.baseTransport,
+          attempt: 0,
+          stage: 0,
+          resetsBackoff: true,
+          resetsCircuitBreaker: options.resetsCircuitBreaker ?? false,
+          at
+        });
+      }
+      return true;
+    }
+  );
 }
 
 class MockPersonDetector {
@@ -372,6 +414,93 @@ describe('run-guard multi camera orchestration', () => {
         snapshotAfterSecond.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.history
       ).toHaveLength(2);
     } finally {
+      runtime.stop();
+    }
+  });
+
+  it('GuardCliTransportReset reinitializes transport fallback sequence via CLI', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+    const { runCli, __test__ } = await import('../src/cli.ts');
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const config: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      config
+    });
+
+    const cliIo = createCliIo();
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      const pipeline = runtime.pipelines.get('video:cam-1');
+      expect(pipeline).toBeDefined();
+      const source = pipeline?.source as MockVideoSource;
+      expect(source).toBeInstanceOf(MockVideoSource);
+
+      const now = Date.now();
+      source.emit('transport-change', {
+        channel: pipeline?.channel ?? 'video:cam-1',
+        from: 'tcp',
+        to: 'udp',
+        reason: 'rtsp-timeout',
+        attempt: 1,
+        stage: 1,
+        resetsBackoff: true,
+        resetsCircuitBreaker: true,
+        at: now,
+        metricsRecorded: false
+      });
+
+      await Promise.resolve();
+
+      const initialSnapshot = metrics.snapshot();
+      expect(
+        initialSnapshot.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.last?.to
+      ).toBe('udp');
+
+      __test__.setRuntime(runtime);
+      const exitCode = await runCli(
+        ['daemon', 'restart', '--transport', 'video:cam-1'],
+        cliIo.io
+      );
+      expect(exitCode).toBe(0);
+      expect(cliIo.stderr).toHaveLength(0);
+      expect(cliIo.stdout.join('')).toContain(
+        'Requested transport fallback reset for video channel video:cam-1'
+      );
+
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'Resetting video transport fallback sequence')
+      );
+
+      await Promise.resolve();
+
+      const snapshot = metrics.snapshot();
+      const channelStats = snapshot.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1'];
+      expect(channelStats?.last?.reason).toBe('manual-cli-reset');
+      expect(channelStats?.last?.to).toBe('tcp');
+      expect(source.getCurrentRtspTransport()).toBe('tcp');
+      expect(source.resetTransportFallback).toHaveBeenCalled();
+    } finally {
+      __test__.reset();
       runtime.stop();
     }
   });
@@ -2592,6 +2721,24 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 });
+
+function createCliIo() {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const stdoutStream = {
+    write(chunk: string) {
+      stdout.push(String(chunk));
+      return true;
+    }
+  } as unknown as NodeJS.WritableStream;
+  const stderrStream = {
+    write(chunk: string) {
+      stderr.push(String(chunk));
+      return true;
+    }
+  } as unknown as NodeJS.WritableStream;
+  return { io: { stdout: stdoutStream, stderr: stderrStream }, stdout, stderr };
+}
 
 async function waitFor(predicate: () => boolean, timeout = 2000) {
   const start = Date.now();

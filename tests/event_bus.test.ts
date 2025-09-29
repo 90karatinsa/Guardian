@@ -5,11 +5,13 @@ import { EventPayload } from '../src/types.js';
 
 describe('EventSuppressionRateLimit', () => {
   let store: ReturnType<typeof vi.fn>;
-  let log: { info: ReturnType<typeof vi.fn> };
+  let log: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn> };
   let metricsMock: {
     recordEvent: ReturnType<typeof vi.fn>;
     recordSuppressedEvent: ReturnType<typeof vi.fn>;
     recordSuppressionHistoryTtlPruned: ReturnType<typeof vi.fn>;
+    recordEventStoreFailure: ReturnType<typeof vi.fn>;
+    recordEventMetricsFailure: ReturnType<typeof vi.fn>;
   };
   let bus: EventBus;
 
@@ -22,11 +24,13 @@ describe('EventSuppressionRateLimit', () => {
 
   beforeEach(() => {
     store = vi.fn();
-    log = { info: vi.fn() };
+    log = { info: vi.fn(), warn: vi.fn() };
     metricsMock = {
       recordEvent: vi.fn(),
       recordSuppressedEvent: vi.fn(),
-      recordSuppressionHistoryTtlPruned: vi.fn()
+      recordSuppressionHistoryTtlPruned: vi.fn(),
+      recordEventStoreFailure: vi.fn(),
+      recordEventMetricsFailure: vi.fn()
     };
     bus = new EventBus({
       store: event => store(event),
@@ -174,6 +178,57 @@ describe('EventSuppressionRateLimit', () => {
     expect(snapshot.suppression.lastEvent?.channel).toBe('video:lobby');
     expect(snapshot.suppression.lastEvent?.windowRemainingMs).toBe(500);
     expect(snapshot.suppression.lastEvent?.cooldownRemainingMs).toBe(400);
+  });
+
+  it('EventSuppressionStoreErrorResilience records failures without interrupting publishers', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const storeError = new Error('database unavailable');
+    const storeMock = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw storeError;
+      })
+      .mockImplementation(() => {});
+
+    const bus = new EventBus({
+      store: event => storeMock(event),
+      log: log as any,
+      metrics
+    });
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0 })).toBe(true);
+    expect(storeMock).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls[0]?.[1]).toBe('Event storage failed; delivery skipped');
+    expect(log.info).not.toHaveBeenCalled();
+
+    const metricsError = new Error('metrics offline');
+    const recordEventSpy = vi.spyOn(metrics, 'recordEvent');
+    recordEventSpy.mockImplementationOnce(() => {
+      throw metricsError;
+    });
+
+    expect(bus.emitEvent({ ...basePayload, ts: 1, message: 'second event' })).toBe(true);
+    expect(storeMock).toHaveBeenCalledTimes(2);
+    expect(log.warn).toHaveBeenCalledTimes(2);
+    expect(log.warn.mock.calls[1]?.[1]).toBe('Event metrics recording failed');
+    expect(log.info).toHaveBeenCalledTimes(1);
+    expect(log.info.mock.calls[0]?.[1]).toBe('second event');
+
+    recordEventSpy.mockRestore();
+
+    expect(bus.emitEvent({ ...basePayload, ts: 2, message: 'recovered event' })).toBe(true);
+    expect(storeMock).toHaveBeenCalledTimes(3);
+    expect(log.info).toHaveBeenCalledTimes(2);
+    expect(log.info.mock.calls[1]?.[1]).toBe('recovered event');
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.events.failures.store.total).toBe(1);
+    expect(snapshot.events.failures.store.lastError).toBe('database unavailable');
+    expect(snapshot.events.failures.metrics.total).toBe(1);
+    expect(snapshot.events.failures.metrics.lastError).toBe('metrics offline');
+    expect(snapshot.events.total).toBe(1);
   });
 
   it('EventSuppressionRateLimitWindow isolates cooldown per channel', () => {
@@ -612,7 +667,7 @@ describe('EventSuppressionRateLimit', () => {
 
 describe('EventSuppressionWindowRecovery', () => {
   let store: ReturnType<typeof vi.fn>;
-  let log: { info: ReturnType<typeof vi.fn> };
+  let log: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn> };
   let metricsMock: {
     recordEvent: ReturnType<typeof vi.fn>;
     recordSuppressedEvent: ReturnType<typeof vi.fn>;
@@ -629,7 +684,7 @@ describe('EventSuppressionWindowRecovery', () => {
 
   beforeEach(() => {
     store = vi.fn();
-    log = { info: vi.fn() };
+    log = { info: vi.fn(), warn: vi.fn() };
     metricsMock = {
       recordEvent: vi.fn(),
       recordSuppressedEvent: vi.fn(),

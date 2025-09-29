@@ -122,6 +122,70 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionCrossDeviceArchive falls back to copy when snapshot move crosses devices', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 10, 12);
+    vi.setSystemTime(now);
+
+    const staleTs = now - 45 * dayMs;
+    const snapshotPath = path.join(cameraOneDir, 'cross-device-old.jpg');
+    fs.writeFileSync(snapshotPath, 'stale');
+    fs.utimesSync(snapshotPath, staleTs / 1000, staleTs / 1000);
+
+    const realRename = fs.renameSync;
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((source, target) => {
+      if (source === snapshotPath) {
+        const error = new Error('EXDEV move') as NodeJS.ErrnoException;
+        error.code = 'EXDEV';
+        throw error;
+      }
+      return realRename(source, target);
+    });
+    const copySpy = vi.spyOn(fs, 'copyFileSync');
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync');
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        snapshot: { mode: 'archive', retentionDays: 10 },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(copySpy).toHaveBeenCalledTimes(1);
+      expect(unlinkSpy).toHaveBeenCalledWith(snapshotPath);
+      const cameraKey = path.basename(cameraOneDir);
+      const perCamera = result.outcome?.perCamera?.[cameraKey];
+      expect(perCamera?.archivedSnapshots).toBe(1);
+      const archiveDate = formatArchiveDate(staleTs);
+      const archiveRoot = path.join(archiveDir, cameraKey, archiveDate);
+      const archivedFiles = collectArchiveFiles(archiveRoot);
+      expect(archivedFiles).toContain(path.join(archiveRoot, 'cross-device-old.jpg'));
+      const runArgs = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runArgs?.archivedSnapshots).toBe(1);
+    } finally {
+      renameSpy.mockRestore();
+      copySpy.mockRestore();
+      unlinkSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionDiskSavingsMetrics records disk usage and vacuum table stats', async () => {
     const now = Date.now();
     const staleTs = now - 90 * dayMs;
