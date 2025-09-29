@@ -334,6 +334,22 @@ type MetricsSnapshot = {
     lastEventAt: string | null;
     byDetector: CounterMap;
     bySeverity: CounterMap;
+    failures: {
+      store: {
+        total: number;
+        lastError: string | null;
+        lastAt: string | null;
+        lastDetector: string | null;
+        lastSource: string | null;
+      };
+      metrics: {
+        total: number;
+        lastError: string | null;
+        lastAt: string | null;
+        lastDetector: string | null;
+        lastSource: string | null;
+      };
+    };
   };
   logs: {
     byLevel: CounterMap;
@@ -536,6 +552,20 @@ class MetricsRegistry {
   private readonly detectorMetrics = new Map<string, DetectorMetricState>();
   private totalEvents = 0;
   private lastEventTimestamp: number | null = null;
+  private eventStoreFailures = 0;
+  private eventMetricsFailures = 0;
+  private lastEventStoreError: {
+    message: string;
+    detector: string | null;
+    source: string | null;
+    at: number;
+  } | null = null;
+  private lastEventMetricsError: {
+    message: string;
+    detector: string | null;
+    source: string | null;
+    at: number;
+  } | null = null;
   private ffmpegRestarts = 0;
   private audioRestarts = 0;
   private lastFfmpegRestartAt: number | null = null;
@@ -604,6 +634,10 @@ class MetricsRegistry {
     this.audioDeviceDiscoveryByFormat.clear();
     this.lastFfmpegRestartMeta = null;
     this.lastAudioRestartMeta = null;
+    this.eventStoreFailures = 0;
+    this.eventMetricsFailures = 0;
+    this.lastEventStoreError = null;
+    this.lastEventMetricsError = null;
     resetPipelineChannelState(this.ffmpegRestartState);
     resetPipelineChannelState(this.audioRestartState);
     this.suppressionByRule.clear();
@@ -727,6 +761,28 @@ class MetricsRegistry {
 
     const severity = event.severity ?? 'info';
     this.severityCounters.set(severity, (this.severityCounters.get(severity) ?? 0) + 1);
+  }
+
+  recordEventStoreFailure(error: unknown, event: EventRecord) {
+    this.eventStoreFailures += 1;
+    const message = error instanceof Error ? error.message : String(error);
+    this.lastEventStoreError = {
+      message,
+      detector: event.detector ?? null,
+      source: event.source ?? null,
+      at: Date.now()
+    };
+  }
+
+  recordEventMetricsFailure(error: unknown, event: EventRecord) {
+    this.eventMetricsFailures += 1;
+    const message = error instanceof Error ? error.message : String(error);
+    this.lastEventMetricsError = {
+      message,
+      detector: event.detector ?? null,
+      source: event.source ?? null,
+      at: Date.now()
+    };
   }
 
   private ensureSuppressionRuleState(ruleId: string): SuppressionRuleState {
@@ -1958,7 +2014,23 @@ class MetricsRegistry {
         total: this.totalEvents,
         lastEventAt: this.lastEventTimestamp ? new Date(this.lastEventTimestamp).toISOString() : null,
         byDetector: mapFrom(this.detectorCounters),
-        bySeverity: mapFrom(this.severityCounters)
+        bySeverity: mapFrom(this.severityCounters),
+        failures: {
+          store: {
+            total: this.eventStoreFailures,
+            lastError: this.lastEventStoreError?.message ?? null,
+            lastAt: this.lastEventStoreError ? new Date(this.lastEventStoreError.at).toISOString() : null,
+            lastDetector: this.lastEventStoreError?.detector ?? null,
+            lastSource: this.lastEventStoreError?.source ?? null
+          },
+          metrics: {
+            total: this.eventMetricsFailures,
+            lastError: this.lastEventMetricsError?.message ?? null,
+            lastAt: this.lastEventMetricsError ? new Date(this.lastEventMetricsError.at).toISOString() : null,
+            lastDetector: this.lastEventMetricsError?.detector ?? null,
+            lastSource: this.lastEventMetricsError?.source ?? null
+          }
+        }
       },
       logs: {
         byLevel: logLevelSnapshot,

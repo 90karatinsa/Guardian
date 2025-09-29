@@ -409,7 +409,20 @@ export class VideoSource extends EventEmitter {
     this.clearStreamIdleTimer();
     this.commandGeneration += 1;
     this.resetCommandClassifications({ preservePersistent: true });
-    const command = this.createCommand();
+
+    let command: ffmpeg.FfmpegCommand;
+    try {
+      command = this.createCommand();
+    } catch (error) {
+      const err =
+        error instanceof Error ? (error as Errno) : (new Error(String(error)) as Errno);
+      const reason = err?.code === 'ENOENT' ? 'ffmpeg-missing' : 'start-error';
+      const normalized = this.normalizeErrno(err);
+      this.emit('error', err);
+      this.scheduleRecovery(reason, normalized);
+      return;
+    }
+
     this.command = command;
 
     this.commandExitPromise = new Promise<void>(resolve => {
@@ -487,7 +500,8 @@ export class VideoSource extends EventEmitter {
       this.consume(stream);
     } catch (error) {
       this.finalizeCommandLifecycle();
-      const err = error as Errno;
+      const err =
+        error instanceof Error ? (error as Errno) : (new Error(String(error)) as Errno);
       this.emit('error', err);
       const reason = err?.code === 'ENOENT' ? 'ffmpeg-missing' : 'start-error';
       this.scheduleRecovery(reason, this.normalizeErrno(err));

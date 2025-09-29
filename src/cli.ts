@@ -29,6 +29,7 @@ type GuardRuntime = {
   stop: () => void | Promise<void>;
   resetCircuitBreaker: (identifier: string) => boolean;
   resetChannelHealth: (identifier: string) => boolean;
+  resetTransportFallback?: (identifier: string) => boolean;
 };
 
 type ShutdownHookSummary = {
@@ -166,6 +167,23 @@ function buildPipelineHealthSummary(
     if (degraded) {
       result.degraded.push(channel);
     }
+  }
+
+  if (result.degraded.length > 1) {
+    const priority: Record<RestartSeverityLevel, number> = {
+      none: 2,
+      warning: 1,
+      critical: 0
+    };
+    result.degraded.sort((left, right) => {
+      const leftSeverity = result.channels[left]?.severity ?? 'none';
+      const rightSeverity = result.channels[right]?.severity ?? 'none';
+      const delta = priority[leftSeverity] - priority[rightSeverity];
+      if (delta !== 0) {
+        return delta;
+      }
+      return left.localeCompare(right);
+    });
   }
 
   result.totalDegraded = result.degraded.length;
@@ -353,6 +371,20 @@ const state: {
   lastShutdownReason: null,
   lastShutdownSignal: null
 };
+
+function resetServiceState() {
+  state.status = 'idle';
+  state.startedAt = null;
+  state.runtime = null;
+  state.stopResolver = null;
+  state.shuttingDown = false;
+  state.shutdownPromise = null;
+  state.lastShutdownError = null;
+  state.lastShutdownHooks = [];
+  state.lastShutdownAt = null;
+  state.lastShutdownReason = null;
+  state.lastShutdownSignal = null;
+}
 
 export function getServiceState() {
   return { status: state.status, startedAt: state.startedAt };
@@ -1640,6 +1672,24 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
   await shutdownTask;
   return state.lastShutdownError;
 }
+
+export const __test__ = {
+  getState: () => ({ ...state }),
+  setRuntime(
+    runtime: GuardRuntime | null,
+    options: { status?: ServiceStatus; startedAt?: number | null } = {}
+  ) {
+    resetServiceState();
+    if (runtime) {
+      state.runtime = runtime;
+      state.status = options.status ?? 'running';
+      state.startedAt =
+        typeof options.startedAt === 'number' ? options.startedAt : Date.now();
+    }
+  },
+  reset: resetServiceState,
+  runDaemonRestartCommand
+};
 
 const resolvedPath = path.resolve(process.argv[1] ?? '');
 const modulePath = fileURLToPath(import.meta.url);

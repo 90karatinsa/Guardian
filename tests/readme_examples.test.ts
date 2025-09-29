@@ -51,6 +51,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('pipelines.ffmpeg.watchdogRestarts');
     expect(readme).toContain('guardian daemon start');
     expect(readme).toContain('guardian daemon status --json');
+    expect(readme).toContain('guardian daemon pipelines list --json');
+    expect(readme).toContain('guardian daemon pipelines reset --channel');
     expect(readme).toContain('guardian daemon health');
     expect(readme).toContain('guardian daemon ready');
     expect(readme).toContain('guardian daemon hooks --reason');

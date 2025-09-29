@@ -242,9 +242,20 @@ export function parseYoloDetections(
     return b.score - a.score;
   });
 
-  const maxDetections = options.maxDetections ?? fused.length;
+  const rawMax = options.maxDetections;
 
-  return fused.slice(0, Math.max(1, maxDetections));
+  if (rawMax !== undefined && rawMax !== null) {
+    if (!Number.isFinite(rawMax)) {
+      return fused;
+    }
+    const truncated = Math.trunc(rawMax);
+    if (truncated <= 0) {
+      return [];
+    }
+    return fused.slice(0, truncated);
+  }
+
+  return fused;
 }
 
 function resolveClassIndices(options: ParseYoloDetectionsOptions, attributeCount: number): number[] {

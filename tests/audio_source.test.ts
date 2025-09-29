@@ -89,6 +89,38 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioFfmpegInputValidation emits recoverable stream error when input missing', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: '   ',
+      retryDelayMs: 250,
+      restartJitterFactor: 0,
+      random: () => 0
+    });
+
+    const recoverSpy = vi.fn();
+    const errorSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', errorSpy);
+
+    source.start();
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const reportedError = errorSpy.mock.calls[0]?.[0] as Error | undefined;
+    expect(reportedError?.message).toContain('Audio ffmpeg input is required');
+    expect(recoverSpy).toHaveBeenCalledTimes(1);
+    const event = recoverSpy.mock.calls[0]?.[0];
+    expect(event.reason).toBe('stream-error');
+
+    vi.advanceTimersByTime(250);
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    source.stop();
+  });
+
   it('AudioCircuitBreakerFfmpegMissing halts retries after repeated missing binaries', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 

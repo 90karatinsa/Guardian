@@ -16,6 +16,7 @@ export interface HttpServerOptions {
   staticDir?: string;
   faceRegistry?: FaceRegistry;
   createFaceRegistry?: () => Promise<FaceRegistry>;
+  snapshotDirs?: string[];
 }
 
 export interface HttpServerRuntime {
@@ -36,7 +37,8 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
     createFaceRegistry:
       options.createFaceRegistry ??
       (async () => FaceRegistry.create({ modelPath: path.resolve(process.cwd(), 'models/face.onnx') })),
-    metrics
+    metrics,
+    snapshotDirs: options.snapshotDirs
   });
 
   const server = http.createServer((req, res) => {

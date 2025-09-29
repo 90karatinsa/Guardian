@@ -251,6 +251,85 @@ describe('YoloParser utilities', () => {
     expect('priorityScore' in detection).toBe(false);
   });
 
+  it('PersonDetectorMaxDetectionsBounds respects zero and fractional limits', () => {
+    const classCount = 1;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assignDetection = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectnessLogit: number;
+        classLogit: number;
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = values.objectnessLogit;
+      data[(YOLO_CLASS_START_INDEX + 0) * detections + index] = values.classLogit;
+    };
+
+    assignDetection(0, {
+      cx: 160,
+      cy: 160,
+      width: 120,
+      height: 140,
+      objectnessLogit: 3,
+      classLogit: 3.2
+    });
+
+    assignDetection(1, {
+      cx: 200,
+      cy: 220,
+      width: 140,
+      height: 160,
+      objectnessLogit: 2.8,
+      classLogit: 2.6
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      padX: 0,
+      padY: 0,
+      originalWidth: 320,
+      originalHeight: 320,
+      resizedWidth: 320,
+      resizedHeight: 320,
+      scale: 1,
+      scaleX: 1,
+      scaleY: 1
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const unlimited = parseYoloDetections(tensor, meta, {
+      classIndex: 0,
+      scoreThreshold: 0.1
+    });
+    expect(unlimited).toHaveLength(2);
+
+    const zeroLimited = parseYoloDetections(tensor, meta, {
+      classIndex: 0,
+      scoreThreshold: 0.1,
+      maxDetections: 0
+    });
+    expect(zeroLimited).toHaveLength(0);
+
+    const fractionalLimit = parseYoloDetections(tensor, meta, {
+      classIndex: 0,
+      scoreThreshold: 0.1,
+      maxDetections: 1.4
+    });
+    expect(fractionalLimit).toHaveLength(1);
+    expect(fractionalLimit[0]?.bbox.width).toBeCloseTo(120, 5);
+  });
+
   it('YoloParserClampsOutOfFrame ensures bounding boxes stay within frame bounds', () => {
     const classCount = 1;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

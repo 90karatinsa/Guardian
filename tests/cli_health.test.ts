@@ -399,20 +399,65 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
-  it('CliDaemonPipelinesCommands expose channel health summaries and reset counters', async () => {
+  it('CliPipelinesListJson mirrors summary output and orders degraded channels by severity', async () => {
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:beta', {
+      severity: 'critical',
+      restarts: 9,
+      backoffMs: 60000,
+      reason: 'watchdog restarts 9 ≥ 6'
+    });
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:alpha', {
+      severity: 'warning',
+      restarts: 4,
+      backoffMs: 12000,
+      reason: 'watchdog restarts 4 ≥ 3'
+    });
+    metrics.setPipelineChannelHealth('audio', 'audio:lobby', {
+      severity: 'warning',
+      restarts: 2,
+      backoffMs: 5000,
+      reason: 'watchdog restarts 2 ≥ 2'
+    });
+
+    const listIo = createTestIo();
+    const listCode = await runCli(['daemon', 'pipelines', 'list', '--json'], listIo.io);
+    expect(listCode).toBe(0);
+    const payload = JSON.parse(listIo.stdout().trim());
+
+    const ffmpeg = payload.pipelines.ffmpeg;
+    expect(ffmpeg.channels['video:alpha'].severity).toBe('warning');
+    expect(ffmpeg.channels['video:beta'].severity).toBe('critical');
+    expect(ffmpeg.degraded).toEqual(['video:beta', 'video:alpha']);
+    expect(ffmpeg.totalDegraded).toBe(2);
+
+    const audio = payload.pipelines.audio;
+    expect(audio.channels['audio:lobby'].severity).toBe('warning');
+    expect(audio.degraded).toEqual(['audio:lobby']);
+    expect(audio.totalDegraded).toBe(1);
+  });
+
+  it('CliPipelinesReset delegates to runtime and clears recorded health state', async () => {
+    const stopSpy = vi.fn();
+    const resetChannelHealth = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn(),
+      resetChannelHealth,
+      resetTransportFallback: vi.fn()
+    });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
     metrics.setPipelineChannelHealth('ffmpeg', 'video:front', {
       severity: 'warning',
       restarts: 3,
       backoffMs: 12000,
       reason: 'watchdog restarts 3 ≥ 3'
     });
-
-    const listIo = createTestIo();
-    const listCode = await runCli(['daemon', 'pipelines', 'list', '--json'], listIo.io);
-    expect(listCode).toBe(0);
-    const listPayload = JSON.parse(listIo.stdout().trim());
-    expect(listPayload.pipelines.ffmpeg.channels['video:front'].degraded).toBe(true);
-    expect(listPayload.pipelines.ffmpeg.channels['video:front'].severity).toBe('warning');
 
     const resetIo = createTestIo();
     const resetCode = await runCli([
@@ -422,11 +467,14 @@ describe('GuardianCliHealthcheck', () => {
       '--channel',
       'video:front'
     ], resetIo.io);
-    expect(resetCode).toBe(0);
-    expect(resetIo.stdout()).toContain('video:front');
 
+    expect(resetCode).toBe(0);
+    expect(resetChannelHealth).toHaveBeenCalledWith('video:front');
     const snapshot = metrics.snapshot();
     expect(snapshot.pipelines.ffmpeg.byChannel['video:front'].health.severity).toBe('none');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
   });
 
   it('CliSystemdIntegration reports integration manifest and matches packaged commands', async () => {

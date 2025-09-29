@@ -782,8 +782,9 @@ function rotateSnapshots(
           const targetDir = relative === '.' ? archiveBase : path.join(archiveBase, relative);
           fs.mkdirSync(targetDir, { recursive: true });
           const targetPath = ensureUniqueArchivePath(targetDir, entry.name);
-          fs.renameSync(sourcePath, targetPath);
-          moved += 1;
+          if (moveSnapshotWithFallback(sourcePath, targetPath, cameraId, warnings)) {
+            moved += 1;
+          }
         }
       } catch (error) {
         warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
@@ -813,6 +814,40 @@ function rotateSnapshots(
   }
 
   return { moved, pruned, warnings };
+}
+
+function moveSnapshotWithFallback(
+  sourcePath: string,
+  targetPath: string,
+  cameraId: string,
+  warnings: Array<{ path: string; error: Error; camera: string }>
+) {
+  try {
+    fs.renameSync(sourcePath, targetPath);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== 'EXDEV') {
+      warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
+      return false;
+    }
+  }
+
+  try {
+    fs.copyFileSync(sourcePath, targetPath);
+    fs.unlinkSync(sourcePath);
+    return true;
+  } catch (copyError) {
+    warnings.push({ path: sourcePath, error: toError(copyError), camera: cameraId });
+    try {
+      if (fs.existsSync(targetPath)) {
+        fs.rmSync(targetPath, { force: true });
+      }
+    } catch (cleanupError) {
+      warnings.push({ path: targetPath, error: toError(cleanupError), camera: cameraId });
+    }
+    return false;
+  }
 }
 
 function buildArchivePath(archiveDir: string, snapshotDir: string, mtimeMs: number): string {

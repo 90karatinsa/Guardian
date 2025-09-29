@@ -85,8 +85,37 @@ class EventBus extends EventEmitter {
     this.metrics = dependencies.metrics ?? metrics;
 
     this.on(EVENT_CHANNEL, event => {
-      this.store(event);
-      this.metrics.recordEvent(event);
+      try {
+        this.store(event);
+      } catch (error) {
+        this.metrics.recordEventStoreFailure(error, event);
+        this.log.warn(
+          {
+            err: error,
+            detector: event.detector,
+            source: event.source,
+            severity: event.severity
+          },
+          'Event storage failed; delivery skipped'
+        );
+        return;
+      }
+
+      try {
+        this.metrics.recordEvent(event);
+      } catch (error) {
+        this.metrics.recordEventMetricsFailure(error, event);
+        this.log.warn(
+          {
+            err: error,
+            detector: event.detector,
+            source: event.source,
+            severity: event.severity
+          },
+          'Event metrics recording failed'
+        );
+      }
+
       this.log.info(
         {
           detector: event.detector,

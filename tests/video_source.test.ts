@@ -429,6 +429,66 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoFfmpegStartErrorGuard recovers from synchronous start failures', async () => {
+    const recoverEvents: RecoverEvent[] = [];
+    const errors: Error[] = [];
+    const fatalEvents: FatalEvent[] = [];
+    const commands: FakeCommand[] = [];
+
+    let attempts = 0;
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      commandFactory: () => {
+        attempts += 1;
+        if (attempts <= 2) {
+          const error = new Error(`start failure ${attempts}`);
+          throw error;
+        }
+        const command = new FakeCommand();
+        commands.push(command);
+        setTimeout(() => {
+          command.emit('start');
+          command.pushFrame(SAMPLE_PNG);
+        }, 0);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', err => {
+      if (err instanceof Error) {
+        errors.push(err);
+      }
+    });
+    source.on('fatal', event => fatalEvents.push(event));
+
+    try {
+      source.start();
+
+      await waitFor(() => attempts >= 3, 1000);
+      await waitFor(
+        () => recoverEvents.filter(event => event.reason === 'start-error').length === 2,
+        1000
+      );
+
+      expect(errors).toHaveLength(2);
+      expect(fatalEvents).toHaveLength(0);
+      expect(commands).toHaveLength(1);
+      await waitFor(() => commands[0]?.framesPushed >= 1, 500);
+
+      const startErrorReasons = recoverEvents.filter(event => event.reason === 'start-error');
+      expect(startErrorReasons).toHaveLength(2);
+      expect(startErrorReasons.every(event => event.errorCode === null)).toBe(true);
+    } finally {
+      await source.stop();
+    }
+  });
+
   it('VideoSourceCircuitBreaker stops retries and emits fatal event after threshold', async () => {
     vi.useFakeTimers();
 
