@@ -310,6 +310,17 @@ describe('RestApiEvents', () => {
     expect(Object.keys(metricsPayload).sort()).toEqual(['fetchedAt', 'retention']);
   });
 
+  it('HttpStaticHeadRequest serves dashboard assets without body for HEAD requests', async () => {
+    const { port } = await ensureServer();
+
+    const response = await fetch(`http://localhost:${port}/dashboard.js`, { method: 'HEAD' });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('application/javascript');
+    const body = await response.text();
+    expect(body).toBe('');
+  });
+
   it('HttpApiChannelFiltersWithoutManualMeta streams and lists enriched events', async () => {
     const busLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const eventBus = new EventBus({ store: event => storeEvent(event), log: busLogger as any, metrics });

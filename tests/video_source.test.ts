@@ -15,10 +15,452 @@ const SAMPLE_PNG = Buffer.from(
   'base64'
 );
 
+type TestRecoveryContext = {
+  errorCode: string | number | null;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+};
+
 describe('VideoSource', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     metrics.reset();
+  });
+
+  it('VideoFfmpegErrorRecovery', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 1_000,
+      watchdogTimeoutMs: 1_000,
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory
+    });
+
+    const recoverEvents: RecoverEvent[] = [];
+    const fatalEvents: FatalEvent[] = [];
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('fatal', event => fatalEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      const command = commands[0];
+
+      const internalBefore = source as unknown as {
+        startTimer: NodeJS.Timeout | null;
+        watchdogTimer: NodeJS.Timeout | null;
+      };
+
+      expect(internalBefore.startTimer).not.toBeNull();
+      expect(internalBefore.watchdogTimer).not.toBeNull();
+
+      command.emit('error', new Error('ffmpeg crashed'));
+
+      await Promise.resolve();
+
+      const internal = source as unknown as {
+        startTimer: NodeJS.Timeout | null;
+        watchdogTimer: NodeJS.Timeout | null;
+        restartTimer: NodeJS.Timeout | null;
+        pendingRestartContext: unknown;
+      };
+
+      expect(internal.startTimer).toBeNull();
+      expect(internal.watchdogTimer).toBeNull();
+      expect(internal.restartTimer).not.toBeNull();
+      expect(internal.pendingRestartContext).not.toBeNull();
+
+      expect(command.killedSignals).toContain('SIGTERM');
+      expect(command.killedSignals).toContain('SIGKILL');
+
+      expect(recoverEvents.map(event => event.reason)).toContain('ffmpeg-error');
+      expect(fatalEvents).toHaveLength(0);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['ffmpeg-error']).toBe(1);
+
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+
+      expect(commandFactory).toHaveBeenCalledTimes(2);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoStreamErrorRecovery', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 1_000,
+      watchdogTimeoutMs: 1_000,
+      idleTimeoutMs: 1_000,
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory
+    });
+
+    const recoverEvents: RecoverEvent[] = [];
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      const command = commands[0];
+
+      const partialFrame = SAMPLE_PNG.subarray(0, SAMPLE_PNG.length - 10);
+      command.pushFrame(partialFrame);
+
+      await Promise.resolve();
+
+      const internalBefore = source as unknown as {
+        buffer: Buffer;
+        streamIdleTimer: NodeJS.Timeout | null;
+        watchdogTimer: NodeJS.Timeout | null;
+      };
+
+      expect(internalBefore.buffer.length).toBeGreaterThan(0);
+      expect(internalBefore.streamIdleTimer).not.toBeNull();
+      expect(internalBefore.watchdogTimer).not.toBeNull();
+
+      command.stream.emit('error', new Error('stream failure'));
+
+      await Promise.resolve();
+
+      const internal = source as unknown as {
+        buffer: Buffer;
+        streamIdleTimer: NodeJS.Timeout | null;
+        watchdogTimer: NodeJS.Timeout | null;
+        restartTimer: NodeJS.Timeout | null;
+        pendingRestartContext: unknown;
+      };
+
+      expect(internal.buffer.length).toBe(0);
+      expect(internal.streamIdleTimer).toBeNull();
+      expect(internal.watchdogTimer).toBeNull();
+      expect(internal.restartTimer).not.toBeNull();
+      expect(internal.pendingRestartContext).not.toBeNull();
+
+      expect(recoverEvents.map(event => event.reason)).toContain('stream-error');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['stream-error']).toBeGreaterThan(0);
+
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+
+      expect(commandFactory).toHaveBeenCalledTimes(2);
+
+      const internalAfter = source as unknown as { pendingRestartContext: unknown };
+      expect(internalAfter.pendingRestartContext).toBeNull();
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoTransportResetMetrics', async () => {
+    const recordSpy = vi.spyOn(metrics, 'recordTransportFallback');
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'rtsp://camera.example/stream',
+      channel: 'video:lobby',
+      framesPerSecond: 1,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      forceKillTimeoutMs: 0,
+      rtspTransportSequence: ['tcp', 'udp'],
+      commandFactory
+    });
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+
+      const internal = source as unknown as {
+        rtspFallbackState: {
+          base: string;
+          current: string;
+          index: number;
+          lastReason: string | null;
+        };
+        maybeApplyRtspTransportFallback: (
+          reason: string,
+          context: TestRecoveryContext,
+          attempt: number
+        ) => void;
+      };
+
+      expect(internal.rtspFallbackState).not.toBeNull();
+      const initialTransport = internal.rtspFallbackState.current;
+
+      internal.maybeApplyRtspTransportFallback(
+        'rtsp-timeout',
+        { errorCode: null, exitCode: null, signal: null },
+        1
+      );
+
+      const fallbackTransport = internal.rtspFallbackState.current;
+      expect(fallbackTransport).not.toBe(initialTransport);
+
+      expect(recordSpy).toHaveBeenCalledWith(
+        'ffmpeg',
+        'rtsp-timeout',
+        expect.objectContaining({
+          channel: 'video:lobby',
+          from: initialTransport,
+          to: fallbackTransport
+        })
+      );
+
+      recordSpy.mockClear();
+
+      const reset = source.resetTransportFallback({
+        reason: 'manual-cli-reset',
+        record: true,
+        resetsCircuitBreaker: true
+      });
+
+      expect(reset).toBe(true);
+      expect(internal.rtspFallbackState.index).toBe(0);
+      expect(internal.rtspFallbackState.current).toBe(internal.rtspFallbackState.base);
+      expect(internal.rtspFallbackState.lastReason).toBe('manual-cli-reset');
+
+      expect(recordSpy).toHaveBeenCalledTimes(1);
+      expect(recordSpy).toHaveBeenCalledWith(
+        'ffmpeg',
+        'manual-cli-reset',
+        expect.objectContaining({
+          channel: 'video:lobby',
+          from: fallbackTransport,
+          to: internal.rtspFallbackState.base,
+          resetsCircuitBreaker: true
+        })
+      );
+
+      const beforeReset = metrics.snapshot();
+      const beforeChannel =
+        beforeReset.pipelines.ffmpeg.transportFallbacks.byChannel['video:lobby'];
+      expect(beforeChannel.total).toBeGreaterThan(0);
+      expect(beforeChannel.last?.reason).toBe('manual-cli-reset');
+
+      metrics.resetPipelineChannel('ffmpeg', 'video:lobby');
+
+      const afterReset = metrics.snapshot();
+      const afterChannel =
+        afterReset.pipelines.ffmpeg.transportFallbacks.byChannel['video:lobby'];
+      expect(afterChannel.total).toBe(0);
+      expect(afterChannel.last).toBeNull();
+
+      const summary = Object.entries(
+        afterReset.pipelines.ffmpeg.transportFallbacks.byChannel
+      )
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([channel, snapshot]) => ({
+          channel,
+          total: snapshot.total,
+          lastReason: snapshot.last?.reason ?? null
+        }));
+
+      expect(summary).toContainEqual({
+        channel: 'video:lobby',
+        total: 0,
+        lastReason: null
+      });
+    } finally {
+      recordSpy.mockRestore();
+      await source.stop();
+    }
+  });
+
+  it('VideoForceKillSkipDelay', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'rtsp://camera.example/stream',
+      framesPerSecond: 1,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      forceKillTimeoutMs: 1000,
+      commandFactory
+    });
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      const command = commands[0];
+
+      const internal = source as unknown as {
+        killTimer: NodeJS.Timeout | null;
+        commandExitPromise: Promise<void> | null;
+        terminateCommand: (
+          force: boolean,
+          options: { skipForceDelay?: boolean }
+        ) => Promise<void> | null;
+      };
+
+      expect(internal.killTimer).toBeNull();
+      expect(internal.commandExitPromise).not.toBeNull();
+
+      const termination = internal.terminateCommand(true, { skipForceDelay: true });
+      expect(termination).toBeInstanceOf(Promise);
+
+      await termination;
+
+      expect(command.killedSignals).toEqual(['SIGTERM', 'SIGKILL']);
+
+      expect(internal.killTimer).toBeNull();
+      expect(internal.commandExitPromise).toBeNull();
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoRtspSequenceUpdate', async () => {
+    const recordSpy = vi.spyOn(metrics, 'recordTransportFallback');
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'rtsp://camera.example/stream',
+      framesPerSecond: 1,
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      forceKillTimeoutMs: 0,
+      rtspTransportSequence: ['tcp', 'udp', 'http'],
+      commandFactory
+    });
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+
+      const internal = source as unknown as {
+        rtspFallbackState: {
+          base: string;
+          sequence: string[];
+          index: number;
+          current: string;
+        };
+        maybeApplyRtspTransportFallback: (
+          reason: string,
+          context: TestRecoveryContext,
+          attempt: number
+        ) => void;
+      };
+
+      expect(internal.rtspFallbackState.sequence).toEqual(['tcp', 'udp', 'http']);
+      expect(source.getCurrentRtspTransport()).toBe('tcp');
+
+      internal.maybeApplyRtspTransportFallback(
+        'rtsp-timeout',
+        { errorCode: null, exitCode: null, signal: null },
+        1
+      );
+
+      expect(recordSpy).toHaveBeenCalledTimes(1);
+      expect(source.getCurrentRtspTransport()).toBe('udp');
+      expect(internal.rtspFallbackState.current).toBe('udp');
+      expect(internal.rtspFallbackState.index).toBe(1);
+
+      const beforeUpdate = metrics.snapshot();
+      const beforeTotal = beforeUpdate.pipelines.ffmpeg.transportFallbacks.total;
+      const beforeLast = beforeUpdate.pipelines.ffmpeg.transportFallbacks.last;
+
+      recordSpy.mockClear();
+
+      source.updateOptions({ rtspTransportSequence: ['http', 'udp', 'tcp'] });
+
+      expect(recordSpy).not.toHaveBeenCalled();
+      expect(source.getCurrentRtspTransport()).toBe('udp');
+      expect(internal.rtspFallbackState.sequence).toEqual(['http', 'udp', 'tcp']);
+      expect(internal.rtspFallbackState.current).toBe('udp');
+      expect(internal.rtspFallbackState.index).toBe(1);
+      expect(internal.rtspFallbackState.base).toBe('http');
+
+      const afterUpdate = metrics.snapshot();
+      expect(afterUpdate.pipelines.ffmpeg.transportFallbacks.total).toBe(beforeTotal);
+      expect(afterUpdate.pipelines.ffmpeg.transportFallbacks.last).toEqual(beforeLast);
+    } finally {
+      recordSpy.mockRestore();
+      await source.stop();
+    }
   });
 
   afterEach(() => {

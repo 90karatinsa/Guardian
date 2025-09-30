@@ -89,6 +89,9 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
     expect(readme).toContain('metricsSummary.pipelines.transportFallbacks.video.byChannel');
     expect(readme).toContain('transportFallbacks.byChannel[].lastReason');
+    expect(readme).toContain('Video source reconnecting (reason=ffmpeg-error)');
+    expect(readme).toContain("pipelines.ffmpeg.byReason['ffmpeg-error']");
+    expect(readme).toContain("`total` değerinin 0'a döndüğünü");
     expect(readme).toContain("metrics.pipelines.audio.byChannel['audio:mic-lobby'].restarts === 0");
     expect(readme).toContain("metrics.pipelines.audio.byChannel['audio:mic-lobby'].health.severity === 'none'");
     expect(readme).toContain('metricsSummary.retention');
@@ -158,6 +161,9 @@ it('ReadmeTransportFallbackDocs documents transport ladder metrics and warnings 
   expect(operations).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
   expect(operations).toContain('guardian daemon restart --transport');
   expect(operations).toContain('metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason');
+  expect(operations).toContain('Video source reconnecting (reason=ffmpeg-error)');
+  expect(operations).toContain("pipelines.ffmpeg.byReason['ffmpeg-error']");
+  expect(operations).toContain("`total` değerinin 0'a döndüğünü");
   expect(operations).toContain('metricsSummary.retention.runs');
 });
 

@@ -501,6 +501,8 @@ satırı, son hata logunun Unix zaman damgasını bildirir.
 ## Video ve ses boru hatları
 Video için ffmpeg süreçleri, `src/video/source.ts` altında watchdog tarafından izlenir. RTSP bağlantıları `tcp→udp→tcp` sıralı transport fallback zincirini uygular; `transport-change` logları ve `metrics.pipelines.ffmpeg.transportFallbacks.total` alanı kaç kez geri düşüş yaşandığını gösterir. `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırlarını loglarda görüyorsanız, fallback listesi üzerinde iterasyon yapıldığını bilirsiniz. Her yeniden başlatma `pipelines.ffmpeg.byReason`, `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.jitterHistogram` alanlarını artırır.
 
+ffmpeg komutları beklenmedik şekilde hata verdiğinde daemon loglarında `Video source reconnecting (reason=ffmpeg-error)` satırı görünür; aynı anda `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.byReason['ffmpeg-error']` sayaçları artar ve toparlanan kanalın kimliğini rapor eder. Manuel taşıyıcı sıfırlamalarını doğrulamak için `guardian daemon restart --transport video:lobby` komutunu çalıştırın; komut tamamlandığında sağlık özetindeki `metricsSummary.pipelines.transportFallbacks.video.byChannel` girdilerinde ilgili `total` değerinin 0'a döndüğünü ve `lastReason` alanının sıfırlandığını kontrol edin.
+
 Ses tarafında anomaly dedektörü, RMS ve spectral centroid ölçümlerini `audio.anomaly` konfigürasyonu doğrultusunda toplar. `metrics.detectors['audio-anomaly'].latencyHistogram` değeri, pencere hizasının doğruluğunu teyit eder. Sustained sessizlikte devre kesici tetiklendiğinde `pipelines.audio.watchdogBackoffByChannel` ve `pipelines.audio.restartHistogram.delay` artışları görülebilir.
 
 ## Docker ile çalışma

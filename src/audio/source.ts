@@ -1279,10 +1279,11 @@ export class AudioSource extends EventEmitter {
 
     let rms = fallbackRms;
     let spectral: number | null = null;
+    let floatSamples: Float32Array | null = null;
 
     if (Meyda && typeof Meyda.extract === 'function') {
       try {
-        const floatSamples = int16ToFloat32(samples);
+        floatSamples = int16ToFloat32(samples);
         const features = Meyda.extract(['rms', 'spectralCentroid'], floatSamples, {
           sampleRate,
           bufferSize: floatSamples.length
@@ -1301,6 +1302,11 @@ export class AudioSource extends EventEmitter {
       } catch (error) {
         // Ignore analysis errors; fallback to existing metrics
       }
+    }
+
+    if (typeof spectral !== 'number') {
+      floatSamples = floatSamples ?? int16ToFloat32(samples);
+      spectral = estimateSpectralCentroid(floatSamples, sampleRate, channels);
     }
 
     const resolvedFrameDurationMs = (() => {
@@ -1483,6 +1489,57 @@ function int16ToFloat32(samples: Int16Array): Float32Array {
     result[i] = samples[i] / 32768;
   }
   return result;
+}
+
+function estimateSpectralCentroid(
+  samples: Float32Array,
+  sampleRate: number,
+  channels: number
+) {
+  if (!samples.length || sampleRate <= 0) {
+    return 0;
+  }
+
+  const channelCount = Math.max(1, channels);
+  let centroidSum = 0;
+  let processedChannels = 0;
+
+  for (let channel = 0; channel < channelCount; channel += 1) {
+    if (channel >= samples.length) {
+      break;
+    }
+
+    let zeroCrossings = 0;
+    let channelLength = 1;
+    let previous = samples[channel];
+
+    for (let index = channel + channelCount; index < samples.length; index += channelCount) {
+      const current = samples[index];
+      if ((previous <= 0 && current > 0) || (previous >= 0 && current < 0)) {
+        zeroCrossings += 1;
+      }
+      previous = current;
+      channelLength += 1;
+    }
+
+    if (channelLength <= 1) {
+      continue;
+    }
+
+    const durationSeconds = channelLength / sampleRate;
+    if (durationSeconds <= 0) {
+      continue;
+    }
+
+    centroidSum += zeroCrossings / (4 * durationSeconds);
+    processedChannels += 1;
+  }
+
+  if (processedChannels === 0) {
+    return 0;
+  }
+
+  return centroidSum / processedChannels;
 }
 
 function calculateFrameDurationMs(totalSamples: number, sampleRate: number, channels: number) {

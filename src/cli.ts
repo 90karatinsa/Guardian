@@ -972,7 +972,13 @@ async function runDaemonRestartCommand(args: string[], io: CliIo): Promise<numbe
       return 1;
     }
 
+    metrics.resetTransportFallback(canonicalVideo);
     io.stdout.write(`Requested transport fallback reset for video channel ${canonicalVideo}\n`);
+    io.stdout.write(`Cleared recorded transport fallback metrics for ${canonicalVideo}\n`);
+    const fallbackNotice = triggered
+      ? `Transport fallback ladder reset for ${canonicalVideo}`
+      : `Transport fallback ladder already at primary input for ${canonicalVideo}`;
+    io.stdout.write(`${fallbackNotice}\n`);
     return 0;
   }
 
