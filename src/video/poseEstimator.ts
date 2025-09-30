@@ -88,6 +88,7 @@ export class PoseEstimator {
   async forecast(motionMeta: Record<string, unknown> | undefined, ts = Date.now()) {
     const start = performance.now();
     metrics.incrementDetectorCounter('pose', 'invocations');
+    let shouldObserveLatency = false;
     try {
       await this.ensureSession();
       if (!this.session || !this.inputName || !this.outputName) {
@@ -103,6 +104,7 @@ export class PoseEstimator {
         return null;
       }
 
+      shouldObserveLatency = true;
       const tensor = buildPoseTensor(history);
       const feeds: Record<string, ort.Tensor> = {
         [this.inputName]: tensor
@@ -188,7 +190,9 @@ export class PoseEstimator {
       metrics.recordDetectorError('pose', (error as Error).message ?? 'forecast-failed');
       throw error;
     } finally {
-      metrics.observeDetectorLatency('pose', performance.now() - start);
+      if (shouldObserveLatency) {
+        metrics.observeDetectorLatency('pose', performance.now() - start);
+      }
     }
   }
 

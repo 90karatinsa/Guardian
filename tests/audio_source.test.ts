@@ -257,6 +257,52 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioAnalysisWithoutMeyda falls back to internal calculations', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+    const meydaModule = await import('meyda');
+    const originalExtract = meydaModule.default.extract;
+
+    try {
+      (meydaModule.default as Record<string, unknown>).extract = undefined;
+
+      const source = new AudioSource({
+        type: 'ffmpeg',
+        input: 'pipe:0',
+        sampleRate: 8000,
+        channels: 1,
+        frameDurationMs: 40
+      });
+
+      const samples = new Int16Array([0, 5000, -2500, 1250, -625, 312, -150, 75, -30, 15]);
+      (source as any).analyzeFrame(samples, 8000, 1, 40, 0.03);
+
+      const analysis = source.getAnalysisSnapshot();
+      expect(analysis.ffmpeg).toBeDefined();
+      expect(analysis.ffmpeg.frames).toBe(1);
+      expect(Number.isFinite(analysis.ffmpeg.rms)).toBe(true);
+      expect(Number.isFinite(analysis.ffmpeg.spectralCentroid)).toBe(true);
+
+      const snapshot = metrics.snapshot();
+      const detector = snapshot.detectors['audio-anomaly'];
+      const ffmpegAnalysis = detector.analysis.ffmpeg;
+      expect(ffmpegAnalysis).toBeDefined();
+      expect(ffmpegAnalysis.rms).toBeCloseTo(analysis.ffmpeg.rms, 6);
+      expect(ffmpegAnalysis.spectralCentroid).toBeCloseTo(
+        analysis.ffmpeg.spectralCentroid,
+        6
+      );
+      expect(ffmpegAnalysis.windows).toBe(analysis.ffmpeg.frames);
+      expect(ffmpegAnalysis.rmsWindowMs).toBeCloseTo(analysis.ffmpeg.rmsWindowMs, 6);
+      expect(ffmpegAnalysis.rmsWindowFrames).toBe(analysis.ffmpeg.rmsWindowFrames);
+
+      expect(meydaExtractMock).not.toHaveBeenCalled();
+
+      source.stop();
+    } finally {
+      (meydaModule.default as Record<string, unknown>).extract = originalExtract;
+    }
+  });
+
   it('AudioCircuitResetManualMetric records manual circuit resets in metrics', async () => {
     vi.useRealTimers();
     metrics.reset();

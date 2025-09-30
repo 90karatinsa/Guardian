@@ -349,6 +349,7 @@ type DetectorSnapshot = {
   lastErrorMessage: string | null;
   latency: LatencyStats | null;
   latencyHistogram: HistogramSnapshot;
+  analysis: Record<string, Record<string, number>>;
 };
 
 type MetricsSnapshot = {
@@ -1580,38 +1581,66 @@ class MetricsRegistry {
       return;
     }
 
+    this.resetTransportFallback(channel);
+  }
+
+  resetTransportFallback(channel: string) {
+    return this.clearTransportFallback(channel);
+  }
+
+  private clearTransportFallback(channel: string) {
     const fallback = this.transportFallbackByChannel.get(channel);
-    const recomputeLast = this.transportFallbackLast?.channel === channel;
-    if (fallback) {
-      this.transportFallbackTotal = Math.max(0, this.transportFallbackTotal - fallback.total);
-
-      for (const [reason, count] of fallback.byReason.entries()) {
-        const existing = this.transportFallbackByReason.get(reason) ?? 0;
-        const remaining = existing - count;
-        if (remaining > 0) {
-          this.transportFallbackByReason.set(reason, remaining);
-        } else {
-          this.transportFallbackByReason.delete(reason);
-        }
-      }
-
-      for (const [target, count] of fallback.byTarget.entries()) {
-        const existing = this.transportFallbackByTarget.get(target) ?? 0;
-        const remaining = existing - count;
-        if (remaining > 0) {
-          this.transportFallbackByTarget.set(target, remaining);
-        } else {
-          this.transportFallbackByTarget.delete(target);
-        }
-      }
-
-      fallback.total = 0;
-      fallback.last = null;
-      fallback.history.length = 0;
-      fallback.droppedHistory = 0;
-      fallback.byReason.clear();
-      fallback.byTarget.clear();
+    if (!fallback) {
+      return false;
     }
+
+    const recomputeLast = this.transportFallbackLast?.channel === channel;
+    if (fallback.total > 0) {
+      this.transportFallbackTotal = Math.max(0, this.transportFallbackTotal - fallback.total);
+    }
+
+    for (const [reason, count] of fallback.byReason.entries()) {
+      const existing = this.transportFallbackByReason.get(reason) ?? 0;
+      const remaining = existing - count;
+      if (remaining > 0) {
+        this.transportFallbackByReason.set(reason, remaining);
+      } else {
+        this.transportFallbackByReason.delete(reason);
+      }
+    }
+
+    for (const [target, count] of fallback.byTarget.entries()) {
+      const existing = this.transportFallbackByTarget.get(target) ?? 0;
+      const remaining = existing - count;
+      if (remaining > 0) {
+        this.transportFallbackByTarget.set(target, remaining);
+      } else {
+        this.transportFallbackByTarget.delete(target);
+      }
+    }
+
+    if (fallback.resetsBackoff > 0) {
+      this.transportFallbackResetsBackoff = Math.max(
+        0,
+        this.transportFallbackResetsBackoff - fallback.resetsBackoff
+      );
+    }
+
+    if (fallback.resetsCircuitBreaker > 0) {
+      this.transportFallbackResetsCircuitBreaker = Math.max(
+        0,
+        this.transportFallbackResetsCircuitBreaker - fallback.resetsCircuitBreaker
+      );
+    }
+
+    fallback.total = 0;
+    fallback.last = null;
+    fallback.history.length = 0;
+    fallback.droppedHistory = 0;
+    fallback.byReason.clear();
+    fallback.byTarget.clear();
+    fallback.resetsBackoff = 0;
+    fallback.resetsCircuitBreaker = 0;
 
     if (recomputeLast) {
       let latest: TransportFallbackRecord | null = null;
@@ -1627,6 +1656,8 @@ class MetricsRegistry {
       }
       this.transportFallbackLast = latest;
     }
+
+    return true;
   }
 
   recordAudioDeviceDiscoveryByFormat(
@@ -3036,6 +3067,7 @@ function mapFromDetectors(source: Map<string, DetectorMetricState>): Record<stri
     const histogramEntries = state.latencyHistogram
       ? Array.from(state.latencyHistogram.entries()).sort(([a], [b]) => compareHistogramKeys(a, b))
       : [];
+    const analysis = mapDetectorAnalysis(state.gauges);
     result[detector] = {
       counters: mapFrom(state.counters),
       gauges: mapFrom(state.gauges),
@@ -3053,10 +3085,55 @@ function mapFromDetectors(source: Map<string, DetectorMetricState>): Record<stri
                 state.latency.count === 0 ? 0 : state.latency.totalMs / state.latency.count
             }
           : null,
-      latencyHistogram: Object.fromEntries(histogramEntries)
+      latencyHistogram: Object.fromEntries(histogramEntries),
+      analysis
     };
   }
   return result;
+}
+
+function mapDetectorAnalysis(gauges: Map<string, number>): Record<string, Record<string, number>> {
+  const formats = new Map<string, Map<string, number>>();
+  for (const [key, value] of gauges.entries()) {
+    if (!key.startsWith('analysis.')) {
+      continue;
+    }
+    const parts = key.split('.');
+    if (parts.length < 3) {
+      continue;
+    }
+    const [, format, ...rest] = parts;
+    if (!format) {
+      continue;
+    }
+    const metricKey = normalizeAnalysisMetric(rest.join('.'));
+    const metrics = formats.get(format) ?? new Map<string, number>();
+    metrics.set(metricKey, value);
+    formats.set(format, metrics);
+  }
+
+  const result: Record<string, Record<string, number>> = {};
+  const orderedFormats = Array.from(formats.entries()).sort(([a], [b]) => a.localeCompare(b));
+  for (const [format, metrics] of orderedFormats) {
+    const orderedMetrics = Array.from(metrics.entries()).sort(([a], [b]) => a.localeCompare(b));
+    result[format] = Object.fromEntries(orderedMetrics);
+  }
+  return result;
+}
+
+function normalizeAnalysisMetric(raw: string) {
+  if (!raw) {
+    return raw;
+  }
+  const segments = raw.split(/[-.]/).filter(segment => segment.length > 0);
+  if (segments.length === 0) {
+    return raw;
+  }
+  return segments
+    .map((segment, index) =>
+      index === 0 ? segment : segment.charAt(0).toUpperCase() + segment.slice(1)
+    )
+    .join('');
 }
 
 function createPipelineChannelState(): PipelineChannelState {

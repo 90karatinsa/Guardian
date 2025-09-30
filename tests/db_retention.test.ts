@@ -674,6 +674,108 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionTaskDisableDuringRun skips extra runs and resumes once re-enabled', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const baselineDisk = getDatabaseDiskUsage();
+    const vacuumSpy = vi
+      .spyOn(dbModule, 'vacuumDatabase')
+      .mockReturnValue({
+        run: 'never',
+        mode: 'auto',
+        analyze: false,
+        reindex: false,
+        optimize: false,
+        target: undefined,
+        pragmas: undefined,
+        indexVersion: 1,
+        ensuredIndexes: [],
+        disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
+        tables: []
+      });
+
+    let task: ReturnType<typeof startRetentionTask>;
+    const policySpy = vi.spyOn(dbModule, 'applyRetentionPolicy');
+    policySpy.mockImplementation(() => {
+      if (task) {
+        task.configure({
+          enabled: false,
+          retentionDays: 30,
+          intervalMs: 1000,
+          archiveDir,
+          snapshotDirs: [cameraOneDir],
+          vacuum: { mode: 'auto', run: 'never' },
+          logger,
+          metrics: metrics as any
+        });
+      }
+      return {
+        removedEvents: 0,
+        archivedSnapshots: 0,
+        prunedArchives: 0,
+        perCamera: {},
+        warnings: []
+      } as any;
+    });
+
+    task = startRetentionTask({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 1000,
+      archiveDir,
+      snapshotDirs: [cameraOneDir],
+      vacuum: { mode: 'auto', run: 'never' },
+      logger,
+      metrics: metrics as any
+    });
+
+    try {
+      await vi.runOnlyPendingTimersAsync();
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(policySpy).toHaveBeenCalledTimes(1);
+      const skipCalls = logger.info.mock.calls.filter(([, message]) => message === 'Retention task skipped');
+      expect(skipCalls).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(5000);
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(policySpy).toHaveBeenCalledTimes(1);
+
+      task.configure({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 1000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        vacuum: { mode: 'auto', run: 'never' },
+        logger,
+        metrics: metrics as any
+      });
+
+      await vi.runOnlyPendingTimersAsync();
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(policySpy).toHaveBeenCalledTimes(2);
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(2);
+    } finally {
+      task.stop();
+      policySpy.mockRestore();
+      vacuumSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('DatabaseChannelIndexMaintenance validates channel index and on-change vacuum', async () => {
     const indexes = db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }>;
     const indexNames = indexes.map(entry => entry.name);

@@ -57,6 +57,12 @@ nasıl yararlanacağınızı adım adım anlatır.
 - Transport fallback ve retention tasarruflarını Prometheus formatında görmek için `metrics.exportTransportFallbackMetricsForPrometheus()`
   ve `metrics.exportRetentionDiskSavingsForPrometheus()` çağrılarını kullanın; çıktı `guardian_transport_fallback_total`
   ve `guardian_retention_disk_savings_bytes_total` satırlarını içerir.
+- ffmpeg süreçleri hata ürettiğinde loglarda `Video source reconnecting (reason=ffmpeg-error)` satırını arayın; aynı anda
+  `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.byReason['ffmpeg-error']` sayaçlarının arttığını doğrulamak
+  toparlanma akışının çalıştığını gösterir.
+- Manuel taşıyıcı sıfırlamalarından sonra `guardian daemon restart --transport video:<kanal>` komutunu izleyin; sağlık
+  özetindeki `metricsSummary.pipelines.transportFallbacks.video.byChannel` kayıtlarında ilgili `total` değerinin 0'a
+  döndüğünü ve `lastReason` alanının temizlendiğini doğrulayın.
 - `pipelines.ffmpeg.watchdogRestarts` ve `watchdogBackoffByChannel` değerleri, stream jitter'larını `detector latency histogramlarını`
   takip ederken hangi kameraların desteklenmesi gerektiğini anlamanıza yardımcı olur.
 

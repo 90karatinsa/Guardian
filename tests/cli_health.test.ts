@@ -435,6 +435,57 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('CliTransportFallbackMetrics resets transport ladders and clears summaries', async () => {
+    const runtimeResetSpy = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({
+      stop: vi.fn(),
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: runtimeResetSpy
+    });
+
+    const startIo = createTestIo();
+    const startPromise = runCli(['start'], startIo.io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const channel = 'video:cam-transport';
+    metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel,
+      from: 'udp',
+      to: 'tcp',
+      attempt: 2,
+      stage: 1,
+      at: Date.now() - 250,
+      resetsBackoff: true,
+      resetsCircuitBreaker: true
+    });
+
+    const restartIo = createTestIo();
+    const restartCode = await runCli(['daemon', 'restart', '--transport', channel], restartIo.io);
+    expect(restartCode).toBe(0);
+    expect(runtimeResetSpy).toHaveBeenCalledWith(channel);
+    expect(restartIo.stdout()).toContain('Cleared recorded transport fallback metrics');
+    expect(restartIo.stdout()).toContain('Transport fallback ladder reset');
+
+    const healthIo = createTestIo();
+    const healthCode = await runCli(['daemon', 'health', '--json'], healthIo.io);
+    expect(healthCode).toBe(0);
+    const payload = JSON.parse(healthIo.stdout().trim());
+    expect(payload.metricsSummary.pipelines.transportFallbacks.video.total).toBe(0);
+    const channelSummary = payload.metricsSummary.pipelines.transportFallbacks.video.byChannel.find(
+      (entry: { channel: string }) => entry.channel === channel
+    );
+    expect(channelSummary).toBeDefined();
+    expect(channelSummary.total).toBe(0);
+    expect(channelSummary.lastReason).toBeNull();
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('CliDaemonPipelineResetHealth clears pipeline health severity and fallback totals', async () => {
     metrics.reset();
     metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {

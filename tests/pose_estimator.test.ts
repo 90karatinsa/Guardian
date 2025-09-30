@@ -34,6 +34,24 @@ describe('PoseEstimatorForecast', () => {
     metrics.reset();
   });
 
+  it('PoseForecastSkipsWithoutHistory returns null without recording latency', async () => {
+    const estimator = await PoseEstimator.create({
+      source: 'video:test-pose',
+      modelPath: 'models/pose.onnx'
+    });
+
+    const forecast = await estimator.forecast(undefined, 123);
+    expect(forecast).toBeNull();
+    expect(runMock).not.toHaveBeenCalled();
+
+    const snapshot = metrics.snapshot();
+    const poseMetrics = snapshot.detectors.pose;
+    expect(poseMetrics.counters.invocations).toBe(1);
+    expect(poseMetrics.counters.skipped).toBe(1);
+    expect(poseMetrics.latency).toBeNull();
+    expect(poseMetrics.latencyHistogram).toEqual({});
+  });
+
   it('PoseForecastThreatFusion generates motion snapshots with future movement context', async () => {
     const bus = new EventEmitter();
     const events: unknown[] = [];
