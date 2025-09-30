@@ -35,6 +35,7 @@ export type ShutdownHook = (context: ShutdownHookContext) => void | Promise<void
 export type IntegrationManifest = {
   docker: {
     healthcheck: string;
+    readyCommand: string;
     stopCommand: string;
     logLevel: {
       get: string;
@@ -79,6 +80,7 @@ const SYSTEMD_HEALTH = `/usr/bin/env ${HEALTH_BIN}`;
 const integrationManifest: IntegrationManifest = {
   docker: {
     healthcheck: `${HEALTH_BIN} --health || exit 1`,
+    readyCommand: `${CLI_BIN} --ready`,
     stopCommand: `${CLI_BIN} stop`,
     logLevel: {
       get: `${CLI_BIN} log-level get`,
@@ -109,6 +111,7 @@ export function getIntegrationManifest(): IntegrationManifest {
   return {
     docker: {
       healthcheck: integrationManifest.docker.healthcheck,
+      readyCommand: integrationManifest.docker.readyCommand,
       stopCommand: integrationManifest.docker.stopCommand,
       logLevel: {
         get: integrationManifest.docker.logLevel.get,

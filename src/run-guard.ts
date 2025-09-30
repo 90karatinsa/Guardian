@@ -61,6 +61,10 @@ type CameraPipelineState = {
     areaInflation?: number;
     areaDeltaThreshold?: number;
     idleRebaselineMs?: number;
+    noiseWarmupFrames?: number;
+    noiseBackoffPadding?: number;
+    temporalMedianWindow?: number;
+    temporalMedianBackoffSmoothing?: number;
   };
   person: {
     score: number;
@@ -500,7 +504,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       areaSmoothing: context.motion.areaSmoothing,
       areaInflation: context.motion.areaInflation,
       areaDeltaThreshold: context.motion.areaDeltaThreshold,
-      idleRebaselineMs: context.motion.idleRebaselineMs
+      idleRebaselineMs: context.motion.idleRebaselineMs,
+      noiseWarmupFrames: context.motion.noiseWarmupFrames,
+      noiseBackoffPadding: context.motion.noiseBackoffPadding,
+      temporalMedianWindow: context.motion.temporalMedianWindow,
+      temporalMedianBackoffSmoothing: context.motion.temporalMedianBackoffSmoothing
     });
 
     const lightDetector = context.pipelineState.light
@@ -514,7 +522,12 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
           backoffFrames: context.pipelineState.light.backoffFrames,
           noiseMultiplier: context.pipelineState.light.noiseMultiplier,
           noiseSmoothing: context.pipelineState.light.noiseSmoothing,
-          idleRebaselineMs: context.pipelineState.light.idleRebaselineMs
+          idleRebaselineMs: context.pipelineState.light.idleRebaselineMs,
+          noiseWarmupFrames: context.pipelineState.light.noiseWarmupFrames,
+          noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding,
+          temporalMedianWindow: context.pipelineState.light.temporalMedianWindow,
+          temporalMedianBackoffSmoothing:
+            context.pipelineState.light.temporalMedianBackoffSmoothing
         })
       : null;
 
@@ -775,7 +788,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         areaDeltaThreshold: context.motion.areaDeltaThreshold,
         idleRebaselineMs: context.motion.idleRebaselineMs,
         noiseWarmupFrames: context.motion.noiseWarmupFrames,
-        noiseBackoffPadding: context.motion.noiseBackoffPadding
+        noiseBackoffPadding: context.motion.noiseBackoffPadding,
+        temporalMedianWindow: context.motion.temporalMedianWindow,
+        temporalMedianBackoffSmoothing: context.motion.temporalMedianBackoffSmoothing
       });
       if (context.pipelineState.light) {
         if (existing.lightDetector) {
@@ -790,7 +805,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
             noiseSmoothing: context.pipelineState.light.noiseSmoothing,
             idleRebaselineMs: context.pipelineState.light.idleRebaselineMs,
             noiseWarmupFrames: context.pipelineState.light.noiseWarmupFrames,
-            noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding
+            noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding,
+            temporalMedianWindow: context.pipelineState.light.temporalMedianWindow,
+            temporalMedianBackoffSmoothing:
+              context.pipelineState.light.temporalMedianBackoffSmoothing
           });
         } else {
           existing.lightDetector = new LightDetector({
@@ -805,7 +823,10 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
             noiseSmoothing: context.pipelineState.light.noiseSmoothing,
             idleRebaselineMs: context.pipelineState.light.idleRebaselineMs,
             noiseWarmupFrames: context.pipelineState.light.noiseWarmupFrames,
-            noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding
+            noiseBackoffPadding: context.pipelineState.light.noiseBackoffPadding,
+            temporalMedianWindow: context.pipelineState.light.temporalMedianWindow,
+            temporalMedianBackoffSmoothing:
+              context.pipelineState.light.temporalMedianBackoffSmoothing
           });
         }
       } else if (existing.lightDetector) {
@@ -1216,7 +1237,10 @@ function resolveCameraMotion(
     areaDeltaThreshold: cameraMotion?.areaDeltaThreshold ?? defaults.areaDeltaThreshold,
     idleRebaselineMs: cameraMotion?.idleRebaselineMs ?? defaults.idleRebaselineMs,
     noiseWarmupFrames: cameraMotion?.noiseWarmupFrames ?? defaults.noiseWarmupFrames,
-    noiseBackoffPadding: cameraMotion?.noiseBackoffPadding ?? defaults.noiseBackoffPadding
+    noiseBackoffPadding: cameraMotion?.noiseBackoffPadding ?? defaults.noiseBackoffPadding,
+    temporalMedianWindow: cameraMotion?.temporalMedianWindow ?? defaults.temporalMedianWindow,
+    temporalMedianBackoffSmoothing:
+      cameraMotion?.temporalMedianBackoffSmoothing ?? defaults.temporalMedianBackoffSmoothing
   };
 }
 
@@ -1242,6 +1266,8 @@ function resolveLightConfig(
   let idleRebaselineMs: number | undefined;
   let noiseWarmupFrames: number | undefined;
   let noiseBackoffPadding: number | undefined;
+  let temporalMedianWindow: number | undefined;
+  let temporalMedianBackoffSmoothing: number | undefined;
 
   for (const layer of layers) {
     if (!layer) {
@@ -1281,6 +1307,12 @@ function resolveLightConfig(
     if (typeof layer.noiseBackoffPadding === 'number') {
       noiseBackoffPadding = layer.noiseBackoffPadding;
     }
+    if (typeof layer.temporalMedianWindow === 'number') {
+      temporalMedianWindow = layer.temporalMedianWindow;
+    }
+    if (typeof layer.temporalMedianBackoffSmoothing === 'number') {
+      temporalMedianBackoffSmoothing = layer.temporalMedianBackoffSmoothing;
+    }
   }
 
   if (typeof deltaThreshold !== 'number') {
@@ -1298,7 +1330,9 @@ function resolveLightConfig(
     noiseSmoothing,
     idleRebaselineMs,
     noiseWarmupFrames,
-    noiseBackoffPadding
+    noiseBackoffPadding,
+    temporalMedianWindow,
+    temporalMedianBackoffSmoothing
   };
 }
 
@@ -1466,7 +1500,9 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
       areaDeltaThreshold: motion.areaDeltaThreshold,
       idleRebaselineMs: motion.idleRebaselineMs,
       noiseWarmupFrames: motion.noiseWarmupFrames,
-      noiseBackoffPadding: motion.noiseBackoffPadding
+      noiseBackoffPadding: motion.noiseBackoffPadding,
+      temporalMedianWindow: motion.temporalMedianWindow,
+      temporalMedianBackoffSmoothing: motion.temporalMedianBackoffSmoothing
     },
     person: {
       score: camera.person?.score ?? channelConfig?.person?.score ?? config.person.score,
@@ -1733,7 +1769,9 @@ function summarizePipelineUpdates(
       'areaDeltaThreshold',
       'idleRebaselineMs',
       'noiseWarmupFrames',
-      'noiseBackoffPadding'
+      'noiseBackoffPadding',
+      'temporalMedianWindow',
+      'temporalMedianBackoffSmoothing'
     ]
   );
   if (Object.keys(motionChanges).length > 0) {
@@ -1861,6 +1899,10 @@ function snapshotLightConfig(config: LightConfig | null | undefined) {
     idleRebaselineMs: normalizeNumber(config.idleRebaselineMs),
     noiseWarmupFrames: normalizeNumber(config.noiseWarmupFrames),
     noiseBackoffPadding: normalizeNumber(config.noiseBackoffPadding),
+    temporalMedianWindow: normalizeNumber(config.temporalMedianWindow),
+    temporalMedianBackoffSmoothing: normalizeNumber(
+      config.temporalMedianBackoffSmoothing
+    ),
     normalHours: config.normalHours?.map(range => ({ ...range })) ?? null
   };
 }
@@ -1917,6 +1959,15 @@ function lightConfigsEqual(a: LightConfig | null | undefined, b: LightConfig | n
     return false;
   }
   if (normalizeNumber(a.noiseBackoffPadding) !== normalizeNumber(b.noiseBackoffPadding)) {
+    return false;
+  }
+  if (normalizeNumber(a.temporalMedianWindow) !== normalizeNumber(b.temporalMedianWindow)) {
+    return false;
+  }
+  if (
+    normalizeNumber(a.temporalMedianBackoffSmoothing) !==
+    normalizeNumber(b.temporalMedianBackoffSmoothing)
+  ) {
     return false;
   }
 
@@ -2441,7 +2492,6 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: E
           message,
           meta: {
             pipeline: 'ffmpeg',
-            channel: restartChannel,
             camera: runtime.id,
             severity: evaluation.severity,
             triggeredBy: evaluation.triggeredBy,

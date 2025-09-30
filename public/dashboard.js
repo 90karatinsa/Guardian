@@ -1,4 +1,37 @@
-import { normalizeChannelId } from '../src/utils/channel.js';
+const KNOWN_CHANNEL_PREFIXES = new Set(['video', 'audio']);
+
+function resolveDefaultChannelType(options) {
+  const configured = options?.defaultType;
+  if (typeof configured === 'string' && configured.trim().length > 0) {
+    return configured.trim().toLowerCase();
+  }
+  return 'video';
+}
+
+function normalizeKnownChannelPrefix(prefix) {
+  const lower = prefix.toLowerCase();
+  if (KNOWN_CHANNEL_PREFIXES.has(lower)) {
+    return lower;
+  }
+  return prefix;
+}
+
+function normalizeChannelId(value, options) {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) {
+    return '';
+  }
+
+  const match = /^([a-z0-9_-]+):(.*)$/i.exec(trimmed);
+  if (match) {
+    const [, rawPrefix, remainder] = match;
+    const prefix = normalizeKnownChannelPrefix(rawPrefix);
+    return `${prefix}:${remainder}`;
+  }
+
+  const defaultType = resolveDefaultChannelType(options);
+  return `${defaultType}:${trimmed}`;
+}
 
 const list = document.getElementById('events');
 const filtersForm = document.getElementById('filters');

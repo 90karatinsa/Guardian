@@ -1,6 +1,7 @@
 import path from 'node:path';
 import process from 'node:process';
 import { buildHealthPayload, buildReadinessPayload, resolveHealthExitCode } from '../src/cli.js';
+import { getIntegrationManifest } from '../src/app.js';
 
 type Writable = Pick<NodeJS.WritableStream, 'write'>;
 
@@ -10,6 +11,7 @@ type IoStreams = {
 };
 
 function printUsage(target: Writable) {
+  const manifest = getIntegrationManifest();
   target.write(
     [
       'Guardian healthcheck helper',
@@ -21,7 +23,12 @@ function printUsage(target: Writable) {
       '  --ready        Emit readiness payload instead of full health snapshot',
       '  --health       Force health payload output (default)',
       '  --pretty       Pretty-print JSON output with indentation',
-      '  -h, --help     Show this help message'
+      '  -h, --help     Show this help message',
+      '',
+      `Docker HEALTHCHECK: ${manifest.docker.healthcheck}`,
+      `Docker readiness: ${manifest.docker.readyCommand}`,
+      `systemd health command: ${manifest.systemd.healthCommand}`,
+      `systemd readiness command: ${manifest.systemd.readyCommand}`
     ].join('\n') + '\n'
   );
 }

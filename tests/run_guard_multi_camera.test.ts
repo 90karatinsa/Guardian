@@ -1950,6 +1950,194 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('RunGuardAppliesTemporalMotionOverrides', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        channels: {
+          'video:cam-1': {
+            motion: {
+              diffThreshold: 24,
+              areaThreshold: 0.02,
+              noiseWarmupFrames: 8,
+              noiseBackoffPadding: 3,
+              temporalMedianWindow: 9,
+              temporalMedianBackoffSmoothing: 0.6
+            },
+            light: {
+              deltaThreshold: 0.08,
+              smoothingFactor: 0.2,
+              noiseWarmupFrames: 5,
+              noiseBackoffPadding: 2,
+              temporalMedianWindow: 7,
+              temporalMedianBackoffSmoothing: 0.45
+            }
+          }
+        },
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 26 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://cam-2',
+            person: { score: 0.5 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: {
+        diffThreshold: 20,
+        areaThreshold: 0.02,
+        noiseWarmupFrames: 4,
+        noiseBackoffPadding: 1,
+        temporalMedianWindow: 11,
+        temporalMedianBackoffSmoothing: 0.35
+      },
+      light: {
+        deltaThreshold: 0.07,
+        smoothingFactor: 0.18,
+        noiseWarmupFrames: 4,
+        noiseBackoffPadding: 1,
+        temporalMedianWindow: 6,
+        temporalMedianBackoffSmoothing: 0.4
+      }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2, 4000);
+
+      const pipeline1 = runtime.pipelines.get('video:cam-1');
+      const pipeline2 = runtime.pipelines.get('video:cam-2');
+      expect(pipeline1).toBeDefined();
+      expect(pipeline2).toBeDefined();
+
+      const motion1 = pipeline1!.motionDetector as MockMotionDetector;
+      const motion2 = pipeline2!.motionDetector as MockMotionDetector;
+      const light1 = pipeline1!.lightDetector as MockLightDetector | null;
+      const light2 = pipeline2!.lightDetector as MockLightDetector | null;
+
+      expect(motion1.options).toMatchObject({
+        noiseWarmupFrames: 8,
+        noiseBackoffPadding: 3,
+        temporalMedianWindow: 9,
+        temporalMedianBackoffSmoothing: 0.6
+      });
+      expect(motion2.options).toMatchObject({
+        noiseWarmupFrames: 4,
+        noiseBackoffPadding: 1,
+        temporalMedianWindow: 11,
+        temporalMedianBackoffSmoothing: 0.35
+      });
+
+      expect(light1?.options).toMatchObject({
+        noiseWarmupFrames: 5,
+        noiseBackoffPadding: 2,
+        temporalMedianWindow: 7,
+        temporalMedianBackoffSmoothing: 0.45
+      });
+      expect(light2?.options).toMatchObject({
+        noiseWarmupFrames: 4,
+        noiseBackoffPadding: 1,
+        temporalMedianWindow: 6,
+        temporalMedianBackoffSmoothing: 0.4
+      });
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          channels: {
+            ...initialConfig.video.channels,
+            'video:cam-1': {
+              ...initialConfig.video.channels?.['video:cam-1'],
+              motion: {
+                ...initialConfig.video.channels?.['video:cam-1']?.motion,
+                noiseWarmupFrames: 7,
+                noiseBackoffPadding: 4,
+                temporalMedianWindow: 10,
+                temporalMedianBackoffSmoothing: 0.65
+              },
+              light: {
+                ...initialConfig.video.channels?.['video:cam-1']?.light,
+                noiseWarmupFrames: 6,
+                noiseBackoffPadding: 3,
+                temporalMedianWindow: 9,
+                temporalMedianBackoffSmoothing: 0.5
+              }
+            }
+          }
+        },
+        motion: {
+          ...initialConfig.motion,
+          noiseWarmupFrames: 10,
+          noiseBackoffPadding: 5,
+          temporalMedianWindow: 13,
+          temporalMedianBackoffSmoothing: 0.5
+        },
+        light: {
+          ...initialConfig.light,
+          noiseWarmupFrames: 6,
+          noiseBackoffPadding: 3,
+          temporalMedianWindow: 8,
+          temporalMedianBackoffSmoothing: 0.55
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(
+        () =>
+          motion1.updateOptions.mock.calls.length > 0 &&
+          motion2.updateOptions.mock.calls.length > 0 &&
+          (light1?.updateOptions.mock.calls.length ?? 0) > 0 &&
+          (light2?.updateOptions.mock.calls.length ?? 0) > 0,
+        4000
+      );
+
+      expect(motion1.updateOptions.mock.calls.at(-1)?.[0]).toMatchObject({
+        noiseWarmupFrames: 7,
+        noiseBackoffPadding: 4,
+        temporalMedianWindow: 10,
+        temporalMedianBackoffSmoothing: 0.65
+      });
+      expect(motion2.updateOptions.mock.calls.at(-1)?.[0]).toMatchObject({
+        noiseWarmupFrames: 10,
+        noiseBackoffPadding: 5,
+        temporalMedianWindow: 13,
+        temporalMedianBackoffSmoothing: 0.5
+      });
+      expect(light1?.updateOptions.mock.calls.at(-1)?.[0]).toMatchObject({
+        noiseWarmupFrames: 6,
+        noiseBackoffPadding: 3,
+        temporalMedianWindow: 9,
+        temporalMedianBackoffSmoothing: 0.5
+      });
+      expect(light2?.updateOptions.mock.calls.at(-1)?.[0]).toMatchObject({
+        noiseWarmupFrames: 6,
+        noiseBackoffPadding: 3,
+        temporalMedianWindow: 8,
+        temporalMedianBackoffSmoothing: 0.55
+      });
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('RunGuardChannelNormalization aligns mixed-case channels to canonical identifiers', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 

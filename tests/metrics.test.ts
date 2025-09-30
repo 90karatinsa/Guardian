@@ -613,6 +613,74 @@ describe('MetricsCounters', () => {
     const resetProm = registry.exportTransportFallbackMetricsForPrometheus();
     expect(resetProm).toMatch(/guardian_transport_fallback_total\{[^}]*pipeline="ffmpeg"[^}]*\} 0/);
   });
+
+  it('MetricsSuppressionHistoryTtl records per-channel TTL pruning metadata', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordSuppressionHistoryTtlPruned({
+      count: 3,
+      ruleId: 'motion-cooldown',
+      channel: 'video:lobby',
+      timelineTtlMs: 10000,
+      timelineExpired: true
+    });
+
+    const snapshot = registry.snapshot();
+
+    expect(snapshot.suppression.historyTotals.historyTtlPruned).toBe(3);
+    expect(snapshot.suppression.historyTotals.ttlPrunedByChannel['video:lobby']).toBe(3);
+    expect(snapshot.suppression.rules['motion-cooldown'].history.ttlPruned).toBe(3);
+    expect(snapshot.suppression.rules['motion-cooldown'].history.lastTtlPruned).toBe(3);
+    expect(snapshot.suppression.rules['motion-cooldown'].history.lastTtlPrunedChannel).toBe(
+      'video:lobby'
+    );
+    expect(snapshot.suppression.rules['motion-cooldown'].history.lastTimelineTtlMs).toBe(10000);
+    expect(snapshot.suppression.rules['motion-cooldown'].history.lastTimelineTtlExpired).toBe(true);
+
+    const prometheus = registry.exportSuppressionHistoryTtlHistogramForPrometheus();
+    expect(prometheus).toContain('guardian_suppression_history_ttl_pruned_total_bucket');
+    expect(prometheus).toContain('guardian_suppression_history_ttl_pruned_total_sum');
+  });
+
+  it('MetricsTransportFallbackChannels exposes reset counters per channel', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordTransportFallback('ffmpeg', 'udp-retry', {
+      from: 'tcp',
+      to: 'udp',
+      channel: 'video:lobby',
+      resetsBackoff: true
+    });
+    registry.recordTransportFallback('ffmpeg', 'tcp-retry', {
+      from: 'udp',
+      to: 'tcp',
+      channel: 'video:lobby',
+      resetsCircuitBreaker: true
+    });
+
+    const snapshot = registry.snapshot();
+
+    const byChannel = snapshot.pipelines.ffmpeg.transportFallbacks.byChannel['video:lobby'];
+    expect(byChannel.total).toBe(2);
+    expect(byChannel.resets.backoff).toBe(1);
+    expect(byChannel.resets.circuitBreaker).toBe(1);
+
+    expect(snapshot.pipelines.ffmpeg.transportFallbacks.resets.total.backoff).toBe(1);
+    expect(snapshot.pipelines.ffmpeg.transportFallbacks.resets.total.circuitBreaker).toBe(1);
+    expect(
+      snapshot.pipelines.ffmpeg.transportFallbacks.resets.byChannel['video:lobby'].backoff
+    ).toBe(1);
+    expect(
+      snapshot.pipelines.ffmpeg.transportFallbacks.resets.byChannel['video:lobby'].circuitBreaker
+    ).toBe(1);
+
+    const prometheus = registry.exportTransportFallbackMetricsForPrometheus();
+    expect(prometheus).toContain('guardian_transport_fallback_resets_total');
+    expect(prometheus).toContain('reset="backoff"');
+    expect(prometheus).toContain('reset="circuit-breaker"');
+    expect(prometheus).toContain('guardian_transport_fallback_resets_channel_total');
+    expect(prometheus).toContain('channel="video:lobby"');
+  });
 });
 
 describe('MetricsSnapshotEnrichment', () => {

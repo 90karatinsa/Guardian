@@ -1283,6 +1283,17 @@ function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boole
   const metaCamera = typeof meta.camera === 'string' ? meta.camera : undefined;
   const snapshotPath = typeof meta.snapshot === 'string' ? meta.snapshot : '';
   const eventChannels = resolveEventChannels(meta);
+  const sourceChannel = canonicalChannel(event.source ?? null);
+  const cameraChannel =
+    typeof metaCamera === 'string' ? canonicalChannel(metaCamera) : null;
+  const channelCandidates = new Set(eventChannels);
+  if (cameraChannel) {
+    channelCandidates.add(cameraChannel);
+  }
+  if (sourceChannel) {
+    channelCandidates.add(sourceChannel);
+  }
+  const candidateChannels = Array.from(channelCandidates);
   const channelFilters = collectChannelFilters(filters);
 
   if (filters.detector && event.detector !== filters.detector) {
@@ -1292,14 +1303,18 @@ function matchesStreamFilters(event: EventRecord, filters: StreamFilters): boole
     return false;
   }
   if (channelFilters.length > 0) {
-    const matchesChannel = eventChannels.some(channel => channelFilters.includes(channel));
+    const matchesChannel = candidateChannels.some(channel => channelFilters.includes(channel));
     if (!matchesChannel) {
       return false;
     }
   }
   if (filters.camera) {
+    const canonicalCameraFilter = canonicalChannel(filters.camera);
     const cameraMatch =
-      event.source === filters.camera || metaCamera === filters.camera || eventChannels.includes(filters.camera);
+      event.source === filters.camera ||
+      metaCamera === filters.camera ||
+      candidateChannels.includes(filters.camera) ||
+      (canonicalCameraFilter ? candidateChannels.includes(canonicalCameraFilter) : false);
     if (!cameraMatch) {
       return false;
     }

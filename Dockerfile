@@ -26,6 +26,7 @@ COPY . .
 
 STOPSIGNAL SIGTERM
 
+# Documented in scripts/healthcheck.ts usage output to keep Docker and systemd probes aligned.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD pnpm exec tsx scripts/healthcheck.ts --health || exit 1
 

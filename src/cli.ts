@@ -109,6 +109,16 @@ type HealthPayload = {
     };
   };
   integration: IntegrationManifest;
+  probes: {
+    docker: {
+      health: string;
+      ready: string;
+    };
+    systemd: {
+      health: string;
+      ready: string;
+    };
+  };
   application: {
     name: string;
     version: string;
@@ -245,6 +255,7 @@ type ReadinessPayload = {
     };
     snapshotCapturedAt: string;
   };
+  probes: HealthPayload['probes'];
 };
 
 const DEFAULT_IO: CliIo = { stdout: process.stdout, stderr: process.stderr };
@@ -556,6 +567,16 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
       shutdown: shutdownSummary
     },
     integration,
+    probes: {
+      docker: {
+        health: integration.docker.healthcheck,
+        ready: integration.docker.readyCommand
+      },
+      systemd: {
+        health: integration.systemd.healthCommand,
+        ready: integration.systemd.readyCommand
+      }
+    },
     runtime: {
       pipelines: {
         videoChannels,
@@ -1221,15 +1242,19 @@ async function runDaemonPipelinesCommand(args: string[], io: CliIo): Promise<num
     }
 
     const pipelineLabel = target.pipeline === 'ffmpeg' ? 'video' : 'audio';
-    const actionTarget =
-      target.pipeline === 'ffmpeg'
-        ? 'pipeline health, circuit breaker, and transport fallback'
-        : 'pipeline health and circuit breaker';
-    const actionLabel =
-      runtimePipelineReset || runtimeCircuitReset || runtimeFallbackReset
-        ? `Reset ${actionTarget} for ${pipelineLabel} channel`
-        : `Cleared recorded ${actionTarget} for ${pipelineLabel} channel`;
+    const runtimeActions = runtimePipelineReset || runtimeCircuitReset;
+    const actionLabel = runtimeActions
+      ? `Reset pipeline health and circuit breaker for ${pipelineLabel} channel`
+      : `Cleared recorded pipeline health and circuit breaker for ${pipelineLabel} channel`;
     io.stdout.write(`${actionLabel} ${target.channel}\n`);
+
+    if (target.pipeline === 'ffmpeg') {
+      io.stdout.write(`Cleared recorded transport fallback metrics for ${target.channel}\n`);
+      const fallbackNotice = runtimeFallbackReset
+        ? `Transport fallback ladder reset for ${target.channel}`
+        : `Transport fallback ladder already at primary input for ${target.channel}`;
+      io.stdout.write(`${fallbackNotice}\n`);
+    }
     return 0;
   }
 
@@ -1870,7 +1895,8 @@ function buildReadinessPayload(health: HealthPayload): ReadinessPayload {
         audio: health.runtime.pipelines.audioChannels
       },
       snapshotCapturedAt: health.metricsCapturedAt
-    }
+    },
+    probes: health.probes
   } satisfies ReadinessPayload;
 }
 

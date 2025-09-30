@@ -147,13 +147,14 @@ class EventBus extends EventEmitter {
   }
 
   emitEvent(payload: EventPayload): boolean {
+    const meta = augmentEventMeta(payload);
     const normalized: EventRecord = {
       ts: normalizeTimestamp(payload.ts),
       source: payload.source,
       detector: payload.detector,
       severity: payload.severity,
       message: payload.message,
-      meta: payload.meta
+      meta
     };
 
     const evaluation = this.evaluateSuppression(normalized);
@@ -411,13 +412,19 @@ class EventBus extends EventEmitter {
       const channel = resolveRuleChannel(rule, eventChannels);
       const { timeline, key: timelineKey } = getTimelineForRule(rule, channel);
       const pruneResult = pruneTimeline(rule, timeline, event.ts, timelineKey);
-      if (pruneResult.ttlPruned > 0) {
+      const ttlCount =
+        pruneResult.ttlPruned > 0
+          ? pruneResult.ttlPruned
+          : pruneResult.timelineClearedByTtl
+          ? 1
+          : 0;
+      if (ttlCount > 0) {
         this.metrics.recordSuppressionHistoryTtlPruned({
           ruleId: rule.id,
           channel: timelineKey,
-          count: pruneResult.ttlPruned,
+          count: ttlCount,
           timelineTtlMs: pruneResult.timelineTtlMs,
-          timelineExpired: pruneResult.timelineClearedByTtl
+          timelineExpired: pruneResult.timelineExpired
         });
       }
       if (pruneResult.timelineExpired && timelineKey) {
@@ -454,7 +461,7 @@ class EventBus extends EventEmitter {
           channel,
           timelineTtlMs: pruneResult.timelineTtlMs,
           timelineHistoryTtlPruned: pruneResult.ttlPruned,
-          timelineHistoryTtlExpired: pruneResult.timelineClearedByTtl
+          timelineHistoryTtlExpired: pruneResult.timelineExpired
         });
         continue;
       }
@@ -479,7 +486,7 @@ class EventBus extends EventEmitter {
           channel,
           timelineTtlMs: pruneResult.timelineTtlMs,
           timelineHistoryTtlPruned: pruneResult.ttlPruned,
-          timelineHistoryTtlExpired: pruneResult.timelineClearedByTtl
+          timelineHistoryTtlExpired: pruneResult.timelineExpired
         });
         continue;
       }
@@ -519,7 +526,7 @@ class EventBus extends EventEmitter {
           channel,
           timelineTtlMs: pruneResult.timelineTtlMs,
           timelineHistoryTtlPruned: pruneResult.ttlPruned,
-          timelineHistoryTtlExpired: pruneResult.timelineClearedByTtl
+          timelineHistoryTtlExpired: pruneResult.timelineExpired
         });
         continue;
       }
@@ -547,6 +554,106 @@ class EventBus extends EventEmitter {
   }
 }
 
+function augmentEventMeta(payload: EventPayload): Record<string, unknown> | undefined {
+  const rawMeta = payload.meta;
+  let meta: Record<string, unknown> | undefined;
+
+  if (rawMeta && typeof rawMeta === 'object') {
+    meta = { ...(rawMeta as Record<string, unknown>) };
+  }
+
+  const channelCandidates: string[] = [];
+  const addChannelCandidate = (candidate: string | null) => {
+    if (!candidate) {
+      return;
+    }
+    if (!channelCandidates.includes(candidate)) {
+      channelCandidates.push(candidate);
+    }
+  };
+
+  if (meta) {
+    const channelField = (meta as Record<string, unknown>).channel;
+    if (typeof channelField === 'string') {
+      const canonical = canonicalChannelFrom(channelField);
+      if (canonical) {
+        (meta as Record<string, unknown>).channel = canonical;
+        addChannelCandidate(canonical);
+      } else {
+        delete (meta as Record<string, unknown>).channel;
+      }
+    } else if (Array.isArray(channelField)) {
+      const normalized = normalizeEventChannels(channelField as string[]);
+      if (normalized.length === 0) {
+        delete (meta as Record<string, unknown>).channel;
+      } else if (normalized.length === 1) {
+        (meta as Record<string, unknown>).channel = normalized[0];
+        addChannelCandidate(normalized[0]);
+      } else {
+        (meta as Record<string, unknown>).channel = normalized;
+        normalized.forEach(addChannelCandidate);
+      }
+    } else if (typeof channelField !== 'undefined') {
+      delete (meta as Record<string, unknown>).channel;
+    }
+  }
+
+  const cameraField = meta && typeof meta.camera === 'string' ? meta.camera.trim() : '';
+  if (cameraField) {
+    if (!meta) {
+      meta = {};
+    }
+    meta.camera = cameraField;
+    const cameraChannel = canonicalChannelFrom(cameraField);
+    addChannelCandidate(cameraChannel);
+  } else if (meta && 'camera' in meta) {
+    delete meta.camera;
+  }
+
+  const sourceChannel = canonicalChannelFrom(payload.source, { requireExplicitPrefix: true });
+  addChannelCandidate(sourceChannel);
+
+  if (channelCandidates.length > 0) {
+    if (!meta) {
+      meta = {};
+    }
+    if (channelCandidates.length === 1) {
+      meta.channel = channelCandidates[0];
+    } else {
+      meta.channel = channelCandidates;
+    }
+    if (typeof meta.camera !== 'string' || meta.camera.trim().length === 0) {
+      meta.camera = channelCandidates[0];
+    }
+  }
+
+  return meta;
+}
+
+function canonicalChannelFrom(
+  value: unknown,
+  options: { requireExplicitPrefix?: boolean } = {}
+): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (options.requireExplicitPrefix && !/^[a-z0-9_-]+:/i.test(trimmed)) {
+    return null;
+  }
+
+  const canonical = canonicalChannel(trimmed);
+  if (!canonical) {
+    return null;
+  }
+  return canonical;
+}
+
 function normalizeTimestamp(ts?: number | Date): number {
   if (typeof ts === 'undefined' || ts === null) {
     return Date.now();
@@ -564,13 +671,14 @@ export function emitEventPayload(bus: EventEmitter, payload: EventPayload): bool
     return bus.emitEvent(payload);
   }
 
+  const meta = augmentEventMeta(payload);
   const record: EventRecord = {
     ts: normalizeTimestamp(payload.ts),
     source: payload.source,
     detector: payload.detector,
     severity: payload.severity,
     message: payload.message,
-    meta: payload.meta
+    meta
   };
 
   bus.emit('event', record);
@@ -701,6 +809,9 @@ function pruneTimeline(
       }
       clearedAllByTtl = true;
       touchTimeline(timeline, ts);
+      if (ttlPruned === 0) {
+        ttlPruned = 1;
+      }
     } else if (timeline.history.length > 0) {
       let removeCount = 0;
       while (removeCount < timeline.history.length && timeline.history[removeCount] <= cutoff) {
@@ -901,6 +1012,14 @@ function extractEventChannels(meta: Record<string, unknown> | undefined): string
       if (typeof value === 'string') {
         collected.push(value);
       }
+    }
+  }
+
+  const cameraCandidate = meta.camera;
+  if (typeof cameraCandidate === 'string') {
+    const canonicalCamera = canonicalChannelFrom(cameraCandidate, { requireExplicitPrefix: true });
+    if (canonicalCamera) {
+      collected.push(canonicalCamera);
     }
   }
 

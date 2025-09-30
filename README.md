@@ -9,6 +9,9 @@ Guardian, ağ kameraları ve ses girişleri üzerinden gelen olayları normalize
   - [RTSP ve çoklu kamera](#rtsp-ve-çoklu-kamera)
   - [Ses fallback ve anomaly ayarları](#ses-fallback-ve-anomaly-ayarları)
   - [Retention ve arşiv döngüsü](#retention-ve-arşiv-döngüsü)
+  - [Konfigürasyon override rehberi](#konfigürasyon-override-rehberi)
+  - [Pipeline sıfırlama akışı](#pipeline-sıfırlama-akışı)
+  - [Offline tanılama ve sağlık uçları](#offline-tanılama-ve-sağlık-uçları)
 - [Guardian'ı çalıştırma](#guardiannı-çalıştırma)
 - [Dashboard](#dashboard)
 - [Metrikler ve sağlık çıktısı](#metrikler-ve-sağlık-çıktısı)
@@ -311,6 +314,68 @@ Options:
 Komut stdout’a `Retention task completed` özetini yazar ve exit kodu 0 döner; `pipelines.ffmpeg.watchdogBackoffByChannel` ve `retention.totals` alanları üzerinden metrik güncellemelerini takip edebilirsiniz. CLI son kapanış nedeni ve hook sonuçlarını da raporlar.
 
 Retention ayarlarını değiştirip dosyayı kaydettiğinizde hot reload mekanizması yeni değerleri uygular.
+
+### Konfigürasyon override rehberi
+Guardian'ın çok kameralı kurulumlarında, global değerleri bozmadan kanal bazlı temporal ayarlamalar ve bastırma kuralları tanımlayabilirsiniz:
+
+- `video.motion.temporalMedianWindow`, `temporalMedianBackoffSmoothing`, `noiseWarmupFrames` ve `noiseBackoffPadding` değerleri hem global seviyede hem de `video.channels.<kanal>.motion` veya `video.cameras[].motion` bloklarında override edilebilir. Hot reload sırasında yalnızca değişen değerler uygulanır; metriklerde `metrics.detectors.motion.gauges.temporalMedianWindow` alanı güncel pencereyi gösterir.
+- Aynı yaklaşımı ışık dedektörleri için `video.channels.<kanal>.light.temporalMedianWindow` gibi alanlarda da kullanabilirsiniz. Pipeline yeniden başlatılmadan yeni pencere ve backoff katsayıları `pipelines.ffmpeg.byChannel[kanal].health` özetine yansır.
+- `events.suppression.rules[].channels` veya `channel` alanına normalleştirilmiş kimlikleri (`video:lobby`, `audio:mic-lobby` gibi) girerek kanala özgü bastırma kuralları oluşturun. Guardian bu değerleri otomatik olarak EventBus üzerinden akan olaylara işler; loglarda manuel metadata eklemenize gerek kalmaz.
+- Mikrofon fallback zincirleri `audio.micFallbacks` altında platform anahtarlarıyla listelenir. Keşif zaman aşımı (`audio.deviceDiscoveryTimeoutMs`) gerçekleşirse Guardian aktif adayları sıfırlar ve `metrics.pipelines.audio.deviceDiscovery.byReason.timeout` sayacını artırır; sonraki cycle yeni cihaz listesiyle başlar.
+
+Aşağıdaki örnek, global pencereyi 3 karede tutarken lobi kamerası için daha agresif smoothing uygular ve bastırma kurallarını kanal grupları üzerinden hedefler:
+
+```jsonc
+{
+  "video": {
+    "motion": { "temporalMedianWindow": 3, "noiseWarmupFrames": 4 },
+    "channels": {
+      "video:lobby": {
+        "motion": {
+          "temporalMedianWindow": 5,
+          "temporalMedianBackoffSmoothing": 0.35,
+          "noiseBackoffPadding": 6
+        }
+      }
+    }
+  },
+  "events": {
+    "suppression": {
+      "rules": [
+        {
+          "id": "lobby-motion",
+          "detector": "motion",
+          "channels": ["video:lobby", "video:parking"],
+          "timelineTtlMs": 15000,
+          "suppressForMs": 3500
+        }
+      ]
+    }
+  }
+}
+```
+
+Değerler uygulandığında `guardian daemon health --json` çıktısındaki `metricsSummary.detectors.motion.temporal` nesnesi ve `pipelines.ffmpeg.byChannel` kayıtları yeni pencere/geri alma katsayılarını rapor eder. Bastırma timeline TTL değişimleri `metrics.suppression.historyTotals.ttlPrunedByChannel` alanında görülür.
+
+### Pipeline sıfırlama akışı
+`guardian daemon pipelines reset` komutu, devre kesici, watchdog zamanlayıcıları ve taşıma fallback geçmişini tek adımda temizler. Çalışma akışı şu şekilde işler:
+
+1. `guardian daemon pipelines reset --channel video:lobby --no-restart` komutunu çalıştırdığınızda stdout üzerinde "Reset pipeline health, circuit breaker, and transport fallback" mesajını görürsünüz.
+2. Aynı anda `guardian daemon status --json` çıktısında `pipelines.ffmpeg.byChannel['video:lobby'].restarts === 0` ve `pipelines.ffmpeg.byChannel['video:lobby'].health.severity === 'none'` değerleri doğrulanmalıdır.
+3. `guardian daemon health --json` içindeki `metricsSummary.pipelines.transportFallbacks.resets.total` ve `...byChannel['video:lobby']` alanları, kaç fallback sıfırlamasının uygulandığını gösterir. Yeni Prometheus serileri `guardian_transport_fallback_resets_total` ve `guardian_transport_fallback_resets_channel_total`, reset türünü (`backoff`, `circuit-breaker`) etiket olarak taşır.
+4. Aynı komutu `audio:` kanalları için uyguladığınızda ses watchdog zamanlayıcıları temizlenir ve `pipelines.audio.byChannel[kanal].restarts` sayaçları sıfırlanır; fallback reset metrikleri video tarafındakiyle aynı yapıya sahiptir.
+
+Komutu yeniden çalıştırmadan önce `pipelines.ffmpeg.watchdogBackoffByChannel` ve `pipelines.ffmpeg.transportFallbacks.byChannel[kanal].history` değerlerinin boşaldığını kontrol ederek bekleyen yeniden başlatma zamanlayıcılarının temizlendiğini doğrulayabilirsiniz.
+
+### Offline tanılama ve sağlık uçları
+Guardian, Docker ve systemd ortamlarında CLI’ya ihtiyaç duymadan sağlık çıktısı verebilen `scripts/healthcheck.ts` yardımcı betiğini içerir:
+
+- `pnpm tsx scripts/healthcheck.ts --health` komutu, `status`, `pipelines`, `metricsSummary` ve `transportFallbackResets` anahtarlarını içeren bir JSON döndürür. Çıktıdaki `transportFallbackResets.total` alanı yukarıda bahsedilen reset sayaçlarıyla eşleşir.
+- `pnpm tsx scripts/healthcheck.ts --ready` komutu SSE ve HTTP uçlarının trafik kabulüne hazır olup olmadığını bildirir; `readiness.streams.sse` anahtarı dashboard bağlantılarının açık sayısını, `events.timeline` alanı ise bastırma timeline TTL temizleme durumunu raporlar.
+- Bu betikler Dockerfile ve `deploy/guardian.service` içinde healthcheck komutlarına bağlanmıştır; offline tanılama için container içinde çalıştırabilir veya systemd `ExecStartPre` adımlarına ekleyebilirsiniz.
+- Sahada ağ erişimi kısıtlıysa JSON çıktısını `jq` ile filtreleyip destek ekiplerine aktarabilirsiniz: `pnpm tsx scripts/healthcheck.ts --health | jq '.metricsSummary.pipelines.transportFallbacks'`.
+
+CLI komutları erişilemediğinde bile bu uçlar sayesinde hangi kanalların fallback reset veya suppression TTL prune yaşadığını tespit etmek mümkündür.
 
 ## Guardian'ı çalıştırma
 Guardian CLI, servis kontrolü ve sağlık kontrollerini yönetir:

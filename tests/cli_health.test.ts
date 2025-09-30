@@ -97,6 +97,8 @@ describe('GuardianCliHealthcheck', () => {
     const readiness = buildReadinessPayload(initialHealth);
     expect(readiness.ready).toBe(false);
     expect(readiness.reason).toBe('service-idle');
+    expect(readiness.probes.systemd.ready).toContain('--ready');
+    expect(readiness.probes.docker.health).toContain('scripts/healthcheck.ts');
 
     const initialReady = createTestIo();
     const initialReadyCode = await runCli(['--ready'], initialReady.io);
@@ -107,6 +109,7 @@ describe('GuardianCliHealthcheck', () => {
     expect(initialPayload.metrics.channels.video).toBe(0);
     expect(initialPayload.metrics.channels.audio).toBe(0);
     expect(typeof initialPayload.metrics.snapshotCapturedAt).toBe('string');
+    expect(initialPayload.probes.systemd.health).toContain('scripts/healthcheck.ts');
 
     const stopSpy = vi.fn();
     startGuardMock.mockResolvedValue({
@@ -129,6 +132,7 @@ describe('GuardianCliHealthcheck', () => {
     expect(readyPayload.reason).toBeNull();
     expect(readyPayload.metrics.channels.video).toBe(0);
     expect(readyPayload.metrics.channels.audio).toBe(0);
+    expect(readyPayload.probes.docker.ready).toContain('--ready');
 
     metrics.incrementLogLevel('error', { message: 'detector error' });
     const degradedIo = createTestIo();
@@ -213,6 +217,8 @@ describe('GuardianCliHealthcheck', () => {
     expect(flagPayload.metrics.pipelines.audio).toBeDefined();
     expect(flagPayload.metrics.pipelines.ffmpeg.byChannel).toBeDefined();
     expect(flagPayload.metrics.pipelines.audio.byChannel).toBeDefined();
+    expect(flagPayload.probes.systemd.health).toContain('scripts/healthcheck.ts');
+    expect(flagPayload.probes.docker.ready).toContain('--ready');
     expect(flagPayload.runtime.pipelines.videoChannels).toBeTypeOf('number');
     expect(flagPayload.runtime.pipelines.audioChannels).toBeTypeOf('number');
     expect(flagPayload.runtime.pipelines.videoRestarts).toBe(0);
@@ -332,6 +338,7 @@ describe('GuardianCliHealthcheck', () => {
     expect(readyCode).toBe(1);
     expect(readyPayload.ready).toBe(false);
     expect(readyPayload.reason).toBe('service-stopped');
+    expect(readyPayload.probes.systemd.health).toContain('scripts/healthcheck.ts');
 
     const stopIo = createTestIo();
     const stopCode = await runCli(['daemon', 'stop'], stopIo.io);
@@ -705,6 +712,56 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('GuardianCliPipelinesResetTransport surfaces transport resets and readiness probes', async () => {
+    const stopSpy = vi.fn();
+    const resetFallback = vi.fn().mockReturnValue(true);
+    const resetCircuitBreaker = vi.fn().mockReturnValue(true);
+    const resetChannelHealth = vi.fn().mockReturnValue(true);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker,
+      resetChannelHealth,
+      resetTransportFallback: resetFallback
+    });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:garage', {
+      severity: 'warning',
+      restarts: 2,
+      backoffMs: 8000,
+      reason: 'manual test'
+    });
+
+    const resetIo = createTestIo();
+    const resetCode = await runCli(
+      ['daemon', 'pipelines', 'reset', '--channel', 'video:garage'],
+      resetIo.io
+    );
+
+    expect(resetCode).toBe(0);
+    expect(resetFallback).toHaveBeenCalledWith('video:garage');
+    const resetOutput = resetIo.stdout();
+    expect(resetOutput).toContain('Cleared recorded transport fallback metrics for video:garage');
+    expect(resetOutput).toContain('Transport fallback ladder reset for video:garage');
+
+    const readyIo = createTestIo();
+    const readyCode = await runCli(['daemon', 'ready'], readyIo.io);
+    expect(readyCode).toBe(0);
+    const readyPayload = JSON.parse(readyIo.stdout().trim());
+    expect(readyPayload.probes.systemd.health).toContain('scripts/healthcheck.ts');
+    expect(readyPayload.probes.systemd.ready).toContain('--ready');
+    expect(readyPayload.probes.docker.health).toContain('scripts/healthcheck.ts');
+    expect(readyPayload.probes.docker.ready).toContain('--ready');
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('CliSystemdIntegration reports integration manifest and matches packaged commands', async () => {
     const health = await buildHealthPayload();
     const manifest = health.integration;
@@ -713,6 +770,7 @@ describe('GuardianCliHealthcheck', () => {
     expect(manifest.docker.stopCommand).toContain('pnpm exec tsx src/cli.ts stop');
     expect(manifest.docker.logLevel.get).toContain('log-level get');
     expect(manifest.docker.logLevel.set).toContain('log-level set');
+    expect(manifest.docker.readyCommand).toContain('--ready');
 
     const dockerfile = fs.readFileSync('Dockerfile', 'utf8');
     expect(dockerfile).toContain(manifest.docker.healthcheck);

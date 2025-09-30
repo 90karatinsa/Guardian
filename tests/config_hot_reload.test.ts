@@ -457,6 +457,126 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigReloadAppliesTemporalOverrides propagates temporal tuning and rejects conflicting channels', async () => {
+    const config = createConfig({
+      diffThreshold: 26,
+      motionOverrides: {
+        areaThreshold: 0.021,
+        minIntervalMs: 1650,
+        debounceFrames: 2,
+        backoffFrames: 4,
+        noiseWarmupFrames: 4,
+        noiseBackoffPadding: 3,
+        temporalMedianWindow: 7,
+        temporalMedianBackoffSmoothing: 0.4
+      }
+    });
+    config.video.channels = {
+      'video:cam-1': {
+        motion: {
+          temporalMedianWindow: 7,
+          temporalMedianBackoffSmoothing: 0.4,
+          noiseWarmupFrames: 4,
+          noiseBackoffPadding: 3
+        }
+      }
+    };
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      await waitFor(() => MockMotionDetector.instances.length === 1);
+      const detector = MockMotionDetector.instances[0];
+
+      expect(detector.options.temporalMedianWindow).toBe(7);
+      expect(detector.options.temporalMedianBackoffSmoothing).toBe(0.4);
+      expect(detector.options.noiseWarmupFrames).toBe(4);
+      expect(detector.options.noiseBackoffPadding).toBe(3);
+
+      const updated = createConfig({
+        diffThreshold: 32,
+        motionOverrides: {
+          areaThreshold: 0.028,
+          minIntervalMs: 1900,
+          debounceFrames: 3,
+          backoffFrames: 6,
+          noiseWarmupFrames: 6,
+          noiseBackoffPadding: 5,
+          temporalMedianWindow: 9,
+          temporalMedianBackoffSmoothing: 0.25
+        }
+      });
+      updated.video.channels = {
+        'video:cam-1': {
+          motion: {
+            temporalMedianWindow: 9,
+            temporalMedianBackoffSmoothing: 0.25,
+            noiseWarmupFrames: 6,
+            noiseBackoffPadding: 5
+          }
+        }
+      };
+
+      fs.writeFileSync(configPath, JSON.stringify(updated, null, 2));
+
+      await waitFor(() => detector.updateOptions.mock.calls.length > 0);
+      const latestUpdate = detector.updateOptions.mock.calls.at(-1)?.[0];
+      expect(latestUpdate).toMatchObject({
+        temporalMedianWindow: 9,
+        temporalMedianBackoffSmoothing: 0.25,
+        noiseWarmupFrames: 6,
+        noiseBackoffPadding: 5
+      });
+
+      const lastGoodRaw = fs.readFileSync(configPath, 'utf-8');
+      detector.updateOptions.mockClear();
+
+      const conflicting = JSON.parse(lastGoodRaw) as GuardianConfig;
+      conflicting.video.channels = {
+        'video:cam-1': {},
+        'VIDEO:CAM-1': {}
+      };
+
+      fs.writeFileSync(configPath, JSON.stringify(conflicting, null, 2));
+
+      await waitFor(
+        () =>
+          logger.warn.mock.calls.some(([payload, message]) => {
+            return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+          }),
+        4000
+      );
+
+      await waitFor(
+        () =>
+          logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied'),
+        4000
+      );
+
+      await waitFor(() => fs.readFileSync(configPath, 'utf-8') === lastGoodRaw, 4000);
+
+      expect(detector.updateOptions).not.toHaveBeenCalled();
+      expect(manager.getConfig().video.channels?.['video:cam-1']).toBeDefined();
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigHotReload reloads suppression rules and resets state', async () => {
     const initialConfig = createConfig({
       diffThreshold: 25,
@@ -1468,19 +1588,23 @@ function createConfig(overrides: {
       snapshotDir: 'snapshots',
       minIntervalMs: 1000
     },
-    motion: {
-      diffThreshold: overrides.diffThreshold,
-      areaThreshold: overrides.motionOverrides?.areaThreshold ?? 0.02,
-      minIntervalMs: overrides.motionOverrides?.minIntervalMs ?? 1500,
-      debounceFrames: overrides.motionOverrides?.debounceFrames,
-      backoffFrames: overrides.motionOverrides?.backoffFrames,
-      noiseMultiplier: overrides.motionOverrides?.noiseMultiplier,
-      noiseSmoothing: overrides.motionOverrides?.noiseSmoothing,
-      areaSmoothing: overrides.motionOverrides?.areaSmoothing,
-      areaInflation: overrides.motionOverrides?.areaInflation,
-      areaDeltaThreshold: overrides.motionOverrides?.areaDeltaThreshold
-    }
-  };
+  motion: {
+    diffThreshold: overrides.diffThreshold,
+    areaThreshold: overrides.motionOverrides?.areaThreshold ?? 0.02,
+    minIntervalMs: overrides.motionOverrides?.minIntervalMs ?? 1500,
+    debounceFrames: overrides.motionOverrides?.debounceFrames,
+    backoffFrames: overrides.motionOverrides?.backoffFrames,
+    noiseMultiplier: overrides.motionOverrides?.noiseMultiplier,
+    noiseSmoothing: overrides.motionOverrides?.noiseSmoothing,
+    areaSmoothing: overrides.motionOverrides?.areaSmoothing,
+    areaInflation: overrides.motionOverrides?.areaInflation,
+    areaDeltaThreshold: overrides.motionOverrides?.areaDeltaThreshold,
+    noiseWarmupFrames: overrides.motionOverrides?.noiseWarmupFrames,
+    noiseBackoffPadding: overrides.motionOverrides?.noiseBackoffPadding,
+    temporalMedianWindow: overrides.motionOverrides?.temporalMedianWindow,
+    temporalMedianBackoffSmoothing: overrides.motionOverrides?.temporalMedianBackoffSmoothing
+  }
+};
 
   return base as GuardianConfig;
 }
