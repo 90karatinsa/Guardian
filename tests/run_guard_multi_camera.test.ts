@@ -1879,7 +1879,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(pipelineCam2).toBeDefined();
       expect(MockVideoSource.instances[0]?.options.channel).toBe('video:cam-1');
       expect(MockVideoSource.instances[1]?.options.channel).toBe('video:cam-2');
-      expect(MockMotionDetector.instances[0]?.options).toMatchObject({ diffThreshold: 32 });
+      expect(MockMotionDetector.instances[0]?.options).toMatchObject({ diffThreshold: 40 });
       expect(MockMotionDetector.instances[1]?.options).toMatchObject({ diffThreshold: 22 });
 
       const [sourceCam1, sourceCam2] = MockVideoSource.instances;
@@ -1946,6 +1946,71 @@ describe('run-guard multi camera orchestration', () => {
       );
     } finally {
       recordSpy.mockRestore();
+      runtime.stop();
+    }
+  });
+
+  it('RunGuardCameraMotionOverride applies camera thresholds without channel caps', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      config: {
+        video: {
+          framesPerSecond: 8,
+          channels: {
+            'cam-1': {
+              motion: { diffThreshold: 32, areaThreshold: 0.025 }
+            },
+            'video:cam-2': {
+              motion: { diffThreshold: 24, areaThreshold: 0.02 }
+            }
+          },
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'cam-1',
+              input: 'rtsp://cam-1',
+              person: { score: 0.55 },
+              motion: { diffThreshold: 40, areaThreshold: 0.03 }
+            },
+            {
+              id: 'cam-2',
+              channel: 'video:cam-2',
+              input: 'rtsp://cam-2',
+              person: { score: 0.6 },
+              motion: { diffThreshold: 22, areaThreshold: 0.018 }
+            }
+          ]
+        },
+        person: {
+          modelPath: 'model.onnx',
+          score: 0.5
+        },
+        motion: { diffThreshold: 20, areaThreshold: 0.02 },
+        events: { thresholds: { info: 0, warning: 5, critical: 10 } }
+      } as GuardianConfig
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2);
+      const pipelineCam1 = runtime.pipelines.get('video:cam-1');
+      const pipelineCam2 = runtime.pipelines.get('video:cam-2');
+      expect(pipelineCam1?.pipelineState.motion.diffThreshold).toBe(40);
+      expect(pipelineCam1?.pipelineState.motion.areaThreshold).toBeCloseTo(0.03, 5);
+      expect(pipelineCam2?.pipelineState.motion.diffThreshold).toBe(22);
+      expect(pipelineCam2?.pipelineState.motion.areaThreshold).toBeCloseTo(0.018, 5);
+      expect(MockMotionDetector.instances).toHaveLength(2);
+      expect(MockMotionDetector.instances[0]?.options).toMatchObject({
+        diffThreshold: 40,
+        areaThreshold: 0.03
+      });
+      expect(MockMotionDetector.instances[1]?.options).toMatchObject({
+        diffThreshold: 22,
+        areaThreshold: 0.018
+      });
+    } finally {
       runtime.stop();
     }
   });
@@ -2189,7 +2254,7 @@ describe('run-guard multi camera orchestration', () => {
         .sort();
       expect(sourceChannels).toEqual(['video:frontdoor', 'video:porch']);
       expect(MockMotionDetector.instances).toHaveLength(2);
-      expect(MockMotionDetector.instances[0]?.options).toMatchObject({ diffThreshold: 36 });
+      expect(MockMotionDetector.instances[0]?.options).toMatchObject({ diffThreshold: 40 });
       expect(MockMotionDetector.instances[1]?.options).toMatchObject({ diffThreshold: 24 });
     } finally {
       runtime.stop();

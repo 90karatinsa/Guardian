@@ -182,7 +182,7 @@ export function parseYoloDetections(
           continue;
         }
 
-        detections.push({
+        const detection: YoloDetection = {
           score,
           classId,
           bbox,
@@ -193,7 +193,11 @@ export function parseYoloDetections(
           appliedThreshold: threshold,
           projectionIndex: projected.projectionIndex,
           normalizedProjection: projected.normalized
-        });
+        };
+
+        detection.priorityScore = computeProjectionPriority(detection);
+
+        detections.push(detection);
       }
     }
   }

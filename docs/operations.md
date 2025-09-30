@@ -43,6 +43,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 ## Log ve metrik inceleme
 - `guardian log-level get` ve `guardian log-level set warn` komutlarıyla log seviyesini değiştirirken, `guardian daemon health`
   çıktısındaki `metrics.logs.byLevel` ve `metrics.logs.histogram` alanlarını izleyin.
+- SSE dashboard'un sağ panelindeki `warnings` tablosu, bastırma timeline TTL prune olaylarını `type: "suppression"` olarak gösterir. `/api/events/stream` uç noktasına bağlandığınızda `{"type":"suppression",...}` payload'larını görürseniz suppression kurallarınızın TTL sınırında olduğunu anlayabilirsiniz; aynı olay `metricsSummary.suppression.historyTotals.ttlPrunedByChannel` artışlarıyla tutarlıdır.
 - Bastırma timeline TTL temizlemelerini takip etmek için `guardian daemon health --json` çıktısındaki
   `metricsSummary.suppression.historyTotals.ttlPrunedByChannel` haritasını inceleyin; yüksek değerler belirli kanalların
   timeline kısıtlamalarına takıldığını gösterir.

@@ -398,7 +398,7 @@ export class AudioSource extends EventEmitter {
   }
 
   static async listDevices(
-    format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' = 'auto',
+    format: 'alsa' | 'avfoundation' | 'dshow' | 'pulse' | 'pipewire' | 'auto' = 'auto',
     options: { timeoutMs?: number; channel?: string } = {}
   ): Promise<MicCandidate[]> {
     const cacheKey = buildDeviceCacheKey(process.platform, format);
@@ -445,6 +445,9 @@ export class AudioSource extends EventEmitter {
               });
               continue;
             }
+            metrics.recordAudioDeviceDiscovery('device-discovery-error', {
+              channel: options.channel
+            });
           }
         }
       }
@@ -1831,7 +1834,7 @@ function parseDeviceList(output: string) {
 }
 
 function resolveDeviceFormats(
-  format: 'alsa' | 'avfoundation' | 'dshow' | 'auto',
+  format: 'alsa' | 'avfoundation' | 'dshow' | 'pulse' | 'pipewire' | 'auto',
   platform: NodeJS.Platform
 ) {
   if (format !== 'auto') {

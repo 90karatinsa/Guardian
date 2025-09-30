@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/eventBus.js';
-import { MetricsRegistry } from '../src/metrics/index.js';
+import { MetricsRegistry, type MetricsWarningEvent } from '../src/metrics/index.js';
 import { EventPayload } from '../src/types.js';
 
 describe('EventSuppressionRateLimit', () => {
@@ -761,6 +761,55 @@ describe('EventSuppressionRateLimit', () => {
       timelineTtlMs: 500,
       timelineExpired: true
     });
+  });
+
+  it('SuppressionTtlWarningMetrics emits warning events for TTL pruning', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const warnings: MetricsWarningEvent[] = [];
+    const handler = (event: MetricsWarningEvent) => warnings.push(event);
+    metrics.onWarning(handler);
+
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'timeline-ttl',
+        detector: 'test-detector',
+        channel: 'cam:a',
+        maxEvents: 2,
+        suppressForMs: 600,
+        timelineTtlMs: 500,
+        reason: 'ttl cleanup'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 120, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(false);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1500, meta: { channel: 'cam:a' } })).toBe(true);
+
+    metrics.offWarning(handler);
+
+    const suppressionWarning = warnings.find(event => event.type === 'suppression');
+    expect(suppressionWarning).toBeDefined();
+    expect(suppressionWarning?.type).toBe('suppression');
+    const snapshot = suppressionWarning?.suppression;
+    expect(snapshot?.ruleId).toBe('timeline-ttl');
+    expect(snapshot?.channel).toBe('cam:a');
+    expect(snapshot?.count).toBe(2);
+    expect(snapshot?.timelineTtlMs).toBe(500);
+    expect(snapshot?.timelineExpired).toBe(true);
+
+    const metricsSnapshot = metrics.snapshot();
+    expect(metricsSnapshot.suppression.warnings).toBeGreaterThanOrEqual(1);
+    expect(metricsSnapshot.suppression.lastWarning?.ruleId).toBe('timeline-ttl');
+    expect(metricsSnapshot.suppression.lastWarning?.channel).toBe('cam:a');
   });
 
   it('EventSuppressionTimelineTtlExpires removes stale cooldown timelines and records TTL purge metrics', () => {

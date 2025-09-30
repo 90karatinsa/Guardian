@@ -445,8 +445,21 @@ async function executeRetentionRun(
   }
 
   let vacuumResult: ReturnType<typeof vacuumDatabase> | null = null;
+  let vacuumFailed: { error: unknown } | null = null;
   if (shouldVacuum) {
-    vacuumResult = vacuumDatabase(options.vacuum, tableBaseline);
+    try {
+      vacuumResult = vacuumDatabase(options.vacuum, tableBaseline);
+    } catch (error) {
+      vacuumFailed = { error };
+      logger.warn({ err: error }, 'Retention vacuum failed');
+      const summary: RetentionWarningSnapshot = {
+        camera: null,
+        path: 'vacuum',
+        reason: 'vacuum-failed'
+      };
+      warnings.push(summary);
+      metrics.recordRetentionWarning(summary);
+    }
   }
 
   metrics.recordRetentionRun({
@@ -458,13 +471,17 @@ async function executeRetentionRun(
   });
 
   const vacuumSummary: RetentionVacuumSummary = {
-    ran: shouldVacuum,
+    ran: shouldVacuum && !vacuumFailed,
     runMode: vacuumResult?.run ?? options.vacuum.run,
-    mode: shouldVacuum ? vacuumResult?.mode ?? options.vacuum.mode ?? 'auto' : 'skipped',
+    mode: shouldVacuum
+      ? vacuumResult?.mode ?? options.vacuum.mode ?? 'auto'
+      : 'skipped',
     analyze: shouldVacuum ? vacuumResult?.analyze === true : false,
     reindex: shouldVacuum ? vacuumResult?.reindex === true : false,
     optimize: shouldVacuum ? vacuumResult?.optimize === true : false,
-    target: shouldVacuum ? vacuumResult?.target ?? options.vacuum.target ?? undefined : undefined,
+    target: shouldVacuum
+      ? vacuumResult?.target ?? options.vacuum.target ?? undefined
+      : undefined,
     pragmas: shouldVacuum ? vacuumResult?.pragmas : undefined,
     indexVersion: shouldVacuum ? vacuumResult?.indexVersion : undefined,
     ensuredIndexes:
@@ -475,8 +492,8 @@ async function executeRetentionRun(
     tables: shouldVacuum && vacuumResult ? vacuumResult.tables : undefined
   };
 
-  const diskAfter = shouldVacuum
-    ? vacuumResult?.disk.after ?? getDatabaseDiskUsage()
+  const diskAfter = shouldVacuum && vacuumResult
+    ? vacuumResult.disk.after
     : getDatabaseDiskUsage();
   const diskSummary = {
     before: diskBefore,

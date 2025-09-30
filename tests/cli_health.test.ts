@@ -879,6 +879,38 @@ describe('GuardianCliHealthcheck', () => {
       spy.mockRestore();
     }
   });
+
+  it('CliAudioDevicesFormats accepts pulse and pipewire formats', async () => {
+    const spy = vi.spyOn(AudioSource, 'listDevices');
+
+    const pulseIo = createTestIo();
+    spy.mockResolvedValueOnce([{ format: 'pulse', device: 'default' }]);
+    const pulseCode = await runCli(
+      ['audio', 'devices', '--format', 'pulse', '--json'],
+      pulseIo.io
+    );
+    expect(pulseCode).toBe(0);
+    expect(JSON.parse(pulseIo.stdout().trim()).format).toBe('pulse');
+    expect(spy).toHaveBeenNthCalledWith(1, 'pulse', { channel: 'cli:audio-devices' });
+
+    const pipewireIo = createTestIo();
+    spy.mockResolvedValueOnce([{ format: 'pipewire', device: 'monitor' }]);
+    const pipewireCode = await runCli(
+      ['audio', 'devices', '--format', 'pipewire', '--json'],
+      pipewireIo.io
+    );
+    expect(pipewireCode).toBe(0);
+    expect(JSON.parse(pipewireIo.stdout().trim()).format).toBe('pipewire');
+    expect(spy).toHaveBeenNthCalledWith(2, 'pipewire', { channel: 'cli:audio-devices' });
+
+    const helpIo = createTestIo();
+    const helpCode = await runCli(['audio', '--help'], helpIo.io);
+    expect(helpCode).toBe(0);
+    expect(helpIo.stdout()).toContain('pulse');
+    expect(helpIo.stdout()).toContain('pipewire');
+
+    spy.mockRestore();
+  });
 });
 
 describe('GuardianCliRetention', () => {

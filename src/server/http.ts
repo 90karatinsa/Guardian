@@ -179,6 +179,8 @@ function getContentType(filePath: string): string {
       return 'image/jpeg';
     case '.gif':
       return 'image/gif';
+    case '.svg':
+      return 'image/svg+xml';
     default:
       return 'application/octet-stream';
   }

@@ -1410,21 +1410,24 @@ const RTSP_TIMEOUT_PATTERNS = [
 ];
 
 const RTSP_AUTH_PATTERNS = [
-  /method\s+DESCRIBE\s+failed:.*401/i,
+  /method\s+DESCRIBE\s+failed:.*(401|403)/i,
   /RTSP\/1\.0\s+401\s+unauthorized/i,
-  /401\s+unauthorized/i,
+  /RTSP\/1\.0\s+403/i,
+  /(401|403)\s+(unauthorized|forbidden)/i,
   /authorization\s+failed/i,
   /authentication\s+failed/i,
   /unauthorized\s+access/i
 ];
 
 const RTSP_NOT_FOUND_PATTERNS = [
-  /method\s+DESCRIBE\s+failed:.*(404|5\d\d)/i,
+  /method\s+DESCRIBE\s+failed:.*(404|454|5\d\d)/i,
   /RTSP\/1\.0\s+404/i,
+  /RTSP\/1\.0\s+454/i,
   /RTSP\/1\.0\s+5\d\d/i,
-  /404\s+not\s+found/i,
+  /(404|454)\s+(not\s+found|session\s+not\s+found)/i,
   /server\s+returned\s+5\d\d/i,
-  /5\d\d\s+(internal|server)\s+error/i
+  /5\d\d\s+(internal|server)\s+error/i,
+  /session\s+not\s+found/i
 ];
 
 const RTSP_CONNECTION_PATTERNS = [
