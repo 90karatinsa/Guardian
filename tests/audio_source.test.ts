@@ -1831,6 +1831,36 @@ describe('AudioSource resilience', () => {
     ).toBe(1);
   });
 
+  it('AudioDeviceDiscoveryExecErrorMetrics records exec failures with reasons', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    execFileMock.mockImplementation((command: string, _args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      const error = new Error(`failed: ${command}`) as ExecFileException;
+      error.code = 1;
+      callback(error, '', '');
+      return child;
+    });
+
+    await expect(
+      AudioSource.listDevices('auto', { channel: 'audio:test-device-discovery' })
+    ).rejects.toThrow('failed: ffmpeg');
+
+    const snapshot = metrics.snapshot();
+    const callCount = execFileMock.mock.calls.length;
+    expect(callCount).toBeGreaterThan(0);
+    expect(snapshot.pipelines.audio.deviceDiscovery.byReason['device-discovery-error']).toBe(
+      callCount
+    );
+    const channelCounts =
+      snapshot.pipelines.audio.deviceDiscoveryByChannel['audio:test-device-discovery'];
+    expect(channelCounts?.['device-discovery-error']).toBe(callCount);
+
+    platformSpy.mockRestore();
+  });
+
   it('AudioWindowing enforces alignment for pipe inputs', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
     const source = new AudioSource({ type: 'ffmpeg', input: 'pipe:0', sampleRate: 8000, channels: 1 });

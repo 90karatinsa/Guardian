@@ -1072,6 +1072,65 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionVacuumErrorWarning surfaces vacuum failure without aborting the run', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 3, 5);
+    vi.setSystemTime(now);
+
+    const vacuumSpy = vi.spyOn(dbModule, 'vacuumDatabase').mockImplementation(() => {
+      throw new Error('vacuum exploded');
+    });
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 30,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraOneDir],
+        vacuum: { mode: 'auto', run: 'always' },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(result.vacuum.ran).toBe(false);
+      expect(result.vacuum.mode).toBe('auto');
+      expect(result.warnings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            camera: null,
+            path: 'vacuum',
+            reason: 'vacuum-failed'
+          })
+        ])
+      );
+      expect(metrics.recordRetentionWarning).toHaveBeenCalledWith({
+        camera: null,
+        path: 'vacuum',
+        reason: 'vacuum-failed'
+      });
+      expect(metrics.recordRetentionRun).toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        { err: expect.any(Error) },
+        'Retention vacuum failed'
+      );
+    } finally {
+      vacuumSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('SnapshotArchiveQuota enforces per-camera limits and reports warnings', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 3, 15);

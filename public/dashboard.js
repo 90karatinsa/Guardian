@@ -631,6 +631,57 @@ function normalizeWarning(payload) {
       at: Number.isFinite(atValue) ? atValue : now
     };
   }
+  if (payload.type === 'suppression' && payload.suppression) {
+    const suppression = payload.suppression as {
+      ruleId?: string | null;
+      channel?: string | null;
+      count?: number;
+      timelineTtlMs?: number | null;
+      timelineExpired?: boolean | null;
+      at?: string | number | null;
+    };
+    const channel = suppression.channel ? normalizeChannelId(suppression.channel) : null;
+    const count =
+      typeof suppression.count === 'number' && Number.isFinite(suppression.count)
+        ? suppression.count
+        : null;
+    const ttlMs =
+      typeof suppression.timelineTtlMs === 'number' && Number.isFinite(suppression.timelineTtlMs)
+        ? suppression.timelineTtlMs
+        : null;
+    const expired =
+      typeof suppression.timelineExpired === 'boolean' ? suppression.timelineExpired : null;
+    const atValue =
+      typeof suppression.at === 'number'
+        ? suppression.at
+        : typeof suppression.at === 'string'
+        ? Date.parse(suppression.at)
+        : now;
+    const detailParts: string[] = [];
+    if (ttlMs !== null) {
+      detailParts.push(`ttl ${ttlMs}ms`);
+    }
+    if (suppression.ruleId) {
+      detailParts.push(`rule ${suppression.ruleId}`);
+    }
+    if (expired !== null) {
+      detailParts.push(expired ? 'timeline expired' : 'timeline active');
+    }
+    const title = channel ? `Suppression TTL pruned (${channel})` : 'Suppression TTL pruned';
+    let message = 'Suppression timeline pruned by TTL';
+    if (count !== null) {
+      message = count === 1 ? '1 suppression entry pruned' : `${count} suppression entries pruned`;
+    }
+    return {
+      id: `suppression:${now}:${Math.random().toString(36).slice(2)}`,
+      type: 'suppression',
+      title,
+      message,
+      detail: detailParts.length > 0 ? detailParts.join(', ') : null,
+      channel,
+      at: Number.isFinite(atValue) ? atValue : now
+    };
+  }
   return null;
 }
 

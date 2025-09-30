@@ -353,7 +353,7 @@ const AUDIO_USAGE = [
   '  guardian audio devices [options]  List detected audio capture devices',
   '',
   'Options:',
-  '  -f, --format <format>  Force ffmpeg format (alsa, avfoundation, dshow, auto)',
+  '  -f, --format <format>  Force ffmpeg format (alsa, avfoundation, dshow, pulse, pipewire, auto)',
   '  -j, --json             Pretty-print JSON output',
   '  -h, --help             Show this help message'
 ].join('\n');
@@ -389,7 +389,7 @@ type DaemonRestartArgs = {
 };
 
 type AudioDevicesArgs = {
-  format: 'alsa' | 'avfoundation' | 'dshow' | 'auto';
+  format: 'alsa' | 'avfoundation' | 'dshow' | 'pulse' | 'pipewire' | 'auto';
   json: boolean;
   help: boolean;
   errors: string[];
@@ -778,7 +778,7 @@ function parseDaemonRestartArgs(args: string[]): DaemonRestartArgs {
 }
 
 function parseAudioDevicesArgs(args: string[]): AudioDevicesArgs {
-  const allowedFormats = new Set(['alsa', 'avfoundation', 'dshow', 'auto']);
+  const allowedFormats = new Set(['alsa', 'avfoundation', 'dshow', 'pulse', 'pipewire', 'auto']);
   const result: AudioDevicesArgs = {
     format: 'auto',
     json: false,

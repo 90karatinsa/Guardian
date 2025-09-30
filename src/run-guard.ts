@@ -1461,26 +1461,10 @@ function buildCameraContext(camera: CameraConfig, config: GuardConfig) {
   const pose = resolvePoseConfig(config.pose, channelConfig?.pose, camera.pose);
   const objects = resolveObjectsConfig(config.objects, channelConfig?.objects, camera.objects);
 
-  const channelMotionDefaults = channelConfig?.motion
+  const motionDefaults = channelConfig?.motion
     ? resolveCameraMotion(channelConfig.motion, config.motion)
-    : null;
-  const motionDefaults = channelMotionDefaults ?? config.motion;
+    : config.motion;
   const motion = resolveCameraMotion(camera.motion, motionDefaults);
-
-  if (channelMotionDefaults) {
-    if (Number.isFinite(channelMotionDefaults.diffThreshold)) {
-      motion.diffThreshold = Math.min(
-        motion.diffThreshold,
-        channelMotionDefaults.diffThreshold
-      );
-    }
-    if (Number.isFinite(channelMotionDefaults.areaThreshold)) {
-      motion.areaThreshold = Math.min(
-        motion.areaThreshold,
-        channelMotionDefaults.areaThreshold
-      );
-    }
-  }
 
   const pipelineState: CameraPipelineState = {
     channel,

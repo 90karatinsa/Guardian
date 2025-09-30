@@ -14,7 +14,13 @@ import {
 import FaceRegistry, { IdentifyResult } from '../../video/faceRegistry.js';
 import logger from '../../logger.js';
 import { EventRecord } from '../../types.js';
-import metricsModule, { MetricsRegistry, type MetricsWarningEvent } from '../../metrics/index.js';
+import metricsModule, {
+  MetricsRegistry,
+  type MetricsWarningEvent,
+  type RetentionWarningSnapshot,
+  type TransportFallbackRecordSnapshot,
+  type SuppressionWarningSnapshot
+} from '../../metrics/index.js';
 import { canonicalChannel, normalizeChannelId } from '../../utils/channel.js';
 import configManager from '../../config/index.js';
 
@@ -148,10 +154,24 @@ export class EventsRouter {
   };
 
   private broadcastWarning(event: MetricsWarningEvent) {
-    const payload =
-      event.type === 'retention'
-        ? { type: 'retention', warning: event.warning }
-        : { type: 'transport-fallback', fallback: event.fallback };
+    let payload:
+      | { type: 'retention'; warning: RetentionWarningSnapshot }
+      | { type: 'transport-fallback'; fallback: TransportFallbackRecordSnapshot }
+      | { type: 'suppression'; suppression: SuppressionWarningSnapshot };
+
+    switch (event.type) {
+      case 'retention':
+        payload = { type: 'retention', warning: event.warning };
+        break;
+      case 'transport-fallback':
+        payload = { type: 'transport-fallback', fallback: event.fallback };
+        break;
+      case 'suppression':
+        payload = { type: 'suppression', suppression: event.suppression };
+        break;
+      default:
+        return;
+    }
 
     for (const [client, state] of this.clients) {
       if (client.writableEnded) {

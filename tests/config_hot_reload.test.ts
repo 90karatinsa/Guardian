@@ -935,6 +935,56 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigMicFallbackFormatValidation rejects unsupported mic fallback formats', async () => {
+    const baseConfig = createConfig({ diffThreshold: 30 });
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({ logger, configManager: manager });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const originalRaw = fs.readFileSync(configPath, 'utf-8');
+      const invalid = JSON.parse(JSON.stringify(baseConfig)) as GuardianConfig;
+      invalid.audio = {
+        micFallbacks: {
+          linux: [{ format: 'invalid-format', device: 'default' }]
+        }
+      } as GuardianConfig['audio'];
+
+      fs.writeFileSync(configPath, JSON.stringify(invalid, null, 2));
+
+      await waitFor(() =>
+        logger.warn.mock.calls.some(([payload, message]) => {
+          return message === 'ConfigReloadRejected' && payload?.reloadRejected === true;
+        })
+      );
+
+      const rejection = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
+      expect(rejection?.[0]?.err).toBeInstanceOf(Error);
+      const errorMessage = rejection?.[0]?.err?.message ?? '';
+      expect(errorMessage).toContain('config.audio.micFallbacks.linux[0].format');
+      expect(errorMessage).toContain('alsa');
+
+      await waitFor(() =>
+        logger.info.mock.calls.some(([, message]) => message === 'Configuration rollback applied')
+      );
+      await waitFor(() => fs.readFileSync(configPath, 'utf-8') === originalRaw);
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('ConfigHotReloadPipelineUpdates logs motion warmup adjustments without restart', async () => {
     const baseConfig = createConfig({ diffThreshold: 30 });
     baseConfig.video.channels = { 'video:cam-1': {} };

@@ -753,7 +753,12 @@ export class LightDetector {
       return false;
     }
 
-    const currentHour = new Date(ts).getHours();
+    const date = new Date(ts);
+    const currentHour =
+      date.getHours() +
+      date.getMinutes() / 60 +
+      date.getSeconds() / 3600 +
+      date.getMilliseconds() / 3_600_000;
 
     return hours.some(range => isHourWithinRange(currentHour, range.start, range.end));
   }
@@ -773,7 +778,11 @@ function isHourWithinRange(hour: number, start: number, end: number): boolean {
 }
 
 function normalizeHour(hour: number) {
-  return ((Math.floor(hour) % 24) + 24) % 24;
+  if (!Number.isFinite(hour)) {
+    return 0;
+  }
+  const normalized = ((hour % 24) + 24) % 24;
+  return normalized === 24 ? 0 : normalized;
 }
 
 function recordWindowSample(buffer: number[], sample: number, size: number) {

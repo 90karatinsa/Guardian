@@ -135,9 +135,19 @@ type TransportFallbackSnapshot = {
   };
 };
 
+type SuppressionWarningSnapshot = {
+  ruleId: string | null;
+  channel: string | null;
+  count: number;
+  timelineTtlMs: number | null;
+  timelineExpired: boolean | null;
+  at: string;
+};
+
 type MetricsWarningEvent =
   | { type: 'retention'; warning: RetentionWarningSnapshot }
-  | { type: 'transport-fallback'; fallback: TransportFallbackRecordSnapshot };
+  | { type: 'transport-fallback'; fallback: TransportFallbackRecordSnapshot }
+  | { type: 'suppression'; suppression: SuppressionWarningSnapshot };
 
 type PipelineRestartHistorySnapshot = {
   reason: string;
@@ -237,6 +247,8 @@ type SuppressionSnapshot = {
       historyCount: Record<string, HistogramSnapshot>;
     };
   };
+  warnings: number;
+  lastWarning: SuppressionWarningSnapshot | null;
 };
 
 type SuppressionRuleSnapshot = {
@@ -586,6 +598,8 @@ class MetricsRegistry {
   private suppressionCombinedHistoryCount = 0;
   private suppressionHistoryTtlPruned = 0;
   private readonly suppressionTtlPrunedByChannel = new Map<string, number>();
+  private suppressionWarnings = 0;
+  private lastSuppressionWarning: SuppressionWarningSnapshot | null = null;
   private readonly detectorMetrics = new Map<string, DetectorMetricState>();
   private totalEvents = 0;
   private lastEventTimestamp: number | null = null;
@@ -694,6 +708,8 @@ class MetricsRegistry {
     this.suppressionCombinedHistoryCount = 0;
     this.suppressionHistoryTtlPruned = 0;
     this.suppressionTtlPrunedByChannel.clear();
+    this.suppressionWarnings = 0;
+    this.lastSuppressionWarning = null;
     this.detectorMetrics.clear();
     this.totalEvents = 0;
     this.lastEventTimestamp = null;
@@ -1198,6 +1214,27 @@ class MetricsRegistry {
         state.lastTimelineTtlExpired = context.timelineExpired;
       }
     }
+
+    const channel =
+      typeof context?.channel === 'string' && context.channel.trim().length > 0
+        ? context.channel.trim()
+        : null;
+    const timelineTtlMs =
+      typeof context?.timelineTtlMs === 'number' && Number.isFinite(context.timelineTtlMs)
+        ? context.timelineTtlMs
+        : null;
+    const snapshot: SuppressionWarningSnapshot = {
+      ruleId: typeof context?.ruleId === 'string' && context.ruleId ? context.ruleId : null,
+      channel,
+      count: normalized,
+      timelineTtlMs,
+      timelineExpired:
+        typeof context?.timelineExpired === 'boolean' ? context.timelineExpired : null,
+      at: new Date().toISOString()
+    };
+    this.suppressionWarnings += 1;
+    this.lastSuppressionWarning = snapshot;
+    this.warningEmitter.emit('warning', { type: 'suppression', suppression: snapshot });
   }
 
   recordRetentionRun(context: RetentionRunContext) {
@@ -2422,7 +2459,9 @@ class MetricsRegistry {
         },
         lastEvent: lastSuppressedEventSnapshot,
         rules: mapFromSuppressionRules(this.suppressionRules),
-        histogram: suppressionHistogramSnapshot
+        histogram: suppressionHistogramSnapshot,
+        warnings: this.suppressionWarnings,
+        lastWarning: this.lastSuppressionWarning ? { ...this.lastSuppressionWarning } : null
       },
       retention: {
         runs: this.retentionRuns,

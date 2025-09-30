@@ -1365,6 +1365,43 @@ describe('LightDetector', () => {
     expect(afterSnapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? 0).toBe(0);
   });
 
+  it('LightDetectorFractionalNormalHours', () => {
+    const detector = new LightDetector(
+      {
+        source: 'fractional-normal-hours',
+        deltaThreshold: 12,
+        smoothingFactor: 0.05,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 2,
+        noiseMultiplier: 1.5,
+        normalHours: [{ start: 6.5, end: 7.25 }],
+        idleRebaselineMs: 0,
+        noiseWarmupFrames: 0
+      },
+      bus
+    );
+
+    const frame = createUniformFrame(8, 8, 36);
+    const baselineTs = Date.UTC(2024, 0, 1, 6, 0, 0);
+    detector.handleFrame(frame, baselineTs);
+
+    const earlyTs = Date.UTC(2024, 0, 1, 6, 20, 0);
+    detector.handleFrame(frame, earlyTs);
+    let snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.normalHoursActive).toBe(0);
+
+    const insideTs = Date.UTC(2024, 0, 1, 6, 40, 0);
+    detector.handleFrame(frame, insideTs);
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.normalHoursActive).toBe(1);
+
+    const outsideTs = Date.UTC(2024, 0, 1, 7, 20, 0);
+    detector.handleFrame(frame, outsideTs);
+    snapshot = metrics.snapshot();
+    expect(snapshot.detectors.light?.gauges?.normalHoursActive).toBe(0);
+  });
+
   it('LightDetectorIdleRebaseline rebuilds baseline after idle gaps', () => {
     const detector = new LightDetector(
       {

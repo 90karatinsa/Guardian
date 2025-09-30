@@ -1419,6 +1419,98 @@ describe('VideoSource', () => {
     ).toBe(1);
   });
 
+  it('VideoRtspForbiddenClassification', async () => {
+    const commands: FakeCommand[] = [];
+    const recoverReasons: string[] = [];
+    const transportReasons: string[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-forbidden',
+      restartDelayMs: 20,
+      restartMaxDelayMs: 20,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        queueMicrotask(() => {
+          command.emit('start');
+          command.emit('stderr', 'RTSP/1.0 403 Forbidden');
+          command.emitClose(1);
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('transport-change', event => transportReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      await waitFor(() => recoverReasons.includes('rtsp-auth-failure'), 500);
+    } finally {
+      await source.stop();
+    }
+
+    expect(recoverReasons).toContain('rtsp-auth-failure');
+    expect(transportReasons.every(reason => reason === 'rtsp-auth-failure')).toBe(true);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byReason['rtsp-auth-failure']).toBe(1);
+    expect(
+      snapshot.pipelines.ffmpeg.byChannel['video:rtsp-forbidden'].byReason['rtsp-auth-failure']
+    ).toBe(1);
+  });
+
+  it('VideoRtspSessionNotFoundClassification', async () => {
+    const commands: FakeCommand[] = [];
+    const recoverReasons: string[] = [];
+    const transportReasons: string[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-session-missing',
+      restartDelayMs: 20,
+      restartMaxDelayMs: 20,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        queueMicrotask(() => {
+          command.emit('start');
+          command.emit('stderr', 'method PLAY failed: 454 Session Not Found');
+          command.emitClose(1);
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('transport-change', event => transportReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      await waitFor(() => recoverReasons.includes('rtsp-not-found'), 500);
+    } finally {
+      await source.stop();
+    }
+
+    expect(recoverReasons).toContain('rtsp-not-found');
+    expect(transportReasons.every(reason => reason === 'rtsp-not-found')).toBe(true);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.pipelines.ffmpeg.byReason['rtsp-not-found']).toBe(1);
+    expect(
+      snapshot.pipelines.ffmpeg.byChannel['video:rtsp-session-missing'].byReason['rtsp-not-found']
+    ).toBe(1);
+  });
+
   it('VideoRtspNotFoundTripsCircuit', async () => {
     const commands: FakeCommand[] = [];
     const fatalEvents: FatalEvent[] = [];

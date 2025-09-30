@@ -216,6 +216,8 @@ export type LightConfig = LightTuningConfig & {
 
 export type AudioMicFallbackCandidate = { format?: string; device: string };
 
+const SUPPORTED_AUDIO_MIC_FORMATS = new Set(['alsa', 'avfoundation', 'dshow', 'pulse', 'pipewire']);
+
 export type AudioAnomalyThresholdConfig = {
   rms?: number;
   centroidJump?: number;
@@ -1287,6 +1289,23 @@ function validateLogicalConfig(config: GuardianConfig) {
         const device = typeof candidate.device === 'string' ? candidate.device.trim() : '';
         if (!device) {
           messages.push(`config.audio.micFallbacks.${platform}[${index}].device must be a non-empty string`);
+        }
+        if (Object.prototype.hasOwnProperty.call(candidate, 'format')) {
+          const rawFormat = candidate.format;
+          const format = typeof rawFormat === 'string' ? rawFormat.trim() : rawFormat;
+          if (typeof format !== 'string' || format.length === 0) {
+            messages.push(
+              `config.audio.micFallbacks.${platform}[${index}].format must be one of ${Array.from(
+                SUPPORTED_AUDIO_MIC_FORMATS
+              ).join(', ')}`
+            );
+          } else if (!SUPPORTED_AUDIO_MIC_FORMATS.has(format)) {
+            messages.push(
+              `config.audio.micFallbacks.${platform}[${index}].format must be one of ${Array.from(
+                SUPPORTED_AUDIO_MIC_FORMATS
+              ).join(', ')}`
+            );
+          }
         }
       });
     }

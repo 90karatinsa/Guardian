@@ -1,14 +1,34 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { TextDecoder } from 'node:util';
 import { EventEmitter } from 'node:events';
+import ts from 'typescript';
 import { PNG } from 'pngjs';
 import { clearEvents, listEvents, storeEvent } from '../src/db.js';
 import { startHttpServer, type HttpServerRuntime, type HttpServerOptions } from '../src/server/http.js';
 import metrics, { MetricsRegistry } from '../src/metrics/index.js';
 import { createEventsRouter } from '../src/server/routes/events.js';
 import { EventBus } from '../src/eventBus.js';
+
+const dashboardScriptSource = fs.readFileSync(path.resolve('public/dashboard.js'), 'utf-8');
+const dashboardScriptTranspiled = ts.transpileModule(dashboardScriptSource, {
+  compilerOptions: {
+    target: ts.ScriptTarget.ES2020,
+    module: ts.ModuleKind.ES2020
+  },
+  fileName: 'public/dashboard.ts'
+}).outputText;
+
+function bootstrapDashboardScript() {
+  if (!globalThis.window) {
+    throw new Error('window is not defined');
+  }
+
+  Reflect.deleteProperty(globalThis.window as any, '__guardianDashboardState');
+  globalThis.window.eval(dashboardScriptTranspiled);
+}
 
 class StubIncomingMessage extends EventEmitter {
   method = 'GET';
@@ -319,6 +339,22 @@ describe('RestApiEvents', () => {
     expect(response.headers.get('content-type')).toContain('application/javascript');
     const body = await response.text();
     expect(body).toBe('');
+  });
+
+  it('HttpStaticSvgContentType serves SVG assets with image/svg+xml type', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-svg-'));
+    const svgPath = path.join(tempDir, 'icon.svg');
+    fs.writeFileSync(svgPath, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"></svg>');
+
+    try {
+      const { port } = await ensureServer({ staticDir: tempDir });
+
+      const response = await fetch(`http://localhost:${port}/icon.svg`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('image/svg+xml');
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('HttpApiChannelFiltersWithoutManualMeta streams and lists enriched events', async () => {
@@ -1220,7 +1256,7 @@ describe('RestApiEvents', () => {
 
     vi.stubGlobal('EventSource', RetentionEventSource as unknown as typeof EventSource);
 
-    await import('../public/dashboard.js');
+    bootstrapDashboardScript();
     await Promise.resolve();
     await vi.waitFor(() => {
       const state = (window as any).__guardianDashboardState;
@@ -2033,7 +2069,7 @@ describe('RestApiEvents', () => {
 
     vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
 
-    await import('../public/dashboard.js');
+    bootstrapDashboardScript();
     await Promise.resolve();
     await vi.waitFor(() => {
       const state = (window as any).__guardianDashboardState;
@@ -2323,7 +2359,7 @@ describe('RestApiEvents', () => {
 
     vi.stubGlobal('EventSource', MinimalEventSource as unknown as typeof EventSource);
 
-    await import('../public/dashboard.js');
+    bootstrapDashboardScript();
     await Promise.resolve();
     await vi.waitFor(() => {
       const events = (window as any).__guardianDashboardState?.events ?? [];
@@ -2562,7 +2598,7 @@ describe('RestApiEvents', () => {
 
     vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
 
-    await import('../public/dashboard.js');
+    bootstrapDashboardScript();
     await Promise.resolve();
     await vi.waitFor(() => {
       const state = (window as any).__guardianDashboardState;
@@ -2618,6 +2654,193 @@ describe('RestApiEvents', () => {
 
     instance?.close();
     MockEventSource.instances.length = 0;
+    dom.window.close();
+    vi.unstubAllGlobals();
+
+    if (originalWindow) {
+      globalThis.window = originalWindow;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.window;
+    }
+    if (originalDocument) {
+      globalThis.document = originalDocument;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.document;
+    }
+    if (originalEventSource) {
+      globalThis.EventSource = originalEventSource;
+    }
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    }
+    if (originalHTMLElement) {
+      globalThis.HTMLElement = originalHTMLElement;
+    }
+    if (originalMessageEvent) {
+      globalThis.MessageEvent = originalMessageEvent;
+    }
+    if (originalNavigator) {
+      globalThis.navigator = originalNavigator;
+    } else {
+      // @ts-expect-error cleanup for navigator in node environment
+      delete globalThis.navigator;
+    }
+  });
+
+  it('DashboardSuppressionWarningRender renders TTL prune warnings', async () => {
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
+
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
+
+    const baselineMetrics = {
+      fetchedAt: new Date(1700005000000).toISOString(),
+      pipelines: {},
+      retention: {
+        runs: 0,
+        lastRunAt: null,
+        warnings: 0,
+        warningsByCamera: {},
+        lastWarning: null,
+        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
+        totalsByCamera: {}
+      }
+    };
+
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events?')) {
+        return new Response(JSON.stringify({ items: [], total: 0 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      if (url.includes('/api/events/snapshots')) {
+        return new Response(JSON.stringify({ items: [], total: 0, summary: { channels: [] } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(JSON.stringify(baselineMetrics), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    type Listener = (event: MessageEvent) => void;
+    class SuppressionEventSource {
+      static instances: SuppressionEventSource[] = [];
+      public readyState = 0;
+      public url: string;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
+
+      constructor(url: string) {
+        this.url = url;
+        SuppressionEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const payload = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(payload));
+      }
+
+      emitMessage(data: string) {
+        this.onmessage?.(new window.MessageEvent('message', { data }));
+      }
+
+      open() {
+        this.readyState = 1;
+        this.onopen?.(new window.Event('open'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.stubGlobal('EventSource', SuppressionEventSource as unknown as typeof EventSource);
+
+    bootstrapDashboardScript();
+
+    await vi.waitFor(() => {
+      const state = (window as any).__guardianDashboardState;
+      if (!state) {
+        throw new Error('dashboard state unavailable');
+      }
+    });
+
+    const instance = SuppressionEventSource.instances[0];
+    expect(instance).toBeDefined();
+    instance!.open();
+
+    const warningPayload = {
+      type: 'suppression',
+      suppression: {
+        ruleId: 'timeline-ttl',
+        channel: 'cam:a',
+        count: 2,
+        timelineTtlMs: 500,
+        timelineExpired: true,
+        at: new Date(1700005000500).toISOString()
+      }
+    };
+    instance!.dispatch('warning', JSON.stringify(warningPayload));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const warningItems = window.document.querySelectorAll('#warning-list .warning-item');
+    expect(warningItems.length).toBeGreaterThan(0);
+    const latestWarning = warningItems[0]?.textContent ?? '';
+    expect(latestWarning).toContain('Suppression TTL pruned');
+    expect(latestWarning).toContain('cam:a');
+    expect(latestWarning).toContain('2 suppression entries pruned');
+
+    const dashboardState = (window as any).__guardianDashboardState;
+    expect(Array.isArray(dashboardState?.warnings)).toBe(true);
+    expect(dashboardState.warnings?.[0]?.type).toBe('suppression');
+
+    instance?.close();
+    SuppressionEventSource.instances.length = 0;
     dom.window.close();
     vi.unstubAllGlobals();
 
