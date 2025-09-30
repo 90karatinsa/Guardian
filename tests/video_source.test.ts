@@ -236,6 +236,65 @@ describe('VideoSource', () => {
     vi.useRealTimers();
   });
 
+  it('VideoCircuitBreakerReportsFinalFailure', async () => {
+    vi.useFakeTimers();
+
+    const recoverReasons: string[] = [];
+    const fatalEvents: FatalEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:watchdog-circuit',
+      restartDelayMs: 5,
+      restartMaxDelayMs: 5,
+      restartJitterFactor: 0,
+      watchdogTimeoutMs: 10,
+      circuitBreakerThreshold: 1,
+      forceKillTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        queueMicrotask(() => {
+          command.emit('start');
+        });
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('fatal', event => fatalEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(15);
+      await Promise.resolve();
+
+      expect(fatalEvents).toHaveLength(1);
+      expect(source.isCircuitBroken()).toBe(true);
+      expect(recoverReasons).toContain('watchdog-timeout');
+      expect(fatalEvents[0]?.reason).toBe('circuit-breaker');
+      expect(fatalEvents[0]?.lastFailure.reason).toBe('watchdog-timeout');
+
+      const internal = source as unknown as {
+        restartTimer: NodeJS.Timeout | null;
+        pendingRestartContext: unknown;
+      };
+      expect(internal.restartTimer).toBeNull();
+      expect(internal.pendingRestartContext).toBeNull();
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['watchdog-timeout']).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.byReason['circuit-breaker']).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('circuit-breaker');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('VideoSourceRtspErrorDedupes', async () => {
     vi.useFakeTimers();
 

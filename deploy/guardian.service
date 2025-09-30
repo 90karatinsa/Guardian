@@ -11,6 +11,7 @@ Environment=GUARDIAN_SIMULATE_VIDEO_RTSP_TIMEOUT=0
 Environment=GUARDIAN_SIMULATE_VIDEO_WATCHDOG=0
 Environment=PATH=/usr/local/bin:/usr/bin
 WorkingDirectory=/opt/guardian
+# Health probes share the scripts/healthcheck.ts helper referenced in the Docker image.
 ExecStartPre=/usr/bin/env pnpm exec tsx scripts/healthcheck.ts --health
 ExecStart=/usr/bin/env pnpm exec tsx src/cli.ts daemon start
 ExecReload=/usr/bin/env pnpm exec tsx src/cli.ts daemon status --json

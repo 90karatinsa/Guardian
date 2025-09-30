@@ -693,11 +693,29 @@ export class VideoSource extends EventEmitter {
     });
     const waitForTermination = termination ?? Promise.resolve();
 
+    const timing = this.computeRestartDelay(attempt);
+
+    const sanitizedDelay = Math.max(0, timing.delayMs);
+
+    const restartContextDetails: PendingRestartContext = {
+      attempt,
+      delayMs: sanitizedDelay,
+      meta: timing.meta,
+      channel,
+      errorCode: errorCode ?? null,
+      exitCode,
+      signal,
+      reportedReasons: new Set<string>()
+    };
+    restartContext = restartContextDetails;
+
     if (shouldTripCircuit) {
       this.shouldStop = true;
       this.recovering = false;
       this.circuitBroken = true;
       this.lastCircuitCandidateReason = null;
+      this.clearRestartTimer();
+      this.reportRecovery(restartContextDetails, reason);
       metrics.recordPipelineRestart('ffmpeg', 'circuit-breaker', {
         attempt,
         channel: channel ?? undefined,
@@ -724,28 +742,13 @@ export class VideoSource extends EventEmitter {
       return;
     }
 
-    const timing = this.computeRestartDelay(attempt);
+    this.pendingRestartContext = restartContextDetails;
 
-    const sanitizedDelay = Math.max(0, timing.delayMs);
-
-    restartContext = {
-      attempt,
-      delayMs: sanitizedDelay,
-      meta: timing.meta,
-      channel,
-      errorCode: errorCode ?? null,
-      exitCode,
-      signal,
-      reportedReasons: new Set<string>()
-    };
-
-    this.pendingRestartContext = restartContext;
-
-    this.reportRecovery(restartContext, reason);
+    this.reportRecovery(restartContextDetails, reason);
 
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      if (this.pendingRestartContext === restartContext) {
+      if (this.pendingRestartContext === restartContextDetails) {
         this.pendingRestartContext = null;
       }
       waitForTermination

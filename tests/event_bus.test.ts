@@ -134,6 +134,48 @@ describe('EventSuppressionRateLimit', () => {
     });
   });
 
+  it('EventBusAugmentsChannelMetadata for suppression and storage', () => {
+    bus.configureSuppression([
+      {
+        id: 'channel-throttle',
+        detector: 'test-detector',
+        channel: 'video:cam-1',
+        suppressForMs: 500,
+        reason: 'channel throttled'
+      }
+    ]);
+
+    const snapshotPath = '/snapshots/event.png';
+
+    expect(
+      bus.emitEvent({
+        ...basePayload,
+        source: 'video:cam-1',
+        ts: 0,
+        meta: { snapshot: snapshotPath }
+      })
+    ).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, source: 'video:cam-1', ts: 250 })).toBe(false);
+
+    expect(store).toHaveBeenCalledTimes(1);
+    const storedRecord = store.mock.calls[0]?.[0];
+    expect(storedRecord?.meta?.channel).toBe('video:cam-1');
+    expect(storedRecord?.meta?.camera).toBe('video:cam-1');
+    expect(storedRecord?.meta?.snapshot).toBe(snapshotPath);
+
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledTimes(1);
+    const metric = metricsMock.recordSuppressedEvent.mock.calls[0]?.[0];
+    expect(metric?.channel).toBe('video:cam-1');
+    expect(metric?.channels).toEqual(['video:cam-1']);
+
+    const suppressionLogs = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressionLogs).toHaveLength(1);
+    expect(suppressionLogs[0]?.suppressionChannel).toBe('video:cam-1');
+    expect(suppressionLogs[0]?.suppressionChannels).toEqual(['video:cam-1']);
+  });
+
   it('EventSuppressionChannelMetrics records channel and window metadata', () => {
     const metrics = new MetricsRegistry();
     metrics.reset();
@@ -719,6 +761,59 @@ describe('EventSuppressionRateLimit', () => {
       timelineTtlMs: 500,
       timelineExpired: true
     });
+  });
+
+  it('EventSuppressionTimelineTtlExpires removes stale cooldown timelines and records TTL purge metrics', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const ttlSpy = vi.spyOn(metrics, 'recordSuppressionHistoryTtlPruned');
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'ttl-expiry',
+        detector: 'test-detector',
+        channel: 'cam:ttl',
+        rateLimit: { count: 2, perMs: 500, cooldownMs: 400 },
+        suppressForMs: 0,
+        timelineTtlMs: 300,
+        reason: 'cooldown purge'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:ttl' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 100, meta: { channel: 'cam:ttl' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 150, meta: { channel: 'cam:ttl' } })).toBe(false);
+
+    const internalRule = (metricsBus as any).suppressionRules.find((rule: any) => rule.id === 'ttl-expiry');
+    expect(internalRule.timelines.size).toBe(1);
+
+    ttlSpy.mockClear();
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1600, meta: { channel: 'cam:ttl' } })).toBe(true);
+
+    expect(ttlSpy).toHaveBeenCalledTimes(1);
+    const ttlArgs = ttlSpy.mock.calls[0]?.[0];
+    expect(ttlArgs).toMatchObject({
+      ruleId: 'ttl-expiry',
+      channel: 'cam:ttl',
+      count: 3,
+      timelineExpired: true
+    });
+
+    expect(internalRule.timelines.size).toBe(0);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.historyTotals.historyTtlPruned).toBeGreaterThanOrEqual(3);
+    const ruleSnapshot = snapshot.suppression.rules['ttl-expiry'];
+    expect(ruleSnapshot.history.lastTtlPruned).toBeGreaterThanOrEqual(3);
+    expect(ruleSnapshot.history.lastTimelineTtlExpired).toBe(true);
+
+    ttlSpy.mockRestore();
   });
 });
 

@@ -164,6 +164,117 @@ describe('YoloParser utilities', () => {
     expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
   });
 
+  it('YoloProjectionFallbacksToResizedDimensions', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assignDetection = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectnessLogit: number;
+        classLogits: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = values.objectnessLogit;
+      values.classLogits.forEach((logit, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logit;
+      });
+    };
+
+    assignDetection(0, {
+      cx: 0.52,
+      cy: 0.48,
+      width: 0.38,
+      height: 0.34,
+      objectnessLogit: 2.4,
+      classLogits: [-4, 1.3]
+    });
+
+    assignDetection(1, {
+      cx: 330,
+      cy: 300,
+      width: 180,
+      height: 190,
+      objectnessLogit: 2.1,
+      classLogits: [-5, 1.1]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      padX: 0,
+      padY: 0,
+      originalWidth: 0,
+      originalHeight: 0,
+      resizedWidth: 640,
+      resizedHeight: 640,
+      scale: 1,
+      scaleX: 1,
+      scaleY: 1,
+      normalized: false,
+      variants: [
+        {
+          padX: 48,
+          padY: 24,
+          originalWidth: 0,
+          originalHeight: 0,
+          resizedWidth: 640,
+          resizedHeight: 640,
+          scale: 1,
+          scaleX: 1,
+          scaleY: 1,
+          normalized: false
+        },
+        {
+          padX: 0,
+          padY: 0,
+          originalWidth: 0,
+          originalHeight: 0,
+          resizedWidth: 640,
+          resizedHeight: 640,
+          scale: 1,
+          scaleX: 1,
+          scaleY: 1,
+          normalized: true
+        }
+      ]
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [1],
+      scoreThreshold: 0.4,
+      classScoreThresholds: { 1: 0.6 },
+      nmsThreshold: 0.5
+    });
+
+    expect(results).toHaveLength(1);
+    const [detection] = results;
+    expect(detection.bbox.left).toBeGreaterThanOrEqual(0);
+    expect(detection.bbox.top).toBeGreaterThanOrEqual(0);
+    expect(detection.bbox.left + detection.bbox.width).toBeLessThanOrEqual(640.0001);
+    expect(detection.bbox.top + detection.bbox.height).toBeLessThanOrEqual(640.0001);
+    expect(detection.areaRatio).toBeGreaterThan(0);
+    expect(detection.appliedThreshold).toBeCloseTo(0.6, 5);
+    expect(detection.fusion).toBeDefined();
+    expect(detection.fusion?.contributors.length).toBe(2);
+    const projectionSet = new Set(
+      (detection.fusion?.contributors ?? []).map(contributor => contributor.projectionIndex)
+    );
+    expect(projectionSet.size).toBeGreaterThan(1);
+    expect(detection.fusion?.confidence ?? 0).toBeGreaterThanOrEqual(detection.appliedThreshold);
+  });
+
   it('YoloParserFiltersNonFiniteDetections', () => {
     const classCount = 3;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

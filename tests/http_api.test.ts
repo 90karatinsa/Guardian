@@ -8,6 +8,7 @@ import { clearEvents, listEvents, storeEvent } from '../src/db.js';
 import { startHttpServer, type HttpServerRuntime, type HttpServerOptions } from '../src/server/http.js';
 import metrics, { MetricsRegistry } from '../src/metrics/index.js';
 import { createEventsRouter } from '../src/server/routes/events.js';
+import { EventBus } from '../src/eventBus.js';
 
 class StubIncomingMessage extends EventEmitter {
   method = 'GET';
@@ -229,6 +230,196 @@ describe('RestApiEvents', () => {
     expect(snapshotPayload.items).toHaveLength(1);
     expect(snapshotPayload.items[0].meta?.snapshot).toBe(snapshotPath);
     expect(snapshotPayload.items[0].meta?.snapshotUrl).toBe(`/api/events/${snapshotPayload.items[0].id}/snapshot`);
+  });
+
+  it('HttpDashboardAssetsResolveChannelUtils serves dashboard asset and streams metrics', async () => {
+    metrics.recordRetentionRun({
+      removedEvents: 1,
+      archivedSnapshots: 0,
+      prunedArchives: 0,
+      diskSavingsBytes: 0,
+      perCamera: { 'video:cam-asset': { archivedSnapshots: 0, prunedArchives: 0 } }
+    });
+
+    const { port } = await ensureServer();
+
+    const assetResponse = await fetch(`http://localhost:${port}/dashboard.js`);
+    expect(assetResponse.status).toBe(200);
+    expect(assetResponse.headers.get('content-type')).toContain('application/javascript');
+    const assetContent = await assetResponse.text();
+    expect(assetContent.includes("from '../src/utils/channel.js'"))
+      .toBe(false);
+    expect(assetContent.includes('function normalizeChannelId')).toBe(true);
+
+    const controller = new AbortController();
+    const streamResponse = await fetch(`http://localhost:${port}/api/events/stream?metrics=retention`, {
+      signal: controller.signal
+    });
+    expect(streamResponse.status).toBe(200);
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const metricsPayload = await new Promise<any>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readChunk = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              reject(new Error('stream ended before metrics arrived'));
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (eventName === 'metrics' && dataLines.length > 0) {
+                resolve(JSON.parse(dataLines.join('')));
+                return;
+              }
+            }
+            readChunk();
+          })
+          .catch(reject);
+      };
+      readChunk();
+    });
+
+    controller.abort();
+    await reader?.cancel().catch(() => undefined);
+
+    expect(metricsPayload).toBeDefined();
+    expect(metricsPayload.retention?.totals?.removedEvents).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(metricsPayload).sort()).toEqual(['fetchedAt', 'retention']);
+  });
+
+  it('HttpApiChannelFiltersWithoutManualMeta streams and lists enriched events', async () => {
+    const busLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const eventBus = new EventBus({ store: event => storeEvent(event), log: busLogger as any, metrics });
+    bus = eventBus;
+
+    const snapshotPath = path.join(snapshotDir, 'auto.png');
+    fs.writeFileSync(snapshotPath, Buffer.from([7, 7, 7, 7]));
+
+    const { port } = await ensureServer();
+
+    const controller = new AbortController();
+    const streamResponse = await fetch(
+      `http://localhost:${port}/api/events/stream?channels=video:cam-1`,
+      { signal: controller.signal }
+    );
+    expect(streamResponse.status).toBe(200);
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const messages: any[] = [];
+    const streamPromise = new Promise<void>((resolve, reject) => {
+      if (!reader) {
+        reject(new Error('missing reader'));
+        return;
+      }
+      let buffer = '';
+      const readNext = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              reject(new Error('stream ended before event payload'));
+              return;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const chunk = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              boundary = buffer.indexOf('\n\n');
+              if (!chunk) {
+                continue;
+              }
+              const lines = chunk.split('\n');
+              let eventName = 'message';
+              const dataLines: string[] = [];
+              for (const line of lines) {
+                if (line.startsWith(':')) {
+                  continue;
+                }
+                if (line.startsWith('event:')) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  dataLines.push(line.slice(5).trim());
+                }
+              }
+              if (dataLines.length === 0) {
+                continue;
+              }
+              if (eventName === 'stream-status' || eventName === 'metrics') {
+                continue;
+              }
+              try {
+                const payload = JSON.parse(dataLines.join('\n'));
+                if (payload && typeof payload === 'object' && 'meta' in payload) {
+                  messages.push(payload);
+                  resolve();
+                  return;
+                }
+              } catch (error) {
+                reject(error as Error);
+                return;
+              }
+              readNext();
+            }
+            readNext();
+          })
+          .catch(reject);
+      };
+      readNext();
+    });
+
+    eventBus.emitEvent({
+      ts: Date.now(),
+      source: 'video:cam-1',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'auto-generated',
+      meta: { snapshot: snapshotPath }
+    });
+
+    await streamPromise;
+    controller.abort();
+
+    expect(messages).toHaveLength(1);
+    const streamed = messages[0];
+    expect(streamed.meta?.channel).toBe('video:cam-1');
+    expect(streamed.meta?.camera).toBe('video:cam-1');
+
+    await vi.waitFor(() => listEvents({ channel: 'video:cam-1', limit: 1 }).total === 1);
+
+    const restResponse = await fetch(`http://localhost:${port}/api/events?channel=video:cam-1`);
+    expect(restResponse.status).toBe(200);
+    const restPayload = await restResponse.json();
+    expect(restPayload.items).toHaveLength(1);
+    const stored = restPayload.items[0];
+    expect(stored.meta?.channel).toBe('video:cam-1');
+    expect(stored.meta?.camera).toBe('video:cam-1');
+    expect(stored.meta?.snapshotUrl).toBe(`/api/events/${stored.id}/snapshot`);
   });
 
   it('HttpApiStreamRetryBounds clamps retry seconds to 1-60 and emits retry line', async () => {

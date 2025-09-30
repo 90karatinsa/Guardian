@@ -90,6 +90,8 @@ type TransportFallbackChannelState = {
   droppedHistory: number;
   byReason: Map<string, number>;
   byTarget: Map<string, number>;
+  resetsBackoff: number;
+  resetsCircuitBreaker: number;
 };
 
 type TransportFallbackChannelSnapshot = {
@@ -100,6 +102,10 @@ type TransportFallbackChannelSnapshot = {
   droppedHistory: number;
   byReason: CounterMap;
   byTarget: CounterMap;
+  resets: {
+    backoff: number;
+    circuitBreaker: number;
+  };
 };
 
 type TransportFallbackRecordSnapshot = {
@@ -120,6 +126,13 @@ type TransportFallbackSnapshot = {
   byReason: CounterMap;
   byTarget: CounterMap;
   byChannel: Record<string, TransportFallbackChannelSnapshot>;
+  resets: {
+    total: {
+      backoff: number;
+      circuitBreaker: number;
+    };
+    byChannel: Record<string, { backoff: number; circuitBreaker: number }>;
+  };
 };
 
 type MetricsWarningEvent =
@@ -175,6 +188,7 @@ type SuppressionSnapshot = {
     historyCount: number;
     combinedHistoryCount: number;
     historyTtlPruned: number;
+    ttlPrunedByChannel: CounterMap;
   };
   lastEvent: {
     ruleId?: string;
@@ -570,6 +584,7 @@ class MetricsRegistry {
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
   private suppressionHistoryTtlPruned = 0;
+  private readonly suppressionTtlPrunedByChannel = new Map<string, number>();
   private readonly detectorMetrics = new Map<string, DetectorMetricState>();
   private totalEvents = 0;
   private lastEventTimestamp: number | null = null;
@@ -611,6 +626,8 @@ class MetricsRegistry {
   private readonly transportFallbackByChannel = new Map<string, TransportFallbackChannelState>();
   private readonly transportFallbackByReason = new Map<string, number>();
   private readonly transportFallbackByTarget = new Map<string, number>();
+  private transportFallbackResetsBackoff = 0;
+  private transportFallbackResetsCircuitBreaker = 0;
 
   constructor() {
     this.registerReservedHistogram('logs.level', LOG_LEVEL_HISTOGRAM);
@@ -675,6 +692,7 @@ class MetricsRegistry {
     this.suppressionHistoryCount = 0;
     this.suppressionCombinedHistoryCount = 0;
     this.suppressionHistoryTtlPruned = 0;
+    this.suppressionTtlPrunedByChannel.clear();
     this.detectorMetrics.clear();
     this.totalEvents = 0;
     this.lastEventTimestamp = null;
@@ -697,6 +715,8 @@ class MetricsRegistry {
     this.transportFallbackByChannel.clear();
     this.transportFallbackByReason.clear();
     this.transportFallbackByTarget.clear();
+    this.transportFallbackResetsBackoff = 0;
+    this.transportFallbackResetsCircuitBreaker = 0;
   }
 
   private registerReservedHistogram(metric: string, config: HistogramConfig) {
@@ -1153,6 +1173,13 @@ class MetricsRegistry {
     }
     this.suppressionHistoryTtlPruned += normalized;
     this.observeHistogram('suppression.historyTtlPruned', normalized, COUNTER_HISTOGRAM);
+    if (typeof context?.channel === 'string' && context.channel.trim().length > 0) {
+      const channel = context.channel.trim();
+      this.suppressionTtlPrunedByChannel.set(
+        channel,
+        (this.suppressionTtlPrunedByChannel.get(channel) ?? 0) + normalized
+      );
+    }
     if (context?.ruleId) {
       const state = this.ensureSuppressionRuleState(context.ruleId);
       state.ttlPruned += normalized;
@@ -1434,6 +1461,13 @@ class MetricsRegistry {
       (this.transportFallbackByTarget.get(targetKey) ?? 0) + 1
     );
 
+    if (record.resetsBackoff) {
+      this.transportFallbackResetsBackoff += 1;
+    }
+    if (record.resetsCircuitBreaker) {
+      this.transportFallbackResetsCircuitBreaker += 1;
+    }
+
     if (record.channel) {
       const state = getTransportFallbackChannelState(
         this.transportFallbackByChannel,
@@ -1443,6 +1477,12 @@ class MetricsRegistry {
       state.last = record;
       state.byReason.set(normalized, (state.byReason.get(normalized) ?? 0) + 1);
       state.byTarget.set(targetKey, (state.byTarget.get(targetKey) ?? 0) + 1);
+      if (record.resetsBackoff) {
+        state.resetsBackoff += 1;
+      }
+      if (record.resetsCircuitBreaker) {
+        state.resetsCircuitBreaker += 1;
+      }
       state.history.push(record);
       if (state.history.length > state.historyLimit) {
         const overflow = state.history.length - state.historyLimit;
@@ -1965,6 +2005,59 @@ class MetricsRegistry {
       lines.push(channelMetric);
     }
 
+    const resetSamples: Array<{ value: number; labels?: Record<string, string> }> = [
+      {
+        value: this.transportFallbackResetsBackoff,
+        labels: { pipeline: 'ffmpeg', reset: 'backoff' }
+      },
+      {
+        value: this.transportFallbackResetsCircuitBreaker,
+        labels: { pipeline: 'ffmpeg', reset: 'circuit-breaker' }
+      }
+    ];
+
+    const resetsMetric = formatPrometheusGauge('transport.fallback.resets.total', resetSamples, {
+      metricName: options.metricName
+        ? `${options.metricName}_resets`
+        : 'guardian_transport_fallback_resets_total',
+      help:
+        options.help ??
+        'Transport fallback resets grouped by pipeline and reset type',
+      labels: baseLabels
+    });
+    if (resetsMetric) {
+      lines.push(resetsMetric);
+    }
+
+    const resetChannelSamples: Array<{ value: number; labels?: Record<string, string> }> = [];
+    for (const [channel, state] of this.transportFallbackByChannel.entries()) {
+      resetChannelSamples.push({
+        value: state.resetsBackoff,
+        labels: { pipeline: 'ffmpeg', channel, reset: 'backoff' }
+      });
+      resetChannelSamples.push({
+        value: state.resetsCircuitBreaker,
+        labels: { pipeline: 'ffmpeg', channel, reset: 'circuit-breaker' }
+      });
+    }
+
+    const resetChannelMetric = formatPrometheusGauge(
+      'transport.fallback.resets.channel',
+      resetChannelSamples,
+      {
+        metricName: options.metricName
+          ? `${options.metricName}_resets_channel`
+          : 'guardian_transport_fallback_resets_channel_total',
+        help:
+          options.help ??
+          'Channel level transport fallback resets grouped by pipeline, channel, and reset type',
+        labels: baseLabels
+      }
+    );
+    if (resetChannelMetric) {
+      lines.push(resetChannelMetric);
+    }
+
     return lines.filter(Boolean).join('\n');
   }
 
@@ -2056,6 +2149,12 @@ class MetricsRegistry {
     const ffmpegByChannel = mapFromPipelineChannels(this.ffmpegRestartsByChannel);
     const audioByChannel = mapFromPipelineChannels(this.audioRestartsByChannel);
     const transportFallbackByChannel = mapTransportFallbackChannels(this.transportFallbackByChannel);
+    const transportFallbackResetsByChannel = Object.fromEntries(
+      Object.entries(transportFallbackByChannel).map(([channel, snapshot]) => [
+        channel,
+        { backoff: snapshot.resets.backoff, circuitBreaker: snapshot.resets.circuitBreaker }
+      ])
+    );
     const ffmpegDelaySnapshot = mapHistogram(ffmpegDelayHistogram ?? new Map());
     const ffmpegAttemptSnapshot = mapHistogram(ffmpegAttemptHistogram ?? new Map());
     const audioDelaySnapshot = mapHistogram(audioDelayHistogram ?? new Map());
@@ -2227,7 +2326,14 @@ class MetricsRegistry {
             last: mapTransportFallbackRecord(this.transportFallbackLast),
             byReason: mapFrom(this.transportFallbackByReason),
             byTarget: mapFrom(this.transportFallbackByTarget),
-            byChannel: transportFallbackByChannel
+            byChannel: transportFallbackByChannel,
+            resets: {
+              total: {
+                backoff: this.transportFallbackResetsBackoff,
+                circuitBreaker: this.transportFallbackResetsCircuitBreaker
+              },
+              byChannel: transportFallbackResetsByChannel
+            }
           }
         },
         audio: {
@@ -2280,7 +2386,8 @@ class MetricsRegistry {
         historyTotals: {
           historyCount: this.suppressionHistoryCount,
           combinedHistoryCount: this.suppressionCombinedHistoryCount,
-          historyTtlPruned: this.suppressionHistoryTtlPruned
+          historyTtlPruned: this.suppressionHistoryTtlPruned,
+          ttlPrunedByChannel: mapFrom(this.suppressionTtlPrunedByChannel)
         },
         lastEvent: lastSuppressedEventSnapshot,
         rules: mapFromSuppressionRules(this.suppressionRules),
@@ -2602,7 +2709,11 @@ function mapTransportFallbackChannels(
       historyLimit: state.historyLimit,
       droppedHistory: state.droppedHistory,
       byReason: mapFrom(state.byReason),
-      byTarget: mapFrom(state.byTarget)
+      byTarget: mapFrom(state.byTarget),
+      resets: {
+        backoff: state.resetsBackoff,
+        circuitBreaker: state.resetsCircuitBreaker
+      }
     };
   }
   return result;
@@ -3029,7 +3140,9 @@ function getTransportFallbackChannelState(
     historyLimit: TRANSPORT_FALLBACK_HISTORY_LIMIT,
     droppedHistory: 0,
     byReason: new Map(),
-    byTarget: new Map()
+    byTarget: new Map(),
+    resetsBackoff: 0,
+    resetsCircuitBreaker: 0
   };
   map.set(channel, state);
   return state;

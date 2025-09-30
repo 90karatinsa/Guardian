@@ -685,7 +685,13 @@ const guardianConfigSchema: JsonSchema = {
                   areaInflation: { type: 'number', minimum: 0 },
                   areaDeltaThreshold: { type: 'number', minimum: 0 },
                   noiseWarmupFrames: { type: 'number', minimum: 0 },
-                  noiseBackoffPadding: { type: 'number', minimum: 0 }
+                  noiseBackoffPadding: { type: 'number', minimum: 0 },
+                  temporalMedianWindow: { type: 'number', minimum: 1 },
+                  temporalMedianBackoffSmoothing: {
+                    type: 'number',
+                    minimum: 0,
+                    maximum: 1
+                  }
                 }
               },
               light: cameraLightConfigSchema,
@@ -1076,6 +1082,40 @@ function validateLogicalConfig(config: GuardianConfig) {
         messages.push(`${path}.areaThreshold must be a finite number between 0 and 1`);
       } else if (area <= 0 || area > 1) {
         messages.push(`${path}.areaThreshold must be between 0 and 1`);
+      }
+    }
+    if (typeof motion.noiseWarmupFrames !== 'undefined') {
+      const warmup = motion.noiseWarmupFrames;
+      if (typeof warmup !== 'number' || !Number.isFinite(warmup)) {
+        messages.push(`${path}.noiseWarmupFrames must be a finite number greater than or equal to 0`);
+      } else if (warmup < 0) {
+        messages.push(`${path}.noiseWarmupFrames must be greater than or equal to 0`);
+      }
+    }
+    if (typeof motion.noiseBackoffPadding !== 'undefined') {
+      const padding = motion.noiseBackoffPadding;
+      if (typeof padding !== 'number' || !Number.isFinite(padding)) {
+        messages.push(`${path}.noiseBackoffPadding must be a finite number greater than or equal to 0`);
+      } else if (padding < 0) {
+        messages.push(`${path}.noiseBackoffPadding must be greater than or equal to 0`);
+      }
+    }
+    if (typeof motion.temporalMedianWindow !== 'undefined') {
+      const window = motion.temporalMedianWindow;
+      if (typeof window !== 'number' || !Number.isFinite(window)) {
+        messages.push(`${path}.temporalMedianWindow must be a finite number greater than or equal to 1`);
+      } else if (window < 1) {
+        messages.push(`${path}.temporalMedianWindow must be greater than or equal to 1`);
+      }
+    }
+    if (typeof motion.temporalMedianBackoffSmoothing !== 'undefined') {
+      const smoothing = motion.temporalMedianBackoffSmoothing;
+      if (typeof smoothing !== 'number' || !Number.isFinite(smoothing)) {
+        messages.push(
+          `${path}.temporalMedianBackoffSmoothing must be a finite number between 0 and 1`
+        );
+      } else if (smoothing < 0 || smoothing > 1) {
+        messages.push(`${path}.temporalMedianBackoffSmoothing must be between 0 and 1`);
       }
     }
   };

@@ -112,6 +112,7 @@ type AnalysisState = {
   rmsTargetMs: number;
   rmsSum: number;
   rmsValues: RmsWindowEntry[];
+  lastFrameDurationMs: number;
 };
 
 export class AudioSource extends EventEmitter {
@@ -172,8 +173,15 @@ export class AudioSource extends EventEmitter {
         this.options,
         this.options.micFallbacks
       );
-      this.micCandidateIndex =
-        this.lastSuccessfulMicIndex !== null ? this.lastSuccessfulMicIndex : 0;
+      if (this.micInputArgs.length > 0) {
+        if (this.lastSuccessfulMicIndex !== null) {
+          this.micCandidateIndex = this.lastSuccessfulMicIndex % this.micInputArgs.length;
+        } else {
+          this.micCandidateIndex = this.micCandidateIndex % this.micInputArgs.length;
+        }
+      } else {
+        this.micCandidateIndex = 0;
+      }
     } else {
       this.micInputArgs = [];
       this.micCandidateIndex = 0;
@@ -274,6 +282,9 @@ export class AudioSource extends EventEmitter {
     const silenceCircuitThresholdChanged =
       Object.prototype.hasOwnProperty.call(options, 'silenceCircuitBreakerThreshold') &&
       next.silenceCircuitBreakerThreshold !== previous.silenceCircuitBreakerThreshold;
+    const analysisWindowChanged =
+      Object.prototype.hasOwnProperty.call(options, 'analysisRmsWindowMs') &&
+      next.analysisRmsWindowMs !== previous.analysisRmsWindowMs;
 
     this.options = next;
 
@@ -295,6 +306,10 @@ export class AudioSource extends EventEmitter {
 
     if (silenceThresholdChanged || silenceDurationChanged || silenceCircuitThresholdChanged) {
       this.resetSilenceState();
+    }
+
+    if (analysisWindowChanged) {
+      this.reconfigureAnalysisWindows();
     }
 
     if (this.process) {
@@ -356,7 +371,6 @@ export class AudioSource extends EventEmitter {
     AudioSource.clearDeviceCache(format);
     if (this.options.type === 'mic') {
       this.micInputArgs = [];
-      this.micCandidateIndex = 0;
       this.activeMicCandidateIndex = null;
       this.lastSuccessfulMicIndex = null;
     }
@@ -1028,10 +1042,87 @@ export class AudioSource extends EventEmitter {
     this.silenceRestartPending = false;
   }
 
+  private reconfigureAnalysisWindows() {
+    if (this.analysisByFormat.size === 0) {
+      return;
+    }
+
+    const targetWindowMs = Math.max(
+      0,
+      this.options.analysisRmsWindowMs ?? DEFAULT_ANALYSIS_RMS_WINDOW_MS
+    );
+
+    for (const [format, state] of this.analysisByFormat.entries()) {
+      const configuredDuration =
+        typeof this.options.frameDurationMs === 'number' &&
+        Number.isFinite(this.options.frameDurationMs) &&
+        this.options.frameDurationMs > 0
+          ? this.options.frameDurationMs
+          : undefined;
+      const lastDuration =
+        typeof state.lastFrameDurationMs === 'number' &&
+        Number.isFinite(state.lastFrameDurationMs) &&
+        state.lastFrameDurationMs > 0
+          ? state.lastFrameDurationMs
+          : undefined;
+      const resolvedDuration = lastDuration ?? configuredDuration ?? DEFAULT_FRAME_DURATION_MS;
+      const desiredWindowMs = targetWindowMs > 0 ? targetWindowMs : resolvedDuration;
+      const targetFrames = Math.max(
+        1,
+        Math.round(desiredWindowMs / Math.max(resolvedDuration, Number.EPSILON))
+      );
+
+      if (state.rmsWindowFrames !== targetFrames) {
+        while (state.rmsValues.length > targetFrames) {
+          const removed = state.rmsValues.shift();
+          if (removed) {
+            state.rmsSum -= removed.value;
+          }
+        }
+        state.rmsWindowFrames = targetFrames;
+      }
+
+      state.rmsTargetMs = desiredWindowMs;
+
+      if (state.rmsValues.length === 0) {
+        state.rmsSum = 0;
+        state.rms = 0;
+        state.rmsWindowMs = 0;
+      } else {
+        state.rmsSum = state.rmsValues.reduce((sum, entry) => sum + entry.value, 0);
+        state.rms = state.rmsSum / state.rmsValues.length;
+        state.rmsWindowMs = state.rmsValues.reduce((acc, entry) => acc + entry.durationMs, 0);
+      }
+
+      state.lastFrameDurationMs = resolvedDuration;
+      this.analysisByFormat.set(format, state);
+
+      metrics.setDetectorGauge('audio-anomaly', `analysis.${format}.rms`, state.rms);
+      metrics.setDetectorGauge(
+        'audio-anomaly',
+        `analysis.${format}.rms-window-ms`,
+        state.rmsWindowMs
+      );
+      metrics.setDetectorGauge(
+        'audio-anomaly',
+        `analysis.${format}.rms-window-frames`,
+        state.rmsWindowFrames
+      );
+
+      this.emit('analysis', {
+        format,
+        rms: state.rms,
+        spectralCentroid: state.spectralCentroid,
+        frames: state.frames,
+        rmsWindowMs: state.rmsWindowMs,
+        rmsWindowFrames: state.rmsWindowFrames
+      });
+    }
+  }
+
   private rotateMicFallback(reason: AudioRecoverEvent['reason']) {
     if (
       this.options.type !== 'mic' ||
-      this.micInputArgs.length <= 1 ||
       (reason !== 'stream-silence' &&
         reason !== 'watchdog-timeout' &&
         reason !== 'device-discovery-timeout')
@@ -1039,11 +1130,21 @@ export class AudioSource extends EventEmitter {
       return;
     }
 
+    const candidates =
+      this.micInputArgs.length > 1
+        ? this.micInputArgs
+        : buildMicInputArgs(process.platform, this.options, this.options.micFallbacks);
+    const totalCandidates = candidates.length;
+
+    if (totalCandidates <= 1) {
+      return;
+    }
+
     const currentIndex =
       this.activeMicCandidateIndex !== null
         ? this.activeMicCandidateIndex
         : this.micCandidateIndex;
-    this.micCandidateIndex = (currentIndex + 1) % this.micInputArgs.length;
+    this.micCandidateIndex = (currentIndex + 1) % totalCandidates;
   }
 
   private rotateBinaryFallback(reason: AudioRecoverEvent['reason']) {
@@ -1054,7 +1155,8 @@ export class AudioSource extends EventEmitter {
         reason !== 'watchdog-timeout' &&
         reason !== 'process-exit' &&
         reason !== 'spawn-error' &&
-        reason !== 'start-timeout')
+        reason !== 'start-timeout' &&
+        reason !== 'device-discovery-timeout')
     ) {
       return;
     }
@@ -1236,7 +1338,8 @@ export class AudioSource extends EventEmitter {
         rmsWindowMs: 0,
         rmsTargetMs: desiredWindowMs,
         rmsSum: 0,
-        rmsValues: []
+        rmsValues: [],
+        lastFrameDurationMs: resolvedFrameDurationMs
       };
     } else {
       state.rmsTargetMs = desiredWindowMs;
@@ -1264,6 +1367,7 @@ export class AudioSource extends EventEmitter {
     const divisor = state.rmsValues.length || 1;
     state.rms = state.rmsSum / divisor;
     state.rmsWindowMs = state.rmsValues.reduce((acc, value) => acc + value.durationMs, 0);
+    state.lastFrameDurationMs = resolvedFrameDurationMs;
 
     state.frames += 1;
     if (typeof spectral === 'number') {

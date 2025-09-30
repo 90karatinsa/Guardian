@@ -590,6 +590,50 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioAnalysisWindowAdaptsToConfig updates analysis snapshots after reconfiguration', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      frameDurationMs: 50,
+      sampleRate: 16000,
+      channels: 1,
+      analysisRmsWindowMs: 100
+    });
+
+    const makeSamples = () =>
+      new Int16Array(Math.round((16000 * 50) / 1000)).fill(7500);
+
+    for (let i = 0; i < 4; i += 1) {
+      (source as any).analyzeFrame(makeSamples(), 16000, 1, 50, 0.05);
+    }
+
+    let snapshot = source.getAnalysisSnapshot();
+    expect(snapshot.ffmpeg?.rmsWindowFrames).toBe(2);
+    expect(snapshot.ffmpeg?.rmsWindowMs).toBeCloseTo(100, 6);
+
+    source.updateOptions({ analysisRmsWindowMs: 450 });
+
+    snapshot = source.getAnalysisSnapshot();
+    expect(snapshot.ffmpeg?.rmsWindowFrames).toBe(9);
+    expect(snapshot.ffmpeg?.rmsWindowMs).toBeCloseTo(100, 6);
+
+    for (let i = 0; i < 10; i += 1) {
+      (source as any).analyzeFrame(makeSamples(), 16000, 1, 50, 0.05);
+    }
+
+    snapshot = source.getAnalysisSnapshot();
+    expect(snapshot.ffmpeg?.rmsWindowFrames).toBe(9);
+    expect(snapshot.ffmpeg?.rmsWindowMs).toBeCloseTo(450, 6);
+
+    const detectorSnapshot = metrics.snapshot().detectors['audio-anomaly'];
+    expect(detectorSnapshot.gauges['analysis.ffmpeg.rms-window-frames']).toBe(9);
+    expect(detectorSnapshot.gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(450, 6);
+
+    source.stop();
+  });
+
   it('AudioSourceDeviceDiscoveryTimeout recovers and records metrics', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -648,6 +692,68 @@ describe('AudioSource resilience', () => {
 
     source.stop();
     clearSpy.mockRestore();
+  });
+
+  it('AudioDeviceDiscoveryTimeoutResetsFallbacks rotates candidates and clears cache', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const timeoutError = new Error('device discovery timed out') as NodeJS.ErrnoException;
+    timeoutError.code = 'ETIME';
+
+    const listSpy = vi
+      .spyOn(AudioSource, 'listDevices')
+      .mockRejectedValue(timeoutError);
+    const clearSpy = vi.spyOn(AudioSource, 'clearDeviceCache');
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:rotate-discovery',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 40,
+      restartDelayMs: 60,
+      restartMaxDelayMs: 60,
+      restartJitterFactor: 0,
+      deviceDiscoveryTimeoutMs: 200,
+      micFallbacks: {
+        default: [
+          { format: 'alsa', device: 'hw:1' },
+          { format: 'alsa', device: 'hw:2' }
+        ]
+      },
+      random: () => 0
+    });
+
+    const recoverSpy = vi.fn();
+    const errorSpy = vi.fn();
+    source.on('recover', recoverSpy);
+    source.on('error', errorSpy);
+
+    source.start();
+
+    await waitForCondition(() => recoverSpy.mock.calls.length > 0, 1000);
+
+    expect(recoverSpy.mock.calls[0]?.[0]?.reason).toBe('device-discovery-timeout');
+    expect(errorSpy).toHaveBeenCalledWith(expect.any(Error));
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    expect(clearSpy).toHaveBeenCalledWith('auto');
+
+    expect((source as any).micCandidateIndex).toBe(1);
+    expect((source as any).currentBinaryIndex).toBe(1);
+
+    const snapshot = metrics.snapshot();
+    expect(
+      snapshot.pipelines.audio.deviceDiscovery.byReason['device-discovery-timeout']
+    ).toBeGreaterThanOrEqual(1);
+    expect(
+      snapshot.pipelines.audio.deviceDiscoveryByChannel['audio:rotate-discovery']['device-discovery-timeout']
+    ).toBeGreaterThanOrEqual(1);
+
+    source.stop();
+    await vi.runOnlyPendingTimersAsync();
+
+    clearSpy.mockRestore();
+    listSpy.mockRestore();
   });
 
   it('AudioDeviceCircuitBreakerReset rotates ffmpeg candidates after silence', async () => {

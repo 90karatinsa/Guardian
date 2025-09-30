@@ -101,6 +101,10 @@ export function parseYoloDetections(
   }
 
   const detections: YoloDetection[] = [];
+  const metaScaleX = resolveScale(meta.scaleX, meta.scale);
+  const metaScaleY = resolveScale(meta.scaleY, meta.scale);
+  const frameWidth = resolveProjectionDimension(meta.originalWidth, meta.resizedWidth, metaScaleX);
+  const frameHeight = resolveProjectionDimension(meta.originalHeight, meta.resizedHeight, metaScaleY);
 
   const resolveThreshold = createThresholdResolver(options);
 
@@ -134,7 +138,7 @@ export function parseYoloDetections(
       if (!isFiniteBoundingBox(projected.box)) {
         continue;
       }
-      const bbox = clampBoundingBoxToFrame(projected.box, meta.originalWidth, meta.originalHeight);
+      const bbox = clampBoundingBoxToFrame(projected.box, frameWidth, frameHeight);
 
       if (
         !isFiniteNumber(bbox.left) ||
@@ -213,10 +217,8 @@ export function parseYoloDetections(
   }
 
   const fused: YoloDetection[] = [];
-  const metaScaleX = resolveScale(meta.scaleX, meta.scale);
-  const metaScaleY = resolveScale(meta.scaleY, meta.scale);
-  const originalWidth = resolveProjectionDimension(meta.originalWidth, meta.resizedWidth, metaScaleX);
-  const originalHeight = resolveProjectionDimension(meta.originalHeight, meta.resizedHeight, metaScaleY);
+  const originalWidth = frameWidth;
+  const originalHeight = frameHeight;
 
   for (const [classId, group] of perClass.entries()) {
     const prioritize = primaryClassId !== null && classId === primaryClassId;

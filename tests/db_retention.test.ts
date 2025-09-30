@@ -1253,6 +1253,113 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionVacuumOnChangeSummary skips idle vacuums and reports ensured indexes when pruning', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 11, 20);
+    vi.setSystemTime(now);
+
+    const cameraKey = path.basename(cameraOneDir);
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const baseOptions = {
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 60000,
+      archiveDir,
+      snapshotDirs: [cameraOneDir],
+      snapshot: {
+        mode: 'archive',
+        retentionDays: 14,
+        maxArchivesPerCamera: { [cameraKey]: 2 }
+      },
+      vacuum: { mode: 'auto', run: 'on-change' } as const,
+      logger,
+      metrics: metrics as any
+    } satisfies Parameters<typeof runRetentionOnce>[0];
+
+    try {
+      const idleResult = await runRetentionOnce(baseOptions);
+
+      expect(idleResult.vacuum.ran).toBe(false);
+      expect(idleResult.vacuum.mode).toBe('skipped');
+      expect(idleResult.vacuum.runMode).toBe('on-change');
+      expect(idleResult.disk.savingsBytes).toBeGreaterThanOrEqual(0);
+      const idleInfo = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(idleInfo?.[0]).toMatchObject({ vacuumMode: 'skipped', vacuumRunMode: 'on-change' });
+      const idleMetrics = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(idleMetrics).toMatchObject({ archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: expect.any(Number) });
+
+      metrics.recordRetentionRun.mockClear();
+      logger.info.mockClear();
+
+      const staleTs = now - 45 * dayMs;
+      const staleFiles = [
+        path.join(cameraOneDir, 'summary-older-a.jpg'),
+        path.join(cameraOneDir, 'summary-older-b.jpg'),
+        path.join(cameraOneDir, 'summary-older-c.jpg')
+      ];
+      for (const file of staleFiles) {
+        fs.writeFileSync(file, file);
+        fs.utimesSync(file, staleTs / 1000, staleTs / 1000);
+      }
+
+      const archiveRoot = path.join(archiveDir, cameraKey, formatArchiveDate(staleTs - dayMs));
+      fs.mkdirSync(archiveRoot, { recursive: true });
+      const existingArchives = [
+        path.join(archiveRoot, 'existing-a.jpg'),
+        path.join(archiveRoot, 'existing-b.jpg'),
+        path.join(archiveRoot, 'existing-c.jpg')
+      ];
+      for (const existing of existingArchives) {
+        fs.writeFileSync(existing, existing);
+        fs.utimesSync(existing, (staleTs - 2 * dayMs) / 1000, (staleTs - 2 * dayMs) / 1000);
+      }
+
+      db.exec("DROP INDEX IF EXISTS idx_events_ts");
+
+      const changedResult = await runRetentionOnce(baseOptions);
+
+      expect(changedResult.vacuum.ran).toBe(true);
+      expect(changedResult.vacuum.mode).toBe('auto');
+      expect(changedResult.vacuum.runMode).toBe('on-change');
+      expect(Array.isArray(changedResult.vacuum.ensuredIndexes)).toBe(true);
+      expect(changedResult.vacuum.ensuredIndexes).toContain('idx_events_ts');
+      expect(typeof changedResult.vacuum.disk?.savingsBytes).toBe('number');
+      expect(changedResult.disk.savingsBytes).toBeGreaterThanOrEqual(0);
+
+      const perCamera = changedResult.outcome?.perCamera?.[cameraKey];
+      expect(perCamera?.archivedSnapshots).toBe(staleFiles.length);
+      expect(perCamera?.prunedArchives).toBeGreaterThanOrEqual(existingArchives.length);
+
+      const archivedFiles = collectArchiveFiles(path.join(archiveDir, cameraKey));
+      expect(archivedFiles.length).toBeLessThanOrEqual(2);
+
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+      const runCall = metrics.recordRetentionRun.mock.calls[0]?.[0];
+      expect(runCall).toMatchObject({
+        archivedSnapshots: staleFiles.length,
+        prunedArchives: expect.any(Number),
+        diskSavingsBytes: changedResult.disk.savingsBytes
+      });
+      expect(runCall?.perCamera?.[cameraKey]?.prunedArchives).toBeGreaterThanOrEqual(existingArchives.length);
+
+      const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+      expect(infoCall?.[0]).toMatchObject({
+        vacuumMode: 'auto',
+        vacuumRunMode: 'on-change',
+        vacuumTasks: expect.objectContaining({ analyze: false, reindex: false, optimize: false }),
+        diskSavingsBytes: changedResult.disk.savingsBytes,
+        perCamera: expect.objectContaining({ [cameraKey]: expect.any(Object) })
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionChannelSnapshotRotation rotates channel snapshots and records per-camera totals', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 5, 10);

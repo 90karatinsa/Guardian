@@ -15,13 +15,18 @@ nasıl yararlanacağınızı adım adım anlatır.
   komutu ile kanalı sıfırlayabilirsiniz.
 - `guardian daemon pipelines reset --channel video:<kanal> --no-restart` komutu çalıştırıldığında stdout üzerindeki
   "Reset pipeline health, circuit breaker, and transport fallback" mesajını ve `guardian daemon health --json`
-  çıktısındaki `pipelines.ffmpeg.channels[kanal].severity === 'none'` ile `metricsSummary.pipelines.transportFallbacks.video.byChannel`
-  listesindeki ilgili kaydın `total === 0` olduğunu kontrol ederek hem devre kesici hem de fallback sayaçlarının temizlendiğini doğrulayın; `--no-restart` bayrağı bekleyen yeniden başlatma zamanlayıcılarını iptal eder.
+  çıktısındaki `pipelines.ffmpeg.channels[kanal].severity === 'none'`, `metricsSummary.pipelines.transportFallbacks.video.byChannel`
+  listesindeki ilgili kaydın `total === 0` olduğunu ve `metricsSummary.pipelines.transportFallbacks.resets.byChannel[kanal]`
+  değerlerinin `backoff === 0`, `circuitBreaker === 0` seviyesine döndüğünü kontrol ederek hem devre kesici hem de fallback sayaçlarının
+  temizlendiğini doğrulayın; `--no-restart` bayrağı bekleyen yeniden başlatma zamanlayıcılarını iptal eder. Ayrıntılar için README'deki
+  [pipeline sıfırlama akışı](../README.md#pipeline-s%C4%B1f%C4%B1rlama-ak%C4%B1%C5%9F%C4%B1) bölümüne bakın.
 - Ses kanalları için `guardian daemon pipelines reset --channel audio:<kanal> --no-restart` komutunu kullanarak hem
   `metrics.pipelines.audio.byChannel[kanal].restarts` hem de `metrics.pipelines.audio.byChannel[kanal].health.severity`
   değerlerinin anında sıfırlandığını doğrulayın; bu işlem audio devre kesicisi yeniden başlatılmadan sayaçları temizler.
 - Docker ya da systemd ortamında healthcheck scriptini test etmek için `pnpm tsx scripts/healthcheck.ts --health` ve `--ready`
-  seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler.
+  seçeneklerini kullanın; `metricsSummary.pipelines.watchdogRestarts` alanı kanal başına devre kesici tetiklerini özetler ve
+  `transportFallbackResets.total` değeri fallback resetlerinin durumunu raporlar. Ayrıntılı kullanım README'deki
+  [offline tanılama ve sağlık uçları](../README.md#offline-tan%C4%B1lama-ve-sa%C4%9Fl%C4%B1k-u%C3%A7lar%C4%B1) bölümünde belgelenmiştir.
 
 ## Periyodik bakım görevleri
 - RTSP veya ffmpeg kaynaklı bağlantı sorunları için `guardian daemon hooks --reason watchdog-reset` komutunu kullanarak devre
@@ -38,6 +43,9 @@ nasıl yararlanacağınızı adım adım anlatır.
 ## Log ve metrik inceleme
 - `guardian log-level get` ve `guardian log-level set warn` komutlarıyla log seviyesini değiştirirken, `guardian daemon health`
   çıktısındaki `metrics.logs.byLevel` ve `metrics.logs.histogram` alanlarını izleyin.
+- Bastırma timeline TTL temizlemelerini takip etmek için `guardian daemon health --json` çıktısındaki
+  `metricsSummary.suppression.historyTotals.ttlPrunedByChannel` haritasını inceleyin; yüksek değerler belirli kanalların
+  timeline kısıtlamalarına takıldığını gösterir.
 - Prometheus dışa aktarımı için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';\nconsole.log(metrics.exportLogLevelCountersForPrometheus({ labels: { site: 'edge-1' } }));"` komutu ile `guardian_log_level_total`
   ve `guardian_log_last_error_timestamp_seconds` gauge değerlerini doğrudan gözlemleyin. Aynı çıktıda `guardian_log_level_state`
   ve `guardian_log_level_change_total` satırları, log seviyesi değişimlerinin ne kadar sık gerçekleştiğini gösterir.
@@ -59,6 +67,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 | `watchdogRestartsByChannel` artıyor | RTSP jitter veya ağ kopması | `guardian daemon pipelines reset --channel video:<kanal> --no-restart`, `guardian daemon pipelines reset --channel audio:<kanal> --no-restart` ve `guardian daemon status --json` |
 | `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor | Transport fallback zinciri sürekli devrede | `guardian daemon restart --transport video:<kanal>` komutunu çalıştırın ve `transportFallbacks.byChannel` sayaçlarını kontrol edin |
 | `Audio source recovering (reason=ffmpeg-missing)` sürüyor | Mikrofon fallback zinciri başarısız | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
+| `metricsSummary.suppression.historyTotals.ttlPrunedByChannel` yükseliyor | Bastırma timeline TTL değerleri çok kısa | README'deki [konfigürasyon override rehberi](../README.md#konfig%C3%BCrasyon-override-rehberi) ile `timelineTtlMs` ve kanal listelerini gözden geçirin |
 
 - SSE dashboard bağlantısı hatayla kapandığında Guardian `req.on('error')` ve `res.on('error')` dinleyicileriyle istemciyi hemen listeden düşer; loglarda "stream-status" olayından sonra `clients.size` artmaz ve `HttpSseResponseErrorCleanup` testi bu davranışı doğrular.
 - Hot reload sırasında `config.video.channels.<kanal>` için karşılık gelen bir kamera bulunmazsa Guardian reload'u `config.video.channels.video:unused-channel does not match any configured camera channel` hatasıyla reddeder; dosyayı düzeltip tekrar denemeden önce son bilinen yapılandırma kullanılmaya devam eder.
@@ -72,4 +81,8 @@ nasıl yararlanacağınızı adım adım anlatır.
 
 ## Ek kaynaklar
 - Daha fazla örnek, `README.md` içindeki Kurulum ve Sorun Giderme bölümlerinde yer alır.
+- Konfigürasyon override'ları, pipeline reset akışı ve offline sağlık uçları için README'deki
+  [konfigürasyon override rehberi](../README.md#konfig%C3%BCrasyon-override-rehberi),
+  [pipeline sıfırlama akışı](../README.md#pipeline-s%C4%B1f%C4%B1rlama-ak%C4%B1%C5%9F%C4%B1) ve
+  [offline tanılama ve sağlık uçları](../README.md#offline-tan%C4%B1lama-ve-sa%C4%9Fl%C4%B1k-u%C3%A7lar%C4%B1) bölümlerine bakın.
 - API referansı için `docs/api.md` (mevcutsa) ve `tests/http_api.test.ts` dosyalarındaki örnek istekleri inceleyebilirsiniz.
