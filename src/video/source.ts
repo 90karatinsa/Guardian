@@ -339,8 +339,8 @@ export class VideoSource extends EventEmitter {
     this.resetCommandClassifications();
     this.pendingRestartContext = null;
     this.clearRestartTimer();
-    this.clearStartTimer();
-    this.clearWatchdogTimer();
+    this.clearStartTimer('stop');
+    this.clearWatchdogTimer('stop');
     this.clearStreamIdleTimer();
     this.cleanupStream();
     this.clearKillTimer();
@@ -351,11 +351,15 @@ export class VideoSource extends EventEmitter {
       await termination;
     } finally {
       this.clearRestartTimer();
-      this.clearStartTimer();
-      this.clearWatchdogTimer();
+      this.clearStartTimer('stop');
+      this.clearWatchdogTimer('stop');
       this.clearStreamIdleTimer();
       this.clearKillTimer();
       this.cleanupStream();
+      if (this.channel) {
+        metrics.resetPipelineChannel('ffmpeg', this.channel);
+      }
+      this.settleAllTimers('stop');
     }
   }
 
@@ -368,7 +372,7 @@ export class VideoSource extends EventEmitter {
       if (!this.hasReceivedFrame) {
         this.hasReceivedFrame = true;
         this.clearPersistentCommandClassifications();
-        this.clearStartTimer();
+        this.clearStartTimer('frame');
         this.restartCount = 0;
         this.markRtspFallbackSuccess();
       }
@@ -426,7 +430,7 @@ export class VideoSource extends EventEmitter {
     this.recovering = false;
     this.hasReceivedFrame = false;
     this.resetStartTimer();
-    this.clearWatchdogTimer();
+    this.clearWatchdogTimer('start');
     this.clearStreamIdleTimer();
     this.commandGeneration += 1;
     this.resetCommandClassifications({ preservePersistent: true });
@@ -502,7 +506,7 @@ export class VideoSource extends EventEmitter {
       this.handleCommandStderr(line);
     };
     const onStart = () => {
-      this.clearStartTimer();
+      this.clearStartTimer('started');
     };
     command.once('start', onStart);
 
@@ -672,8 +676,8 @@ export class VideoSource extends EventEmitter {
     const threshold = this.options.circuitBreakerThreshold ?? DEFAULT_CIRCUIT_BREAKER_THRESHOLD;
     const shouldTripCircuit = isCircuitCandidate && threshold > 0 && this.circuitBreakerFailures >= threshold;
 
-    this.clearStartTimer();
-    this.clearWatchdogTimer();
+    this.clearStartTimer('recovery');
+    this.clearWatchdogTimer('recovery');
     this.clearStreamIdleTimer();
     this.cleanupStream();
 
@@ -783,8 +787,8 @@ export class VideoSource extends EventEmitter {
 
   private clearAllTimers() {
     this.clearRestartTimer();
-    this.clearStartTimer();
-    this.clearWatchdogTimer();
+    this.clearStartTimer('reset');
+    this.clearWatchdogTimer('reset');
     this.clearStreamIdleTimer();
     this.clearKillTimer();
   }
@@ -882,15 +886,37 @@ export class VideoSource extends EventEmitter {
     );
   }
 
-  private clearStartTimer() {
+  private trackTimerStart(timer: 'start' | 'watchdog', timeoutMs: number) {
+    if (!this.channel) {
+      return;
+    }
+    metrics.startPipelineTimer('ffmpeg', this.channel, timer, timeoutMs);
+  }
+
+  private settleTimer(timer: 'start' | 'watchdog', reason: string) {
+    if (!this.channel) {
+      return;
+    }
+    metrics.resolvePipelineTimer('ffmpeg', this.channel, timer, reason);
+  }
+
+  private settleAllTimers(reason: string) {
+    if (!this.channel) {
+      return;
+    }
+    metrics.clearPipelineTimers('ffmpeg', this.channel, reason);
+  }
+
+  private clearStartTimer(reason?: string) {
     if (this.startTimer) {
       clearTimeout(this.startTimer);
       this.startTimer = null;
+      this.settleTimer('start', reason ?? 'cleared');
     }
   }
 
   private resetStartTimer() {
-    this.clearStartTimer();
+    this.clearStartTimer('reschedule');
     if (this.shouldStop) {
       return;
     }
@@ -900,8 +926,10 @@ export class VideoSource extends EventEmitter {
       return;
     }
 
+    this.trackTimerStart('start', timeout);
     this.startTimer = setTimeout(() => {
       this.startTimer = null;
+      this.settleTimer('start', 'timeout');
       if (this.shouldStop || this.hasReceivedFrame) {
         return;
       }
@@ -925,10 +953,11 @@ export class VideoSource extends EventEmitter {
     }
   }
 
-  private clearWatchdogTimer() {
+  private clearWatchdogTimer(reason?: string) {
     if (this.watchdogTimer) {
       clearTimeout(this.watchdogTimer);
       this.watchdogTimer = null;
+      this.settleTimer('watchdog', reason ?? 'cleared');
     }
   }
 
@@ -940,7 +969,7 @@ export class VideoSource extends EventEmitter {
   }
 
   private resetWatchdogTimer() {
-    this.clearWatchdogTimer();
+    this.clearWatchdogTimer('reschedule');
     if (this.shouldStop) {
       return;
     }
@@ -951,8 +980,10 @@ export class VideoSource extends EventEmitter {
       return;
     }
 
+    this.trackTimerStart('watchdog', idleTimeout);
     this.watchdogTimer = setTimeout(() => {
       this.watchdogTimer = null;
+      this.settleTimer('watchdog', 'timeout');
       if (this.shouldStop) {
         return;
       }

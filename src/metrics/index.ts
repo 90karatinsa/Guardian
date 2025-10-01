@@ -170,6 +170,34 @@ type PipelineDeviceDiscoverySnapshot = {
   byFormat: CounterMap;
 };
 
+type PipelineTimerType = 'start' | 'watchdog';
+
+type PipelineTimerState = {
+  pending: boolean;
+  timeoutMs: number | null;
+  startedAt: number | null;
+  dueAt: number | null;
+  lastStartedAt: number | null;
+  lastCompletedAt: number | null;
+  lastElapsedMs: number | null;
+  lastReason: string | null;
+};
+
+type PipelineTimerStateSnapshot = {
+  pending: boolean;
+  timeoutMs: number | null;
+  startedAt: string | null;
+  dueAt: string | null;
+  lastStartedAt: string | null;
+  lastCompletedAt: string | null;
+  lastElapsedMs: number | null;
+  lastReason: string | null;
+};
+
+type PipelineTimerSnapshot = {
+  byChannel: Record<string, Record<string, PipelineTimerStateSnapshot>>;
+};
+
 type PipelineSnapshot = PipelineChannelSnapshot & {
   attempts: CounterMap;
   byChannel: Record<string, PipelineChannelSnapshot>;
@@ -185,6 +213,7 @@ type PipelineSnapshot = PipelineChannelSnapshot & {
     attempt: HistogramSnapshot;
   };
   transportFallbacks: TransportFallbackSnapshot;
+  timers: PipelineTimerSnapshot;
 };
 
 type SuppressionSnapshot = {
@@ -643,6 +672,13 @@ class MetricsRegistry {
   private readonly transportFallbackByTarget = new Map<string, number>();
   private transportFallbackResetsBackoff = 0;
   private transportFallbackResetsCircuitBreaker = 0;
+  private readonly pipelineTimers: Record<
+    PipelineType,
+    Map<string, Map<PipelineTimerType, PipelineTimerState>>
+  > = {
+    ffmpeg: new Map(),
+    audio: new Map()
+  };
 
   constructor() {
     this.registerReservedHistogram('logs.level', LOG_LEVEL_HISTOGRAM);
@@ -734,6 +770,8 @@ class MetricsRegistry {
     this.transportFallbackByTarget.clear();
     this.transportFallbackResetsBackoff = 0;
     this.transportFallbackResetsCircuitBreaker = 0;
+    this.pipelineTimers.ffmpeg.clear();
+    this.pipelineTimers.audio.clear();
   }
 
   private registerReservedHistogram(metric: string, config: HistogramConfig) {
@@ -1549,8 +1587,95 @@ class MetricsRegistry {
       return;
     }
 
+    this.pipelineTimers[pipeline].delete(channel);
+
     const jitterMetric = `pipeline.${pipeline}.restart.jitter.channel.${channel}`;
     this.clearHistogram(jitterMetric);
+  }
+
+  startPipelineTimer(
+    pipeline: PipelineType,
+    channel: string | null | undefined,
+    timer: PipelineTimerType,
+    timeoutMs: number
+  ) {
+    if (!channel || timeoutMs <= 0) {
+      return;
+    }
+
+    const normalized = channel.trim();
+    if (!normalized) {
+      return;
+    }
+
+    const registry = this.pipelineTimers[pipeline];
+    const state = getPipelineTimerState(registry, normalized, timer);
+    const now = Date.now();
+    state.pending = true;
+    state.timeoutMs = timeoutMs;
+    state.startedAt = now;
+    state.dueAt = now + timeoutMs;
+  }
+
+  resolvePipelineTimer(
+    pipeline: PipelineType,
+    channel: string | null | undefined,
+    timer: PipelineTimerType,
+    reason: string,
+    options: { completedAt?: number; elapsedMs?: number } = {}
+  ) {
+    if (!channel) {
+      return;
+    }
+
+    const normalized = channel.trim();
+    if (!normalized) {
+      return;
+    }
+
+    const registry = this.pipelineTimers[pipeline];
+    const state = getPipelineTimerState(registry, normalized, timer);
+    const completedAt =
+      typeof options.completedAt === 'number' && Number.isFinite(options.completedAt)
+        ? options.completedAt
+        : Date.now();
+    const startedAt = state.startedAt ?? state.lastStartedAt ?? completedAt;
+    state.pending = false;
+    state.lastStartedAt = startedAt;
+    state.lastCompletedAt = completedAt;
+    if (typeof options.elapsedMs === 'number' && Number.isFinite(options.elapsedMs)) {
+      state.lastElapsedMs = options.elapsedMs;
+    } else if (state.startedAt !== null) {
+      state.lastElapsedMs = completedAt - state.startedAt;
+    }
+    state.lastReason = reason || null;
+    state.startedAt = null;
+    state.dueAt = null;
+  }
+
+  clearPipelineTimers(
+    pipeline: PipelineType,
+    channel: string | null | undefined,
+    reason = 'cleared'
+  ) {
+    if (!channel) {
+      return;
+    }
+
+    const normalized = channel.trim();
+    if (!normalized) {
+      return;
+    }
+
+    const registry = this.pipelineTimers[pipeline];
+    const timers = registry.get(normalized);
+    if (!timers) {
+      return;
+    }
+
+    for (const timerKey of timers.keys()) {
+      this.resolvePipelineTimer(pipeline, normalized, timerKey, reason);
+    }
   }
 
   setPipelineChannelHealth(
@@ -1613,6 +1738,8 @@ class MetricsRegistry {
     if (state) {
       resetPipelineChannelState(state);
     }
+
+    this.clearPipelineTimers(pipeline, channel, 'reset');
 
     if (pipeline !== 'ffmpeg') {
       return;
@@ -2217,6 +2344,8 @@ class MetricsRegistry {
     const ffmpegByChannel = mapFromPipelineChannels(this.ffmpegRestartsByChannel);
     const audioByChannel = mapFromPipelineChannels(this.audioRestartsByChannel);
     const transportFallbackByChannel = mapTransportFallbackChannels(this.transportFallbackByChannel);
+    const ffmpegTimers = mapPipelineTimers(this.pipelineTimers.ffmpeg);
+    const audioTimers = mapPipelineTimers(this.pipelineTimers.audio);
     const transportFallbackResetsByChannel = Object.fromEntries(
       Object.entries(transportFallbackByChannel).map(([channel, snapshot]) => [
         channel,
@@ -2402,7 +2531,8 @@ class MetricsRegistry {
               },
               byChannel: transportFallbackResetsByChannel
             }
-          }
+          },
+          timers: ffmpegTimers
         },
         audio: {
           restarts: this.audioRestarts,
@@ -2441,7 +2571,8 @@ class MetricsRegistry {
             byReason: {},
             byTarget: {},
             byChannel: {}
-          }
+          },
+          timers: audioTimers
         }
       },
       suppression: {
@@ -3195,6 +3326,68 @@ function createPipelineChannelState(): PipelineChannelState {
     attemptHistogram: new Map<string, number>(),
     health: createPipelineChannelHealthState()
   };
+}
+
+type PipelineTimerRegistry = Map<string, Map<PipelineTimerType, PipelineTimerState>>;
+
+function createPipelineTimerState(): PipelineTimerState {
+  return {
+    pending: false,
+    timeoutMs: null,
+    startedAt: null,
+    dueAt: null,
+    lastStartedAt: null,
+    lastCompletedAt: null,
+    lastElapsedMs: null,
+    lastReason: null
+  };
+}
+
+function getPipelineTimerState(
+  registry: PipelineTimerRegistry,
+  channel: string,
+  timer: PipelineTimerType
+): PipelineTimerState {
+  let timers = registry.get(channel);
+  if (!timers) {
+    timers = new Map<PipelineTimerType, PipelineTimerState>();
+    registry.set(channel, timers);
+  }
+  let state = timers.get(timer);
+  if (!state) {
+    state = createPipelineTimerState();
+    timers.set(timer, state);
+  }
+  return state;
+}
+
+function mapPipelineTimers(registry: PipelineTimerRegistry): PipelineTimerSnapshot {
+  const result: PipelineTimerSnapshot = { byChannel: {} };
+  const channels = Array.from(registry.keys()).sort((a, b) => a.localeCompare(b));
+  for (const channel of channels) {
+    const timers = registry.get(channel);
+    if (!timers) {
+      continue;
+    }
+    const channelSnapshot: Record<string, PipelineTimerStateSnapshot> = {};
+    const orderedTimers = Array.from(timers.entries()).sort(([a], [b]) => a.localeCompare(b));
+    for (const [timer, state] of orderedTimers) {
+      channelSnapshot[timer] = {
+        pending: state.pending,
+        timeoutMs: state.timeoutMs,
+        startedAt: state.startedAt ? new Date(state.startedAt).toISOString() : null,
+        dueAt: state.dueAt ? new Date(state.dueAt).toISOString() : null,
+        lastStartedAt: state.lastStartedAt ? new Date(state.lastStartedAt).toISOString() : null,
+        lastCompletedAt: state.lastCompletedAt
+          ? new Date(state.lastCompletedAt).toISOString()
+          : null,
+        lastElapsedMs: state.lastElapsedMs,
+        lastReason: state.lastReason
+      };
+    }
+    result.byChannel[channel] = channelSnapshot;
+  }
+  return result;
 }
 
 function resetPipelineChannelState(state: PipelineChannelState) {
