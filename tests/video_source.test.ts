@@ -925,6 +925,103 @@ describe('VideoSource', () => {
     expect(snapshot.pipelines.ffmpeg.lastRestart?.reason).toBe('watchdog-timeout');
   });
 
+  it('VideoSourceRecoveryTimeouts tracks timers and clears metrics on stop', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+    const commandFactory = () => {
+      const command = new FakeCommand();
+      commands.push(command);
+      if (commands.length >= 2) {
+        setTimeout(() => {
+          command.emit('start');
+        }, 0);
+      }
+      return command as unknown as FfmpegCommand;
+    };
+
+    const source = new VideoSource({
+      file: 'rtsp://example-camera/stream',
+      framesPerSecond: 1,
+      channel: 'video:test-camera',
+      startTimeoutMs: 25,
+      watchdogTimeoutMs: 35,
+      restartDelayMs: 15,
+      restartMaxDelayMs: 15,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(30);
+      await Promise.resolve();
+
+      const startTimeoutEvent = recoverEvents.find(event => event.reason === 'start-timeout');
+      expect(startTimeoutEvent).toBeDefined();
+      expect(commands[0]?.killedSignals).toEqual(expect.arrayContaining(['SIGTERM', 'SIGKILL']));
+
+      const firstDelay = startTimeoutEvent?.delayMs ?? 0;
+      await vi.advanceTimersByTimeAsync(firstDelay + 1);
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+
+      const second = commands[1];
+      second.emit('stderr', 'method DESCRIBE failed: Connection timed out');
+
+      await Promise.resolve();
+
+      const rtspEvent = recoverEvents.find(event => event.reason === 'rtsp-timeout');
+      expect(rtspEvent).toBeDefined();
+
+      const rtspDelay = rtspEvent?.delayMs ?? 0;
+      await vi.advanceTimersByTimeAsync(rtspDelay + 1);
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(3);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(40);
+      await Promise.resolve();
+
+      const watchdogEvent = recoverEvents.find(event => event.reason === 'watchdog-timeout');
+      expect(watchdogEvent).toBeDefined();
+
+      const beforeSnapshot = metrics.snapshot();
+      const beforeChannel = beforeSnapshot.pipelines.ffmpeg.byChannel['video:test-camera'];
+      expect(beforeChannel.watchdogBackoffMs).toBeGreaterThan(0);
+      const timerBefore = beforeSnapshot.pipelines.ffmpeg.timers.byChannel['video:test-camera'];
+      expect(timerBefore.watchdog?.pending).toBe(false);
+      expect(timerBefore.watchdog?.lastReason).toBe('timeout');
+      expect(timerBefore.start?.lastReason).toBe('started');
+    } finally {
+      await source.stop();
+      await Promise.resolve();
+      vi.useRealTimers();
+    }
+
+    const afterSnapshot = metrics.snapshot();
+    const afterChannel = afterSnapshot.pipelines.ffmpeg.byChannel['video:test-camera'];
+    expect(afterChannel.watchdogBackoffMs).toBe(0);
+    const timerAfter = afterSnapshot.pipelines.ffmpeg.timers.byChannel['video:test-camera'];
+    expect(timerAfter.watchdog?.pending).toBe(false);
+    expect(timerAfter.watchdog?.lastReason).toBe('stop');
+    expect(timerAfter.start?.lastReason).toBe('stop');
+  });
+
   it('VideoFfmpegGracefulRecovery tracks start-timeout and watchdog restarts with metrics', async () => {
     metrics.reset();
 
