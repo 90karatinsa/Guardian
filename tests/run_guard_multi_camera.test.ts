@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import type { ConfigManager, GuardianConfig } from '../src/config/index.js';
+import type { CameraConfig, ConfigManager, GuardianConfig } from '../src/config/index.js';
 import { EventBus } from '../src/eventBus.js';
 
 let metrics: typeof import('../src/metrics/index.js').default;
@@ -324,7 +324,7 @@ describe('run-guard multi camera orchestration', () => {
         4000
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -415,7 +415,209 @@ describe('run-guard multi camera orchestration', () => {
         snapshotAfterSecond.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.history
       ).toHaveLength(2);
     } finally {
-      runtime.stop();
+      await runtime.stop();
+    }
+  });
+
+  it('GuardReloadRtspTransportRestart rebuilds the pipeline when rtsp transport changes', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            ffmpeg: { rtspTransport: 'tcp' },
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      expect(MockVideoSource.instances).toHaveLength(1);
+
+      const initialPipeline = runtime.pipelines.get('video:cam-1');
+      expect(initialPipeline).toBeDefined();
+      const initialSource = initialPipeline?.source as MockVideoSource | undefined;
+      const initialTransport = initialPipeline?.transport;
+      expect(initialTransport?.current).toBe('tcp');
+
+      const now = Date.now();
+      initialSource?.emit('transport-change', {
+        channel: 'video:cam-1',
+        from: 'tcp',
+        to: 'udp',
+        reason: 'rtsp-timeout',
+        attempt: 1,
+        stage: 1,
+        resetsBackoff: true,
+        resetsCircuitBreaker: true,
+        at: now,
+        metricsRecorded: false
+      });
+
+      await Promise.resolve();
+
+      expect(initialTransport?.history).toHaveLength(1);
+
+      const snapshotBeforeReload = metrics.snapshot();
+      expect(
+        snapshotBeforeReload.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.history
+      ).toHaveLength(1);
+
+      const nextConfig: GuardianConfig = JSON.parse(JSON.stringify(initialConfig));
+      nextConfig.video.cameras[0]!.ffmpeg = {
+        ...(nextConfig.video.cameras[0]!.ffmpeg ?? {}),
+        rtspTransport: 'udp'
+      } as CameraConfig['ffmpeg'];
+
+      manager.setConfig(nextConfig);
+
+      await waitFor(
+        () => runtime.pipelines.get('video:cam-1')?.pipelineState.ffmpeg.rtspTransport === 'udp'
+      );
+
+      expect(MockVideoSource.instances).toHaveLength(2);
+      const restartedPipeline = runtime.pipelines.get('video:cam-1');
+      expect(restartedPipeline).toBeDefined();
+      expect(restartedPipeline).not.toBe(initialPipeline);
+
+      const restartedSource = restartedPipeline?.source as MockVideoSource | undefined;
+      expect(restartedSource).toBe(MockVideoSource.instances.at(-1));
+      expect(restartedSource?.options.rtspTransport).toBe('udp');
+
+      const startCount = MockVideoSource.startCounts.at(-1);
+      expect(startCount).toBe(1);
+
+      const transportState = restartedPipeline?.transport;
+      expect(transportState?.history).toHaveLength(0);
+      expect(transportState?.total).toBe(0);
+      expect(transportState?.current).toBe('udp');
+
+      const snapshotAfterReload = metrics.snapshot();
+      const fallbackSnapshot =
+        snapshotAfterReload.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1'];
+      expect(fallbackSnapshot?.total ?? 0).toBe(0);
+      expect(fallbackSnapshot?.history ?? []).toHaveLength(0);
+      expect(fallbackSnapshot?.last ?? null).toBeNull();
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('GuardStopWaitsForVideo waits for video pipelines to finish stopping', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const config: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://camera-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      config
+    });
+
+    const deferred = createDeferred<void>();
+    let stopPromise: Promise<void> | null = null;
+    let stopSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      const pipeline = runtime.pipelines.get('video:cam-1');
+      expect(pipeline).toBeDefined();
+
+      const source = pipeline?.source as MockVideoSource;
+      const channel = pipeline?.channel ?? 'video:cam-1';
+
+      const now = Date.now();
+      source.emit('recover', {
+        reason: 'watchdog-timeout',
+        attempt: 1,
+        delayMs: 420,
+        at: now,
+        channel,
+        meta: { baseDelayMs: 420 }
+      });
+
+      await waitFor(() => pipeline?.restartStats.watchdogRestarts === 1);
+      await waitFor(
+        () => metrics.snapshot().pipelines.ffmpeg.watchdogRestartsByChannel[channel] === 1
+      );
+
+      stopSpy = vi
+        .spyOn(source, 'stop')
+        .mockImplementation(async () => {
+          source.emit('stopped');
+          await deferred.promise;
+        });
+
+      stopPromise = runtime.stop();
+      expect(stopPromise).toBeInstanceOf(Promise);
+
+      let resolved = false;
+      void stopPromise.then(() => {
+        resolved = true;
+      });
+
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      const snapshotDuringStop = metrics.snapshot();
+      expect(snapshotDuringStop.pipelines.ffmpeg.watchdogRestartsByChannel[channel]).toBe(1);
+      expect(pipeline?.restartStats.watchdogRestarts).toBe(1);
+
+      deferred.resolve();
+      await stopPromise;
+
+      expect(resolved).toBe(true);
+
+      const snapshotAfterStop = metrics.snapshot();
+      expect(snapshotAfterStop.pipelines.ffmpeg.watchdogRestartsByChannel[channel]).toBeUndefined();
+      expect(pipeline?.restartStats.watchdogRestarts).toBe(0);
+      expect(pipeline?.restartStats.watchdogBackoffMs).toBe(0);
+      expect(pipeline?.restartStats.health.severity).toBe('none');
+      expect(pipeline?.restartStats.health.reason).toBeNull();
+      expect(pipeline?.restartStats.health.degradedSince).toBeNull();
+    } finally {
+      deferred.resolve();
+      stopSpy?.mockRestore();
+      if (stopPromise) {
+        await stopPromise.catch(() => {});
+      } else {
+        await runtime.stop();
+      }
     }
   });
 
@@ -502,7 +704,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(source.resetTransportFallback).toHaveBeenCalled();
     } finally {
       __test__.reset();
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -624,7 +826,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(afterSnapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBe(0);
       expect(afterSnapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.restarts).toBe(0);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -694,7 +896,7 @@ describe('run-guard multi camera orchestration', () => {
         reason: 'manual-cli-reset'
       });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -880,7 +1082,7 @@ describe('run-guard multi camera orchestration', () => {
       areaThreshold: 0.018
     });
 
-    runtime.stop();
+    await runtime.stop();
   });
 
   it('RunGuardChannelOverrides tracks per-channel restart metrics', async () => {
@@ -987,7 +1189,7 @@ describe('run-guard multi camera orchestration', () => {
     expect(camBSnapshot.byReason['stream-error']).toBe(1);
     expect(camBSnapshot.totalRestartDelayMs).toBe(600);
 
-    runtime.stop();
+    await runtime.stop();
   });
 
   it('RunGuardChannelDegradeEvents emits system events when watchdog thresholds are exceeded', async () => {
@@ -1047,7 +1249,7 @@ describe('run-guard multi camera orchestration', () => {
     expect(channelSnapshot.health.restarts).toBeGreaterThanOrEqual(3);
     expect(channelSnapshot.health.degradedSince).toBeTypeOf('string');
 
-    runtime.stop();
+    await runtime.stop();
   });
 
   it('RunGuardChannelIdleOverrides propagates ffmpeg timers without restart', async () => {
@@ -1192,7 +1394,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(pipeline!.restartStats.last?.meta.minDelayMs).toBe(180);
       expect(pipeline!.restartStats.byReason.get('watchdog-timeout')).toBeGreaterThanOrEqual(1);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1350,7 +1552,7 @@ describe('run-guard multi camera orchestration', () => {
         expect.objectContaining({ debounceFrames: 5, backoffFrames: 9 })
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   }, 10000);
 
@@ -1482,7 +1684,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']?.restarts).toBe(1);
       expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']).toBeUndefined();
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1609,7 +1811,7 @@ describe('run-guard multi camera orchestration', () => {
 
       expect(MockVideoSource.instances.length).toBeGreaterThan(originalInstanceCount);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   }, 12000);
 
@@ -1675,7 +1877,7 @@ describe('run-guard multi camera orchestration', () => {
         snapshot.histograms['pipeline.ffmpeg.restart.jitter.channel.video:cam-1']
       ).toBeUndefined();
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1759,7 +1961,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']).toBeUndefined();
       expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']).toBeDefined();
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1823,7 +2025,7 @@ describe('run-guard multi camera orchestration', () => {
       const snapshot = metrics.snapshot();
       expect(snapshot.pipelines.audio.byChannel['audio:mic-test']).toBeUndefined();
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1946,7 +2148,7 @@ describe('run-guard multi camera orchestration', () => {
       );
     } finally {
       recordSpy.mockRestore();
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2011,7 +2213,7 @@ describe('run-guard multi camera orchestration', () => {
         areaThreshold: 0.018
       });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2199,7 +2401,7 @@ describe('run-guard multi camera orchestration', () => {
         temporalMedianBackoffSmoothing: 0.55
       });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2257,7 +2459,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(MockMotionDetector.instances[0]?.options).toMatchObject({ diffThreshold: 40 });
       expect(MockMotionDetector.instances[1]?.options).toMatchObject({ diffThreshold: 24 });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2321,7 +2523,7 @@ describe('run-guard multi camera orchestration', () => {
     const secondReset = runtime.resetCircuitBreaker(channel);
     expect(secondReset).toBe(false);
 
-    runtime.stop();
+    await runtime.stop();
   });
 
   it('RunGuardChannelPoseOverrides applies layered pose config and restarts on updates', async () => {
@@ -2404,7 +2606,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(latestPose?.forecastHorizonMs).toBe(950);
       expect(latestPose?.minMovement).toBe(0.3);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2491,7 +2693,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(latest?.labels).toEqual(['person', 'vehicle', 'package']);
       expect(latest?.labelMap).toEqual({ vehicle: 'threat', package: 'delivery' });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2548,7 +2750,7 @@ describe('run-guard multi camera orchestration', () => {
         vehicle: 'vehicle'
       });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2669,7 +2871,7 @@ describe('run-guard multi camera orchestration', () => {
       expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.byReason?.['corrupted-frame']).toBe(1);
     } finally {
       restartSpy.mockRestore();
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2742,7 +2944,7 @@ describe('run-guard multi camera orchestration', () => {
         snapshot.pipelines.ffmpeg.historyLimit
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -2892,7 +3094,7 @@ describe('run-guard multi camera orchestration', () => {
     expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-default']?.restarts).toBe(1);
     expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-override']?.restarts).toBe(1);
 
-    runtime.stop();
+    await runtime.stop();
   });
 
   it('GuardRtspPerCamera applies channel overrides and tracks recoveries independently', async () => {
@@ -3144,7 +3346,7 @@ describe('run-guard multi camera orchestration', () => {
       ).toBe(1);
       expect(metricsSnapshot.pipelines.ffmpeg.byChannel['video:cam-2']?.restarts).toBe(1);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -3305,7 +3507,7 @@ describe('run-guard multi camera orchestration', () => {
         logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -3381,7 +3583,7 @@ describe('run-guard multi camera orchestration', () => {
 
     expect(MockPersonDetector.calls).toEqual(['video:cam-1', 'video:cam-2']);
 
-    runtime.stop();
+    await runtime.stop();
   });
 
   it('LightPipelineActivation enables light detectors per camera and applies hot reload updates', async () => {
@@ -3482,7 +3684,7 @@ describe('run-guard multi camera orchestration', () => {
         expect.objectContaining({ deltaThreshold: 35, debounceFrames: 5, noiseMultiplier: 3 })
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -3572,7 +3774,7 @@ describe('run-guard multi camera orchestration', () => {
     } finally {
       resolveStop?.();
       stopSpy?.mockRestore();
-      runtime.stop();
+      await runtime.stop();
     }
   });
 });
@@ -3593,6 +3795,16 @@ function createCliIo() {
     }
   } as unknown as NodeJS.WritableStream;
   return { io: { stdout: stdoutStream, stderr: stderrStream }, stdout, stderr };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 async function waitFor(predicate: () => boolean, timeout = 2000) {

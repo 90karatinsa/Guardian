@@ -164,6 +164,80 @@ describe('YoloParser utilities', () => {
     expect(packageDetection?.areaRatio ?? 0).toBeCloseTo((200 * 250) / (800 * 600), 5);
   });
 
+  it('YoloClassPriorityTieBreak prioritizes person class and projection priority', () => {
+    const classCount = 2;
+    const attributes = YOLO_CLASS_START_INDEX + classCount;
+    const detections = 2;
+    const data = new Float32Array(attributes * detections).fill(0);
+
+    const assignDetection = (
+      index: number,
+      values: {
+        cx: number;
+        cy: number;
+        width: number;
+        height: number;
+        objectnessLogit: number;
+        classLogits: number[];
+      }
+    ) => {
+      data[0 * detections + index] = values.cx;
+      data[1 * detections + index] = values.cy;
+      data[2 * detections + index] = values.width;
+      data[3 * detections + index] = values.height;
+      data[OBJECTNESS_INDEX * detections + index] = values.objectnessLogit;
+      values.classLogits.forEach((logitValue, offset) => {
+        const attributeIndex = YOLO_CLASS_START_INDEX + offset;
+        data[attributeIndex * detections + index] = logitValue;
+      });
+    };
+
+    assignDetection(0, {
+      cx: 320,
+      cy: 240,
+      width: 400,
+      height: 300,
+      objectnessLogit: logit(0.9),
+      classLogits: [logit(0.9), logit(0.9)]
+    });
+
+    assignDetection(1, {
+      cx: 120,
+      cy: 120,
+      width: 120,
+      height: 100,
+      objectnessLogit: logit(0.9),
+      classLogits: [logit(0.9), logit(0.05)]
+    });
+
+    const tensor = new ort.Tensor('float32', data, [1, attributes, detections]);
+
+    const meta = {
+      scale: 0.8,
+      padX: 0,
+      padY: 80,
+      originalWidth: 800,
+      originalHeight: 600,
+      resizedWidth: 640,
+      resizedHeight: 480,
+      scaleX: 640 / 800,
+      scaleY: 480 / 600
+    } satisfies Parameters<typeof parseYoloDetections>[1];
+
+    const results = parseYoloDetections(tensor, meta, {
+      classIndices: [0, 1],
+      scoreThreshold: 0.5,
+      nmsThreshold: 0.1
+    });
+
+    expect(results).toHaveLength(3);
+    expect(results[0]?.classId).toBe(0);
+    expect(results[1]?.classId).toBe(0);
+    expect(results[2]?.classId).toBe(1);
+    expect(results[0]?.score ?? 0).toBeCloseTo(results[2]?.score ?? 0, 5);
+    expect(results[0]?.areaRatio ?? 0).toBeGreaterThan(results[1]?.areaRatio ?? 0);
+  });
+
   it('YoloProjectionFallbacksToResizedDimensions', () => {
     const classCount = 2;
     const attributes = YOLO_CLASS_START_INDEX + classCount;

@@ -1126,10 +1126,26 @@ function validateLogicalConfig(config: GuardianConfig) {
     if (!Array.isArray(sequence)) {
       return;
     }
+    const seen = new Map<string, { index: number; value: string }>();
     sequence.forEach((value, index) => {
-      if (typeof value !== 'string' || value.trim().length === 0) {
+      if (typeof value !== 'string') {
         messages.push(`${path}[${index}] must be a non-empty string`);
+        return;
       }
+      const trimmed = value.trim();
+      if (trimmed.length === 0) {
+        messages.push(`${path}[${index}] must be a non-empty string`);
+        return;
+      }
+      const key = trimmed.toLowerCase();
+      const existing = seen.get(key);
+      if (existing) {
+        messages.push(
+          `${path}[${index}] duplicates ${path}[${existing.index}] value "${existing.value}" ignoring case`
+        );
+        return;
+      }
+      seen.set(key, { index, value: trimmed });
     });
   };
 

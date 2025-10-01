@@ -53,6 +53,16 @@ function createTestIo(): TestIo {
   };
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function parseSystemdUnit(content: string): Record<string, string[]> {
   const map: Record<string, string[]> = {};
   for (const rawLine of content.split(/\r?\n/)) {
@@ -528,6 +538,12 @@ describe('GuardianCliHealthcheck', () => {
     expect(channelSummary.backoffMs).toBe(0);
     expect(channelSummary.watchdogRestarts).toBe(0);
     expect(channelSummary.watchdogBackoffMs).toBe(0);
+    expect(payload.pipelines.ffmpeg.transportFallbacks.total).toBe(0);
+    expect(payload.pipelines.ffmpeg.transportFallbacks.byChannel).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ channel: 'video:cam-1', total: 0, lastReason: null })
+      ])
+    );
 
     const fallbackSummary = payload.metricsSummary.pipelines.transportFallbacks.video.byChannel.find(
       (entry: { channel: string }) => entry.channel === 'video:cam-1'
@@ -553,6 +569,23 @@ describe('GuardianCliHealthcheck', () => {
       channel: 'front-door',
       to: 'udp',
       at: baseTime - 500
+    });
+
+    metrics.recordSuppressedEvent({
+      ruleId: 'motion-window',
+      reason: 'cooldown',
+      channel: 'front-door',
+      historyCount: 2,
+      combinedHistoryCount: 3,
+      channels: ['front-door']
+    });
+    metrics.recordSuppressedEvent({
+      ruleId: 'motion-window',
+      reason: 'cooldown',
+      channel: 'rear-lot',
+      historyCount: 1,
+      combinedHistoryCount: 1,
+      channels: ['rear-lot']
     });
 
     metrics.recordRetentionRun({
@@ -593,6 +626,31 @@ describe('GuardianCliHealthcheck', () => {
       }
     ]);
     expect(payload.metricsSummary.pipelines.transportFallbacks.audio.byChannel).toEqual([]);
+    expect(payload.pipelines.ffmpeg.transportFallbacks.total).toBe(3);
+    expect(payload.pipelines.ffmpeg.transportFallbacks.byChannel).toEqual([
+      {
+        channel: 'front-door',
+        total: 2,
+        lastReason: 'rtsp-timeout',
+        lastAt: expect.any(String)
+      },
+      {
+        channel: 'rear-lot',
+        total: 1,
+        lastReason: 'connect-error',
+        lastAt: expect.any(String)
+      }
+    ]);
+    expect(payload.suppression.total).toBe(2);
+    expect(payload.suppression.byChannel).toEqual([
+      { channel: 'front-door', total: 1 },
+      { channel: 'rear-lot', total: 1 }
+    ]);
+    expect(payload.suppression.byReason).toEqual([{ reason: 'cooldown', total: 2 }]);
+    expect(payload.suppression.history.historyCount).toBe(3);
+    expect(payload.suppression.history.combinedHistoryCount).toBe(4);
+    expect(payload.suppression.history.historyTtlPruned).toBe(0);
+    expect(payload.suppression.lastEvent?.ruleId).toBe('motion-window');
     expect(payload.metricsSummary.retention).toMatchObject({
       runs: 1,
       warnings: 2,
@@ -958,6 +1016,7 @@ describe('GuardianCliRetention', () => {
       optimize: false,
       pragmas: undefined,
       indexVersion: 1,
+      indexVersionChanged: false,
       ensuredIndexes: [],
       disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
       tables: []
@@ -1022,6 +1081,92 @@ describe('GuardianCliShutdown', () => {
     expect(stopCode).toBe(0);
     expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(stopIo.stdout()).toContain('Guardian daemon stopped (status: ok)');
+    await expect(startPromise).resolves.toBe(0);
+  });
+
+  it('CliHealthAwaitStop waits for guard stop promises and reports suppression summaries', async () => {
+    const deferred = createDeferred<void>();
+    const stopSpy = vi.fn().mockReturnValue(deferred.promise);
+    startGuardMock.mockResolvedValue({
+      stop: stopSpy,
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: vi.fn().mockReturnValue(false)
+    });
+
+    const startPromise = runCli(['start'], createTestIo().io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const sampleTime = Date.now();
+    metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
+      channel: 'video:cam-main',
+      delayMs: 1500,
+      jitterMs: 60,
+      at: sampleTime - 250
+    });
+    metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+      channel: 'video:cam-main',
+      from: 'udp',
+      to: 'tcp',
+      at: sampleTime - 500
+    });
+    metrics.recordSuppressedEvent({
+      ruleId: 'motion-window',
+      reason: 'cooldown',
+      channel: 'video:cam-main',
+      historyCount: 2,
+      combinedHistoryCount: 4,
+      cooldownMs: 1500,
+      channels: ['video:cam-main']
+    });
+
+    const healthIo = createTestIo();
+    const healthCode = await runCli(['daemon', 'health', '--json'], healthIo.io);
+    expect(healthCode).toBe(0);
+    const payload = JSON.parse(healthIo.stdout().trim());
+    expect(payload.pipelines.ffmpeg.watchdogRestarts).toBe(1);
+    expect(payload.pipelines.ffmpeg.transportFallbacks.total).toBe(1);
+    expect(payload.pipelines.ffmpeg.transportFallbacks.byChannel).toEqual([
+      {
+        channel: 'video:cam-main',
+        total: 1,
+        lastReason: 'rtsp-timeout',
+        lastAt: expect.any(String)
+      }
+    ]);
+    expect(payload.suppression.total).toBe(1);
+    expect(payload.suppression.byChannel).toEqual([
+      { channel: 'video:cam-main', total: 1 }
+    ]);
+    expect(payload.suppression.lastEvent?.reason).toBe('cooldown');
+
+    const stopIo = createTestIo();
+    const stopPromise = runCli(['stop'], stopIo.io);
+
+    await vi.waitFor(() => {
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+    });
+
+    let stopResolved = false;
+    void stopPromise.then(() => {
+      stopResolved = true;
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(stopResolved).toBe(false);
+    expect(stopIo.stdout()).toBe('');
+
+    deferred.resolve();
+
+    const stopCode = await stopPromise;
+    expect(stopCode).toBe(0);
+    expect(stopIo.stdout()).toContain('Guardian daemon stopped (status: ok)');
+
     await expect(startPromise).resolves.toBe(0);
   });
 

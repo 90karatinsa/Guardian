@@ -5,14 +5,16 @@
 body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   margin: 0;
-  padding: 1.5rem;
+  padding: clamp(1rem, 2vw + 1rem, 2.5rem);
   background: #f5f7fa;
   color: #1f2933;
 }
 
-header {
-  max-width: 960px;
-  margin: 0 auto 1.5rem auto;
+.dashboard-header {
+  max-width: 1200px;
+  margin: 0 auto 1.75rem;
+  display: grid;
+  gap: 0.75rem;
 }
 
 h1 {
@@ -50,10 +52,10 @@ h1 {
 
 .filters {
   margin-top: 1rem;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 0.75rem;
-  align-items: flex-end;
+  align-items: end;
 }
 
 .filters label {
@@ -65,7 +67,7 @@ h1 {
 }
 
 .filters label.wide {
-  flex: 1 1 16rem;
+  grid-column: span 2;
 }
 
 .filters input,
@@ -85,6 +87,7 @@ h1 {
   padding: 0.5rem 1rem;
   font-weight: 600;
   cursor: pointer;
+  justify-self: start;
 }
 
 .filters button.secondary {
@@ -92,36 +95,26 @@ h1 {
   color: #243b53;
 }
 
-.stream-widget,
-.metrics-widget {
+.dashboard-card {
   background: #fff;
-  border-radius: 0.75rem;
+  border-radius: 0.85rem;
   padding: 1rem 1.25rem;
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-  border: 1px solid #d9e2ec;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(217, 226, 236, 0.8);
+  backdrop-filter: blur(4px);
 }
 
 .stream-widget h2,
-.metrics-widget h2 {
+.metrics-widget h2,
+.channel-filter h2 {
   margin: 0 0 0.75rem 0;
   font-size: 1.05rem;
   color: #243b53;
 }
 
 .channel-filter {
-  background: #fff;
-  border-radius: 0.75rem;
-  padding: 1rem 1.25rem;
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-  border: 1px solid #d9e2ec;
   display: grid;
   gap: 0.75rem;
-}
-
-.channel-filter h2 {
-  margin: 0;
-  font-size: 1.05rem;
-  color: #243b53;
 }
 
 .channel-options {
@@ -277,13 +270,21 @@ h1 {
   color: #1f2933;
 }
 
-main.dashboard {
+main.dashboard-grid {
   max-width: 1200px;
   margin: 0 auto;
   display: grid;
   gap: 1.5rem;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 7fr) minmax(0, 4fr);
   align-items: start;
+}
+
+main.dashboard-grid[data-layout='tablet'] {
+  grid-template-columns: minmax(0, 5fr) minmax(0, 4fr);
+}
+
+main.dashboard-grid[data-layout='compact'] {
+  grid-template-columns: 1fr;
 }
 
 #event-column {
@@ -292,9 +293,16 @@ main.dashboard {
   align-content: start;
 }
 
-#events {
+.event-feed {
   display: grid;
   gap: 0.75rem;
+}
+
+.event-feed.dashboard-card {
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
 }
 
 .event {
@@ -310,6 +318,11 @@ main.dashboard {
 .event:hover {
   border-color: #8898aa;
   box-shadow: 0 4px 12px rgba(15, 23, 42, 0.12);
+}
+
+.event:focus-visible {
+  outline: 3px solid rgba(18, 127, 191, 0.4);
+  outline-offset: 2px;
 }
 
 .event.active {
@@ -343,21 +356,30 @@ main.dashboard {
   color: #d64545;
 }
 
-#preview {
-  background: #fff;
-  border-radius: 0.75rem;
-  padding: 1rem;
-  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-  border: 1px solid #d9e2ec;
+.preview-panel {
+  display: grid;
+  gap: 1rem;
 }
 
-#preview figure {
+.preview-figure {
   margin: 0;
+  display: grid;
+  gap: 0.75rem;
 }
 
-#preview img {
+.preview-figure:focus-visible {
+  outline: 3px solid rgba(18, 127, 191, 0.6);
+  outline-offset: 2px;
+}
+
+.preview-images {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.preview-images img {
   width: 100%;
-  border-radius: 0.5rem;
+  border-radius: 0.6rem;
   box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08);
 }
 
@@ -368,7 +390,22 @@ main.dashboard {
 }
 
 @media (max-width: 960px) {
-  main.dashboard {
+  main.dashboard-grid[data-layout='tablet'],
+  main.dashboard-grid[data-layout='compact'] {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  body {
+    padding: 1rem;
+  }
+
+  .filters {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+
+  .filters label.wide {
+    grid-column: span 1;
   }
 }

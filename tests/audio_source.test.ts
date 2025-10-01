@@ -89,6 +89,91 @@ describe('AudioSource resilience', () => {
     source.stop();
   });
 
+  it('AudioDeviceDiscoveryTimeoutUnref unrefs the timeout and schedules a retry', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const fakeTimer = {
+      unref: vi.fn(),
+      ref: vi.fn(),
+      hasRef: vi.fn()
+    } as unknown as NodeJS.Timeout;
+    const killSpy = vi.fn();
+    const realSetTimeout = global.setTimeout;
+    const realClearTimeout = global.clearTimeout;
+    let discoveryTimeoutHandler: (() => void) | null = null;
+
+    const setTimeoutSpy = vi
+      .spyOn(global, 'setTimeout')
+      .mockImplementation((handler: any, timeout?: any, ...args: any[]) => {
+        if (typeof handler === 'function' && timeout === 1234 && !discoveryTimeoutHandler) {
+          discoveryTimeoutHandler = handler as () => void;
+          return fakeTimer;
+        }
+        return realSetTimeout(handler as any, timeout as any, ...args);
+      });
+
+    const clearTimeoutSpy = vi
+      .spyOn(global, 'clearTimeout')
+      .mockImplementation((timeout: any) => {
+        if (timeout === fakeTimer) {
+          return;
+        }
+        return realClearTimeout(timeout as any);
+      });
+
+    execFileMock.mockImplementationOnce(() => ({
+      kill: killSpy
+    }) as unknown as ChildProcess);
+    execFileMock.mockImplementation((_, __, callback: ExecFileCallback) => {
+      const error = new Error('ffprobe timeout') as ExecFileException;
+      error.code = 'ETIME';
+      (error as ExecFileException & { timedOut?: boolean }).timedOut = true;
+      callback(error, '', '');
+      return { kill: vi.fn() } as unknown as ChildProcess;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:device-discovery-timeout',
+      deviceDiscoveryTimeoutMs: 1234,
+      restartDelayMs: 100,
+      restartMaxDelayMs: 100,
+      restartJitterFactor: 0,
+      random: () => 0
+    });
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(execFileMock).toHaveBeenCalled();
+      expect(fakeTimer.unref).toHaveBeenCalledTimes(1);
+      expect(discoveryTimeoutHandler).toBeTypeOf('function');
+
+      discoveryTimeoutHandler?.();
+
+      const pendingSequence = (source as any).startSequencePromise;
+      if (pendingSequence) {
+        await pendingSequence.catch(() => {});
+      }
+
+      expect(killSpy).toHaveBeenCalledWith('SIGKILL');
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(fakeTimer);
+      const snapshot = metrics.snapshot();
+      expect(
+        snapshot.pipelines.audio.deviceDiscovery.byReason['device-discovery-timeout']
+      ).toBeGreaterThanOrEqual(1);
+      const deviceChannelStats =
+        snapshot.pipelines.audio.deviceDiscoveryByChannel['audio:device-discovery-timeout'];
+      expect(deviceChannelStats?.['device-discovery-timeout']).toBeGreaterThanOrEqual(1);
+    } finally {
+      source.stop();
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
   it('AudioFfmpegInputValidation emits recoverable stream error when input missing', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -676,6 +761,52 @@ describe('AudioSource resilience', () => {
     const detectorSnapshot = metrics.snapshot().detectors['audio-anomaly'];
     expect(detectorSnapshot.gauges['analysis.ffmpeg.rms-window-frames']).toBe(9);
     expect(detectorSnapshot.gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(450, 6);
+
+    source.stop();
+  });
+
+  it('AudioAnalysisWindowReconfigure trims existing analysis buffers when the window shrinks', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'pipe:0',
+      frameDurationMs: 40,
+      sampleRate: 16000,
+      channels: 1,
+      analysisRmsWindowMs: 400
+    });
+
+    const makeSamples = (durationMs: number) =>
+      new Int16Array(Math.round((16000 * durationMs) / 1000)).fill(500);
+
+    for (let i = 0; i < 12; i += 1) {
+      (source as any).analyzeFrame(makeSamples(40), 16000, 1, 40, 0.05);
+    }
+
+    const initialState = (source as any).analysisByFormat.get('ffmpeg');
+    expect(initialState?.rmsValues.length).toBeGreaterThan(4);
+
+    source.updateOptions({ analysisRmsWindowMs: 160 });
+
+    const updatedState = (source as any).analysisByFormat.get('ffmpeg');
+    expect(updatedState).toBeDefined();
+
+    const targetFrames = Math.max(1, Math.round(160 / 40));
+    expect(updatedState.rmsValues.length).toBeLessThanOrEqual(targetFrames);
+    const retainedDuration = updatedState.rmsValues.reduce(
+      (sum: number, entry: { durationMs: number }) => sum + entry.durationMs,
+      0
+    );
+    expect(retainedDuration).toBeLessThanOrEqual(160);
+
+    const analysisSnapshot = source.getAnalysisSnapshot();
+    expect(analysisSnapshot.ffmpeg?.rmsWindowFrames).toBe(targetFrames);
+    expect(analysisSnapshot.ffmpeg?.rmsWindowMs).toBeCloseTo(160, 6);
+
+    const detectorSnapshot = metrics.snapshot().detectors['audio-anomaly'];
+    expect(detectorSnapshot.gauges['analysis.ffmpeg.rms-window-frames']).toBe(targetFrames);
+    expect(detectorSnapshot.gauges['analysis.ffmpeg.rms-window-ms']).toBeCloseTo(160, 6);
 
     source.stop();
   });

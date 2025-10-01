@@ -54,6 +54,7 @@ export type RetentionVacuumSummary = {
   target?: string;
   pragmas?: string[];
   indexVersion?: number;
+  indexVersionChanged?: boolean;
   ensuredIndexes?: string[];
   disk?: {
     before: DatabaseDiskUsageSnapshot;
@@ -484,6 +485,10 @@ async function executeRetentionRun(
       : undefined,
     pragmas: shouldVacuum ? vacuumResult?.pragmas : undefined,
     indexVersion: shouldVacuum ? vacuumResult?.indexVersion : undefined,
+    indexVersionChanged:
+      shouldVacuum && typeof vacuumResult?.indexVersionChanged === 'boolean'
+        ? vacuumResult.indexVersionChanged
+        : undefined,
     ensuredIndexes:
       shouldVacuum && vacuumResult?.ensuredIndexes && vacuumResult.ensuredIndexes.length > 0
         ? vacuumResult.ensuredIndexes
@@ -517,6 +522,7 @@ async function executeRetentionRun(
             target: vacuumSummary.target,
             pragmas: vacuumSummary.pragmas,
             indexVersion: vacuumSummary.indexVersion,
+            indexVersionChanged: vacuumSummary.indexVersionChanged,
             ensuredIndexes: vacuumSummary.ensuredIndexes,
             disk: vacuumSummary.disk,
             tables: vacuumSummary.tables

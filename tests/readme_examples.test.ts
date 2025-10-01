@@ -38,7 +38,7 @@ function createIo() {
 }
 
 describe('ReadmeExamples', () => {
-  it('ReadmeExamplesStayValid ensures README snippets and CLI output stay in sync', async () => {
+  it('ReadmeOfflineUsageRefresh ensures README snippets and CLI output stay in sync', async () => {
     const readme = readReadme();
 
     expect(readme).toContain('"idleTimeoutMs": 5000');
@@ -104,6 +104,14 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('status: ok');
     expect(readme).toContain('scripts/healthcheck.ts --health');
     expect(readme).toContain('Offline kullanım');
+    expect(readme).toContain('pnpm fetch --prod');
+    expect(readme).toContain('tar czf guardian-pnpm-store.tar.gz');
+    expect(readme).toContain('pnpm install --offline --prod');
+    expect(readme).toContain('pnpm store status');
+    expect(readme).toContain('HEALTHCHECK --interval=30s --timeout=5s CMD ["pnpm","tsx","scripts/healthcheck.ts","--health"]');
+    expect(readme).toContain('docker exec guardian pnpm tsx scripts/healthcheck.ts --ready');
+    expect(readme).toContain('systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health');
+    expect(readme).toContain('data-layout="compact"');
 
     metrics.reset();
     const capture = createIo();
@@ -165,6 +173,9 @@ it('ReadmeTransportFallbackDocs documents transport ladder metrics and warnings 
   expect(operations).toContain("pipelines.ffmpeg.byReason['ffmpeg-error']");
   expect(operations).toContain("`total` değerinin 0'a döndüğünü");
   expect(operations).toContain('metricsSummary.retention.runs');
+  expect(operations).toContain('HEALTHCHECK --interval=30s --timeout=5s CMD ["pnpm","tsx","scripts/healthcheck.ts","--health"]');
+  expect(operations).toContain('systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health --pretty');
+  expect(operations).toContain('pnpm fetch --prod');
 });
 
 it('ReadmeExamplesSnapshots stays in sync with SSE cleanup notes', () => {
@@ -214,5 +225,11 @@ describe('OperationsDocLinks', () => {
     expect(operations).toContain('config.video.channels.<kanal>');
     expect(operations).toContain('guardian daemon pipelines reset --channel video:<kanal> --no-restart');
     expect(operations).toContain('guardian daemon pipelines reset --channel audio:<kanal> --no-restart');
+    expect(operations).toContain('guardian-pnpm-store.tar.gz');
+    expect(operations).toContain('pnpm install --offline --prod');
+    expect(operations).toContain('pnpm tsx scripts/healthcheck.ts --pretty --config config/edge.json');
+    expect(operations).toContain('systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health --pretty');
+    expect(operations).toContain('data-layout="compact"');
+    expect(operations).toContain('pipelinesSummary.transportFallbacks.video.byChannel[].total');
   });
 });

@@ -1075,26 +1075,35 @@ export class AudioSource extends EventEmitter {
         Math.round(desiredWindowMs / Math.max(resolvedDuration, Number.EPSILON))
       );
 
-      if (state.rmsWindowFrames !== targetFrames) {
-        while (state.rmsValues.length > targetFrames) {
-          const removed = state.rmsValues.shift();
-          if (removed) {
-            state.rmsSum -= removed.value;
-          }
-        }
-        state.rmsWindowFrames = targetFrames;
+      state.rmsTargetMs = desiredWindowMs;
+      state.rmsWindowFrames = targetFrames;
+
+      while (state.rmsValues.length > state.rmsWindowFrames) {
+        state.rmsValues.shift();
       }
 
-      state.rmsTargetMs = desiredWindowMs;
+      let windowDuration = state.rmsValues.reduce((acc, entry) => acc + entry.durationMs, 0);
+      if (desiredWindowMs > 0) {
+        while (state.rmsValues.length > 1 && windowDuration > desiredWindowMs + 1e-3) {
+          const removed = state.rmsValues.shift();
+          if (!removed) {
+            break;
+          }
+          windowDuration -= removed.durationMs;
+        }
+        windowDuration = state.rmsValues.reduce((acc, entry) => acc + entry.durationMs, 0);
+      }
+
+      state.rmsSum = state.rmsValues.reduce((sum, entry) => sum + entry.value, 0);
 
       if (state.rmsValues.length === 0) {
-        state.rmsSum = 0;
         state.rms = 0;
         state.rmsWindowMs = 0;
       } else {
-        state.rmsSum = state.rmsValues.reduce((sum, entry) => sum + entry.value, 0);
         state.rms = state.rmsSum / state.rmsValues.length;
-        state.rmsWindowMs = state.rmsValues.reduce((acc, entry) => acc + entry.durationMs, 0);
+        const clampedWindowMs =
+          desiredWindowMs > 0 ? Math.min(windowDuration, desiredWindowMs) : windowDuration;
+        state.rmsWindowMs = clampedWindowMs;
       }
 
       state.lastFrameDurationMs = resolvedDuration;
@@ -1795,6 +1804,9 @@ function execFileAsync(
         }
         reject(err);
       }, timeoutMs);
+      if (typeof timeout.unref === 'function') {
+        timeout.unref();
+      }
     }
   });
 }

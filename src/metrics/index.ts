@@ -260,6 +260,7 @@ type SuppressionSnapshot = {
     timelineTtlMs?: number | null;
     timelineHistoryTtlPruned?: number | null;
     timelineHistoryTtlExpired?: boolean | null;
+    timelineExpired?: boolean | null;
   } | null;
   rules: Record<string, SuppressionRuleSnapshot>;
   histogram: {
@@ -304,6 +305,7 @@ type SuppressionRuleSnapshot = {
     lastTimelineTtlMs: number | null;
     lastTimelineHistoryTtlPruned: number | null;
     lastTimelineTtlExpired: boolean | null;
+    lastTimelineExpired: boolean | null;
     lastTtlPrunedChannel: string | null;
   };
 };
@@ -344,6 +346,7 @@ type SuppressedEventMetric = {
   timelineTtlMs?: number;
   timelineHistoryTtlPruned?: number;
   timelineHistoryTtlExpired?: boolean;
+  timelineExpired?: boolean;
 };
 
 type RetentionTotals = {
@@ -484,6 +487,10 @@ type PrometheusDetectorOptions = {
   counterHelp?: string;
   gaugeMetricName?: string;
   gaugeHelp?: string;
+  poseConfidenceMetricName?: string;
+  poseConfidenceHelp?: string;
+  suppressionWarningMetricName?: string;
+  suppressionWarningHelp?: string;
   labels?: Record<string, string>;
 };
 
@@ -504,6 +511,20 @@ const COUNTER_HISTOGRAM: HistogramConfig = {
       return `<${bucket}`;
     }
     return previous === bucket ? `${bucket}` : `${previous}-${bucket}`;
+  }
+};
+
+const POSE_CONFIDENCE_HISTOGRAM: HistogramConfig = {
+  buckets: [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1],
+  format: (bucket, previous) => {
+    const formatValue = (value: number) =>
+      Number.isInteger(value) ? `${value}` : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    if (typeof previous === 'undefined') {
+      return `<${formatValue(bucket)}`;
+    }
+    const lower = formatValue(previous);
+    const upper = formatValue(bucket);
+    return previous === bucket ? upper : `${lower}-${upper}`;
   }
 };
 
@@ -622,6 +643,7 @@ class MetricsRegistry {
     timelineTtlMs?: number | null;
     timelineHistoryTtlPruned?: number | null;
     timelineHistoryTtlExpired?: boolean | null;
+    timelineExpired?: boolean | null;
   } | null = null;
   private suppressionHistoryCount = 0;
   private suppressionCombinedHistoryCount = 0;
@@ -909,6 +931,7 @@ class MetricsRegistry {
       lastTimelineTtlMs: null,
       lastTimelineHistoryTtlPruned: null,
       lastTimelineTtlExpired: null,
+      lastTimelineExpired: null,
       lastTtlPrunedChannel: null
     };
     this.suppressionRules.set(ruleId, state);
@@ -1153,6 +1176,10 @@ class MetricsRegistry {
       timelineHistoryTtlExpired:
         typeof normalizedDetail.timelineHistoryTtlExpired === 'boolean'
           ? normalizedDetail.timelineHistoryTtlExpired
+          : null,
+      timelineExpired:
+        typeof normalizedDetail.timelineExpired === 'boolean'
+          ? normalizedDetail.timelineExpired
           : null
     };
     if (ruleId) {
@@ -1201,6 +1228,9 @@ class MetricsRegistry {
       }
       if (typeof normalizedDetail.timelineHistoryTtlExpired === 'boolean') {
         ruleState.lastTimelineTtlExpired = normalizedDetail.timelineHistoryTtlExpired;
+      }
+      if (typeof normalizedDetail.timelineExpired === 'boolean') {
+        ruleState.lastTimelineExpired = normalizedDetail.timelineExpired;
       }
       ruleState.lastChannel = primaryChannel;
       ruleState.lastChannels = channelList.length > 0 ? [...channelList] : null;
@@ -1322,6 +1352,14 @@ class MetricsRegistry {
     };
     this.lastRetentionWarning = payload;
     this.warningEmitter.emit('warning', { type: 'retention', warning: payload });
+  }
+
+  recordPoseForecastConfidence(confidence: number) {
+    if (!Number.isFinite(confidence)) {
+      return;
+    }
+    const normalized = Math.min(1, Math.max(0, confidence));
+    this.observeHistogram('pose.confidence', normalized, POSE_CONFIDENCE_HISTOGRAM);
   }
 
   incrementDetectorCounter(detector: string, counter: string, amount = 1) {
@@ -2149,6 +2187,38 @@ class MetricsRegistry {
       lines.push(gaugeMetric);
     }
 
+    const poseConfidenceMetric = this.exportHistogramForPrometheus('pose.confidence', {
+      metricName: options.poseConfidenceMetricName ?? 'guardian_pose_confidence',
+      help:
+        options.poseConfidenceHelp ??
+        'Histogram of pose forecast confidence ratios observed during detector runs',
+      labels: baseLabels
+    });
+    if (poseConfidenceMetric) {
+      lines.push(poseConfidenceMetric);
+    }
+
+    const suppressionWarningMetric = formatPrometheusGauge(
+      'suppression.warning.total',
+      [
+        {
+          value: this.suppressionWarnings,
+          labels: {}
+        }
+      ],
+      {
+        metricName:
+          options.suppressionWarningMetricName ?? 'guardian_suppression_warning_total',
+        help:
+          options.suppressionWarningHelp ??
+          'Total suppression warning events emitted by the rules engine',
+        labels: baseLabels
+      }
+    );
+    if (suppressionWarningMetric) {
+      lines.push(suppressionWarningMetric);
+    }
+
     return lines.filter(Boolean).join('\n');
   }
 
@@ -2416,6 +2486,10 @@ class MetricsRegistry {
             typeof this.lastSuppressedEvent.timelineHistoryTtlExpired === 'boolean'
               ? this.lastSuppressedEvent.timelineHistoryTtlExpired
               : null,
+          timelineExpired:
+            typeof this.lastSuppressedEvent.timelineExpired === 'boolean'
+              ? this.lastSuppressedEvent.timelineExpired
+              : null,
           channelStates: mapSuppressionChannelStates(this.lastSuppressedEvent.channelStates)
         }
       : null;
@@ -2682,6 +2756,7 @@ type SuppressionRuleState = {
   lastTimelineTtlMs: number | null;
   lastTimelineHistoryTtlPruned: number | null;
   lastTimelineTtlExpired: boolean | null;
+  lastTimelineExpired: boolean | null;
   lastTtlPrunedChannel: string | null;
 };
 
@@ -3209,6 +3284,8 @@ function mapFromSuppressionRules(source: Map<string, SuppressionRuleState>): Rec
             : null,
         lastTimelineTtlExpired:
           typeof state.lastTimelineTtlExpired === 'boolean' ? state.lastTimelineTtlExpired : null,
+        lastTimelineExpired:
+          typeof state.lastTimelineExpired === 'boolean' ? state.lastTimelineExpired : null,
         lastTtlPrunedChannel: state.lastTtlPrunedChannel ?? null
       }
     };

@@ -322,6 +322,49 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionVacuumIndexRebuild recreates missing indexes and reports ensure summary', async () => {
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const indexDefinitions = [
+      ...(dbModule.__test__?.EVENT_INDEX_DEFINITIONS ?? []),
+      ...(dbModule.__test__?.FACE_INDEX_DEFINITIONS ?? [])
+    ];
+    for (const definition of indexDefinitions) {
+      db.exec(`DROP INDEX IF EXISTS ${definition.name}`);
+    }
+    db.exec('PRAGMA user_version = 0');
+
+    const result = await runRetentionOnce({
+      enabled: true,
+      retentionDays: 30,
+      intervalMs: 60000,
+      archiveDir,
+      snapshotDirs: [cameraOneDir],
+      vacuum: { mode: 'auto', run: 'always' },
+      logger,
+      metrics: metrics as any
+    });
+
+    const expectedNames = indexDefinitions.map(definition => definition.name).sort();
+    const ensured = [...(result.vacuum.ensuredIndexes ?? [])].sort();
+    expect(result.vacuum.ran).toBe(true);
+    expect(ensured).toEqual(expectedNames);
+    expect(result.vacuum.indexVersion).toBe(dbModule.__test__?.EVENT_INDEX_SCHEMA_VERSION ?? 1);
+    expect(result.vacuum.indexVersionChanged).toBe(true);
+    const infoCall = logger.info.mock.calls.find(([, message]) => message === 'Retention task completed');
+    expect(infoCall?.[0]?.vacuumTasks?.indexVersionChanged).toBe(true);
+    const loggedIndexes = [...(infoCall?.[0]?.vacuumTasks?.ensuredIndexes ?? [])].sort();
+    expect(loggedIndexes).toEqual(expectedNames);
+  });
+
   it('RetentionSnapshotDeleteMode deletes stale snapshots without archiving and skips vacuum', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     const now = Date.UTC(2024, 10, 5);
@@ -538,6 +581,7 @@ describe('RetentionMaintenance', () => {
         target: undefined,
         pragmas: undefined,
         indexVersion: 1,
+        indexVersionChanged: false,
         ensuredIndexes: [],
         disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
         tables: []
@@ -613,6 +657,7 @@ describe('RetentionMaintenance', () => {
         target: undefined,
         pragmas: undefined,
         indexVersion: 1,
+        indexVersionChanged: false,
         ensuredIndexes: [],
         disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
         tables: []
@@ -699,6 +744,7 @@ describe('RetentionMaintenance', () => {
         target: undefined,
         pragmas: undefined,
         indexVersion: 1,
+        indexVersionChanged: false,
         ensuredIndexes: [],
         disk: { before: baselineDisk, after: baselineDisk, savingsBytes: 0 },
         tables: []

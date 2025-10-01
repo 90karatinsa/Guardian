@@ -28,6 +28,17 @@ nasıl yararlanacağınızı adım adım anlatır.
   `transportFallbackResets.total` değeri fallback resetlerinin durumunu raporlar. Ayrıntılı kullanım README'deki
   [offline tanılama ve sağlık uçları](../README.md#offline-tan%C4%B1lama-ve-sa%C4%9Fl%C4%B1k-u%C3%A7lar%C4%B1) bölümünde belgelenmiştir.
 
+### Docker ve systemd healthcheck pratikleri
+- Docker imajınıza `HEALTHCHECK --interval=30s --timeout=5s CMD ["pnpm","tsx","scripts/healthcheck.ts","--health"]` satırını
+  ekleyerek guardian daemon'unun liveness durumunu doğrulayın. Komut başarısız olursa `docker inspect --format '{{json .State.Health}}'`
+  çıktısı `Status: "unhealthy"` değerini döndürür; konteyneri yeniden başlatmadan önce `docker exec guardian pnpm tsx scripts/healthcheck.ts --ready`
+  komutuyla aynı scripti elle tetikleyebilirsiniz.
+- systemd ortamında `ExecStartPre=/usr/bin/env pnpm tsx scripts/healthcheck.ts --ready` satırı servis başlamadan önce SSE uçlarının hazır olduğunu kontrol eder.
+  `systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health --pretty` komutu aynı kontrolü interaktif olarak çalıştırır ve JSON çıktısındaki
+  `pipelinesSummary.transportFallbacks.video.byChannel[].total` alanları RTSP fallback döngüsünün yoğunluğunu gösterir.
+- Uzaktan tanılama senaryolarında `pnpm tsx scripts/healthcheck.ts --pretty --config /etc/guardian/config.json` parametresi ile alternatif konfigürasyon yollarını test edin; script,
+  guardian süreci çalışmıyorsa `status: "error"` ve `reason: "guardian-daemon-unreachable"` alanlarını döndürür.
+
 ## Periyodik bakım görevleri
 - RTSP veya ffmpeg kaynaklı bağlantı sorunları için `guardian daemon hooks --reason watchdog-reset` komutunu kullanarak devre
   kesicileri elle temizleyin.
@@ -40,9 +51,22 @@ nasıl yararlanacağınızı adım adım anlatır.
 - `guardian retention run --config config/production.json` ile farklı konfigürasyon dosyaları için bakım planlayabilirsiniz;
   `pnpm tsx src/cli.ts retention --help` çıktısı güncel seçenekleri listeler.
 
+## Çevrimdışı dağıtımlar için hazırlık
+- Edge kutularında Guardian'ı güncellemeden önce build host üzerinde `pnpm fetch --prod` komutunu çalıştırın ve `tar czf guardian-pnpm-store.tar.gz $(pnpm store path --silent)`
+  ile pnpm mağazasını arşivleyin. Arşiv, hedef cihazda `tar xzf guardian-pnpm-store.tar.gz -C $(pnpm store path --silent)` ve `pnpm install --offline --prod`
+  komutlarıyla açılır.
+- Offline cihazlarda healthcheck doğrulaması yapmak için `pnpm tsx scripts/healthcheck.ts --pretty --config config/edge.json` komutunu kullanın; çıkıştaki `metricsSummary.pipelines.watchdogRestarts`
+  ve `pipelinesSummary.transportFallbacks` değerleri bağlantı istikrarını gösterir.
+- Uzun süreli saha kurulumlarında disk tüketimini kontrol etmek için `guardian retention run --config config/edge.json` komutunu manuel tetikleyin ve
+  ardından `pnpm exec tsx src/tasks/retention.ts --run now` ile arşiv vakumlarını planlayın; loglarda `vacuum.summary.ensuredIndexes` ve `diskSavingsBytes`
+  satırlarının beklenen değerleri raporladığını doğrulayın.
+
 ## Log ve metrik inceleme
 - `guardian log-level get` ve `guardian log-level set warn` komutlarıyla log seviyesini değiştirirken, `guardian daemon health`
   çıktısındaki `metrics.logs.byLevel` ve `metrics.logs.histogram` alanlarını izleyin.
+- Dashboard mobil görünümü test etmek için tarayıcı geliştirici araçlarıyla genişliği 640 piksel altına düşürün; `main.dashboard-grid`
+  elementinin `data-layout="compact"` değerini aldığını ve snapshot panelinin kart listesinin altına indiğini doğrulayın. `Reset filters`
+  düğmesi kanal seçimini temizleyerek `state.filters.channels` kümesini boşaltır.
 - SSE dashboard'un sağ panelindeki `warnings` tablosu, bastırma timeline TTL prune olaylarını `type: "suppression"` olarak gösterir. `/api/events/stream` uç noktasına bağlandığınızda `{"type":"suppression",...}` payload'larını görürseniz suppression kurallarınızın TTL sınırında olduğunu anlayabilirsiniz; aynı olay `metricsSummary.suppression.historyTotals.ttlPrunedByChannel` artışlarıyla tutarlıdır.
 - Bastırma timeline TTL temizlemelerini takip etmek için `guardian daemon health --json` çıktısındaki
   `metricsSummary.suppression.historyTotals.ttlPrunedByChannel` haritasını inceleyin; yüksek değerler belirli kanalların
