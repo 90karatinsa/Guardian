@@ -33,6 +33,7 @@ interface InternalSuppressionRule {
   timelines: Map<string, SuppressionTimeline>;
   historyLimit: number;
   timelineTtlMs?: number;
+  pendingTimelineExpirations: Map<string, number>;
 }
 
 type SuppressionTimeline = {
@@ -64,6 +65,7 @@ interface SuppressionHit {
   timelineTtlMs?: number;
   timelineHistoryTtlPruned?: number;
   timelineHistoryTtlExpired?: boolean;
+  timelineExpired?: boolean;
 }
 
 type ChannelSuppressionState = {
@@ -143,6 +145,7 @@ class EventBus extends EventEmitter {
     for (const rule of this.suppressionRules) {
       resetTimeline(rule.timeline);
       rule.timelines.clear();
+      rule.pendingTimelineExpirations.clear();
     }
   }
 
@@ -225,7 +228,8 @@ class EventBus extends EventEmitter {
           combinedHistoryCount: combinedHistory.length,
           timelineTtlMs: hit.timelineTtlMs,
           timelineHistoryTtlPruned: hit.timelineHistoryTtlPruned,
-          timelineHistoryTtlExpired: hit.timelineHistoryTtlExpired
+          timelineHistoryTtlExpired: hit.timelineHistoryTtlExpired,
+          timelineExpired: hit.timelineExpired === true
         };
       });
       suppressedBy.forEach((suppressedMeta, index) => {
@@ -316,6 +320,7 @@ class EventBus extends EventEmitter {
         suppressionTimelineTtlMs: primary?.timelineTtlMs,
         suppressionTimelineHistoryTtlPruned: primary?.timelineHistoryTtlPruned ?? 0,
         suppressionTimelineHistoryTtlExpired: primary?.timelineHistoryTtlExpired ?? false,
+        suppressionTimelineExpired: primary?.timelineExpired === true,
         suppressionChannelStates: Object.fromEntries(
           Array.from(channelStates.entries()).map(([channel, state]) => [
             channel,
@@ -365,7 +370,8 @@ class EventBus extends EventEmitter {
           channelStates: meta.suppressionChannelStates,
           timelineTtlMs: hit.timelineTtlMs,
           timelineHistoryTtlPruned: hit.timelineHistoryTtlPruned,
-          timelineHistoryTtlExpired: hit.timelineHistoryTtlExpired
+          timelineHistoryTtlExpired: hit.timelineHistoryTtlExpired,
+          timelineExpired: hit.timelineExpired === true
         };
         this.metrics.recordSuppressedEvent(detail);
       });
@@ -411,6 +417,10 @@ class EventBus extends EventEmitter {
 
       const channel = resolveRuleChannel(rule, eventChannels);
       const { timeline, key: timelineKey } = getTimelineForRule(rule, channel);
+      const existingPendingExpirationAt =
+        timelineKey && rule.pendingTimelineExpirations.has(timelineKey)
+          ? rule.pendingTimelineExpirations.get(timelineKey)
+          : undefined;
       const pruneResult = pruneTimeline(rule, timeline, event.ts, timelineKey);
       const ttlCount =
         pruneResult.ttlPruned > 0
@@ -428,8 +438,17 @@ class EventBus extends EventEmitter {
         });
       }
       if (pruneResult.timelineExpired && timelineKey) {
+        rule.pendingTimelineExpirations.set(timelineKey, event.ts);
         rule.timelines.delete(timelineKey);
       }
+      const timelineExpiredMeta =
+        pruneResult.timelineExpired ||
+        (typeof existingPendingExpirationAt === 'number' && Number.isFinite(existingPendingExpirationAt));
+      const consumePendingTimelineExpiration = () => {
+        if (timelineExpiredMeta && timelineKey && rule.pendingTimelineExpirations.has(timelineKey)) {
+          rule.pendingTimelineExpirations.delete(timelineKey);
+        }
+      };
 
       const windowActive = event.ts < timeline.suppressedUntil;
       const rateLimitConfig = rule.rateLimit;
@@ -461,8 +480,10 @@ class EventBus extends EventEmitter {
           channel,
           timelineTtlMs: pruneResult.timelineTtlMs,
           timelineHistoryTtlPruned: pruneResult.ttlPruned,
-          timelineHistoryTtlExpired: pruneResult.timelineExpired
+          timelineHistoryTtlExpired: pruneResult.timelineExpired,
+          timelineExpired: timelineExpiredMeta
         });
+        consumePendingTimelineExpiration();
         continue;
       }
 
@@ -486,8 +507,10 @@ class EventBus extends EventEmitter {
           channel,
           timelineTtlMs: pruneResult.timelineTtlMs,
           timelineHistoryTtlPruned: pruneResult.ttlPruned,
-          timelineHistoryTtlExpired: pruneResult.timelineExpired
+          timelineHistoryTtlExpired: pruneResult.timelineExpired,
+          timelineExpired: timelineExpiredMeta
         });
+        consumePendingTimelineExpiration();
         continue;
       }
 
@@ -526,8 +549,10 @@ class EventBus extends EventEmitter {
           channel,
           timelineTtlMs: pruneResult.timelineTtlMs,
           timelineHistoryTtlPruned: pruneResult.ttlPruned,
-          timelineHistoryTtlExpired: pruneResult.timelineExpired
+          timelineHistoryTtlExpired: pruneResult.timelineExpired,
+          timelineExpired: timelineExpiredMeta
         });
+        consumePendingTimelineExpiration();
         continue;
       }
 
@@ -716,7 +741,8 @@ function normalizeSuppressionRule(rule: EventSuppressionRule): InternalSuppressi
     timeline: createTimeline(null, effectiveTimelineTtlMs),
     timelines: new Map<string, SuppressionTimeline>(),
     historyLimit: Math.max(rateLimit?.count ?? 0, maxEvents ?? 0, 10),
-    timelineTtlMs: effectiveTimelineTtlMs
+    timelineTtlMs: effectiveTimelineTtlMs,
+    pendingTimelineExpirations: new Map<string, number>()
   };
 }
 

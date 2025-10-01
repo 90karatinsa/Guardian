@@ -319,6 +319,10 @@ export class EventsRouter {
       }
     }, this.heartbeatMs);
 
+    if (typeof heartbeat.unref === 'function') {
+      heartbeat.unref();
+    }
+
     this.clients.set(res, {
       heartbeat,
       filters,

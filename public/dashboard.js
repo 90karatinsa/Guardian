@@ -1,4 +1,8 @@
 const KNOWN_CHANNEL_PREFIXES = new Set(['video', 'audio']);
+const LAYOUT_BREAKPOINTS = [
+  { name: 'compact', query: '(max-width: 640px)' },
+  { name: 'tablet', query: '(max-width: 1024px)' }
+];
 
 function resolveDefaultChannelType(options) {
   const configured = options?.defaultType;
@@ -33,9 +37,11 @@ function normalizeChannelId(value, options) {
   return `${defaultType}:${trimmed}`;
 }
 
+const dashboardContainer = document.querySelector('main.dashboard-grid');
 const list = document.getElementById('events');
 const filtersForm = document.getElementById('filters');
 const resetButton = document.getElementById('reset-filters');
+const previewPanel = document.getElementById('preview');
 const previewEmpty = document.getElementById('preview-empty');
 const previewFigure = document.getElementById('preview-figure');
 const previewImage = document.getElementById('preview-image');
@@ -63,6 +69,10 @@ const channelStatusContainer = document.getElementById('channel-status');
 const channelStatusEmpty = document.getElementById('channel-status-empty');
 const warningList = document.getElementById('warning-list');
 const warningEmpty = document.getElementById('warning-empty');
+
+if (previewPanel) {
+  previewPanel.setAttribute('aria-busy', 'false');
+}
 
 if (previewImage) {
   previewImage.addEventListener('load', () => {
@@ -121,7 +131,14 @@ const state = {
     lastThreat: null,
     lastUpdated: null
   },
-  warnings: []
+  warnings: [],
+  layout: {
+    active: 'wide',
+    breakpoints: LAYOUT_BREAKPOINTS.map(({ name, query }) => ({ name, query })),
+    container: dashboardContainer ?? null,
+    watchers: [],
+    applyLayout: null
+  }
 };
 
 function getSelectedChannels() {
@@ -129,6 +146,49 @@ function getSelectedChannels() {
     state.filters.channels = new Set();
   }
   return state.filters.channels;
+}
+
+function initializeResponsiveLayout() {
+  if (!dashboardContainer) {
+    return;
+  }
+
+  state.layout.container = dashboardContainer;
+  const supportsMatchMedia = typeof window !== 'undefined' && typeof window.matchMedia === 'function';
+  const watchers = supportsMatchMedia
+    ? LAYOUT_BREAKPOINTS.map(({ name, query }) => ({ name, query, matcher: window.matchMedia(query) }))
+    : [];
+
+  const applyLayout = () => {
+    let next = 'wide';
+    for (const watcher of watchers) {
+      if (watcher.matcher.matches) {
+        next = watcher.name;
+        break;
+      }
+    }
+
+    if (dashboardContainer.dataset.layout !== next) {
+      dashboardContainer.dataset.layout = next;
+    }
+    if (previewPanel) {
+      previewPanel.dataset.layout = next;
+    }
+    state.layout.active = next;
+  };
+
+  watchers.forEach(({ matcher }) => {
+    const handler = () => applyLayout();
+    if (typeof matcher.addEventListener === 'function') {
+      matcher.addEventListener('change', handler);
+    } else if (typeof matcher.addListener === 'function') {
+      matcher.addListener(handler);
+    }
+  });
+
+  state.layout.watchers = watchers.map(({ name, query }) => ({ name, query }));
+  state.layout.applyLayout = applyLayout;
+  applyLayout();
 }
 
 function getEventKey(event) {
@@ -364,6 +424,9 @@ function showPreview(event) {
   const timestamp = new Date(event.ts).toLocaleString();
   const description = `${event.detector} · ${event.source}`;
   const captionValue = `${description} — ${timestamp}`;
+  if (previewPanel) {
+    previewPanel.setAttribute('aria-busy', 'true');
+  }
   if (previewCaptionText) {
     previewCaptionText.textContent = captionValue;
   } else if (previewCaption) {
@@ -436,18 +499,31 @@ function showPreview(event) {
 
   if (hasMain || hasFace) {
     previewFigure.hidden = false;
+    previewFigure.setAttribute('aria-hidden', 'false');
     previewEmpty.hidden = true;
+    previewEmpty.setAttribute('aria-hidden', 'true');
   } else {
     previewFigure.hidden = true;
+    previewFigure.setAttribute('aria-hidden', 'true');
     previewEmpty.hidden = false;
+    previewEmpty.setAttribute('aria-hidden', 'false');
     previewEmpty.textContent = 'No snapshot is available for the selected event.';
+  }
+
+  if (previewPanel) {
+    previewPanel.setAttribute('aria-busy', 'false');
   }
 }
 
 function clearPreview() {
   state.activeId = null;
+  if (previewPanel) {
+    previewPanel.setAttribute('aria-busy', 'false');
+  }
   previewFigure.hidden = true;
+  previewFigure.setAttribute('aria-hidden', 'true');
   previewEmpty.hidden = false;
+  previewEmpty.setAttribute('aria-hidden', 'false');
   previewEmpty.textContent = 'Select an event to view the latest snapshot.';
   if (previewCaptionText) {
     previewCaptionText.textContent = '';
@@ -1966,6 +2042,7 @@ resetButton.addEventListener('click', () => {
   subscribe();
 });
 
+initializeResponsiveLayout();
 updateStreamWidget();
 renderWarnings();
 const METRICS_REFRESH_INTERVAL = 30_000;

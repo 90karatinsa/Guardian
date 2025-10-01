@@ -169,10 +169,11 @@ function setUserVersion(version: number) {
   db.exec(`PRAGMA user_version = ${normalized}`);
 }
 
-type IndexEnsureResult = { created: string[]; version: number };
+type IndexEnsureResult = { created: string[]; version: number; previousVersion: number };
 
 function ensureEventIndexes(): IndexEnsureResult {
   const created: string[] = [];
+  const previousVersion = readUserVersion();
   const existingEvents = new Set(
     (db.prepare("PRAGMA index_list('events')").all() as Array<{ name: string }> | undefined)?.map(
       entry => entry.name
@@ -199,13 +200,13 @@ function ensureEventIndexes(): IndexEnsureResult {
     }
   }
 
-  let version = readUserVersion();
+  let version = previousVersion;
   if (version < EVENT_INDEX_SCHEMA_VERSION) {
     setUserVersion(EVENT_INDEX_SCHEMA_VERSION);
     version = EVENT_INDEX_SCHEMA_VERSION;
   }
 
-  return { created, version };
+  return { created, version, previousVersion };
 }
 
 const insertStatement = db.prepare(
@@ -492,6 +493,7 @@ export interface VacuumOptions {
 
 export interface VacuumExecutionResult extends Required<VacuumOptions> {
   indexVersion: number;
+  indexVersionChanged: boolean;
   ensuredIndexes: string[];
   disk: {
     before: DatabaseDiskUsageSnapshot;
@@ -577,6 +579,7 @@ export function vacuumDatabase(
   const { run: _run, ...vacuum } = normalized;
 
   const indexState = ensureEventIndexes();
+  const indexVersionChanged = indexState.version !== indexState.previousVersion;
 
   const diskBefore = getDatabaseDiskUsage();
   const tablesBefore = tryReadTableStats();
@@ -666,6 +669,7 @@ export function vacuumDatabase(
   return {
     ...normalized,
     indexVersion: indexState.version,
+    indexVersionChanged,
     ensuredIndexes: indexState.created,
     disk: { before: diskBefore, after: diskAfter, savingsBytes },
     tables: tableDiff.sort((a, b) => a.name.localeCompare(b.name))
@@ -1199,5 +1203,14 @@ function normalizeEventMeta(meta: EventRecord['meta']): Record<string, unknown> 
 
   return normalized;
 }
+
+export const __test__ = {
+  ensureEventIndexes,
+  readUserVersion,
+  setUserVersion,
+  EVENT_INDEX_SCHEMA_VERSION,
+  EVENT_INDEX_DEFINITIONS,
+  FACE_INDEX_DEFINITIONS
+};
 
 export default db;

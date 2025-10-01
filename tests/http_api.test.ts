@@ -330,6 +330,24 @@ describe('RestApiEvents', () => {
     expect(Object.keys(metricsPayload).sort()).toEqual(['fetchedAt', 'retention']);
   });
 
+  it('DashboardResponsiveLayout exposes responsive markup and breakpoint-aware layout controls', async () => {
+    const { port } = await ensureServer();
+
+    const indexResponse = await fetch(`http://localhost:${port}/`);
+    expect(indexResponse.status).toBe(200);
+    const html = await indexResponse.text();
+
+    expect(html).toContain('class="dashboard dashboard-grid"');
+    expect(html).toContain('data-layout="wide"');
+    expect(html).toContain('class="dashboard-card stream-widget"');
+    expect(html).toContain('class="dashboard-card preview-panel"');
+    expect(html).toContain('role="group"');
+
+    expect(dashboardScriptSource).toContain('const LAYOUT_BREAKPOINTS');
+    expect(dashboardScriptSource).toContain('matchMedia(');
+    expect(dashboardScriptSource).toContain('dataset.layout');
+  });
+
   it('HttpStaticHeadRequest serves dashboard assets without body for HEAD requests', async () => {
     const { port } = await ensureServer();
 
@@ -507,6 +525,49 @@ describe('RestApiEvents', () => {
     expect(collectRetryLine('?retryMs=2500')).toBe('retry: 2500');
 
     router.close();
+  });
+
+  it('HttpEventStreamHeartbeatUnref unrefs and clears the heartbeat timer on close', () => {
+    const router = createEventsRouter({ bus: new EventEmitter() });
+    const fakeTimer = {
+      unref: vi.fn(),
+      ref: vi.fn(),
+      hasRef: vi.fn()
+    } as unknown as NodeJS.Timeout;
+
+    const intervalSpy = vi
+      .spyOn(global, 'setInterval')
+      .mockImplementation((...args: Parameters<typeof setInterval>) => {
+        const [handler, timeout] = args;
+        expect(typeof handler).toBe('function');
+        expect(timeout).toBe(15000);
+        return fakeTimer;
+      });
+    const clearSpy = vi.spyOn(global, 'clearInterval').mockImplementation(() => {});
+
+    const request = new StubIncomingMessage('/api/events/stream?metrics=none');
+    const response = new StubServerResponse();
+
+    try {
+      const handled = router.handle(
+        request as unknown as import('node:http').IncomingMessage,
+        response as unknown as import('node:http').ServerResponse
+      );
+
+      expect(handled).toBe(true);
+      expect(intervalSpy).toHaveBeenCalledTimes(1);
+      expect(fakeTimer.unref).toHaveBeenCalledTimes(1);
+
+      request.emit('close');
+      response.emit('close');
+
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      expect(clearSpy).toHaveBeenCalledWith(fakeTimer);
+    } finally {
+      intervalSpy.mockRestore();
+      clearSpy.mockRestore();
+      router.close();
+    }
   });
 
   it('HttpApiSnapshotAllowlist denies ../etc/passwd style inputs', async () => {

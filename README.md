@@ -14,10 +14,15 @@ Guardian, ağ kameraları ve ses girişleri üzerinden gelen olayları normalize
   - [Offline tanılama ve sağlık uçları](#offline-tanılama-ve-sağlık-uçları)
 - [Guardian'ı çalıştırma](#guardiannı-çalıştırma)
 - [Dashboard](#dashboard)
+  - [Mobil ve erişilebilir kullanım ipuçları](#mobil-ve-erişilebilir-kullanım-ipuçları)
 - [Metrikler ve sağlık çıktısı](#metrikler-ve-sağlık-çıktısı)
 - [Video ve ses boru hatları](#video-ve-ses-boru-hatları)
 - [Docker ile çalışma](#docker-ile-çalışma)
+- [Healthcheck entegrasyonu](#healthcheck-entegrasyonu)
 - [systemd servisi](#systemd-servisi)
+- [Offline kullanım](#offline-kullanım)
+  - [Bağımlılık önbelleği hazırlama](#bağımlılık-önbelleği-hazırlama)
+  - [Çevrimdışı bakım ipuçları](#çevrimdışı-bakım-ipuçları)
 - [Operasyon kılavuzu](#operasyon-kılavuzu)
 - [Sorun giderme](#sorun-giderme)
 
@@ -461,6 +466,12 @@ curl -N "http://localhost:3000/api/events/stream?metrics=audio,retention"
 
 Dashboard filtreleri ve REST uç noktaları, kanalları case-insensitive olarak normalize eder. `channel` sorgu parametresine `microphone`, `AUDIO:MICROPHONE` veya `Video:Lobby` yazmanız fark etmez; Guardian `audio:microphone` ve `video:lobby` kimliklerine dönüştürerek aynı olayları döndürür. Prefixsiz ses kanallarını denemek için `curl "http://localhost:3000/api/events?channel=microphone"` komutu `audio:microphone` kanalına ait kayıtları listeleyecektir.
 
+### Mobil ve erişilebilir kullanım ipuçları
+- `main.dashboard-grid` kapsayıcısı ve snapshot paneli, `public/dashboard.js` içindeki responsive layout gözlemcileri sayesinde ekran genişliğine göre `data-layout="compact"`, `data-layout="tablet"` veya `data-layout="wide"` değerlerini otomatik olarak alır. 640 piksel altındaki telefonlarda sütunlar tek kolona düşer ve snapshot paneli kartların altına taşınır.
+- Snapshot bileşeninin `aria-busy` durumu, yeni bir görsel istenirken `true` olarak işaretlenir ve `<img id="preview-image">` ile `<img id="preview-face-image">` elementlerinin `data-state` öznitelikleri `loaded`/`error` durumlarına göre güncellenir; bu sayede ekran okuyucular kullanıcıya son durum bilgisi verir.
+- `#warning-list` bileşeni, SSE akışındaki `warnings` olaylarını sıraya eklerken `#stream-heartbeats`, `#stream-events` ve `#stream-snapshots` sayaçlarını da günceller; bu değerler dashboard'un "Stream activity" kartındaki canlı sayaçlarla anında eşleşir.
+- Filtre panelindeki `Kanala göre filtrele` alanı, `video:` veya `audio:` ön ekleri olmadan yazılan kimlikleri normalize eder. Gerekirse `Reset filters` düğmesine tıklayarak tüm formlar, seçilen kanallar ve aktif snapshot temizlenebilir; bu işlem `state.filters` içindeki `channels` `Set` örneğini de sıfırlar.
+
 ## Metrikler ve sağlık çıktısı
 `pnpm tsx src/cli.ts --health` veya `guardian daemon status --json` komutları, aşağıdaki gibi bir metrik özeti döndürür:
 
@@ -507,23 +518,91 @@ ffmpeg komutları beklenmedik şekilde hata verdiğinde daemon loglarında `Vide
 Ses tarafında anomaly dedektörü, RMS ve spectral centroid ölçümlerini `audio.anomaly` konfigürasyonu doğrultusunda toplar. `metrics.detectors['audio-anomaly'].latencyHistogram` değeri, pencere hizasının doğruluğunu teyit eder. Sustained sessizlikte devre kesici tetiklendiğinde `pipelines.audio.watchdogBackoffByChannel` ve `pipelines.audio.restartHistogram.delay` artışları görülebilir.
 
 ## Docker ile çalışma
-`Dockerfile` çok aşamalı build tanımlar. İmajı inşa etmek için:
+`Dockerfile` çok aşamalı build tanımlar ve `public/`, `scripts/` ile `models/` dizinlerini imaj içerisine kopyalar. İmajı inşa etmek için:
 
 ```bash
 pnpm run build
 docker build -t guardian:latest .
 ```
 
-Docker healthcheck'i `guardian daemon health` ve `guardian daemon status --json` komutlarına dayanır ve log seviyeleri konteyner içinde `guardian log-level set warn` ile güncellenebilir. Persistans için `data/` ve `archive/` dizinlerini volume olarak bağlamayı unutmayın.
+Container'ı başlatırken RTSP veya mikrofon girdilerini dışarıdan geçirmeniz gerekir:
+
+```bash
+docker run \
+  --name guardian \
+  -p 3000:3000 \
+  -v $(pwd)/config:/app/config:ro \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/archive:/app/archive \
+  -v $(pwd)/models:/app/models:ro \
+  guardian:latest --config config/edge.json
+```
+
+Persistans için `data/` ve `archive/` dizinlerini volume olarak bağlamayı unutmayın. Docker healthcheck satırını container manifest'ine eklerken `scripts/healthcheck.ts` scriptini kullanabilirsiniz; ayrıntılar için [Healthcheck entegrasyonu](#healthcheck-entegrasyonu) bölümüne bakın. Kayıtlı log seviyesini konteyner içinde `guardian log-level set warn` komutuyla yükseltebilir ve `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.watchdogRestartsByChannel` alanlarıyla yeniden başlatma döngülerini takip edebilirsiniz.
+
+## Healthcheck entegrasyonu
+Guardian, Docker ve systemd ortamlarında aynı `scripts/healthcheck.ts` scriptiyle hem liveness hem readiness kontrolleri sağlar. Script, guardian CLI'yi çağırmadan metrik özetini ve pipeline durumunu doğruladığından başlatma sırasında ek bağımlılık gerektirmez.
+
+### Docker healthcheck örneği
+İmajınıza aşağıdaki satırı ekleyerek container başına otomatik sağlık denetimi tanımlayabilirsiniz:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s CMD ["pnpm","tsx","scripts/healthcheck.ts","--health"]
+```
+
+Kontrolün manuel olarak aynı çıktıyı verdiğini doğrulamak için:
+
+```bash
+docker exec guardian pnpm tsx scripts/healthcheck.ts --ready
+docker inspect --format '{{json .State.Health.Status}}' guardian
+```
+
+`--health` seçeneği metriklerde `status: "ok"` ve `pipelines.ffmpeg.watchdogRestarts` sayaçlarını doğrularken, `--ready` seçeneği SSE uçlarının trafik kabul ettiğini garantiler.
+
+### systemd healthcheck örneği
+Systemd unit dosyanıza Guardian'ın healthcheck scriptini doğrudan entegre edebilirsiniz:
+
+```ini
+ExecStartPre=/usr/bin/env pnpm tsx scripts/healthcheck.ts --ready
+ExecStartPost=/usr/bin/env pnpm tsx scripts/healthcheck.ts --health --pretty
+```
+
+El ile doğrulamak için aşağıdaki komut, `guardian` kullanıcısı adına aynı scripti koşturur ve exit kodunu bekler:
+
+```bash
+systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --ready
+```
+
+Çıktıdaki `pipelinesSummary.transportFallbacks` değerleri, daemon yeniden başlatılmadan önce RTSP fallback zincirinin kaç kez devreye girdiğini rapor eder. systemd journald loglarında aynı bilgiyi `guardian daemon health --json` komutuyla karşılaştırabilirsiniz.
 
 ## Offline kullanım
-- RTSP kameralarla çalışan saha kutularında guardian imajını ve `models/` klasörünü önceden kopyalayın. `pnpm install --offline` komutunu kullanabilmek için `pnpm fetch` ile bağımlılık önbelleğini hazırlayın.
+Guardian'ı internet erişimi olmayan saha kutularına dağıtırken bağımlılık önbelleğini, model dosyalarını ve sağlık kontrollerini önceden hazırlamak kritik önem taşır.
+
+### Bağımlılık önbelleği hazırlama
+1. Build host üzerinde bağımlılık stoğunu doldurun ve arşivleyin:
+
+   ```bash
+   pnpm fetch --prod
+   tar czf guardian-pnpm-store.tar.gz $(pnpm store path --silent)
+   ```
+
+2. Arşivi hedef cihaza ve proje klasörüne kopyalayın. İlk kurulumda aşağıdaki komutlar, internet olmadan bile bağımlılıkları kurar:
+
+   ```bash
+   tar xzf guardian-pnpm-store.tar.gz -C $(pnpm store path --silent)
+   pnpm install --offline --prod
+   pnpm store status
+   ```
+
+3. `models/` klasörünü (örneğin `models/yolov8n.onnx`) ve `config/` altındaki üretim yapılandırmalarını aynı rsync/USB sürecinde taşımayı unutmayın.
+
+### Çevrimdışı bakım ipuçları
 - İnternet erişimi olmadan sağlık durumunu doğrulamak için `pnpm tsx scripts/healthcheck.ts --pretty` komutu hem Docker hem systemd senaryolarında aynı JSON çıktısını üretir; `status: "ok"` satırı ve `metricsSummary.pipelines.watchdogRestarts` alanları bağlantı stabilitesini gösterir.
 - Edge cihazı yeniden çevrimiçi olduğunda `pnpm exec tsx -e "import metrics from './src/metrics/index.ts'; console.log(metrics.exportLogLevelCountersForPrometheus({ labels: { site: 'edge-1' } }))"` komutu ile tamponda tutulan log metriklerini Prometheus uyumlu formatta dışa aktarabilirsiniz.
 - `guardian retention run --config` komutuyla arşiv bakımını elle tetikleyerek uzun süre çevrimdışı kalan cihazlarda disk tüketimini kontrol altında tutun; `vacuum=auto (run=on-change)` özetinde `prunedArchives` alanını izleyin.
 
 ## systemd servisi
-`deploy/guardian.service` ve `deploy/systemd.service` dosyaları, CLI'nin `start`, `stop` ve `health` komutlarını kullanan örnek unit tanımları içerir. `journalctl -u guardian` çıktısında `metrics.logs.byLevel.error` artışını veya `pipelines.audio.watchdogBackoffByChannel` değişikliklerini izleyebilirsiniz.
+`deploy/guardian.service` ve `deploy/systemd.service` dosyaları, CLI'nin `start`, `stop` ve `health` komutlarını kullanan örnek unit tanımları içerir. `ExecStartPre=/usr/bin/env pnpm tsx scripts/healthcheck.ts --ready` satırı ile servisin trafik kabul etmeden önce SSE uçlarının hazır olduğu doğrulanabilir. `systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health` komutuyla aynı scripti manuel olarak tetikleyip exit kodunu gözlemleyebilirsiniz. `journalctl -u guardian` çıktısında `metrics.logs.byLevel.error` artışını veya `pipelines.audio.watchdogBackoffByChannel` değişikliklerini izleyebilirsiniz; loglar `guardian_log_last_error_timestamp_seconds` gauge'u ile senkron hareket eder.
 
 ## Operasyon kılavuzu
 Guardian'ı 7/24 çalıştırırken yapılması gereken rutin kontroller ve bakım adımları için [Operasyon kılavuzu](docs/operations.md)
@@ -539,6 +618,8 @@ operasyonel rehber ile birlikte okunmalıdır.
 | `pipelines.ffmpeg.watchdogRestartsByChannel` hızla artıyor | RTSP bağlantısı kopuyor ya da jitter yüksek | `guardian daemon restart --channel video:lobby` ve `pnpm exec tsx src/cli.ts daemon status --json` |
 | `metrics.pipelines.ffmpeg.transportFallbacks.total` artıyor veya `transport-change` logları sıklaşıyor | TCP↔UDP transport zinciri sürekli geri düşüyor | `guardian daemon restart --transport video:lobby` ile kanalın taşıyıcı sırasını sıfırlayın ve `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.transportFallbacks.byChannel` ile `metricsSummary.pipelines.transportFallbacks.video.byChannel[].lastReason` alanlarını izleyin |
 | `Audio source recovering (reason=ffmpeg-missing)` mesajları | Mikrofon fallback listesi tükeniyor veya cihaz keşfi zaman aşımına düşüyor | `guardian audio devices --json` ve `pnpm tsx scripts/healthcheck.ts --ready` |
+| Docker healthcheck `unhealthy` durumuna düşüyor | `scripts/healthcheck.ts` scripti guardian process'ine ulaşamıyor veya config yolu yanlış | `docker exec guardian pnpm tsx scripts/healthcheck.ts --health` ile manuel çalıştırın; gerektiğinde `--config` parametresi ekleyin |
+| Dashboard mobil görünümde tek kolona geçmiyor | Tarayıcı penceresi `matchMedia('(max-width: 640px)')` koşulunu tetiklemiyor veya caching sebebiyle eski CSS yüklü | `localStorage.clear()` ardından pencere genişliğini küçültün; `main.dashboard-grid` elementinin `data-layout="compact"` değeri aldığını ve `preview` panelinin alt sütuna taşındığını doğrulayın |
 
 - `guardian daemon status --json` veya `pnpm exec tsx src/cli.ts --health` çıktısında `metrics.logs.byLevel.error` hızla artıyorsa log seviyesini `guardian log-level set debug` ile yükseltip detaylı inceleme yapın.
 - `guardian daemon pipelines list --json` çıktısındaki `pipelines.ffmpeg.channels`, `pipelines.ffmpeg.degraded` ve `pipelines.audio.degraded` alanlarını takip ederek hangi kanalların watchdog tarafından sınırlandığını görün; bir kanal manuel temizlik gerektirdiğinde `guardian daemon pipelines reset --channel video:lobby` komutu çalışan guard runtime'ına watchdog sıfırlaması gönderir ve `metrics.pipelines.ffmpeg.byChannel['video:lobby'].health.severity` değerini `none` seviyesine çeker.

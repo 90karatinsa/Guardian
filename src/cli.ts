@@ -26,7 +26,7 @@ type CliIo = {
 };
 
 type GuardRuntime = {
-  stop: () => void | Promise<void>;
+  stop: () => Promise<void>;
   resetCircuitBreaker: (identifier: string, options?: { restart?: boolean }) => boolean;
   resetChannelHealth: (identifier: string) => boolean;
   resetTransportFallback?: (identifier: string) => boolean;
@@ -55,6 +55,7 @@ type HealthPayload = {
     ffmpeg: PipelineHealthSummary;
     audio: PipelineHealthSummary;
   };
+  suppression: SuppressionSummary;
   metricsSummary: {
     pipelines: {
       restarts: {
@@ -147,6 +148,11 @@ type PipelineHealthSummary = {
   channels: Record<string, PipelineChannelStatus>;
   degraded: string[];
   totalDegraded: number;
+  restarts: number;
+  watchdogRestarts: number;
+  watchdogBackoffMs: number;
+  lastWatchdogJitterMs: number | null;
+  transportFallbacks: TransportFallbackSummary;
 };
 
 type TransportFallbackChannelSummary = {
@@ -154,6 +160,12 @@ type TransportFallbackChannelSummary = {
   total: number;
   lastReason: string | null;
   lastAt: string | null;
+};
+
+type TransportFallbackSummary = {
+  total: number;
+  last: MetricsSnapshot['pipelines']['ffmpeg']['transportFallbacks']['last'];
+  byChannel: TransportFallbackChannelSummary[];
 };
 
 type RetentionSummary = {
@@ -166,32 +178,66 @@ type RetentionSummary = {
 type TransportFallbackChannelSnapshots =
   MetricsSnapshot['pipelines']['ffmpeg']['transportFallbacks']['byChannel'];
 
+type SuppressionCounterSummary<Key extends string> = {
+  [P in Key]: string;
+} & { total: number };
+
+type SuppressionSummary = {
+  total: number;
+  warnings: number;
+  byChannel: SuppressionCounterSummary<'channel'>[];
+  byReason: SuppressionCounterSummary<'reason'>[];
+  byRule: SuppressionCounterSummary<'rule'>[];
+  byType: SuppressionCounterSummary<'type'>[];
+  history: {
+    historyCount: number;
+    combinedHistoryCount: number;
+    historyTtlPruned: number;
+    ttlPrunedByChannel: SuppressionCounterSummary<'channel'>[];
+  };
+  lastEvent: MetricsSnapshot['suppression']['lastEvent'] | null;
+};
+
 function buildPipelineHealthSummary(
-  channels: Record<
-    string,
-    MetricsSnapshot['pipelines']['ffmpeg']['byChannel'][string]
-  >
+  snapshot: MetricsSnapshot['pipelines']['ffmpeg'],
+  fallbackChannels: TransportFallbackChannelSummary[]
 ): PipelineHealthSummary {
   const result: PipelineHealthSummary = {
     channels: {},
     degraded: [],
-    totalDegraded: 0
+    totalDegraded: 0,
+    restarts: snapshot.restarts,
+    watchdogRestarts: snapshot.watchdogRestarts,
+    watchdogBackoffMs: snapshot.watchdogBackoffMs,
+    lastWatchdogJitterMs: snapshot.lastWatchdogJitterMs ?? null,
+    transportFallbacks: {
+      total: snapshot.transportFallbacks.total,
+      last: snapshot.transportFallbacks.last,
+      byChannel: fallbackChannels
+    }
   };
 
-  const entries = Object.entries(channels).sort(([a], [b]) => a.localeCompare(b));
-  for (const [channel, snapshot] of entries) {
-    const health = snapshot.health;
+  const entries = Object.entries(snapshot.byChannel ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b)
+  );
+  for (const [channel, channelSnapshot] of entries) {
+    const health = channelSnapshot.health;
     const degraded = health.severity !== 'none';
     const status: PipelineChannelStatus = {
       degraded,
       severity: health.severity,
       reason: health.reason ?? null,
       degradedSince: health.degradedSince ?? null,
-      restarts: typeof health.restarts === 'number' ? health.restarts : snapshot.watchdogRestarts,
+      restarts:
+        typeof health.restarts === 'number'
+          ? health.restarts
+          : channelSnapshot.watchdogRestarts,
       backoffMs:
-        typeof health.backoffMs === 'number' ? health.backoffMs : snapshot.totalWatchdogBackoffMs,
-      watchdogRestarts: snapshot.watchdogRestarts,
-      watchdogBackoffMs: snapshot.totalWatchdogBackoffMs
+        typeof health.backoffMs === 'number'
+          ? health.backoffMs
+          : channelSnapshot.totalWatchdogBackoffMs,
+      watchdogRestarts: channelSnapshot.watchdogRestarts,
+      watchdogBackoffMs: channelSnapshot.totalWatchdogBackoffMs
     };
     result.channels[channel] = status;
     if (degraded) {
@@ -235,6 +281,55 @@ function summarizeTransportFallbackChannels(
       lastReason: snapshot.last?.reason ?? null,
       lastAt: snapshot.last?.at ?? null
     }));
+}
+
+function summarizeSuppressionCounters<Key extends string>(
+  counters: Record<string, number> | undefined,
+  key: Key
+): SuppressionCounterSummary<Key>[] {
+  if (!counters) {
+    return [];
+  }
+
+  return Object.entries(counters)
+    .filter(([keyValue]) => keyValue.length > 0)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([value, total]) => ({ [key]: value, total })) as SuppressionCounterSummary<Key>[];
+}
+
+function buildSuppressionSummary(snapshot: MetricsSnapshot['suppression']): SuppressionSummary {
+  const lastEvent = snapshot.lastEvent
+    ? {
+        ...snapshot.lastEvent,
+        channelStates: snapshot.lastEvent.channelStates
+          ? Object.fromEntries(
+              Object.entries(snapshot.lastEvent.channelStates).map(([channel, state]) => [
+                channel,
+                state ? { ...state } : {}
+              ])
+            )
+          : null
+      }
+    : null;
+
+  return {
+    total: snapshot.total,
+    warnings: snapshot.warnings,
+    byChannel: summarizeSuppressionCounters(snapshot.byChannel, 'channel'),
+    byReason: summarizeSuppressionCounters(snapshot.byReason, 'reason'),
+    byRule: summarizeSuppressionCounters(snapshot.byRule, 'rule'),
+    byType: summarizeSuppressionCounters(snapshot.byType, 'type'),
+    history: {
+      historyCount: snapshot.historyTotals.historyCount,
+      combinedHistoryCount: snapshot.historyTotals.combinedHistoryCount,
+      historyTtlPruned: snapshot.historyTotals.historyTtlPruned,
+      ttlPrunedByChannel: summarizeSuppressionCounters(
+        snapshot.historyTotals.ttlPrunedByChannel,
+        'channel'
+      )
+    },
+    lastEvent
+  };
 }
 
 type ReadinessPayload = {
@@ -443,13 +538,19 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const snapshot = metrics.snapshot();
   const errorCount = snapshot.logs.byLevel.error ?? 0;
   const fatalCount = snapshot.logs.byLevel.fatal ?? 0;
-  const ffmpegHealth = buildPipelineHealthSummary(snapshot.pipelines.ffmpeg.byChannel ?? {});
-  const audioHealth = buildPipelineHealthSummary(snapshot.pipelines.audio.byChannel ?? {});
   const ffmpegFallbackChannels = summarizeTransportFallbackChannels(
     snapshot.pipelines.ffmpeg.transportFallbacks.byChannel
   );
   const audioFallbackChannels = summarizeTransportFallbackChannels(
     snapshot.pipelines.audio.transportFallbacks.byChannel
+  );
+  const ffmpegHealth = buildPipelineHealthSummary(
+    snapshot.pipelines.ffmpeg,
+    ffmpegFallbackChannels
+  );
+  const audioHealth = buildPipelineHealthSummary(
+    snapshot.pipelines.audio,
+    audioFallbackChannels
   );
   const pipelinesDegraded =
     ffmpegHealth.totalDegraded > 0 || audioHealth.totalDegraded > 0;
@@ -480,6 +581,7 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
     totals: retentionTotals,
     totalsByCamera: retentionTotalsByCamera
   };
+  const suppressionSummary = buildSuppressionSummary(snapshot.suppression);
 
   let status: HealthStatus = 'ok';
   if (state.status === 'starting') {
@@ -520,6 +622,7 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
       ffmpeg: ffmpegHealth,
       audio: audioHealth
     },
+    suppression: suppressionSummary,
     metricsSummary: {
       pipelines: {
         restarts: {
@@ -1663,7 +1766,7 @@ async function startDaemon(io: CliIo): Promise<number> {
 
   if (state.status !== 'starting') {
     try {
-      await Promise.resolve(runtime.stop());
+      await runtime.stop();
     } catch (error) {
       logger.warn({ err: error }, 'Guardian runtime stop failed after aborted start');
     }
@@ -1785,7 +1888,7 @@ async function performShutdown(reason: string, signal?: NodeJS.Signals): Promise
       const startedAt = performance.now();
       await metrics.time('guard.shutdown.ms', async () => {
         if (runtime) {
-          await Promise.resolve(runtime.stop());
+          await runtime.stop();
         }
       });
       shutdownDurationMs = performance.now() - startedAt;

@@ -864,6 +864,55 @@ describe('EventSuppressionRateLimit', () => {
 
     ttlSpy.mockRestore();
   });
+
+  it('EventSuppressionPerChannelRateLimit resets TTL cooldowns per channel and reports timeline expiration', () => {
+    bus.configureSuppression([
+      {
+        id: 'per-channel-ttl',
+        detector: 'test-detector',
+        channel: ['cam:a', 'cam:b'],
+        rateLimit: { count: 2, perMs: 600, cooldownMs: 400 },
+        suppressForMs: 400,
+        timelineTtlMs: 500,
+        reason: 'per-channel ttl'
+      }
+    ]);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 200, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 260, meta: { channel: 'cam:a' } })).toBe(false);
+
+    const initialDetail = metricsMock.recordSuppressedEvent.mock.calls.at(-1)?.[0];
+    expect(initialDetail?.timelineExpired).toBe(false);
+
+    metricsMock.recordSuppressedEvent.mockClear();
+    log.info.mockClear();
+
+    expect(bus.emitEvent({ ...basePayload, ts: 1350, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 1500, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 1550, meta: { channel: 'cam:a' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 1600, meta: { channel: 'cam:a' } })).toBe(false);
+
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledTimes(1);
+    const ttlDetail = metricsMock.recordSuppressedEvent.mock.calls[0]?.[0];
+    expect(ttlDetail).toMatchObject({
+      ruleId: 'per-channel-ttl',
+      channel: 'cam:a',
+      timelineExpired: true,
+      historyCount: 3
+    });
+
+    const suppressedMeta = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressedMeta).toHaveLength(1);
+    const [ttlSuppression] = suppressedMeta;
+    expect(ttlSuppression?.suppressionTimelineExpired).toBe(true);
+    expect(ttlSuppression?.suppressedBy?.[0]?.timelineExpired).toBe(true);
+    expect(ttlSuppression?.suppressedBy?.[0]?.historyCount).toBe(3);
+    expect(Array.isArray(ttlSuppression?.suppressionHistory)).toBe(true);
+    expect(ttlSuppression?.suppressionHistoryCount).toBe(3);
+  });
 });
 
 describe('EventSuppressionWindowRecovery', () => {

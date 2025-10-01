@@ -228,7 +228,7 @@ describe('ConfigHotReload', () => {
 
       await waitFor(() => runtime.pipelines.get('video:cam-1')?.pipelineState.person.score === 0.5, 4000);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -352,7 +352,7 @@ describe('ConfigHotReload', () => {
         MockVideoSource.instances.some(instance => instance.options.channel === 'video:cam-3')
       ).toBe(true);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -453,7 +453,7 @@ describe('ConfigHotReload', () => {
         'configuration reloaded'
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -573,7 +573,7 @@ describe('ConfigHotReload', () => {
       expect(detector.updateOptions).not.toHaveBeenCalled();
       expect(manager.getConfig().video.channels?.['video:cam-1']).toBeDefined();
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -681,7 +681,7 @@ describe('ConfigHotReload', () => {
       const updatedSuppression = busLogger.info.mock.calls.find(([, message]) => message === 'Event suppressed');
       expect(updatedSuppression?.[0]?.meta).toMatchObject({ suppressionRuleId: 'updated' });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -719,7 +719,7 @@ describe('ConfigHotReload', () => {
       ).toBe(false);
       expect(MockVideoSource.instances).toHaveLength(1);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -843,7 +843,7 @@ describe('ConfigHotReload', () => {
         expect.objectContaining({ ruleId: 'ttl-rule', count: expect.any(Number) })
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -931,7 +931,7 @@ describe('ConfigHotReload', () => {
 
       await new Promise(resolve => setTimeout(resolve, 250));
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -981,7 +981,7 @@ describe('ConfigHotReload', () => {
       );
       await waitFor(() => fs.readFileSync(configPath, 'utf-8') === originalRaw);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1022,7 +1022,7 @@ describe('ConfigHotReload', () => {
       expect(updateCall?.[0]?.updates?.motion?.noiseWarmupFrames).toEqual({ previous: 0, next: 4 });
       expect(updateCall?.[0]?.updates?.motion?.noiseBackoffPadding).toEqual({ previous: 0, next: 2 });
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1120,7 +1120,7 @@ describe('ConfigHotReload', () => {
         logger.info.mock.calls.some(([, message]) => message === 'configuration reloaded')
       ).toBe(true);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   }, 10000);
 
@@ -1184,7 +1184,7 @@ describe('ConfigHotReload', () => {
       expect(runtime.pipelines.has('video:cam-2')).toBe(false);
       expect(stopSpy).toHaveBeenCalledTimes(1);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1224,7 +1224,7 @@ describe('ConfigHotReload', () => {
       expect(warnCall?.[0]).toMatchObject({ configPath, action: 'reload', restored: true, reloadRejected: true });
       expect(warnCall?.[0]?.err).toBeInstanceOf(Error);
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1283,7 +1283,7 @@ describe('ConfigHotReload', () => {
       const restored = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as GuardianConfig;
       expect(restored.audio).toBeUndefined();
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1416,7 +1416,7 @@ describe('ConfigHotReload', () => {
       });
     } finally {
       anomalySpy.mockRestore();
-      runtime.stop();
+      await runtime.stop();
     }
   });
 
@@ -1474,7 +1474,96 @@ describe('ConfigHotReload', () => {
         deviceDiscoveryTimeoutMs: 950
       });
     } finally {
-      runtime.stop();
+      await runtime.stop();
+    }
+  });
+
+  it('ConfigRejectsDuplicateTransportFallback rejects duplicate or empty fallback entries', async () => {
+    const base = createConfig({ diffThreshold: 26 });
+    base.video.ffmpeg = { transportFallbackSequence: ['tcp', 'udp'] };
+    if (base.video.cameras) {
+      base.video.cameras[0].input = 'rtsp://cam-1';
+      base.video.cameras[0].ffmpeg = {
+        ...(base.video.cameras[0].ffmpeg ?? {}),
+        rtspTransport: 'tcp',
+        transportFallbackSequence: ['tcp', 'udp']
+      } as CameraConfig['ffmpeg'];
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(base, null, 2));
+
+    const manager = new ConfigManager(configPath);
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const videoSource = MockVideoSource.instances[0];
+      const initialUpdates = videoSource.updateOptions.mock.calls.length;
+
+      const invalid = JSON.parse(JSON.stringify(base)) as GuardianConfig;
+      if (invalid.video.ffmpeg) {
+        invalid.video.ffmpeg.transportFallbackSequence = ['tcp', 'TCP', ''];
+      }
+      if (invalid.video.cameras) {
+        invalid.video.cameras[0].ffmpeg = {
+          ...(invalid.video.cameras[0].ffmpeg ?? {}),
+          transportFallbackSequence: ['udp', 'udp', ' ']
+        } as CameraConfig['ffmpeg'];
+      }
+
+      fs.writeFileSync(configPath, JSON.stringify(invalid, null, 2));
+
+      await waitFor(
+        () =>
+          logger.warn.mock.calls.some(
+            ([payload, message]) => message === 'ConfigReloadRejected' && payload?.reloadRejected === true
+          ),
+        4000
+      );
+
+      const warnCall = logger.warn.mock.calls.find(([, message]) => message === 'ConfigReloadRejected');
+      expect(warnCall?.[0]).toMatchObject({ reloadRejected: true, restored: true });
+      const reason = String(warnCall?.[0]?.err?.message ?? '');
+      expect(reason).toContain('transportFallbackSequence');
+      expect(reason.toLowerCase()).toContain('duplicate');
+
+      await waitFor(() => {
+        const restoredOnDisk = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as GuardianConfig;
+        return (
+          Array.isArray(restoredOnDisk.video.ffmpeg?.transportFallbackSequence) &&
+          restoredOnDisk.video.ffmpeg?.transportFallbackSequence?.join(',') === 'tcp,udp'
+        );
+      }, 4000);
+
+      const restored = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as GuardianConfig;
+      expect(restored.video.ffmpeg?.transportFallbackSequence).toEqual(['tcp', 'udp']);
+      if (restored.video.cameras) {
+        expect(restored.video.cameras[0].ffmpeg?.transportFallbackSequence).toEqual(['tcp', 'udp']);
+      }
+
+      const current = manager.getConfig();
+      expect(current.video.ffmpeg?.transportFallbackSequence).toEqual(['tcp', 'udp']);
+      if (current.video.cameras) {
+        expect(current.video.cameras[0].ffmpeg?.transportFallbackSequence).toEqual(['tcp', 'udp']);
+      }
+
+      expect(videoSource.updateOptions.mock.calls.length).toBe(initialUpdates);
+    } finally {
+      await runtime.stop();
     }
   });
 
@@ -1566,7 +1655,7 @@ describe('ConfigHotReload', () => {
         initialSnapshot.pipelines.ffmpeg.restarts
       );
     } finally {
-      runtime.stop();
+      await runtime.stop();
     }
   });
 });

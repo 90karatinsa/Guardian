@@ -107,6 +107,7 @@ export class LightDetector {
     const temporalOptionsChanged =
       hasOptionChanged('temporalMedianWindow') ||
       hasOptionChanged('temporalMedianBackoffSmoothing');
+    const suppressionOptionsChanged = backoffPaddingChanged || temporalOptionsChanged;
 
     const countersResetNeeded =
       baselineResetNeeded ||
@@ -124,16 +125,7 @@ export class LightDetector {
 
     if (backoffPaddingChanged) {
       this.baseNoiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
-      this.noiseBackoffPadding = Math.max(this.noiseBackoffPadding, this.baseNoiseBackoffPadding);
-      const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
-      const padding = Math.max(0, Math.round(this.noiseBackoffPadding));
-      const paddedBackoff = baseBackoff + padding;
-      this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
-      this.updatePendingSuppressedGauge();
-    }
-
-    if (temporalOptionsChanged) {
-      this.resetTemporalGate();
+      this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
     }
 
     if (baselineResetNeeded) {
@@ -141,9 +133,31 @@ export class LightDetector {
     } else if (countersResetNeeded) {
       this.resetAdaptiveState({
         preserveBaseline: true,
-        preserveSuppression: true,
+        preserveSuppression: !suppressionOptionsChanged,
         preserveWarmup: !warmupChanged
       });
+    }
+
+    if (suppressionOptionsChanged) {
+      metrics.resetDetectorCounters('light', [
+        'suppressedFrames',
+        'suppressedFramesBeforeTrigger',
+        'backoffFrames',
+        'backoffSuppressedFrames',
+        'backoffActivations',
+        'backoffFrameBudget'
+      ]);
+      this.updatePendingSuppressedGauge();
+      const baseDebounce = next.debounceFrames ?? DEFAULT_DEBOUNCE_FRAMES;
+      const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
+      const padding = Math.max(0, Math.round(this.noiseBackoffPadding));
+      metrics.setDetectorGauge('light', 'effectiveDebounceFrames', baseDebounce);
+      metrics.setDetectorGauge('light', 'effectiveBackoffFrames', baseBackoff + padding);
+      metrics.setDetectorGauge('light', 'noiseBackoffPadding', this.noiseBackoffPadding);
+    }
+
+    if (temporalOptionsChanged) {
+      this.resetTemporalGate();
     }
   }
 

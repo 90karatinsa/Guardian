@@ -149,6 +149,7 @@ export class PoseEstimator {
         ? movementCount / forecast.movementFlags.length
         : 0);
       metrics.setDetectorGauge('pose', 'movingJointRatio', movementRatio);
+      metrics.recordPoseForecastConfidence(enrichedForecast.confidence);
 
       const payload: EventPayload = {
         ts,

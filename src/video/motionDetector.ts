@@ -131,6 +131,7 @@ export class MotionDetector {
     const temporalOptionsChanged =
       hasOptionChanged('temporalMedianWindow') ||
       hasOptionChanged('temporalMedianBackoffSmoothing');
+    const suppressionOptionsChanged = backoffPaddingChanged || temporalOptionsChanged;
 
     const countersResetNeeded =
       referenceResetNeeded ||
@@ -148,22 +149,7 @@ export class MotionDetector {
 
     if (backoffPaddingChanged) {
       this.baseNoiseBackoffPadding = Math.max(0, next.noiseBackoffPadding ?? 0);
-      this.noiseBackoffPadding = Math.max(this.noiseBackoffPadding, this.baseNoiseBackoffPadding);
-      const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
-      const padding = Math.max(0, Math.round(this.noiseBackoffPadding));
-      const paddedBackoff = baseBackoff + padding;
-      this.backoffFrames = Math.min(this.backoffFrames, paddedBackoff);
-      if (this.pendingSuppressedFramesBeforeTrigger > 0) {
-        this.pendingSuppressedFramesBeforeTrigger = Math.min(
-          this.pendingSuppressedFramesBeforeTrigger,
-          paddedBackoff
-        );
-      }
-      this.updateSuppressedGauge();
-    }
-
-    if (temporalOptionsChanged) {
-      this.resetTemporalGate();
+      this.noiseBackoffPadding = this.baseNoiseBackoffPadding;
     }
 
     if (referenceResetNeeded) {
@@ -171,9 +157,29 @@ export class MotionDetector {
     } else if (countersResetNeeded) {
       this.resetAdaptiveState({
         preserveReference: true,
-        preserveSuppressionCounters: true,
+        preserveSuppressionCounters: !suppressionOptionsChanged,
         preserveWarmup: !warmupChanged
       });
+    }
+
+    if (suppressionOptionsChanged) {
+      metrics.resetDetectorCounters('motion', [
+        'suppressedFrames',
+        'suppressedFramesBeforeTrigger',
+        'backoffSuppressedFrames',
+        'backoffActivations'
+      ]);
+      this.updateSuppressedGauge();
+      const baseDebounce = next.debounceFrames ?? DEFAULT_DEBOUNCE_FRAMES;
+      const baseBackoff = next.backoffFrames ?? DEFAULT_BACKOFF_FRAMES;
+      const padding = Math.max(0, Math.round(this.noiseBackoffPadding));
+      metrics.setDetectorGauge('motion', 'effectiveDebounceFrames', baseDebounce);
+      metrics.setDetectorGauge('motion', 'effectiveBackoffFrames', baseBackoff + padding);
+      metrics.setDetectorGauge('motion', 'noiseBackoffPadding', Math.max(0, this.noiseBackoffPadding));
+    }
+
+    if (temporalOptionsChanged) {
+      this.resetTemporalGate();
     }
   }
 

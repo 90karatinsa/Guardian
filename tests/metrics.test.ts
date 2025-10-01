@@ -681,6 +681,26 @@ describe('MetricsCounters', () => {
     expect(prometheus).toContain('guardian_transport_fallback_resets_channel_total');
     expect(prometheus).toContain('channel="video:lobby"');
   });
+
+  it('MetricsPoseAndSuppressionCounters exports pose confidence buckets and warning totals', () => {
+    const registry = new MetricsRegistry();
+
+    registry.recordPoseForecastConfidence(0.12);
+    registry.recordPoseForecastConfidence(0.68);
+    registry.recordPoseForecastConfidence(1.25);
+
+    registry.recordSuppressionHistoryTtlPruned({ count: 2, ruleId: 'motion-cooldown' });
+    registry.recordSuppressionHistoryTtlPruned({ count: 1, channel: 'video:lobby' });
+
+    const prometheus = registry.exportDetectorCountersForPrometheus();
+
+    expect(prometheus).toContain('guardian_pose_confidence_bucket');
+    expect(prometheus).toContain('guardian_pose_confidence_count');
+    expect(prometheus).toContain('guardian_suppression_warning_total');
+
+    const snapshot = registry.snapshot();
+    expect(snapshot.suppression.warnings).toBe(2);
+  });
 });
 
 describe('MetricsSnapshotEnrichment', () => {

@@ -2,11 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Guardian Dashboard</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <header>
+    <header class="dashboard-header">
       <h1>Guardian Events</h1>
       <p class="meta">
         Streaming live events. Filter by source, channel, or severity to focus on the signals that
@@ -72,9 +73,9 @@
         <button type="button" id="reset-filters" class="secondary">Reset</button>
       </form>
     </header>
-    <main class="dashboard">
-      <div id="event-column">
-        <section class="stream-widget" aria-live="polite" aria-label="Stream activity">
+    <main class="dashboard dashboard-grid" data-layout="wide">
+      <div id="event-column" class="dashboard-grid__primary">
+        <section class="dashboard-card stream-widget" aria-live="polite" aria-label="Stream activity">
           <h2>Live stream</h2>
           <dl>
             <dt>Status</dt>
@@ -97,14 +98,18 @@
             <dd id="pose-threat">—</dd>
           </dl>
         </section>
-        <section class="metrics-widget" aria-live="polite" aria-label="Threat summary">
+        <section
+          class="dashboard-card metrics-widget"
+          aria-live="polite"
+          aria-label="Threat summary"
+        >
           <h2>Threat summary</h2>
           <div id="threat-summary" class="metrics-grid">
             <p class="meta" id="threat-summary-empty">Awaiting event data…</p>
           </div>
         </section>
         <section
-          class="metrics-widget"
+          class="dashboard-card metrics-widget"
           aria-live="polite"
           aria-label="Pipeline and channel metrics"
         >
@@ -114,7 +119,7 @@
           </div>
         </section>
         <section
-          class="metrics-widget"
+          class="dashboard-card metrics-widget"
           aria-live="polite"
           aria-label="Channel status overview"
         >
@@ -123,14 +128,14 @@
             <p class="meta" id="channel-status-empty">No channel metrics available yet.</p>
           </div>
         </section>
-        <section class="metrics-widget" aria-live="polite" aria-label="System warnings">
+        <section class="dashboard-card metrics-widget" aria-live="polite" aria-label="System warnings">
           <h2>System warnings</h2>
           <p class="meta" id="warning-empty">No warnings observed yet.</p>
           <ul id="warning-list" class="warning-list" aria-live="polite"></ul>
         </section>
         <section
           id="channel-filter"
-          class="channel-filter"
+          class="dashboard-card channel-filter"
           aria-label="Channel filters"
           aria-live="polite"
         >
@@ -138,11 +143,38 @@
           <p id="channel-filter-empty" class="meta">No channels observed yet.</p>
           <div id="channel-filter-options" class="channel-options" role="group"></div>
         </section>
-        <section aria-live="polite" aria-label="Live events" id="events"></section>
+        <section
+          aria-live="polite"
+          aria-label="Live events"
+          id="events"
+          class="dashboard-card event-feed"
+        ></section>
       </div>
-      <aside id="preview" aria-label="Snapshot preview">
-        <div class="preview-empty" id="preview-empty">Select an event to view the latest snapshot.</div>
-        <figure id="preview-figure" hidden>
+      <aside
+        id="preview"
+        class="dashboard-card preview-panel"
+        aria-label="Snapshot preview"
+        aria-live="polite"
+      >
+        <div
+          class="preview-empty"
+          id="preview-empty"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          Select an event to view the latest snapshot.
+        </div>
+        <figure
+          id="preview-figure"
+          class="preview-figure"
+          hidden
+          role="group"
+          tabindex="0"
+          aria-live="polite"
+          aria-labelledby="preview-caption-text"
+          aria-describedby="preview-caption"
+        >
           <div class="preview-images">
             <img id="preview-image" alt="Selected event snapshot" />
             <img id="preview-face-image" alt="Selected face snapshot" hidden />

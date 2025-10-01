@@ -2060,7 +2060,7 @@ describe('VideoSource', () => {
       appliedJitterMs: 0
     });
 
-    runtime.stop();
+    await runtime.stop();
 
     vi.resetModules();
     vi.doUnmock('../src/video/source.js');

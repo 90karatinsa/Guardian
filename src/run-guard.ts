@@ -177,7 +177,7 @@ export interface GuardStartOptions {
 }
 
 export type GuardRuntime = {
-  stop: () => void;
+  stop: () => Promise<void>;
   pipelines: Map<string, CameraRuntime>;
   retention?: RetentionTask | null;
   resetCircuitBreaker: (identifier: string, options?: { restart?: boolean }) => boolean;
@@ -721,6 +721,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         existing.pipelineState.ffmpeg.transportFallbackSequence,
         context.pipelineState.ffmpeg.transportFallbackSequence
       );
+      const rtspTransportChanged =
+        existing.pipelineState.ffmpeg.rtspTransport !==
+        context.pipelineState.ffmpeg.rtspTransport;
 
       const restartRequested =
         forceRestart || needsPipelineRestart(existing.pipelineState, context.pipelineState);
@@ -728,7 +731,8 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       if (restartRequested) {
         pipelines.delete(existing.channel);
         pipelinesById.delete(existing.id);
-        if (transportSequenceChanged) {
+        if (transportSequenceChanged || rtspTransportChanged) {
+          metrics.resetTransportFallback(existing.channel);
           metrics.clearPipelineChannel('ffmpeg', existing.channel);
         }
         existing.cleanup.forEach(fn => {
@@ -1094,7 +1098,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     return true;
   };
 
-  const stop = () => {
+  const stop = async () => {
     bus.off('event', eventHandler);
     if (!injectedConfig) {
       manager.off('reload', handleReload);
@@ -1105,6 +1109,7 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
     }
     stopAudioRuntime(audioRuntime);
     audioRuntime = null;
+    const videoStopTasks: Promise<void>[] = [];
     for (const runtime of pipelinesById.values()) {
       runtime.cleanup.forEach(fn => {
         try {
@@ -1114,12 +1119,33 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
         }
       });
       runtime.cleanup.length = 0;
-      runtime.source.stop();
-      metrics.clearPipelineChannel('ffmpeg', runtime.channel);
+      let stopPromise: Promise<void>;
+      try {
+        stopPromise = Promise.resolve(runtime.source.stop());
+      } catch (error) {
+        logger.warn({ err: error, camera: runtime.id }, 'Failed to stop guard pipeline');
+        stopPromise = Promise.resolve();
+      }
+
+      const task = stopPromise
+        .catch(error => {
+          logger.warn({ err: error, camera: runtime.id }, 'Video source stop failed');
+        })
+        .finally(() => {
+          runtime.restartStats.watchdogRestarts = 0;
+          runtime.restartStats.watchdogBackoffMs = 0;
+          runtime.restartStats.health.severity = 'none';
+          runtime.restartStats.health.reason = null;
+          runtime.restartStats.health.degradedSince = null;
+          metrics.clearPipelineChannel('ffmpeg', runtime.channel);
+        });
+
+      videoStopTasks.push(task);
     }
     pipelines.clear();
     pipelinesById.clear();
     retentionTask?.stop();
+    await Promise.all(videoStopTasks);
   };
 
   return {
@@ -1810,6 +1836,15 @@ function summarizePipelineUpdates(
       'circuitBreakerThreshold'
     ]
   );
+  if (
+    runtime.pipelineState.ffmpeg.rtspTransport !==
+    next.pipelineState.ffmpeg.rtspTransport
+  ) {
+    (ffmpegChanges as Record<string, unknown>).rtspTransport = {
+      previous: runtime.pipelineState.ffmpeg.rtspTransport ?? null,
+      next: next.pipelineState.ffmpeg.rtspTransport ?? null
+    };
+  }
   if (
     !arrayEqual(
       runtime.pipelineState.ffmpeg.transportFallbackSequence,
@@ -2596,8 +2631,10 @@ if (
   process.on('SIGINT', () => {
     loggerModule.info('Stopping guard pipeline');
     runtimePromise
-      .then(runtime => {
-        runtime?.stop();
+      .then(async runtime => {
+        if (runtime) {
+          await runtime.stop();
+        }
       })
       .finally(() => {
         process.exit(0);
