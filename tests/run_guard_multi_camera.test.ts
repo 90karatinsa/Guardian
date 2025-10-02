@@ -2875,6 +2875,83 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('RunGuardListenerCleanup keeps video source handlers stable across reconfigure', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const buildConfig = (diffThreshold: number): GuardianConfig =>
+      ({
+        video: {
+          framesPerSecond: 5,
+          cameras: [
+            {
+              id: 'cam-1',
+              channel: 'video:cam-1',
+              input: 'rtsp://camera-1/stream',
+              person: { score: 0.5 },
+              motion: { diffThreshold, areaThreshold: 0.02 }
+            }
+          ]
+        },
+        person: { modelPath: 'person.onnx', score: 0.5 },
+        motion: { diffThreshold, areaThreshold: 0.02 }
+      } as GuardianConfig);
+
+    const manager = new MockConfigManager(buildConfig(20));
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 1);
+      await waitFor(() => MockVideoSource.instances.length === 1);
+
+      const source = MockVideoSource.instances[0];
+      const listenerEvents = [
+        'frame',
+        'error',
+        'recover',
+        'transport-change',
+        'fatal',
+        'end'
+      ] as const;
+
+      const baseline = Object.fromEntries(
+        listenerEvents.map(event => [event, source.listenerCount(event)])
+      ) as Record<(typeof listenerEvents)[number], number>;
+
+      expect(baseline.frame).toBeGreaterThan(0);
+      expect(baseline.error).toBeGreaterThan(0);
+
+      manager.setConfig(buildConfig(25));
+
+      await waitFor(() => source.updateOptions.mock.calls.length > 0);
+      await Promise.resolve();
+
+      expect(MockVideoSource.instances.length).toBe(1);
+      listenerEvents.forEach(event => {
+        expect(source.listenerCount(event)).toBe(baseline[event]);
+      });
+
+      source.updateOptions.mockClear();
+
+      manager.setConfig(buildConfig(30));
+
+      await waitFor(() => source.updateOptions.mock.calls.length > 0);
+      await Promise.resolve();
+
+      expect(MockVideoSource.instances.length).toBe(1);
+      listenerEvents.forEach(event => {
+        expect(source.listenerCount(event)).toBe(baseline[event]);
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
   it('RunGuardRestartHistoryCap limits restart history and tracks totals', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 

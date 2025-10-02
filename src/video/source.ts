@@ -764,6 +764,7 @@ export class VideoSource extends EventEmitter {
           this.startCommand();
         });
     }, sanitizedDelay);
+    this.restartTimer.unref?.();
   }
 
   private finalizeCommandLifecycle() {
@@ -844,6 +845,7 @@ export class VideoSource extends EventEmitter {
       options.onForceKill?.();
       this.finalizeCommandLifecycle();
     }, delay);
+    this.killTimer.unref?.();
 
     return exitPromise;
   }
@@ -936,6 +938,7 @@ export class VideoSource extends EventEmitter {
       this.emit('error', new Error('Video source failed to start before timeout'));
       this.scheduleRecovery('start-timeout');
     }, timeout);
+    this.startTimer.unref?.();
   }
 
   private clearRestartTimer() {
@@ -990,6 +993,7 @@ export class VideoSource extends EventEmitter {
       this.emit('error', new Error('Video source watchdog timeout'));
       this.scheduleRecovery('watchdog-timeout');
     }, idleTimeout);
+    this.watchdogTimer.unref?.();
   }
 
   private resetStreamIdleTimer() {
@@ -1016,6 +1020,7 @@ export class VideoSource extends EventEmitter {
       this.emit('error', new Error('Video source stream idle timeout'));
       this.scheduleRecovery('stream-idle');
     }, idleTimeout);
+    this.streamIdleTimer.unref?.();
   }
 
   private computeRestartDelay(attempt: number): RestartDelayResult {

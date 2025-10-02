@@ -134,6 +134,65 @@ describe('EventSuppressionRateLimit', () => {
     });
   });
 
+  it('EventSuppressionResetTimeline clears per-channel state and stops suppression after reset', () => {
+    const suppressedLogs = () =>
+      log.info.mock.calls.filter(([, message]) => message === 'Event suppressed');
+
+    bus.configureSuppression([
+      {
+        id: 'timeline-reset',
+        detector: 'test-detector',
+        channel: ['video:cam-reset', 'video:cam-secondary'],
+        rateLimit: { count: 1, perMs: 200, cooldownMs: 400 },
+        suppressForMs: 200,
+        timelineTtlMs: 300,
+        reason: 'timeline reset rule'
+      }
+    ]);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'video:cam-reset' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 50, meta: { channel: 'video:cam-reset' } })).toBe(false);
+
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledTimes(1);
+    expect(suppressedLogs()).toHaveLength(1);
+
+    const rules = (bus as any).suppressionRules as Array<{
+      id: string;
+      timelines: Map<string, { history: number[]; suppressedUntil: number }>;
+      pendingTimelineExpirations: Map<string, number>;
+    }>;
+    const ruleState = rules.find(rule => rule.id === 'timeline-reset');
+    expect(ruleState).toBeDefined();
+    const channelTimeline = ruleState?.timelines.get('video:cam-reset');
+    expect(channelTimeline).toBeDefined();
+    expect((channelTimeline?.history.length ?? 0) > 0).toBe(true);
+    expect(ruleState?.timelines.size).toBe(1);
+    expect(ruleState?.pendingTimelineExpirations.size).toBe(0);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 5000, meta: { channel: 'video:cam-reset' } })).toBe(true);
+    expect(ruleState?.pendingTimelineExpirations.size).toBe(1);
+    expect(ruleState?.timelines.size).toBe(0);
+
+    expect(bus.emitEvent({ ...basePayload, ts: 5050, meta: { channel: 'video:cam-secondary' } })).toBe(true);
+    expect(bus.emitEvent({ ...basePayload, ts: 5060, meta: { channel: 'video:cam-secondary' } })).toBe(false);
+
+    expect(ruleState?.timelines.size).toBe(1);
+    expect(ruleState?.pendingTimelineExpirations.size).toBe(1);
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledTimes(2);
+    expect(suppressedLogs()).toHaveLength(2);
+
+    bus.resetSuppressionState();
+
+    expect(ruleState?.timelines.size).toBe(0);
+    expect(ruleState?.pendingTimelineExpirations.size).toBe(0);
+    expect(ruleState?.timelines.has('video:cam-reset')).toBe(false);
+
+    const suppressedCountAfterReset = suppressedLogs().length;
+    expect(bus.emitEvent({ ...basePayload, ts: 6000, meta: { channel: 'video:cam-reset' } })).toBe(true);
+    expect(suppressedLogs()).toHaveLength(suppressedCountAfterReset);
+    expect(metricsMock.recordSuppressedEvent).toHaveBeenCalledTimes(2);
+  });
+
   it('EventBusAugmentsChannelMetadata for suppression and storage', () => {
     bus.configureSuppression([
       {
