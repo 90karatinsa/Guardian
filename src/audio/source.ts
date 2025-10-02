@@ -854,6 +854,7 @@ export class AudioSource extends EventEmitter {
           this.startPipeline();
         });
     }, Math.max(0, timing.delayMs));
+    this.restartTimer.unref?.();
   }
 
   private detachProcess() {
@@ -927,6 +928,7 @@ export class AudioSource extends EventEmitter {
       }
       this.resolveProcessExit();
     }, delay);
+    this.killTimer.unref?.();
 
     return exitPromise;
   }
@@ -960,6 +962,7 @@ export class AudioSource extends EventEmitter {
       this.emit('error', new Error('Audio source start timeout'));
       this.scheduleRetry('start-timeout');
     }, timeout);
+    this.startTimer.unref?.();
   }
 
   private clearIdleTimer() {
@@ -984,6 +987,7 @@ export class AudioSource extends EventEmitter {
       this.emit('error', new Error('Audio source idle timeout'));
       this.scheduleRetry('stream-idle');
     }, timeout);
+    this.idleTimer.unref?.();
   }
 
   private clearWatchdogTimer() {
@@ -1012,6 +1016,7 @@ export class AudioSource extends EventEmitter {
       this.emit('error', new Error('Audio source watchdog timeout'));
       this.scheduleRetry('watchdog-timeout');
     }, timeout);
+    this.watchdogTimer.unref?.();
   }
 
   private clearKillTimer() {

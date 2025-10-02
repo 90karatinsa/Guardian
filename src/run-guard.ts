@@ -2343,7 +2343,7 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: E
   const { source } = runtime;
   const personDetector = runtime.personDetector;
 
-  source.on('frame', async frame => {
+  const handleFrame = async (frame: Buffer) => {
     const ts = Date.now();
 
     try {
@@ -2379,13 +2379,19 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: E
         runtime.framesSinceMotion = null;
       }
     }
-  });
+  };
 
-  source.on('error', error => {
+  source.on('frame', handleFrame);
+  runtime.cleanup.push(() => source.off('frame', handleFrame));
+
+  const handleError = (error: Error) => {
     logger.error({ err: error, camera: runtime.id }, 'Video source error');
-  });
+  };
 
-  source.on('recover', event => {
+  source.on('error', handleError);
+  runtime.cleanup.push(() => source.off('error', handleError));
+
+  const handleRecover = (event: RecoverEvent) => {
     const now = Date.now();
     const stats = runtime.restartStats;
     stats.total += 1;
@@ -2543,7 +2549,10 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: E
         backoffMs: stats.watchdogBackoffMs
       });
     }
-  });
+  };
+
+  source.on('recover', handleRecover);
+  runtime.cleanup.push(() => source.off('recover', handleRecover));
 
   const handleTransportChange = (event: TransportFallbackEvent) => {
     const state = runtime.transport;
@@ -2597,7 +2606,7 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: E
   source.on('transport-change', handleTransportChange);
   runtime.cleanup.push(() => source.off('transport-change', handleTransportChange));
 
-  source.on('fatal', (event: FatalEvent) => {
+  const handleFatal = (event: FatalEvent) => {
     const now = Date.now();
     runtime.restartStats.lastFatal = { ...event, at: now };
     const channel = event.channel ?? runtime.channel;
@@ -2611,11 +2620,17 @@ function setupSourceHandlers(logger: GuardLogger, runtime: CameraRuntime, bus: E
       },
       'Video source fatal error'
     );
-  });
+  };
 
-  source.on('end', () => {
+  source.on('fatal', handleFatal);
+  runtime.cleanup.push(() => source.off('fatal', handleFatal));
+
+  const handleEnd = () => {
     logger.warn({ camera: runtime.id }, 'Video source ended');
-  });
+  };
+
+  source.on('end', handleEnd);
+  runtime.cleanup.push(() => source.off('end', handleEnd));
 }
 
 if (

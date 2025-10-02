@@ -192,6 +192,94 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoTimerUnref', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:timer-unref',
+      startTimeoutMs: 50,
+      watchdogTimeoutMs: 40,
+      idleTimeoutMs: 35,
+      restartDelayMs: 25,
+      restartMaxDelayMs: 25,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 20,
+      commandFactory
+    });
+
+    source.on('error', () => {});
+
+    let finalSnapshot = metrics.snapshot();
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      const command = commands[0];
+
+      const internals = source as unknown as {
+        startTimer: NodeJS.Timeout | null;
+        watchdogTimer: NodeJS.Timeout | null;
+        streamIdleTimer: NodeJS.Timeout | null;
+        restartTimer: NodeJS.Timeout | null;
+        killTimer: NodeJS.Timeout | null;
+      };
+
+      expect(internals.startTimer).not.toBeNull();
+      expect(internals.startTimer?.hasRef?.()).toBe(false);
+      expect(internals.watchdogTimer).not.toBeNull();
+      expect(internals.watchdogTimer?.hasRef?.()).toBe(false);
+
+      command.pushFrame(SAMPLE_PNG);
+
+      await Promise.resolve();
+
+      expect(internals.streamIdleTimer).not.toBeNull();
+      expect(internals.streamIdleTimer?.hasRef?.()).toBe(false);
+
+      command.emit('error', new Error('ffmpeg crashed'));
+
+      await Promise.resolve();
+
+      expect(internals.restartTimer).not.toBeNull();
+      expect(internals.restartTimer?.hasRef?.()).toBe(false);
+      expect(internals.killTimer).not.toBeNull();
+      expect(internals.killTimer?.hasRef?.()).toBe(false);
+      expect(command.killedSignals).toContain('SIGTERM');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['ffmpeg-error']).toBeGreaterThanOrEqual(1);
+      const channelStats = snapshot.pipelines.ffmpeg.byChannel['video:timer-unref'];
+      expect(channelStats.restarts).toBeGreaterThanOrEqual(1);
+      expect(channelStats.byReason['ffmpeg-error']).toBeGreaterThanOrEqual(1);
+    } finally {
+      await source.stop();
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(0);
+      finalSnapshot = metrics.snapshot();
+      vi.useRealTimers();
+    }
+
+    const timerStats = finalSnapshot.pipelines.ffmpeg.timers.byChannel['video:timer-unref'];
+    expect(timerStats).toBeDefined();
+    expect(timerStats!.start?.pending).toBe(false);
+    expect(timerStats!.watchdog?.pending).toBe(false);
+    expect(timerStats!.start?.lastReason).toBe('stop');
+    expect(timerStats!.watchdog?.lastReason).toBe('stop');
+  });
+
   it('VideoTransportResetMetrics', async () => {
     const recordSpy = vi.spyOn(metrics, 'recordTransportFallback');
 
@@ -317,6 +405,81 @@ describe('VideoSource', () => {
     } finally {
       recordSpy.mockRestore();
       await source.stop();
+    }
+  });
+
+  it('VideoPipelineTimerMetrics settles timers exactly once per recovery', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const startSpy = vi.spyOn(metrics, 'startPipelineTimer');
+    const resolveSpy = vi.spyOn(metrics, 'resolvePipelineTimer');
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      queueMicrotask(() => {
+        command.emit('error', new Error('ffmpeg failed during startup'));
+      });
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      channel: 'video:pipeline-metrics',
+      startTimeoutMs: 1_000,
+      watchdogTimeoutMs: 500,
+      restartDelayMs: 25,
+      restartMaxDelayMs: 25,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory
+    });
+
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+
+      const startCalls = startSpy.mock.calls.filter(([, , timer]) => timer === 'start');
+      expect(startCalls).toHaveLength(1);
+      expect(startCalls[0]?.[0]).toBe('ffmpeg');
+      expect(startCalls[0]?.[1]).toBe('video:pipeline-metrics');
+
+      const watchdogCalls = startSpy.mock.calls.filter(([, , timer]) => timer === 'watchdog');
+      expect(watchdogCalls).toHaveLength(1);
+      expect(watchdogCalls[0]?.[0]).toBe('ffmpeg');
+      expect(watchdogCalls[0]?.[1]).toBe('video:pipeline-metrics');
+
+      const recoveryStartCalls = resolveSpy.mock.calls.filter(
+        ([, , timer, reason]) => timer === 'start' && reason === 'recovery'
+      );
+      expect(recoveryStartCalls).toHaveLength(1);
+
+      const recoveryWatchdogCalls = resolveSpy.mock.calls.filter(
+        ([, , timer, reason]) => timer === 'watchdog' && reason === 'recovery'
+      );
+      expect(recoveryWatchdogCalls).toHaveLength(1);
+
+      const snapshot = metrics.snapshot();
+      const timers = snapshot.pipelines.ffmpeg.timers.byChannel['video:pipeline-metrics'];
+      expect(timers?.start?.pending).toBe(false);
+      expect(timers?.watchdog?.pending).toBe(false);
+      expect(timers?.start?.lastReason).toBe('recovery');
+      expect(timers?.watchdog?.lastReason).toBe('recovery');
+    } finally {
+      await source.stop();
+      startSpy.mockRestore();
+      resolveSpy.mockRestore();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
     }
   });
 

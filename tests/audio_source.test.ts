@@ -174,6 +174,111 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioTimerUnref ensures all timers unref and metrics track restarts', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    class FakeProcess extends EventEmitter {
+      public stdout = new PassThrough();
+      public stderr = new PassThrough();
+      public stdin = new PassThrough();
+      public killed = false;
+      public killSignals: NodeJS.Signals[] = [];
+
+      kill(signal?: NodeJS.Signals) {
+        const applied = signal ?? ('SIGTERM' as NodeJS.Signals);
+        this.killSignals.push(applied);
+        if (applied === 'SIGKILL') {
+          this.killed = true;
+        }
+        return true;
+      }
+    }
+
+    let activeProcess: FakeProcess | null = null;
+    spawnMock.mockImplementation(() => {
+      activeProcess = new FakeProcess();
+      return activeProcess as unknown as ChildProcessWithoutNullStreams;
+    });
+
+    const source = new AudioSource({
+      type: 'ffmpeg',
+      input: 'noop',
+      channel: 'audio:timer-unref',
+      startTimeoutMs: 25,
+      idleTimeoutMs: 30,
+      watchdogTimeoutMs: 40,
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 60,
+      random: () => 0
+    });
+
+    source.on('error', () => {});
+
+    let finalSnapshot = metrics.snapshot();
+
+    try {
+      source.start();
+
+      await Promise.resolve();
+
+      const internals = source as unknown as {
+        startTimer: NodeJS.Timeout | null;
+        idleTimer: NodeJS.Timeout | null;
+        watchdogTimer: NodeJS.Timeout | null;
+        restartTimer: NodeJS.Timeout | null;
+        killTimer: NodeJS.Timeout | null;
+      };
+
+      expect(activeProcess).not.toBeNull();
+      const proc = activeProcess!;
+
+      expect(internals.startTimer).not.toBeNull();
+      expect(internals.startTimer?.hasRef?.()).toBe(false);
+      expect(internals.idleTimer).not.toBeNull();
+      expect(internals.idleTimer?.hasRef?.()).toBe(false);
+      expect(internals.watchdogTimer).not.toBeNull();
+      expect(internals.watchdogTimer?.hasRef?.()).toBe(false);
+
+      proc.stdout.emit('data', Buffer.alloc(4));
+
+      await Promise.resolve();
+
+      proc.emit('error', new Error('spawn failure'));
+
+      await Promise.resolve();
+
+      expect(internals.restartTimer).not.toBeNull();
+      expect(internals.restartTimer?.hasRef?.()).toBe(false);
+      expect(internals.killTimer).not.toBeNull();
+      expect(internals.killTimer?.hasRef?.()).toBe(false);
+      expect(proc.killSignals).toContain('SIGTERM');
+
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+
+      expect(proc.killSignals).toContain('SIGKILL');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.audio.byReason['spawn-error']).toBeGreaterThanOrEqual(1);
+      const channelStats = snapshot.pipelines.audio.byChannel['audio:timer-unref'];
+      expect(channelStats?.restarts).toBeGreaterThanOrEqual(1);
+    } finally {
+      await source.stop();
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(0);
+      finalSnapshot = metrics.snapshot();
+    }
+
+    const timerStats =
+      finalSnapshot.pipelines.audio.timers.byChannel['audio:timer-unref'];
+    if (timerStats) {
+      expect(timerStats.start?.pending).toBe(false);
+      expect(timerStats.watchdog?.pending).toBe(false);
+    }
+  });
+
   it('AudioFfmpegInputValidation emits recoverable stream error when input missing', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 
@@ -1990,6 +2095,77 @@ describe('AudioSource resilience', () => {
     expect(channelCounts?.['device-discovery-error']).toBe(callCount);
 
     platformSpy.mockRestore();
+  });
+
+  it('AudioDeviceDiscoveryMetrics records unique formats once and honors cache reuse', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const formatSpy = vi.spyOn(metrics, 'recordAudioDeviceDiscoveryByFormat');
+
+    const pipewireOutput = `
+[pipewire @ 000001]  "Mic Primary"
+[pipewire @ 000001]  "Mic Primary"
+[pipewire @ 000001]  "Mic Secondary"
+[pipewire @ 000001]  "Mic Secondary"
+`;
+
+    execFileMock.mockImplementation((command: string, args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      const formatIndex = args.indexOf('-f');
+      const format = formatIndex >= 0 ? args[formatIndex + 1] : '';
+
+      if (format === 'pulse') {
+        callback(null, '', '');
+        return child;
+      }
+
+      if (format === 'pipewire') {
+        callback(null, '', pipewireOutput);
+        return child;
+      }
+
+      const error = new Error(`unexpected format: ${format}`) as ExecFileException;
+      callback(error, '', '');
+      return child;
+    });
+
+    AudioSource.clearDeviceCache();
+
+    try {
+      const devices = await AudioSource.listDevices('auto', {
+        timeoutMs: 250,
+        channel: 'audio:metrics'
+      });
+
+      expect(devices).toEqual([
+        { format: 'pipewire', device: 'Mic Primary' },
+        { format: 'pipewire', device: 'Mic Secondary' }
+      ]);
+
+      const startCalls = formatSpy.mock.calls.filter(call => call[0] === 'pipewire');
+      expect(startCalls).toHaveLength(1);
+      expect(startCalls[0]?.[1]).toEqual({ count: 2, channel: 'audio:metrics' });
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.audio.deviceDiscovery.byFormat.pipewire).toBe(2);
+
+      formatSpy.mockClear();
+      execFileMock.mockClear();
+
+      const cached = await AudioSource.listDevices('auto', {
+        timeoutMs: 250,
+        channel: 'audio:metrics'
+      });
+
+      expect(cached).toEqual(devices);
+      expect(execFileMock).not.toHaveBeenCalled();
+      expect(formatSpy).not.toHaveBeenCalled();
+    } finally {
+      formatSpy.mockRestore();
+      platformSpy.mockRestore();
+      AudioSource.clearDeviceCache();
+    }
   });
 
   it('AudioWindowing enforces alignment for pipe inputs', async () => {

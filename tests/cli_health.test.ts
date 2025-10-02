@@ -496,6 +496,43 @@ describe('GuardianCliHealthcheck', () => {
     await expect(startPromise).resolves.toBe(0);
   });
 
+  it('CliDaemonRestartTransport resets runtime fallbacks and clears metrics state', async () => {
+    const runtimeResetSpy = vi.fn().mockReturnValue(true);
+    const metricsResetSpy = vi.spyOn(metrics, 'resetTransportFallback');
+    startGuardMock.mockResolvedValue({
+      stop: vi.fn(),
+      resetCircuitBreaker: vi.fn().mockReturnValue(false),
+      resetChannelHealth: vi.fn().mockReturnValue(false),
+      resetTransportFallback: runtimeResetSpy
+    });
+
+    const startIo = createTestIo();
+    const startPromise = runCli(['start'], startIo.io);
+
+    await vi.waitFor(() => {
+      expect(startGuardMock).toHaveBeenCalledTimes(1);
+    });
+
+    const channel = 'Video:Transport-Main';
+    const restartIo = createTestIo();
+    const code = await runCli(['daemon', 'restart', '--transport', channel], restartIo.io);
+
+    expect(code).toBe(0);
+    expect(runtimeResetSpy).toHaveBeenCalledTimes(1);
+    expect(runtimeResetSpy).toHaveBeenCalledWith(channel);
+    expect(metricsResetSpy).toHaveBeenCalledTimes(1);
+    expect(metricsResetSpy).toHaveBeenCalledWith('video:transport-main');
+    expect(restartIo.stdout()).toContain(
+      'Requested transport fallback reset for video channel video:transport-main'
+    );
+    expect(restartIo.stdout()).toContain('Transport fallback ladder reset for video:transport-main');
+
+    metricsResetSpy.mockRestore();
+
+    await runCli(['stop'], createTestIo().io);
+    await expect(startPromise).resolves.toBe(0);
+  });
+
   it('CliDaemonPipelineResetHealth clears pipeline health severity and fallback totals', async () => {
     metrics.reset();
     metrics.recordPipelineRestart('ffmpeg', 'watchdog-timeout', {
