@@ -2,6 +2,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { buildHealthPayload, buildReadinessPayload, resolveHealthExitCode } from '../src/cli.js';
 import { getIntegrationManifest } from '../src/app.js';
+import configManager, { loadConfigFromFile, type GuardianConfig } from '../src/config/index.js';
 
 type Writable = Pick<NodeJS.WritableStream, 'write'>;
 
@@ -23,6 +24,7 @@ function printUsage(target: Writable) {
       '  --ready        Emit readiness payload instead of full health snapshot',
       '  --health       Force health payload output (default)',
       '  --pretty       Pretty-print JSON output with indentation',
+      '  -c, --config <path>  Load configuration from alternate file before running checks',
       '  -h, --help     Show this help message',
       '',
       `Docker HEALTHCHECK: ${manifest.docker.healthcheck}`,
@@ -40,14 +42,58 @@ type ParsedArgs = {
   pretty: boolean;
   help: boolean;
   errors: string[];
+  configPath: string | null;
 };
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const parsed: ParsedArgs = { mode: 'health', pretty: false, help: false, errors: [] };
-  for (const token of argv) {
+  const parsed: ParsedArgs = { mode: 'health', pretty: false, help: false, errors: [], configPath: null };
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
     if (!token) {
       continue;
     }
+
+    if (token === '--config' || token === '-c') {
+      const next = argv[index + 1];
+      if (!next) {
+        parsed.errors.push('Missing value for --config');
+      } else {
+        parsed.configPath = next;
+        index += 1;
+      }
+      continue;
+    }
+
+    if (token.startsWith('--config=')) {
+      const value = token.slice('--config='.length);
+      if (value) {
+        parsed.configPath = value;
+      } else {
+        parsed.errors.push('Missing value for --config');
+      }
+      continue;
+    }
+
+    if (token.startsWith('-c=')) {
+      const value = token.slice(3);
+      if (value) {
+        parsed.configPath = value;
+      } else {
+        parsed.errors.push('Missing value for -c');
+      }
+      continue;
+    }
+
+    if (token.startsWith('-c') && token.length > 2) {
+      const value = token.slice(2);
+      if (value) {
+        parsed.configPath = value;
+      } else {
+        parsed.errors.push('Missing value for -c');
+      }
+      continue;
+    }
+
     switch (token) {
       case '--ready':
       case 'ready':
@@ -101,17 +147,40 @@ export async function runHealthcheck(argv: string[], streams: IoStreams = {
     return 1;
   }
 
-  const health = await buildHealthPayload();
-  if (args.mode === 'ready') {
-    const readiness = buildReadinessPayload(health);
-    const output = args.pretty ? JSON.stringify(readiness, null, 2) : JSON.stringify(readiness);
-    streams.stdout.write(`${output}\n`);
-    return readiness.ready ? 0 : 1;
+  let restoreConfig: (() => void) | null = null;
+  if (args.configPath) {
+    try {
+      const override = loadConfigFromFile(args.configPath);
+      const manager = configManager as unknown as { getConfig: () => GuardianConfig };
+      const originalGetConfig = manager.getConfig;
+      manager.getConfig = () => override;
+      restoreConfig = () => {
+        manager.getConfig = originalGetConfig;
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      streams.stderr.write(`Failed to load configuration: ${message}\n`);
+      return 1;
+    }
   }
 
-  const output = args.pretty ? JSON.stringify(health, null, 2) : JSON.stringify(health);
-  streams.stdout.write(`${output}\n`);
-  return resolveHealthExitCode(health.status);
+  try {
+    const health = await buildHealthPayload();
+    if (args.mode === 'ready') {
+      const readiness = buildReadinessPayload(health);
+      const output = args.pretty ? JSON.stringify(readiness, null, 2) : JSON.stringify(readiness);
+      streams.stdout.write(`${output}\n`);
+      return readiness.ready ? 0 : 1;
+    }
+
+    const output = args.pretty ? JSON.stringify(health, null, 2) : JSON.stringify(health);
+    streams.stdout.write(`${output}\n`);
+    return resolveHealthExitCode(health.status);
+  } finally {
+    if (restoreConfig) {
+      restoreConfig();
+    }
+  }
 }
 
 const scriptName = path.basename(process.argv[1] ?? '');

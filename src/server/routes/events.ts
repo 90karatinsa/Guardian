@@ -34,7 +34,7 @@ interface EventsRouterOptions {
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => boolean;
 
-type StreamFilters = Omit<ListEventsOptions, 'limit' | 'offset'>;
+type StreamFilters = Omit<ListEventsOptions, 'limit' | 'offset' | 'afterId'>;
 
 type MetricsSelection = {
   enabled: boolean;
@@ -46,6 +46,12 @@ type MetricsSelection = {
 type SnapshotSelection = {
   enabled: boolean;
   historyLimit: number;
+};
+
+type ResumeRequest = {
+  enabled: boolean;
+  lastEventId: number | null;
+  backlogLimit: number;
 };
 
 type ClientState = {
@@ -139,7 +145,7 @@ export class EventsRouter {
       }
 
       try {
-        client.write(`data: ${payload}\n\n`);
+        writeEventBlock(client, formatted, payload);
         const digest = createMetricsDigest(metricsSnapshot, state.metricsFilter);
         if (digest) {
           client.write(`event: metrics\n`);
@@ -274,6 +280,7 @@ export class EventsRouter {
     const facesRequest = resolveFacesRequest(url.searchParams);
     const metricsFilter = resolveMetricsSelection(url.searchParams);
     const snapshotRequest = resolveSnapshotRequest(url.searchParams);
+    const resumeRequest = resolveResumeRequest(req, url);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -339,6 +346,10 @@ export class EventsRouter {
 
     if (snapshotRequest.enabled) {
       void this.pushSnapshotHistory(res, filters, snapshotRequest);
+    }
+
+    if (resumeRequest.enabled && resumeRequest.lastEventId !== null) {
+      void this.pushEventBacklog(res, filters, resumeRequest.lastEventId, resumeRequest.backlogLimit);
     }
 
     let cleanedUp = false;
@@ -751,10 +762,53 @@ export class EventsRouter {
           return;
         }
         const formatted = formatEventForClient(entry);
-        target.write(`data: ${JSON.stringify(formatted)}\n\n`);
+        writeEventBlock(target, formatted);
       }
     } catch (error) {
       logger.warn({ err: error }, 'Failed to stream snapshot history');
+    }
+  }
+
+  private async pushEventBacklog(
+    target: ServerResponse,
+    filters: StreamFilters,
+    lastEventId: number,
+    limit: number
+  ): Promise<void> {
+    if (target.writableEnded) {
+      return;
+    }
+
+    const normalizedLastId = Number.isFinite(lastEventId) ? Math.floor(lastEventId) : NaN;
+    const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1;
+
+    if (!Number.isFinite(normalizedLastId) || normalizedLastId < 0) {
+      return;
+    }
+
+    const options: ListEventsOptions = {
+      ...filters,
+      afterId: normalizedLastId,
+      limit: normalizedLimit,
+      offset: 0
+    };
+
+    try {
+      const backlog = listEvents(options);
+      if (!backlog.items.length) {
+        return;
+      }
+
+      const ordered = backlog.items.slice().reverse();
+      for (const entry of ordered) {
+        if (target.writableEnded) {
+          return;
+        }
+        const formatted = formatEventForClient(entry);
+        writeEventBlock(target, formatted);
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'Failed to stream event backlog');
     }
   }
 
@@ -936,11 +990,70 @@ function parseListOptions(url: URL): ListEventsOptions {
 
 function extractStreamFilters(url: URL): StreamFilters {
   const parsed = parseListOptions(url);
-  const { limit: _limit, offset: _offset, ...filters } = parsed;
+  const { limit: _limit, offset: _offset, afterId: _afterId, ...filters } = parsed;
   if (filters.search) {
     filters.search = filters.search.toLowerCase();
   }
   return filters;
+}
+
+const DEFAULT_BACKLOG_LIMIT = 50;
+
+function resolveResumeRequest(req: IncomingMessage, url: URL): ResumeRequest {
+  const params = url.searchParams;
+
+  const parseId = (value: string | null): number | null => {
+    if (!value) {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+    const normalized = Math.floor(parsed);
+    return normalized >= 0 ? normalized : null;
+  };
+
+  const queryId =
+    parseId(params.get('lastEventId')) ?? parseId(params.get('lastEventID')) ?? null;
+
+  const headerValue = req.headers['last-event-id'];
+  let headerId: number | null = null;
+  if (typeof headerValue === 'string') {
+    headerId = parseId(headerValue);
+  } else if (Array.isArray(headerValue)) {
+    const lastValue = headerValue[headerValue.length - 1] ?? null;
+    headerId = parseId(lastValue ?? null);
+  }
+
+  const lastEventId = queryId ?? headerId;
+
+  const backlogParam = params.get('backlog');
+  const backlogDisabled =
+    backlogParam !== null &&
+    ['0', 'false', 'no', 'off'].includes(backlogParam.trim().toLowerCase());
+
+  const limitParam = params.get('backlogLimit');
+  let backlogLimit = DEFAULT_BACKLOG_LIMIT;
+  if (limitParam) {
+    const parsedLimit = Number(limitParam);
+    if (Number.isFinite(parsedLimit)) {
+      const normalized = Math.max(1, Math.floor(parsedLimit));
+      backlogLimit = Math.min(normalized, 100);
+    }
+  }
+
+  const enabled = !backlogDisabled && typeof lastEventId === 'number';
+
+  return {
+    enabled,
+    lastEventId: typeof lastEventId === 'number' ? lastEventId : null,
+    backlogLimit
+  };
 }
 
 function resolveRetryInterval(params: URLSearchParams): number {
@@ -1127,6 +1240,18 @@ function formatEventForClient<T extends EventRecord | EventRecordWithId>(
 }
 
 type SummarizedEvent = EventRecordWithId & { meta?: Record<string, unknown> };
+
+function writeEventBlock(
+  target: ServerResponse,
+  event: SummarizedEvent,
+  serialized?: string
+) {
+  const payload = serialized ?? JSON.stringify(event);
+  if (typeof event.id === 'number') {
+    target.write(`id: ${event.id}\n`);
+  }
+  target.write(`data: ${payload}\n\n`);
+}
 
 function summarizeEvents(events: SummarizedEvent[]) {
   const totalsByDetector: Record<string, number> = {};

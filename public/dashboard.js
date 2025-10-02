@@ -109,6 +109,7 @@ const state = {
   },
   activeId: null,
   eventSource: null,
+  lastEventId: null,
   reconnectDelayMs: 5000,
   stream: {
     heartbeats: 0,
@@ -140,6 +141,47 @@ const state = {
     applyLayout: null
   }
 };
+
+function parseEventId(candidate) {
+  if (candidate === null || typeof candidate === 'undefined') {
+    return null;
+  }
+  if (typeof candidate === 'number') {
+    return Number.isFinite(candidate) ? Math.floor(candidate) : null;
+  }
+  if (typeof candidate === 'string') {
+    const trimmed = candidate.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? Math.floor(parsed) : null;
+  }
+  return null;
+}
+
+function recordLastEventId(candidate) {
+  const id = parseEventId(candidate);
+  if (id === null || id < 0) {
+    return;
+  }
+  if (typeof state.lastEventId === 'number' && Number.isFinite(state.lastEventId)) {
+    state.lastEventId = Math.max(state.lastEventId, id);
+  } else {
+    state.lastEventId = id;
+  }
+}
+
+function syncLastEventIdFromEvents(events) {
+  if (!Array.isArray(events)) {
+    return;
+  }
+  for (const entry of events) {
+    if (entry && typeof entry === 'object') {
+      recordLastEventId(entry.id);
+    }
+  }
+}
 
 function getSelectedChannels() {
   if (!(state.filters.channels instanceof Set)) {
@@ -819,6 +861,7 @@ async function loadInitial() {
     const payload = await response.json();
     if (Array.isArray(payload.items)) {
       state.events = sortEvents(payload.items.map(withKey));
+      syncLastEventIdFromEvents(payload.items);
       rebuildChannelsFromEvents();
       renderEvents();
       updateSummaries(payload.summary);
@@ -843,6 +886,7 @@ function insertEvent(event) {
   if (state.events.length > MAX_EVENTS) {
     state.events.length = MAX_EVENTS;
   }
+  recordLastEventId(keyed.id);
   const ts = typeof keyed.ts === 'number' ? keyed.ts : Date.now();
   registerChannel(getEventChannel(keyed), ts);
   renderEvents();
@@ -1883,11 +1927,16 @@ function subscribe() {
   params.set('faces', '1');
   params.set('snapshots', '1');
   params.set('snapshotLimit', '10');
+  if (typeof state.lastEventId === 'number' && Number.isFinite(state.lastEventId)) {
+    params.set('lastEventId', String(state.lastEventId));
+    params.set('backlog', '1');
+  }
   const source = new EventSource(`/api/events/stream?${params.toString()}`);
   state.eventSource = source;
 
   source.onopen = () => {
     setConnectionState('connected');
+    channelFilter?.setAttribute('aria-busy', 'false');
   };
 
   source.addEventListener('stream-status', event => {
@@ -1974,6 +2023,10 @@ function subscribe() {
   source.onmessage = event => {
     try {
       const payload = JSON.parse(event.data);
+      recordLastEventId(event.lastEventId ?? null);
+      if (payload && typeof payload === 'object') {
+        recordLastEventId(payload.id);
+      }
       const keyed = insertEvent(payload);
       recordStreamEvent(typeof payload?.ts === 'number' ? payload.ts : Date.now());
       const meta = payload?.meta ?? {};

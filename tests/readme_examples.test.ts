@@ -111,6 +111,8 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('HEALTHCHECK --interval=30s --timeout=5s CMD ["pnpm","tsx","scripts/healthcheck.ts","--health"]');
     expect(readme).toContain('docker exec guardian pnpm tsx scripts/healthcheck.ts --ready');
     expect(readme).toContain('systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health');
+    expect(readme).toContain('-c/--config');
+    expect(readme).toContain('scripts/healthcheck.ts -c config/edge.json');
     expect(readme).toContain('data-layout="compact"');
 
     metrics.reset();
@@ -227,7 +229,7 @@ describe('OperationsDocLinks', () => {
     expect(operations).toContain('guardian daemon pipelines reset --channel audio:<kanal> --no-restart');
     expect(operations).toContain('guardian-pnpm-store.tar.gz');
     expect(operations).toContain('pnpm install --offline --prod');
-    expect(operations).toContain('pnpm tsx scripts/healthcheck.ts --pretty --config config/edge.json');
+    expect(operations).toContain('pnpm tsx scripts/healthcheck.ts --pretty -c config/edge.json');
     expect(operations).toContain('systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health --pretty');
     expect(operations).toContain('data-layout="compact"');
     expect(operations).toContain('pipelinesSummary.transportFallbacks.video.byChannel[].total');

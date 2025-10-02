@@ -267,6 +267,7 @@ export interface ListEventsOptions {
   search?: string;
   snapshot?: 'with' | 'without';
   faceSnapshot?: 'with' | 'without';
+  afterId?: number;
 }
 
 export interface PaginatedEvents {
@@ -281,7 +282,7 @@ export interface FaceMatchResult {
 
 export function storeEvent(event: EventRecord) {
   const normalizedMeta = normalizeEventMeta(event.meta);
-  insertStatement.run({
+  const result = insertStatement.run({
     ts: event.ts,
     source: event.source,
     detector: event.detector,
@@ -289,6 +290,22 @@ export function storeEvent(event: EventRecord) {
     message: event.message,
     meta: normalizedMeta ? JSON.stringify(normalizedMeta) : null
   });
+
+  const insertedId =
+    typeof result.lastInsertRowid === 'number'
+      ? result.lastInsertRowid
+      : typeof result.lastInsertRowid === 'bigint'
+      ? Number(result.lastInsertRowid)
+      : null;
+
+  if (typeof insertedId === 'number' && Number.isFinite(insertedId)) {
+    Object.defineProperty(event, 'id', {
+      value: insertedId,
+      configurable: true,
+      enumerable: true,
+      writable: false
+    });
+  }
 }
 
 export interface StoreFaceOptions {
@@ -421,6 +438,11 @@ export function listEvents(options: ListEventsOptions = {}): PaginatedEvents {
     filters.push(
       "COALESCE(json_extract(meta, '$.faceSnapshot'), json_extract(meta, '$.face.snapshot'), '') = ''"
     );
+  }
+
+  if (typeof options.afterId === 'number' && Number.isFinite(options.afterId)) {
+    filters.push('id > @afterId');
+    params.afterId = Math.floor(options.afterId);
   }
 
   const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';

@@ -36,7 +36,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 - systemd ortamında `ExecStartPre=/usr/bin/env pnpm tsx scripts/healthcheck.ts --ready` satırı servis başlamadan önce SSE uçlarının hazır olduğunu kontrol eder.
   `systemd-run --user --wait pnpm tsx scripts/healthcheck.ts --health --pretty` komutu aynı kontrolü interaktif olarak çalıştırır ve JSON çıktısındaki
   `pipelinesSummary.transportFallbacks.video.byChannel[].total` alanları RTSP fallback döngüsünün yoğunluğunu gösterir.
-- Uzaktan tanılama senaryolarında `pnpm tsx scripts/healthcheck.ts --pretty --config /etc/guardian/config.json` parametresi ile alternatif konfigürasyon yollarını test edin; script,
+- Uzaktan tanılama senaryolarında `pnpm tsx scripts/healthcheck.ts --pretty -c /etc/guardian/config.json` parametresi ile alternatif konfigürasyon yollarını test edin; script,
   guardian süreci çalışmıyorsa `status: "error"` ve `reason: "guardian-daemon-unreachable"` alanlarını döndürür.
 
 ## Periyodik bakım görevleri
@@ -55,7 +55,7 @@ nasıl yararlanacağınızı adım adım anlatır.
 - Edge kutularında Guardian'ı güncellemeden önce build host üzerinde `pnpm fetch --prod` komutunu çalıştırın ve `tar czf guardian-pnpm-store.tar.gz $(pnpm store path --silent)`
   ile pnpm mağazasını arşivleyin. Arşiv, hedef cihazda `tar xzf guardian-pnpm-store.tar.gz -C $(pnpm store path --silent)` ve `pnpm install --offline --prod`
   komutlarıyla açılır.
-- Offline cihazlarda healthcheck doğrulaması yapmak için `pnpm tsx scripts/healthcheck.ts --pretty --config config/edge.json` komutunu kullanın; çıkıştaki `metricsSummary.pipelines.watchdogRestarts`
+- Offline cihazlarda healthcheck doğrulaması yapmak için `pnpm tsx scripts/healthcheck.ts --pretty -c config/edge.json` komutunu kullanın; çıkıştaki `metricsSummary.pipelines.watchdogRestarts`
   ve `pipelinesSummary.transportFallbacks` değerleri bağlantı istikrarını gösterir.
 - Uzun süreli saha kurulumlarında disk tüketimini kontrol etmek için `guardian retention run --config config/edge.json` komutunu manuel tetikleyin ve
   ardından `pnpm exec tsx src/tasks/retention.ts --run now` ile arşiv vakumlarını planlayın; loglarda `vacuum.summary.ensuredIndexes` ve `diskSavingsBytes`
