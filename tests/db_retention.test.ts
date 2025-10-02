@@ -8,6 +8,14 @@ import { runRetentionOnce, startRetentionTask } from '../src/tasks/retention.js'
 import { __test__ as guardTestUtils } from '../src/run-guard.ts';
 import { EventRecord } from '../src/types.js';
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(res => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 describe('RetentionMaintenance', () => {
   const dayMs = 24 * 60 * 60 * 1000;
   let tempDir: string;
@@ -1654,6 +1662,122 @@ describe('RetentionMaintenance', () => {
     } finally {
       task.stop();
       execSpy.mockRestore();
+    }
+  });
+
+  it('RetentionTimerUnref detaches scheduled timers when retention is disabled', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+
+    type FakeTimer = {
+      callback: (...args: any[]) => unknown;
+      args: any[];
+      delay: number;
+      active: boolean;
+      ref: ReturnType<typeof vi.fn>;
+      unref: ReturnType<typeof vi.fn>;
+    };
+
+    const timers: FakeTimer[] = [];
+    const setTimeoutSpy = vi
+      .spyOn(global, 'setTimeout')
+      .mockImplementation(((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+        const entry: FakeTimer = {
+          callback,
+          args,
+          delay: typeof delay === 'number' ? delay : 0,
+          active: true,
+          ref: vi.fn(),
+          unref: vi.fn()
+        };
+        entry.ref.mockReturnValue(entry as unknown as NodeJS.Timeout);
+        entry.unref.mockReturnValue(entry as unknown as NodeJS.Timeout);
+        timers.push(entry);
+        return entry as unknown as NodeJS.Timeout;
+      }) as any);
+    const clearTimeoutSpy = vi
+      .spyOn(global, 'clearTimeout')
+      .mockImplementation(((handle: any) => {
+        if (handle && typeof handle === 'object') {
+          handle.active = false;
+        }
+      }) as any);
+
+    const runDeferred = createDeferred<void>();
+    const skipDeferred = createDeferred<void>();
+
+    const metrics = {
+      recordRetentionRun: vi.fn(() => runDeferred.resolve()),
+      recordRetentionWarning: vi.fn()
+    };
+    const logger = {
+      info: vi.fn((_payload: unknown, message: string) => {
+        if (message === 'Retention task skipped') {
+          skipDeferred.resolve();
+        }
+      }),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    const baseOptions = {
+      retentionDays: 1,
+      intervalMs: 60_000,
+      archiveDir,
+      snapshotDirs: [cameraOneDir],
+      vacuum: false as const
+    };
+
+    const task = startRetentionTask({
+      ...baseOptions,
+      enabled: true,
+      logger,
+      metrics: metrics as any
+    });
+
+    try {
+      expect(timers).toHaveLength(1);
+      const initialTimer = timers.shift();
+      if (!initialTimer) {
+        throw new Error('Expected initial retention timer');
+      }
+      expect(initialTimer.unref).toHaveBeenCalledTimes(1);
+
+      initialTimer.callback(...initialTimer.args);
+      await runDeferred.promise;
+
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+
+      await Promise.resolve();
+
+      expect(timers.length).toBeGreaterThan(0);
+      const intervalTimer = timers.shift();
+      if (!intervalTimer) {
+        throw new Error('Expected interval retention timer');
+      }
+      expect(intervalTimer.unref).toHaveBeenCalledTimes(1);
+
+      task.configure({ ...baseOptions, enabled: false });
+
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(intervalTimer);
+
+      expect(timers.length).toBeGreaterThan(0);
+      const restoreTimer = timers.shift();
+      if (!restoreTimer) {
+        throw new Error('Expected restore retention timer');
+      }
+      expect(restoreTimer.unref).toHaveBeenCalledTimes(1);
+
+      restoreTimer.callback(...restoreTimer.args);
+      await skipDeferred.promise;
+
+      expect(metrics.recordRetentionRun).toHaveBeenCalledTimes(1);
+      expect(metrics.recordRetentionWarning).not.toHaveBeenCalled();
+      expect(logger.info).toHaveBeenCalledWith({ enabled: false }, 'Retention task skipped');
+      expect(timers).toHaveLength(0);
+    } finally {
+      task.stop();
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
     }
   });
 });

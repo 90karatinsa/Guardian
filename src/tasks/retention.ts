@@ -145,10 +145,14 @@ export class RetentionTask {
       return;
     }
 
-    this.timer = setTimeout(() => {
+    const nextTimer = setTimeout(() => {
       this.timer = null;
       void this.runOnce();
     }, delayMs);
+    if (typeof nextTimer.unref === 'function') {
+      nextTimer.unref();
+    }
+    this.timer = nextTimer;
   }
 
   private async runOnce() {

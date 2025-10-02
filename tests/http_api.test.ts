@@ -1074,6 +1074,346 @@ describe('RestApiEvents', () => {
     expect(warningTypes).toContain('transport-fallback');
   });
 
+  it('HttpEventStreamResume demonstrates reconnection backlog and dashboard resume', async () => {
+    const now = Date.now();
+    storeEvent({
+      ts: now - 1_000,
+      source: 'video:lobby',
+      detector: 'motion',
+      severity: 'info',
+      message: 'Initial lobby motion',
+      meta: { channel: 'video:lobby', camera: 'video:lobby' }
+    });
+
+    const firstRecord = listEvents({ channel: 'video:lobby', limit: 1 }).items[0];
+    expect(firstRecord).toBeTruthy();
+
+    const { port } = await ensureServer();
+
+    const controller = new AbortController();
+    const streamResponse = await fetch(
+      `http://localhost:${port}/api/events/stream?channel=${encodeURIComponent('video:lobby')}`,
+      { signal: controller.signal }
+    );
+    expect(streamResponse.status).toBe(200);
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    const decoder = new TextDecoder();
+    const createSseMessageReader = (streamReader: any) => {
+      let buffer = '';
+      return async () => {
+        while (true) {
+          const { done, value } = await streamReader.read();
+          if (done) {
+            throw new Error('stream ended before message event');
+          }
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf('\n\n');
+          while (boundary >= 0) {
+            const block = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            boundary = buffer.indexOf('\n\n');
+            const lines = block.split('\n');
+            let eventName = 'message';
+            const dataLines: string[] = [];
+            let id: string | null = null;
+            for (const line of lines) {
+              if (line.startsWith('event:')) {
+                eventName = line.slice(6).trim();
+              } else if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).trim());
+              } else if (line.startsWith('id:')) {
+                id = line.slice(3).trim();
+              }
+            }
+            if (eventName === 'message' && dataLines.length > 0) {
+              return { id, data: dataLines.join('\n') };
+            }
+          }
+        }
+      };
+    };
+
+    const readInitialMessage = createSseMessageReader(reader!);
+    const firstMessagePromise = readInitialMessage();
+    bus.emit('event', firstRecord);
+    const firstMessage = await firstMessagePromise;
+    const firstPayload = JSON.parse(firstMessage.data);
+    expect(firstPayload.id).toBe(firstRecord.id);
+    expect(Number(firstMessage.id)).toBe(firstRecord.id);
+
+    controller.abort();
+
+    storeEvent({
+      ts: now + 100,
+      source: 'video:lobby',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Follow-up lobby motion',
+      meta: { channel: 'video:lobby', camera: 'video:lobby' }
+    });
+
+    const backlogRecord = listEvents({ channel: 'video:lobby', limit: 1 }).items[0];
+    expect(backlogRecord.id).toBeGreaterThan(firstRecord.id ?? 0);
+
+    const resumeController = new AbortController();
+    const resumeResponse = await fetch(
+      `http://localhost:${port}/api/events/stream?channel=${encodeURIComponent('video:lobby')}` +
+        `&lastEventId=${firstRecord.id}&backlog=1`,
+      { signal: resumeController.signal }
+    );
+    expect(resumeResponse.status).toBe(200);
+    const resumeReader = resumeResponse.body?.getReader();
+    expect(resumeReader).toBeDefined();
+    const readResumedMessage = createSseMessageReader(resumeReader!);
+    const backlogMessage = await readResumedMessage();
+    const backlogPayload = JSON.parse(backlogMessage.data);
+    expect(backlogPayload.id).toBe(backlogRecord.id);
+    expect(Number(backlogMessage.id)).toBe(backlogRecord.id);
+    resumeController.abort();
+
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
+
+    vi.useFakeTimers();
+
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
+
+    const initialDashboardEvents = [
+      {
+        id: 750,
+        ts: now - 500,
+        source: 'video:lobby',
+        detector: 'motion',
+        severity: 'info',
+        message: 'Seed dashboard event',
+        meta: { channel: 'video:lobby', camera: 'video:lobby' }
+      }
+    ];
+
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events?')) {
+        return new Response(
+          JSON.stringify({
+            items: initialDashboardEvents,
+            total: initialDashboardEvents.length,
+            summary: { detectors: [], channels: [] }
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(
+          JSON.stringify({
+            fetchedAt: new Date(now).toISOString(),
+            pipelines: {},
+            retention: {
+              runs: 0,
+              lastRunAt: null,
+              warnings: 0,
+              warningsByCamera: {},
+              lastWarning: null,
+              totals: {
+                removedEvents: 0,
+                archivedSnapshots: 0,
+                prunedArchives: 0,
+                diskSavingsBytes: 0
+              },
+              totalsByCamera: {}
+            }
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    type Listener = (event: MessageEvent) => void;
+    class ResumeEventSource {
+      static instances: ResumeEventSource[] = [];
+      public url: string;
+      public readyState = 0;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      public onerror: ((event: Event) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
+
+      constructor(url: string) {
+        this.url = url;
+        ResumeEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const event = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(event));
+      }
+
+      emitMessage(data: string, options: { lastEventId?: string } = {}) {
+        const init: MessageEventInit = { data };
+        if (options.lastEventId) {
+          (init as any).lastEventId = options.lastEventId;
+        }
+        this.onmessage?.(new window.MessageEvent('message', init));
+      }
+
+      open() {
+        this.readyState = 1;
+        this.onopen?.(new window.Event('open'));
+      }
+
+      fail() {
+        this.onerror?.(new window.Event('error'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    vi.stubGlobal('EventSource', ResumeEventSource as unknown as typeof EventSource);
+
+    bootstrapDashboardScript();
+
+    await vi.waitFor(() => {
+      const state = (window as any).__guardianDashboardState;
+      if (!state) {
+        throw new Error('dashboard state unavailable');
+      }
+    });
+
+    const initialInstance = ResumeEventSource.instances[0];
+    expect(initialInstance).toBeDefined();
+    initialInstance!.open();
+    initialInstance!.dispatch('stream-status', JSON.stringify({ status: 'connected', retryMs: 75 }));
+
+    const firstStreamEvent = {
+      id: 760,
+      ts: now + 250,
+      source: 'video:lobby',
+      detector: 'motion',
+      severity: 'warning',
+      message: 'Live lobby alert',
+      meta: { channel: 'video:lobby', camera: 'video:lobby' }
+    };
+    initialInstance!.emitMessage(JSON.stringify(firstStreamEvent), {
+      lastEventId: String(firstStreamEvent.id)
+    });
+
+    await Promise.resolve();
+
+    const dashboardState = (window as any).__guardianDashboardState;
+    expect(dashboardState.lastEventId).toBe(firstStreamEvent.id);
+    expect(dashboardState.stream.events).toBeGreaterThanOrEqual(1);
+
+    initialInstance!.fail();
+    await vi.runOnlyPendingTimersAsync();
+
+    await vi.waitFor(() => {
+      if (ResumeEventSource.instances.length < 2) {
+        throw new Error('awaiting reconnection');
+      }
+    });
+
+    const resumedInstance = ResumeEventSource.instances[1];
+    expect(resumedInstance.url).toContain(`lastEventId=${firstStreamEvent.id}`);
+    expect(resumedInstance.url).toContain('backlog=1');
+    resumedInstance.open();
+
+    const resumedEvent = {
+      id: 765,
+      ts: now + 500,
+      source: 'video:lobby',
+      detector: 'motion',
+      severity: 'critical',
+      message: 'Recovered backlog event',
+      meta: { channel: 'video:lobby', camera: 'video:lobby' }
+    };
+    resumedInstance.emitMessage(JSON.stringify(resumedEvent), {
+      lastEventId: String(resumedEvent.id)
+    });
+
+    await Promise.resolve();
+
+    const resumedState = (window as any).__guardianDashboardState;
+    expect(resumedState.lastEventId).toBe(resumedEvent.id);
+    expect(resumedState.events.some((entry: any) => entry.id === resumedEvent.id)).toBe(true);
+    expect(resumedState.stream.events).toBeGreaterThanOrEqual(1);
+
+    resumedInstance.close();
+    initialInstance?.close();
+    ResumeEventSource.instances.length = 0;
+    dom.window.close();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+
+    if (originalWindow) {
+      globalThis.window = originalWindow;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.window;
+    }
+    if (originalDocument) {
+      globalThis.document = originalDocument;
+    } else {
+      // @ts-expect-error cleanup for test environment
+      delete globalThis.document;
+    }
+    if (originalEventSource) {
+      globalThis.EventSource = originalEventSource;
+    }
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    }
+    if (originalHTMLElement) {
+      globalThis.HTMLElement = originalHTMLElement;
+    }
+    if (originalMessageEvent) {
+      globalThis.MessageEvent = originalMessageEvent;
+    }
+    if (originalNavigator) {
+      globalThis.navigator = originalNavigator;
+    } else {
+      // @ts-expect-error cleanup for navigator in node environment
+      delete globalThis.navigator;
+    }
+  });
+
   it('HttpStreamCombinedMetricsSelection streams selected metrics subsets without extras', async () => {
     metrics.recordRetentionRun({
       removedEvents: 2,

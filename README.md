@@ -380,6 +380,7 @@ Guardian, Docker ve systemd ortamlarında CLI’ya ihtiyaç duymadan sağlık ç
 - `pnpm tsx scripts/healthcheck.ts --ready` komutu SSE ve HTTP uçlarının trafik kabulüne hazır olup olmadığını bildirir; `readiness.streams.sse` anahtarı dashboard bağlantılarının açık sayısını, `events.timeline` alanı ise bastırma timeline TTL temizleme durumunu raporlar.
 - Bu betikler Dockerfile ve `deploy/guardian.service` içinde healthcheck komutlarına bağlanmıştır; offline tanılama için container içinde çalıştırabilir veya systemd `ExecStartPre` adımlarına ekleyebilirsiniz.
 - Sahada ağ erişimi kısıtlıysa JSON çıktısını `jq` ile filtreleyip destek ekiplerine aktarabilirsiniz: `pnpm tsx scripts/healthcheck.ts --health | jq '.metricsSummary.pipelines.transportFallbacks'`.
+- Farklı bir konfigürasyon profilini doğrulamak için `-c/--config` parametresini kullanabilirsiniz. Script, payload üretmeden önce dosyayı `loadConfigFromFile` ile okur; örneğin `pnpm tsx scripts/healthcheck.ts -c config/edge.json --health` komutu offline profile karşı sağlık durumunu raporlar.
 
 CLI komutları erişilemediğinde bile bu uçlar sayesinde hangi kanalların fallback reset veya suppression TTL prune yaşadığını tespit etmek mümkündür.
 
@@ -597,7 +598,7 @@ Guardian'ı internet erişimi olmayan saha kutularına dağıtırken bağımlıl
 3. `models/` klasörünü (örneğin `models/yolov8n.onnx`) ve `config/` altındaki üretim yapılandırmalarını aynı rsync/USB sürecinde taşımayı unutmayın.
 
 ### Çevrimdışı bakım ipuçları
-- İnternet erişimi olmadan sağlık durumunu doğrulamak için `pnpm tsx scripts/healthcheck.ts --pretty` komutu hem Docker hem systemd senaryolarında aynı JSON çıktısını üretir; `status: "ok"` satırı ve `metricsSummary.pipelines.watchdogRestarts` alanları bağlantı stabilitesini gösterir.
+- İnternet erişimi olmadan sağlık durumunu doğrulamak için `pnpm tsx scripts/healthcheck.ts --pretty` komutu hem Docker hem systemd senaryolarında aynı JSON çıktısını üretir; `status: "ok"` satırı ve `metricsSummary.pipelines.watchdogRestarts` alanları bağlantı stabilitesini gösterir. Alternatif bir yapılandırmayı test etmeniz gerektiğinde `pnpm tsx scripts/healthcheck.ts -c config/edge.json --pretty` komutu aynı çıktıyı seçtiğiniz JSON dosyasına göre hazırlar.
 - Edge cihazı yeniden çevrimiçi olduğunda `pnpm exec tsx -e "import metrics from './src/metrics/index.ts'; console.log(metrics.exportLogLevelCountersForPrometheus({ labels: { site: 'edge-1' } }))"` komutu ile tamponda tutulan log metriklerini Prometheus uyumlu formatta dışa aktarabilirsiniz.
 - `guardian retention run --config` komutuyla arşiv bakımını elle tetikleyerek uzun süre çevrimdışı kalan cihazlarda disk tüketimini kontrol altında tutun; `vacuum=auto (run=on-change)` özetinde `prunedArchives` alanını izleyin.
 
