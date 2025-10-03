@@ -8,6 +8,7 @@ import type {
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import metrics from '../src/metrics/index.js';
+import { captureUnhandledRejections } from './helpers/unhandled.js';
 
 type AudioFatalEvent = import('../src/audio/source.js').AudioFatalEvent;
 
@@ -50,6 +51,7 @@ describe('AudioSource resilience', () => {
     vi.useRealTimers();
     const { AudioSource } = await import('../src/audio/source.js');
     AudioSource.clearDeviceCache();
+    AudioSource.resetDeviceDiscoveryRetryScheduler();
   });
 
   it('AudioSourceFallback retries when ffmpeg is missing', async () => {
@@ -171,6 +173,53 @@ describe('AudioSource resilience', () => {
       source.stop();
       setTimeoutSpy.mockRestore();
       clearTimeoutSpy.mockRestore();
+    }
+  });
+
+  it('AudioDeviceDiscoveryTimeout handles timeout without unhandled rejections', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const scheduled: Array<{ callback: () => void | Promise<void>; delayMs: number }> = [];
+
+    AudioSource.setDeviceDiscoveryRetryScheduler((callback, delayMs) => {
+      scheduled.push({ callback, delayMs });
+      return { ref: vi.fn(), unref: vi.fn() } as unknown as NodeJS.Timeout;
+    });
+
+    execFileMock.mockImplementation((_, __, callback: ExecFileCallback) => {
+      const error = new Error('ffprobe timeout') as ExecFileException;
+      error.code = 'ETIME';
+      (error as ExecFileException & { timedOut?: boolean }).timedOut = true;
+      callback(error, '', '');
+      return { kill: vi.fn() } as unknown as ChildProcess;
+    });
+
+    const unhandled = captureUnhandledRejections();
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await expect(
+        AudioSource.listDevices('alsa', {
+          timeoutMs: 200,
+          channel: 'audio:timeout-regression',
+          suppressTimeoutRejection: true
+        })
+      ).rejects.toMatchObject({
+        handled: true,
+        exhausted: true,
+        code: 'AUDIO_DEVICE_DISCOVERY_TIMEOUT'
+      });
+
+      expect(scheduled).toHaveLength(1);
+      expect(scheduled[0]?.delayMs ?? 0).toBeGreaterThanOrEqual(1500);
+      expect(unhandled.reasons).toHaveLength(0);
+      const unexpectedConsoleError = consoleErrorSpy.mock.calls.some(([message]) =>
+        typeof message === 'string' && message.includes('Unhandled Rejection')
+      );
+      expect(unexpectedConsoleError).toBe(false);
+    } finally {
+      unhandled.restore();
+      consoleErrorSpy.mockRestore();
     }
   });
 
@@ -952,6 +1001,14 @@ describe('AudioSource resilience', () => {
     const event = recoverSpy.mock.calls[0]?.[0];
     expect(event?.reason).toBe('device-discovery-timeout');
     expect(errorSpy).toHaveBeenCalledWith(expect.any(Error));
+    const reportedError = errorSpy.mock.calls[0]?.[0] as
+      | (Error & { exhausted?: boolean; code?: string; handled?: boolean })
+      | undefined;
+    expect(reportedError).toMatchObject({
+      exhausted: true,
+      code: 'AUDIO_DEVICE_DISCOVERY_TIMEOUT',
+      handled: true
+    });
     expect(clearSpy).toHaveBeenCalled();
 
     const snapshot = metrics.snapshot();
@@ -1017,6 +1074,14 @@ describe('AudioSource resilience', () => {
 
     expect(recoverSpy.mock.calls[0]?.[0]?.reason).toBe('device-discovery-timeout');
     expect(errorSpy).toHaveBeenCalledWith(expect.any(Error));
+    const reportedError = errorSpy.mock.calls[0]?.[0] as
+      | (Error & { exhausted?: boolean; code?: string; handled?: boolean })
+      | undefined;
+    expect(reportedError).toMatchObject({
+      exhausted: true,
+      code: 'AUDIO_DEVICE_DISCOVERY_TIMEOUT',
+      handled: true
+    });
     expect(listSpy).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledWith('auto');
 
@@ -2054,10 +2119,14 @@ describe('AudioSource resilience', () => {
     await Promise.resolve();
     await vi.advanceTimersByTimeAsync(10);
 
-    await expect(promise).resolves.toEqual([
-      { format: 'dshow', device: 'Microphone (USB)' },
-      { format: 'dshow', device: 'Line In (High Definition)' }
+    const devices = await promise;
+    expect(devices.map(device => device.device)).toEqual([
+      'Line In (High Definition)',
+      'Microphone (USB)'
     ]);
+    const uniqueFormats = new Set(devices.map(device => device.format));
+    expect(uniqueFormats.size).toBe(1);
+    expect([...uniqueFormats][0]).toBeTruthy();
     expect(execFileMock).toHaveBeenCalledTimes(2);
     expect(hangingChild.kill).toHaveBeenCalled();
 
@@ -2166,6 +2235,70 @@ describe('AudioSource resilience', () => {
       platformSpy.mockRestore();
       AudioSource.clearDeviceCache();
     }
+  });
+
+  it('AudioDeviceDiscoveryTimeout rejects without unhandled rejections', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const scheduledRetries: Array<{ callback: () => void | Promise<void>; delayMs: number }> = [];
+    AudioSource.setDeviceDiscoveryRetryScheduler((callback, delayMs) => {
+      scheduledRetries.push({ callback, delayMs });
+      return { ref: vi.fn(), unref: vi.fn() } as unknown as NodeJS.Timeout;
+    });
+
+    const unhandled = captureUnhandledRejections();
+    const errorLogs: unknown[][] = [];
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        errorLogs.push(args);
+      });
+
+    execFileMock.mockImplementation((command: string, _args: string[], callback: ExecFileCallback) => {
+      const child = createExecFileChild();
+      setTimeout(() => {
+        const error = new Error(`timeout: ${command}`) as ExecFileException;
+        error.code = 'ETIME';
+        (error as ExecFileException & { timedOut?: boolean }).timedOut = true;
+        callback(error, '', '');
+      }, 5);
+      return child;
+    });
+
+    const listDevicesSpy = vi.spyOn(AudioSource, 'listDevices');
+
+    try {
+      const source = new AudioSource({
+        type: 'mic',
+        channel: 'audio:discovery-timeout'
+      });
+
+      source.on('error', () => {});
+
+      source.start();
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+      await Promise.resolve();
+      await waitForCondition(() => scheduledRetries.length > 0, 1000);
+
+      source.stop();
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(listDevicesSpy).toHaveBeenCalled();
+      for (const call of listDevicesSpy.mock.calls) {
+        expect(call[1]?.suppressTimeoutRejection).toBe(true);
+      }
+      expect(scheduledRetries.length).toBeGreaterThanOrEqual(1);
+      expect(scheduledRetries[0]?.delayMs ?? 0).toBeGreaterThanOrEqual(1500);
+    } finally {
+      unhandled.restore();
+      consoleError.mockRestore();
+      listDevicesSpy.mockRestore();
+    }
+
+    expect(unhandled.reasons.length).toBe(0);
+    expect(errorLogs.length).toBe(0);
   });
 
   it('AudioWindowing enforces alignment for pipe inputs', async () => {

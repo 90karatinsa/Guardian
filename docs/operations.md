@@ -18,7 +18,8 @@ nasıl yararlanacağınızı adım adım anlatır.
   çıktısındaki `pipelines.ffmpeg.channels[kanal].severity === 'none'`, `metricsSummary.pipelines.transportFallbacks.video.byChannel`
   listesindeki ilgili kaydın `total === 0` olduğunu ve `metricsSummary.pipelines.transportFallbacks.resets.byChannel[kanal]`
   değerlerinin `backoff === 0`, `circuitBreaker === 0` seviyesine döndüğünü kontrol ederek hem devre kesici hem de fallback sayaçlarının
-  temizlendiğini doğrulayın; `--no-restart` bayrağı bekleyen yeniden başlatma zamanlayıcılarını iptal eder. Ayrıntılar için README'deki
+  temizlendiğini doğrulayın; komutu tekrarladığınızda aynı listedeki kaydın `total` değerinin 0'a döndüğünü CLI'da da görmelisiniz.
+  `--no-restart` bayrağı bekleyen yeniden başlatma zamanlayıcılarını iptal eder. Ayrıntılar için README'deki
   [pipeline sıfırlama akışı](../README.md#pipeline-s%C4%B1f%C4%B1rlama-ak%C4%B1%C5%9F%C4%B1) bölümüne bakın.
 - Ses kanalları için `guardian daemon pipelines reset --channel audio:<kanal> --no-restart` komutunu kullanarak hem
   `metrics.pipelines.audio.byChannel[kanal].restarts` hem de `metrics.pipelines.audio.byChannel[kanal].health.severity`
@@ -73,7 +74,9 @@ nasıl yararlanacağınızı adım adım anlatır.
   timeline kısıtlamalarına takıldığını gösterir.
 - Prometheus dışa aktarımı için `pnpm exec tsx -e "import metrics from './src/metrics/index.ts';\nconsole.log(metrics.exportLogLevelCountersForPrometheus({ labels: { site: 'edge-1' } }));"` komutu ile `guardian_log_level_total`
   ve `guardian_log_last_error_timestamp_seconds` gauge değerlerini doğrudan gözlemleyin. Aynı çıktıda `guardian_log_level_state`
-  ve `guardian_log_level_change_total` satırları, log seviyesi değişimlerinin ne kadar sık gerçekleştiğini gösterir.
+  ve `guardian_log_level_change_total` satırları, log seviyesi değişimlerinin ne kadar sık gerçekleştiğini gösterir. `metrics.reset()`
+  çağrısı, bu log seviye sayaçlarını ve son hata durumunu sıfırlar; reset sonrasında logger yeniden mevcut seviyeyi rapor eder ve ilk
+  hata mesajı yeniden kaydedilir.
 - Prometheus entegrasyonları için `metrics.exportDetectorLatencyHistogram('motion')` çıktısını `pnpm exec tsx` üzerinden
   alabilir, histogram buckets ile dedektör gecikme dağılımını inceleyebilirsiniz.
 - Pipeline geri kazanım analizinde `metrics.exportPipelineRestartHistogram('ffmpeg', 'jitter', { metricName: 'guardian_ffmpeg_restart_jitter_ms' })`

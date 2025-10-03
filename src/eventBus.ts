@@ -164,8 +164,11 @@ class EventBus extends EventEmitter {
 
     if (evaluation.suppressed) {
       const eventChannels = extractEventChannels(normalized.meta);
+      const perHitChannels = evaluation.hits.map(hit => collectSuppressionChannelsFromHit(hit));
+      const suppressionChannels = collectSuppressionChannels(perHitChannels);
       const primary = evaluation.hits[0];
-      const primaryChannel = primary?.channel ?? eventChannels[0] ?? null;
+      const primaryChannel =
+        primary?.channel ?? suppressionChannels[0] ?? eventChannels[0] ?? null;
       const primaryWindowRemainingMs =
         primary && typeof primary.windowExpiresAt === 'number'
           ? Math.max(0, primary.windowExpiresAt - normalized.ts)
@@ -186,7 +189,7 @@ class EventBus extends EventEmitter {
           : undefined;
       const combinedHistory = mergeSuppressionHistory(evaluation.hits, normalized.ts);
       const channelStates = new Map<string, ChannelSuppressionState>();
-      const suppressedBy = evaluation.hits.map(hit => {
+      const suppressedBy = evaluation.hits.map((hit, index) => {
         const history = dedupeAndSortHistory(hit.history);
         const windowRemainingMs =
           typeof hit.windowExpiresAt === 'number'
@@ -207,6 +210,7 @@ class EventBus extends EventEmitter {
             : typeof hit.cooldownMs === 'number'
             ? normalized.ts + hit.cooldownMs
             : undefined;
+        const hitChannels = perHitChannels[index] ?? [];
         return {
           ruleId: hit.rule.id,
           reason: hit.reason,
@@ -220,7 +224,7 @@ class EventBus extends EventEmitter {
           rateLimitWindowMs: hit.rateLimit?.perMs,
           cooldownMs: hit.cooldownMs,
           channel: hit.channel ?? undefined,
-          channels: [...eventChannels],
+          channels: hitChannels,
           windowRemainingMs,
           cooldownRemainingMs,
           cooldownExpiresAt,
@@ -315,7 +319,7 @@ class EventBus extends EventEmitter {
         suppressionHistoryCount: combinedHistory.length,
         suppressedBy,
         suppressionChannel: primaryChannel,
-        suppressionChannels: [...eventChannels],
+        suppressionChannels,
         suppressionWindowRemainingMs: primaryWindowRemainingMs,
         suppressionTimelineTtlMs: primary?.timelineTtlMs,
         suppressionTimelineHistoryTtlPruned: primary?.timelineHistoryTtlPruned ?? 0,
@@ -350,6 +354,7 @@ class EventBus extends EventEmitter {
       evaluation.hits.forEach((hit, index) => {
         const suppressedMeta = suppressedBy[index];
         const history = dedupeAndSortHistory(hit.history);
+        const hitChannels = perHitChannels[index] ?? [];
         const detail: SuppressedEventMetric = {
           ruleId: hit.rule.id,
           reason: hit.reason,
@@ -363,7 +368,7 @@ class EventBus extends EventEmitter {
           maxEvents: hit.rule.maxEvents,
           combinedHistoryCount: combinedHistory.length,
           channel: hit.channel ?? undefined,
-          channels: [...eventChannels],
+          channels: hitChannels,
           windowRemainingMs: suppressedMeta.windowRemainingMs,
           cooldownRemainingMs: suppressedMeta.cooldownRemainingMs,
           cooldownExpiresAt: suppressedMeta.cooldownExpiresAt,
@@ -1070,6 +1075,36 @@ function mergeSuppressionHistory(hits: SuppressionHit[], eventTs: number): numbe
   }
 
   return dedupeAndSortHistory([...merged]);
+}
+
+function collectSuppressionChannelsFromHit(hit: SuppressionHit): string[] {
+  if (!hit.channel) {
+    return [];
+  }
+
+  const canonical = canonicalChannel(hit.channel);
+  return canonical ? [canonical] : [];
+}
+
+function collectSuppressionChannels(perHitChannels: string[][]): string[] {
+  if (perHitChannels.length === 0) {
+    return [];
+  }
+
+  const collected: string[] = [];
+  const seen = new Set<string>();
+
+  for (const channels of perHitChannels) {
+    for (const channel of channels) {
+      if (seen.has(channel)) {
+        continue;
+      }
+      seen.add(channel);
+      collected.push(channel);
+    }
+  }
+
+  return collected;
 }
 
 function sortHistory(history: number[]) {

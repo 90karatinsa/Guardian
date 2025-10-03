@@ -584,6 +584,7 @@ type DetectorLatencyState = {
 
 class MetricsRegistry {
   private readonly warningEmitter = new EventEmitter();
+  private readonly resetEmitter = new EventEmitter();
   private readonly logLevelCounters = new Map<string, number>();
   private readonly logLevelByDetector = new Map<string, Map<string, number>>();
   private readonly logLevelHistogram = new Map<string, number>();
@@ -794,6 +795,14 @@ class MetricsRegistry {
     this.transportFallbackResetsCircuitBreaker = 0;
     this.pipelineTimers.ffmpeg.clear();
     this.pipelineTimers.audio.clear();
+    this.resetEmitter.emit('reset');
+  }
+
+  onReset(listener: () => void) {
+    this.resetEmitter.on('reset', listener);
+    return () => {
+      this.resetEmitter.off('reset', listener);
+    };
   }
 
   private registerReservedHistogram(metric: string, config: HistogramConfig) {

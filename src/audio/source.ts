@@ -97,9 +97,44 @@ const DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS = 2000;
 const DEFAULT_SILENCE_CIRCUIT_BREAKER_THRESHOLD = 4;
 const DEFAULT_ANALYSIS_RMS_WINDOW_MS = 400;
 
+export class DeviceDiscoveryTimeoutError extends Error {
+  public readonly code = 'AUDIO_DEVICE_DISCOVERY_TIMEOUT';
+  public readonly exhausted = true;
+  public handled = true;
+
+  constructor(message?: string, options?: { cause?: unknown }) {
+    super(message ?? 'Audio device discovery timed out');
+    this.name = 'DeviceDiscoveryTimeoutError';
+    if (options && 'cause' in options) {
+      const { cause } = options;
+      if (cause !== undefined) {
+        (this as Error & { cause?: unknown }).cause = cause;
+      }
+    }
+  }
+}
+
+function toDeviceDiscoveryTimeoutError(error?: unknown): DeviceDiscoveryTimeoutError {
+  if (error instanceof DeviceDiscoveryTimeoutError) {
+    error.handled = true;
+    return error;
+  }
+
+  const cause = error instanceof Error ? error : undefined;
+  const message =
+    cause?.message && typeof cause.message === 'string' && cause.message.length > 0
+      ? cause.message
+      : undefined;
+  const timeoutError = new DeviceDiscoveryTimeoutError(message, { cause });
+  timeoutError.handled = true;
+  return timeoutError;
+}
+
 const FFMPEG_CANDIDATES = buildFfmpegCandidates();
 const FFPROBE_CANDIDATES = buildFfprobeCandidates();
 const DEVICE_DISCOVERY_CACHE = new Map<string, Promise<MicCandidate[]>>();
+const DEVICE_DISCOVERY_RETRY_TIMERS = new Map<string, NodeJS.Timeout>();
+const DEFAULT_DEVICE_DISCOVERY_RETRY_DELAY_MS = 1500;
 
 type RmsWindowEntry = { value: number; durationMs: number };
 
@@ -145,6 +180,63 @@ export class AudioSource extends EventEmitter {
   private lastCircuitCandidateReason: AudioRecoverEvent['reason'] | null = null;
   private startSequencePromise: Promise<void> | null = null;
   private readonly analysisByFormat = new Map<string, AnalysisState>();
+
+  private static deviceDiscoveryRetryScheduler: (
+    callback: () => void | Promise<void>,
+    delayMs: number
+  ) => NodeJS.Timeout = (callback, delayMs) => setTimeout(callback, delayMs);
+
+  static setDeviceDiscoveryRetryScheduler(
+    scheduler: (callback: () => void | Promise<void>, delayMs: number) => NodeJS.Timeout
+  ) {
+    AudioSource.deviceDiscoveryRetryScheduler = scheduler;
+  }
+
+  static resetDeviceDiscoveryRetryScheduler() {
+    AudioSource.deviceDiscoveryRetryScheduler = (callback, delayMs) =>
+      setTimeout(callback, delayMs);
+  }
+
+  private static scheduleDeviceDiscoveryRetry(
+    cacheKey: string,
+    format: 'alsa' | 'avfoundation' | 'dshow' | 'pulse' | 'pipewire' | 'auto',
+    options: { timeoutMs?: number; channel?: string; suppressTimeoutRejection?: boolean }
+  ) {
+    if (DEVICE_DISCOVERY_RETRY_TIMERS.has(cacheKey)) {
+      return;
+    }
+
+    const delayMs = Math.max(
+      DEFAULT_DEVICE_DISCOVERY_RETRY_DELAY_MS,
+      options.timeoutMs ?? DEFAULT_DEVICE_DISCOVERY_TIMEOUT_MS
+    );
+
+    const timer = AudioSource.deviceDiscoveryRetryScheduler(async () => {
+      DEVICE_DISCOVERY_RETRY_TIMERS.delete(cacheKey);
+      try {
+        await AudioSource.listDevices(format, {
+          ...options,
+          suppressTimeoutRejection: true
+        });
+      } catch {
+        // Swallow follow-up discovery errors; metrics recorded elsewhere.
+      }
+    }, delayMs);
+
+    if (typeof timer?.unref === 'function') {
+      timer.unref();
+    }
+
+    DEVICE_DISCOVERY_RETRY_TIMERS.set(cacheKey, timer);
+  }
+
+  private static cancelDeviceDiscoveryRetry(cacheKey: string) {
+    const timer = DEVICE_DISCOVERY_RETRY_TIMERS.get(cacheKey);
+    if (timer) {
+      clearTimeout(timer);
+      DEVICE_DISCOVERY_RETRY_TIMERS.delete(cacheKey);
+    }
+  }
 
   constructor(private options: AudioSourceOptions) {
     super();
@@ -366,7 +458,7 @@ export class AudioSource extends EventEmitter {
       return;
     }
 
-    const err = error ?? new Error('Audio device discovery timed out');
+    const err = toDeviceDiscoveryTimeoutError(error);
     const format = options.format ?? this.options.inputFormat;
     AudioSource.clearDeviceCache(format);
     if (this.options.type === 'mic') {
@@ -399,7 +491,7 @@ export class AudioSource extends EventEmitter {
 
   static async listDevices(
     format: 'alsa' | 'avfoundation' | 'dshow' | 'pulse' | 'pipewire' | 'auto' = 'auto',
-    options: { timeoutMs?: number; channel?: string } = {}
+    options: { timeoutMs?: number; channel?: string; suppressTimeoutRejection?: boolean } = {}
   ): Promise<MicCandidate[]> {
     const cacheKey = buildDeviceCacheKey(process.platform, format);
     const cached = DEVICE_DISCOVERY_CACHE.get(cacheKey);
@@ -455,11 +547,16 @@ export class AudioSource extends EventEmitter {
       throw lastError ?? new Error('Unable to list audio devices');
     })();
 
-    DEVICE_DISCOVERY_CACHE.set(cacheKey, discovery);
+    const sharedDiscovery = discovery.catch(error => {
+      throw error;
+    });
+
+    DEVICE_DISCOVERY_CACHE.set(cacheKey, sharedDiscovery);
 
     try {
-      const devices = await discovery;
+      const devices = await sharedDiscovery;
       const ordered = sortDiscoveredDevices(process.platform, devices);
+      AudioSource.cancelDeviceDiscoveryRetry(cacheKey);
       DEVICE_DISCOVERY_CACHE.set(
         cacheKey,
         Promise.resolve(ordered.map(device => ({ ...device })))
@@ -467,6 +564,11 @@ export class AudioSource extends EventEmitter {
       return ordered.map(device => ({ ...device }));
     } catch (error) {
       DEVICE_DISCOVERY_CACHE.delete(cacheKey);
+      if (isTimeoutError(error) && options.suppressTimeoutRejection) {
+        const timeoutError = toDeviceDiscoveryTimeoutError(error);
+        AudioSource.scheduleDeviceDiscoveryRetry(cacheKey, format, options);
+        throw timeoutError;
+      }
       throw error;
     }
   }
@@ -474,10 +576,16 @@ export class AudioSource extends EventEmitter {
   static clearDeviceCache(format: 'alsa' | 'avfoundation' | 'dshow' | 'auto' | undefined = undefined) {
     if (!format || format === 'auto') {
       DEVICE_DISCOVERY_CACHE.clear();
+      for (const timer of DEVICE_DISCOVERY_RETRY_TIMERS.values()) {
+        clearTimeout(timer);
+      }
+      DEVICE_DISCOVERY_RETRY_TIMERS.clear();
       return;
     }
 
-    DEVICE_DISCOVERY_CACHE.delete(buildDeviceCacheKey(process.platform, format));
+    const cacheKey = buildDeviceCacheKey(process.platform, format);
+    DEVICE_DISCOVERY_CACHE.delete(cacheKey);
+    AudioSource.cancelDeviceDiscoveryRetry(cacheKey);
   }
 
   private async prepareMicCandidates(): Promise<boolean> {
@@ -508,7 +616,8 @@ export class AudioSource extends EventEmitter {
     try {
       const discovered = await AudioSource.listDevices(format, {
         timeoutMs,
-        channel: this.options.channel
+        channel: this.options.channel,
+        suppressTimeoutRejection: true
       });
 
       if (this.shouldStop || this.circuitBroken) {
@@ -532,7 +641,7 @@ export class AudioSource extends EventEmitter {
       }
     } catch (error) {
       if (isTimeoutError(error)) {
-        const err = error instanceof Error ? error : new Error('Audio device discovery timed out');
+        const err = toDeviceDiscoveryTimeoutError(error);
         this.triggerDeviceDiscoveryTimeout(err, { format });
         return false;
       }

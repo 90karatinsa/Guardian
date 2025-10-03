@@ -129,6 +129,9 @@ export class AudioAnomalyDetector {
   }
 
   updateOptions(options: Partial<Omit<AudioAnomalyOptions, 'source'>>) {
+    const previousRmsWindowFrames = this.rmsWindowFrames;
+    const previousCentroidWindowFrames = this.centroidWindowFrames;
+    const previousMinTriggerDurationMs = this.defaultMinTriggerDurationMs;
     const hasChanges =
       options.sampleRate !== undefined ||
       options.frameSize !== undefined ||
@@ -194,7 +197,39 @@ export class AudioAnomalyDetector {
       this.resampleWindows(nextRmsFrames, nextCentroidFrames, false);
     }
 
-    this.currentThresholds = null;
+    const windowShrank =
+      this.rmsWindowFrames < previousRmsWindowFrames ||
+      this.centroidWindowFrames < previousCentroidWindowFrames;
+    const minTriggerShrank = this.defaultMinTriggerDurationMs < previousMinTriggerDurationMs;
+    const windowSettingsChanged =
+      options.rmsWindowMs !== undefined || options.centroidWindowMs !== undefined;
+    const scheduleChanged = options.thresholds !== undefined || options.nightHours !== undefined;
+
+    if (windowShrank) {
+      const excess = Math.max(0, this.buffer.length - this.frameSize);
+      if (excess > 0) {
+        this.buffer.splice(0, excess);
+      }
+    }
+
+    if (windowShrank || minTriggerShrank || windowSettingsChanged || scheduleChanged) {
+      this.resetAccumulation();
+      this.lastEventTs = 0;
+      this.processedFrames = 0;
+    }
+
+    if (scheduleChanged) {
+      this.rmsValues.length = 0;
+      this.centroidValues.length = 0;
+    }
+
+    const shouldReapplyThresholds =
+      geometryChanged || windowSettingsChanged || scheduleChanged || options.minTriggerDurationMs !== undefined;
+
+    if (shouldReapplyThresholds) {
+      this.currentThresholds = null;
+      this.resolveThresholds(Date.now());
+    }
   }
 
   handleChunk(samples: Int16Array, ts = Date.now()) {
@@ -423,6 +458,12 @@ export class AudioAnomalyDetector {
     );
     this.resetAccumulation();
     this.processedFrames = 0;
+    if (this.buffer.length > this.frameSize) {
+      this.buffer.splice(0, this.buffer.length - this.frameSize);
+    }
+    this.resizeWindowStore(this.rmsValues, this.rmsWindowFrames);
+    this.resizeWindowStore(this.centroidValues, this.centroidWindowFrames);
+    this.lastEventTs = 0;
   }
 
   private resetWindows() {
