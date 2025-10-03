@@ -540,7 +540,7 @@ export interface RetentionOutcome {
   archivedSnapshots: number;
   prunedArchives: number;
   warnings: Array<{ path: string; error: Error; camera: string }>;
-  perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number }>;
+  perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number; fallbackMoves?: number }>;
 }
 
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
@@ -555,7 +555,7 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   let archivedSnapshots = 0;
   let prunedArchives = 0;
   let removedSnapshots = 0;
-  const perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number }> = {};
+  const perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number; fallbackMoves?: number }> = {};
   const warnings: Array<{ path: string; error: Error; camera: string }> = [];
 
   for (const { sourceDir, archiveBase } of directories) {
@@ -576,15 +576,14 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
     if (snapshotOptions.mode === 'delete') {
       removedSnapshots += rotation.moved;
     } else {
-      archivedSnapshots += rotation.moved;
+      archivedSnapshots += rotation.perCamera.archivedSnapshots;
     }
-    prunedArchives += rotation.pruned;
+    prunedArchives += rotation.perCamera.prunedArchives;
     warnings.push(...rotation.warnings);
-    const cameraStats = perCamera[cameraId] ?? { archivedSnapshots: 0, prunedArchives: 0 };
-    if (snapshotOptions.mode !== 'delete') {
-      cameraStats.archivedSnapshots += rotation.moved;
-    }
-    cameraStats.prunedArchives += rotation.pruned;
+    const cameraStats = perCamera[cameraId] ?? { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 };
+    cameraStats.archivedSnapshots += rotation.perCamera.archivedSnapshots;
+    cameraStats.prunedArchives += rotation.perCamera.prunedArchives;
+    cameraStats.fallbackMoves = (cameraStats.fallbackMoves ?? 0) + rotation.perCamera.fallbackMoves;
     perCamera[cameraId] = cameraStats;
   }
 
@@ -732,7 +731,10 @@ type RotationOutcome = {
   moved: number;
   pruned: number;
   warnings: Array<{ path: string; error: Error; camera: string }>;
+  perCamera: { archivedSnapshots: number; prunedArchives: number; fallbackMoves: number };
 };
+
+type MoveResult = 'moved' | 'fallback' | 'failed';
 
 function rotateSnapshots(
   snapshotDir: string,
@@ -751,6 +753,8 @@ function rotateSnapshots(
   }
 
   let moved = 0;
+  let archivedForCamera = 0;
+  let fallbackMoves = 0;
   const warnings: Array<{ path: string; error: Error; camera: string }> = [];
   const stack: Array<{ dir: string; relative: string }> = [{ dir: snapshotDir, relative: '.' }];
 
@@ -808,8 +812,13 @@ function rotateSnapshots(
           const targetDir = relative === '.' ? archiveBase : path.join(archiveBase, relative);
           fs.mkdirSync(targetDir, { recursive: true });
           const targetPath = ensureUniqueArchivePath(targetDir, entry.name);
-          if (moveSnapshotWithFallback(sourcePath, targetPath, cameraId, warnings)) {
+          const moveResult = moveSnapshotWithFallback(sourcePath, targetPath, cameraId, warnings);
+          if (moveResult === 'moved' || moveResult === 'fallback') {
             moved += 1;
+            archivedForCamera += 1;
+            if (moveResult === 'fallback') {
+              fallbackMoves += 1;
+            }
           }
         }
       } catch (error) {
@@ -839,7 +848,12 @@ function rotateSnapshots(
     }
   }
 
-  return { moved, pruned, warnings };
+  return {
+    moved,
+    pruned,
+    warnings,
+    perCamera: { archivedSnapshots: archivedForCamera, prunedArchives: pruned, fallbackMoves }
+  };
 }
 
 function moveSnapshotWithFallback(
@@ -847,22 +861,22 @@ function moveSnapshotWithFallback(
   targetPath: string,
   cameraId: string,
   warnings: Array<{ path: string; error: Error; camera: string }>
-) {
+) : MoveResult {
   try {
     fs.renameSync(sourcePath, targetPath);
-    return true;
+    return 'moved';
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
-    if (err.code !== 'EXDEV') {
+    const code = typeof err?.code === 'string' ? err.code : undefined;
+    if (code !== 'EXDEV') {
       warnings.push({ path: sourcePath, error: toError(error), camera: cameraId });
-      return false;
     }
   }
 
   try {
     fs.copyFileSync(sourcePath, targetPath);
     fs.unlinkSync(sourcePath);
-    return true;
+    return 'fallback';
   } catch (copyError) {
     warnings.push({ path: sourcePath, error: toError(copyError), camera: cameraId });
     try {
@@ -872,7 +886,7 @@ function moveSnapshotWithFallback(
     } catch (cleanupError) {
       warnings.push({ path: targetPath, error: toError(cleanupError), camera: cameraId });
     }
-    return false;
+    return 'failed';
   }
 }
 

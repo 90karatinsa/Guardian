@@ -292,6 +292,7 @@ Guardian, veritabanı ve snapshot dizinlerini periyodik olarak temizleyen bir re
 - `events.retention.retentionDays`: SQLite üzerindeki olay kayıtlarının kaç gün saklanacağını belirtir. Silinen satır sayısı `VACUUM`/`VACUUM FULL` adımlarının tetiklenip tetiklenmeyeceğini belirler.
 - `events.retention.archiveDir`, `events.retention.maxArchivesPerCamera`, `events.retention.snapshot.retentionDays` ve `events.retention.snapshot.maxArchivesPerCamera`: Snapshot arşivleri tarih bazlı klasörlerde toplanır (`archive/2024-03-18/` gibi). Limit aşıldığında en eski klasörler taşınır ve silinir. `snapshot.mode` değeri `archive` veya `cleanup` olarak yapılandırılabilir.
 - Görev her çalıştırmada loglara `Retention task completed` satırını bırakır; `archivedSnapshots` değeri 0’dan büyükse arşiv döngüsünün devrede olduğu anlaşılır. `vacuum.mode` değeriniz `auto` ise, önceki çalıştırmada hiçbir satır/snapshot temizlenmediyse VACUUM adımı atlanır. `vacuum.run` alanı `always`, `on-change` veya `never` değerlerini kabul eder ve CLI çıktısında `vacuum=auto (run=on-change)` gibi bir özet gösterilir.
+- Log özetindeki `perCamera` alanı her kamera için başarıyla arşivlenen ve kota nedeniyle prune edilen snapshot sayısını bildirir; EXDEV gibi taşıma hatalarında devreye giren kopyalama fallback'i de bu sayaçlara dahil edilir.
 
 Bakım sırasında retention politikasını manuel olarak tetiklemek için CLI komutunu kullanabilirsiniz:
 
@@ -362,6 +363,10 @@ Aşağıdaki örnek, global pencereyi 3 karede tutarken lobi kamerası için dah
 ```
 
 Değerler uygulandığında `guardian daemon health --json` çıktısındaki `metricsSummary.detectors.motion.temporal` nesnesi ve `pipelines.ffmpeg.byChannel` kayıtları yeni pencere/geri alma katsayılarını rapor eder. Bastırma timeline TTL değişimleri `metrics.suppression.historyTotals.ttlPrunedByChannel` alanında görülür.
+
+#### Event suppression meta alanları
+
+EventBus üzerinden yayılan olaylar bastırıldığında, log ve HTTP API payload'larında yer alan `meta.suppressionChannels` listesi yalnızca bastırmaya sebep olan kural kanallarını içerir. Kaynak (`source`) alanından türetilen veya kamera eşitlemesi için eklenen kanallar bu listeden ayıklanır; aynı filtre `suppressedBy[].channels` ve `metrics.recordSuppressedEvent` çağrılarında gönderilen `channels` alanına da uygulanır. Böylece `sensor:*` gibi kaynak kimlikleri suppression meta verisine dahil edilmez ve kanal normalizasyonu beklendiği gibi doğrulanır.
 
 ### Pipeline sıfırlama akışı
 `guardian daemon pipelines reset` komutu, devre kesici, watchdog zamanlayıcıları ve taşıma fallback geçmişini tek adımda temizler. Çalışma akışı şu şekilde işler:
@@ -514,6 +519,12 @@ satırı, son hata logunun Unix zaman damgasını bildirir.
 ## Video ve ses boru hatları
 Video için ffmpeg süreçleri, `src/video/source.ts` altında watchdog tarafından izlenir. RTSP bağlantıları `tcp→udp→tcp` sıralı transport fallback zincirini uygular; `transport-change` logları ve `metrics.pipelines.ffmpeg.transportFallbacks.total` alanı kaç kez geri düşüş yaşandığını gösterir. `Audio source recovering (reason=ffmpeg-missing|stream-idle)` satırlarını loglarda görüyorsanız, fallback listesi üzerinde iterasyon yapıldığını bilirsiniz. Her yeniden başlatma `pipelines.ffmpeg.byReason`, `pipelines.ffmpeg.restartHistogram.delay` ve `pipelines.ffmpeg.jitterHistogram` alanlarını artırır.
 
+### Tehdit skorlaması ve alias eşlemesi
+
+- Kişi dedektörü, `ObjectClassifier` sonuçlarını olay meta verisine kopyalarken ham sınıf isimlerini `labelMap` tanımlarına göre normalize eder. Aynı alias altında toplanan olasılıklar tek bir kovada birleştirilir; böylece "cat" ve "dog" gibi farklı etiketler `pet` alias'ı için tek bir toplam olasılık üretir.
+- Meta verideki `objects[].probabilities` alanı bu toplulaştırılmış dağılımı taşırken `rawProbabilities` aynı kovadaki ham sınıf katkılarını korur. Tehdit hesaplamaları bu ortak kümeyi kullanarak alias ve ham isimler arasında tutarlı eşikler uygular.
+- Tehdit skoru, nesnenin YOLO sınıflandırma skoru ile alias altındaki toplam tehdit olasılığının çarpımıdır; sonuç `threatThreshold` değerine göre değerlendirilir. Olay meta verisinde `threatThreshold` ve `threatSummary` alanları eşik altında kalan skorları kırparak güncellenmiş day/night eşik planlarının hemen uygulanmasını sağlar.
+
 ffmpeg komutları beklenmedik şekilde hata verdiğinde daemon loglarında `Video source reconnecting (reason=ffmpeg-error)` satırı görünür; aynı anda `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.byReason['ffmpeg-error']` sayaçları artar ve toparlanan kanalın kimliğini rapor eder. Manuel taşıyıcı sıfırlamalarını doğrulamak için `guardian daemon restart --transport video:lobby` komutunu çalıştırın; komut tamamlandığında sağlık özetindeki `metricsSummary.pipelines.transportFallbacks.video.byChannel` girdilerinde ilgili `total` değerinin 0'a döndüğünü ve `lastReason` alanının sıfırlandığını kontrol edin.
 
 Ses tarafında anomaly dedektörü, RMS ve spectral centroid ölçümlerini `audio.anomaly` konfigürasyonu doğrultusunda toplar. `metrics.detectors['audio-anomaly'].latencyHistogram` değeri, pencere hizasının doğruluğunu teyit eder. Sustained sessizlikte devre kesici tetiklendiğinde `pipelines.audio.watchdogBackoffByChannel` ve `pipelines.audio.restartHistogram.delay` artışları görülebilir.
@@ -594,6 +605,8 @@ Guardian'ı internet erişimi olmayan saha kutularına dağıtırken bağımlıl
    pnpm install --offline --prod
    pnpm store status
    ```
+
+   jsdom da artık doğrudan çalışma zamanı bağımlılığı olarak paketlendiğinden, HTTP API REST/SSE testleri (Vitest) offline ortamda bile `npm test -- tests/http_api.test.ts` komutuyla eksik modül hatası vermeden çalıştırılabilir.
 
 3. `models/` klasörünü (örneğin `models/yolov8n.onnx`) ve `config/` altındaki üretim yapılandırmalarını aynı rsync/USB sürecinde taşımayı unutmayın.
 

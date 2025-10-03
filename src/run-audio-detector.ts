@@ -1,7 +1,7 @@
 import config from 'config';
 import logger from './logger.js';
 import eventBus from './eventBus.js';
-import { AudioSource } from './audio/source.js';
+import { AudioSource, DeviceDiscoveryTimeoutError } from './audio/source.js';
 import AudioAnomalyDetector from './audio/anomaly.js';
 import type { AudioConfig } from './config/index.js';
 
@@ -116,7 +116,7 @@ source.start();
 if (simulateDiscoveryTimeout !== '0') {
   setTimeout(() => {
     source.triggerDeviceDiscoveryTimeout(
-      new Error('Simulated audio device discovery timeout')
+      new DeviceDiscoveryTimeoutError('Simulated audio device discovery timeout')
     );
   }, Math.max(0, discoveryDelayMs));
 }

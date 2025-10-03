@@ -2116,24 +2116,52 @@ describe('VideoSource', () => {
   });
 
   it('removes stream listeners when the stream closes', async () => {
-    const source = new VideoSource({ file: 'noop', framesPerSecond: 1 });
-    const stream = new PassThrough();
+    vi.useFakeTimers();
 
-    source.consume(stream);
-    expect(stream.listenerCount('data')).toBeGreaterThan(0);
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
 
-    stream.end();
-    stream.destroy();
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      commandFactory
+    });
 
-    await new Promise(resolve => setImmediate(resolve));
+    try {
+      source.start();
 
-    expect(stream.listenerCount('data')).toBe(0);
-    expect(stream.listenerCount('error')).toBe(0);
-    expect(stream.listenerCount('end')).toBe(0);
+      await waitFor(() => commands.length === 1, 200);
+      const command = commands[0];
+      const stream = command.stream;
 
-    await source.stop();
+      expect(stream.listenerCount('data')).toBeGreaterThan(0);
+      expect(stream.listenerCount('error')).toBe(1);
+      expect(stream.listenerCount('end')).toBe(1);
+      expect(stream.listenerCount('close')).toBe(1);
 
-    expect(commands.length).toBeGreaterThanOrEqual(3);
+      stream.emit('close');
+
+      expect(stream.listenerCount('data')).toBe(0);
+      expect(stream.listenerCount('error')).toBe(0);
+      expect(stream.listenerCount('end')).toBe(0);
+      expect(stream.listenerCount('close')).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(100);
+      await waitFor(() => commands.length >= 2, 500);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+
+    expect(commands.length).toBeGreaterThanOrEqual(2);
   });
 
   it('VideoSourceRecovery surfaces guard feedback with reason', async () => {

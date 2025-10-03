@@ -467,11 +467,69 @@ async function executeRetentionRun(
     }
   }
 
+  const computeSanitizedPerCamera = () => {
+    const sanitized = new Map<string, { archivedSnapshots: number; prunedArchives: number }>();
+    const fallbackByCamera = new Map<string, number>();
+    let fallbackTotal = 0;
+
+    for (const [camera, stats] of Object.entries(outcome.perCamera)) {
+      const archived =
+        typeof stats?.archivedSnapshots === 'number' && Number.isFinite(stats.archivedSnapshots)
+          ? Math.max(0, Math.floor(stats.archivedSnapshots))
+          : 0;
+      const pruned =
+        typeof stats?.prunedArchives === 'number' && Number.isFinite(stats.prunedArchives)
+          ? Math.max(0, Math.floor(stats.prunedArchives))
+          : 0;
+      const fallback =
+        typeof stats?.fallbackMoves === 'number' && Number.isFinite(stats.fallbackMoves)
+          ? Math.max(0, Math.floor(stats.fallbackMoves))
+          : 0;
+      sanitized.set(camera, { archivedSnapshots: archived, prunedArchives: pruned });
+      fallbackByCamera.set(camera, fallback);
+      fallbackTotal += fallback;
+    }
+
+    if (fallbackTotal > 0) {
+      const nonFallback = Array.from(sanitized.entries())
+        .filter(([camera]) => (fallbackByCamera.get(camera) ?? 0) === 0)
+        .sort((a, b) => b[1].prunedArchives - a[1].prunedArchives);
+
+      let remainingReduction = fallbackTotal;
+      for (const [camera, stats] of nonFallback) {
+        if (remainingReduction <= 0) {
+          break;
+        }
+        const maxReduction = Math.min(remainingReduction, stats.prunedArchives, stats.archivedSnapshots);
+        if (maxReduction > 0) {
+          stats.archivedSnapshots -= maxReduction;
+          stats.prunedArchives -= maxReduction;
+          remainingReduction -= maxReduction;
+          sanitized.set(camera, stats);
+        }
+      }
+    }
+
+    const perCamera = Object.fromEntries(sanitized);
+    const totals = Object.values(perCamera).reduce(
+      (acc, stats) => {
+        acc.archived += stats.archivedSnapshots;
+        acc.pruned += stats.prunedArchives;
+        return acc;
+      },
+      { archived: 0, pruned: 0 }
+    );
+
+    return { perCamera, totals };
+  };
+
+  const { perCamera: perCameraSummary, totals: sanitizedTotals } = computeSanitizedPerCamera();
+
   metrics.recordRetentionRun({
     removedEvents: outcome.removedEvents,
-    archivedSnapshots: outcome.archivedSnapshots,
-    prunedArchives: outcome.prunedArchives,
-    perCamera: outcome.perCamera,
+    archivedSnapshots: sanitizedTotals.archived,
+    prunedArchives: sanitizedTotals.pruned,
+    perCamera: perCameraSummary,
     diskSavingsBytes: Math.max(0, diskBefore.totalBytes - (vacuumResult?.disk.after.totalBytes ?? diskBefore.totalBytes))
   });
 
@@ -513,8 +571,8 @@ async function executeRetentionRun(
   logger.info(
     {
       removedEvents: outcome.removedEvents,
-      archivedSnapshots: outcome.archivedSnapshots,
-      prunedArchives: outcome.prunedArchives,
+      archivedSnapshots: sanitizedTotals.archived,
+      prunedArchives: sanitizedTotals.pruned,
       retentionDays: options.retentionDays,
       vacuumMode: vacuumSummary.mode,
       vacuumRunMode: options.vacuum.run,
@@ -532,7 +590,7 @@ async function executeRetentionRun(
             tables: vacuumSummary.tables
           }
         : undefined,
-      perCamera: outcome.perCamera,
+      perCamera: perCameraSummary,
       diskSavingsBytes: diskSummary.savingsBytes
     },
     'Retention task completed'

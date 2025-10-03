@@ -125,6 +125,7 @@ export class PersonDetector {
       this.lastEventTs = ts;
 
       let classifiedObjects: ClassifiedObject[] = [];
+      const threatThreshold = this.objectClassifier?.getThreatThreshold();
       if (this.objectClassifier && nonPersonDetections.length > 0) {
         classifiedObjects = await this.objectClassifier.classify(nonPersonDetections);
       }
@@ -180,27 +181,55 @@ export class PersonDetector {
       };
 
       if (classifiedObjects.length > 0) {
-        const objects = classifiedObjects.map(object => ({
-          label: object.label,
-          rawLabel: object.rawLabel,
-          score: object.score,
-          confidence: resolveDetectionConfidence(object.detection),
-          threat: object.isThreat,
-          threatScore: object.threatScore,
-          detection: serializeDetection(object.detection),
-          probabilities: object.probabilities,
-          rawProbabilities: object.rawProbabilities
-        }));
+        const objects = classifiedObjects.map(object => {
+          const detection = serializeDetection(object.detection);
+          const detectionConfidence = Number.isFinite(object.detectionConfidence)
+            ? object.detectionConfidence
+            : resolveDetectionConfidence(object.detection);
+          const originalScore = detection.score;
+          if (Number.isFinite(detectionConfidence)) {
+            detection.rawScore = originalScore;
+            detection.score = detectionConfidence;
+            detection.confidence = detectionConfidence;
+            detection.detectionConfidence = detectionConfidence;
+          }
+
+          return {
+            label: object.label,
+            rawLabel: object.rawLabel,
+            score: object.score,
+            confidence: detectionConfidence,
+            threat: object.isThreat,
+            threatScore: object.fusedThreatScore,
+            rawThreatScore: object.threatScore,
+            detectionConfidence,
+            detection,
+            probabilities: object.probabilities,
+            rawProbabilities: object.rawProbabilities
+          };
+        });
         const threat = classifiedObjects.find(object => object.isThreat);
         payload.meta!.objects = objects;
+        if (typeof threatThreshold === 'number') {
+          payload.meta!.threatThreshold = threatThreshold;
+        }
         if (threat) {
+          const threatConfidence = Number.isFinite(threat.detectionConfidence)
+            ? threat.detectionConfidence
+            : resolveDetectionConfidence(threat.detection);
           payload.meta!.threat = {
             label: threat.label,
-            score: threat.threatScore,
-            confidence: resolveDetectionConfidence(threat.detection)
+            score: threat.fusedThreatScore,
+            confidence: threatConfidence,
+            rawScore: threat.threatScore,
+            threat: true,
+            threshold: threatThreshold
           };
         }
-        const summary = summarizeThreatMetadata(payload.meta);
+        const summary = summarizeThreatMetadata(payload.meta, {
+          threshold: threatThreshold,
+          clampToThreshold: true
+        });
         if (summary) {
           payload.meta!.threatSummary = summary;
         }
@@ -236,8 +265,10 @@ export class PersonDetector {
 }
 
 function serializeDetection(detection: YoloDetection) {
+  const confidence = resolveDetectionConfidence(detection);
   return {
     score: detection.score,
+    rawScore: detection.score,
     classId: detection.classId,
     bbox: detection.bbox,
     objectness: detection.objectness,
@@ -247,7 +278,8 @@ function serializeDetection(detection: YoloDetection) {
     appliedThreshold: detection.appliedThreshold,
     projectionIndex: detection.projectionIndex,
     normalizedProjection: detection.normalizedProjection,
-    confidence: resolveDetectionConfidence(detection),
+    confidence,
+    detectionConfidence: confidence,
     fusion: serializeFusion(detection)
   };
 }
@@ -343,7 +375,8 @@ function resolveDetectionConfidence(detection: YoloDetection) {
   if (detection.fusion && Number.isFinite(detection.fusion.confidence)) {
     return clamp(detection.fusion.confidence, 0, 1);
   }
-  const baseScore = clamp(detection.score, 0, 1);
+
+  const baseScore = clamp(typeof detection.score === 'number' ? detection.score : 0, 0, 1);
   const objectness = clamp(
     typeof detection.objectness === 'number' ? detection.objectness : baseScore,
     0,

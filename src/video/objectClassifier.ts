@@ -25,6 +25,8 @@ export interface ClassifiedObject {
   probabilities: Record<string, number>;
   rawProbabilities: Record<string, number>;
   threatScore: number;
+  fusedThreatScore: number;
+  detectionConfidence: number;
   isThreat: boolean;
 }
 
@@ -140,10 +142,9 @@ export class ObjectClassifier {
       const logits = scores.slice(start, end);
       const probabilities = softmax(logits);
       const rawProbabilities: Record<string, number> = {};
-      const resolvedProbabilities: Record<string, number> = {};
-      const aggregateLeaders = new Map<
+      const probabilityBuckets = new Map<
         string,
-        { label: string; probability: number; combined: number }
+        { total: number; raw: Map<string, number>; leader: { label: string; probability: number } }
       >();
 
       for (let i = 0; i < labels.length; i += 1) {
@@ -151,51 +152,77 @@ export class ObjectClassifier {
         const probability = probabilities[i] ?? 0;
         rawProbabilities[rawLabel] = probability;
         const resolved = this.mapLabel(rawLabel);
-        const current = resolvedProbabilities[resolved] ?? 0;
-        const combined = current + probability;
-        resolvedProbabilities[resolved] = combined;
-        const leader = aggregateLeaders.get(resolved);
-        if (!leader || probability > leader.probability) {
-          aggregateLeaders.set(resolved, { label: rawLabel, probability, combined });
-        } else if (leader && combined !== leader.combined) {
-          aggregateLeaders.set(resolved, { ...leader, combined });
+        const existing = probabilityBuckets.get(resolved);
+        if (existing) {
+          existing.total += probability;
+          existing.raw.set(rawLabel, probability);
+          if (probability >= existing.leader.probability) {
+            existing.leader = { label: rawLabel, probability };
+          }
+        } else {
+          probabilityBuckets.set(resolved, {
+            total: probability,
+            raw: new Map([[rawLabel, probability]]),
+            leader: { label: rawLabel, probability }
+          });
         }
       }
 
-      const initialRaw = labels[0] ?? 'class-0';
-      let bestLabel = this.mapLabel(initialRaw);
-      let bestScore = resolvedProbabilities[bestLabel] ?? probabilities[0] ?? 0;
-      let bestRawLabel = aggregateLeaders.get(bestLabel)?.label ?? initialRaw;
-      for (const [resolved, aggregate] of Object.entries(resolvedProbabilities)) {
-        if (aggregate > bestScore) {
-          bestScore = aggregate;
-          const leader = aggregateLeaders.get(resolved);
+      const aggregatedProbabilities: Record<string, number> = {};
+      let bestLabel = labels[0] ? this.mapLabel(labels[0]) : 'class-0';
+      let bestRawLabel = labels[0] ?? 'class-0';
+      let bestScore = -Infinity;
+
+      for (const [resolved, bucket] of probabilityBuckets.entries()) {
+        aggregatedProbabilities[resolved] = bucket.total;
+        if (bucket.total > bestScore) {
+          bestScore = bucket.total;
           bestLabel = resolved;
-          bestRawLabel = leader?.label ?? resolved;
+          bestRawLabel = bucket.leader.label;
         }
       }
 
+      if (!Number.isFinite(bestScore)) {
+        bestScore = aggregatedProbabilities[bestLabel] ?? probabilities[0] ?? 0;
+      }
+
+      const probabilityLookup: Record<string, number> = { ...aggregatedProbabilities };
+      for (const bucket of probabilityBuckets.values()) {
+        for (const [rawLabel, probability] of bucket.raw.entries()) {
+          probabilityLookup[rawLabel] = probability;
+        }
+      }
+
+      const baseScore = clamp(Number(detection.score), 0, 1);
+      const fusionConfidenceValue = Number.isFinite(Number(detection.fusion?.confidence))
+        ? clamp(Number(detection.fusion?.confidence), 0, 1)
+        : 0;
+      const objectnessConfidence = Number.isFinite(Number(detection.objectness))
+        ? clamp(Number(detection.objectness), 0, 1)
+        : 0;
+      const classConfidence = Number.isFinite(Number(detection.classProbability))
+        ? clamp(Number(detection.classProbability), 0, 1)
+        : 0;
       const detectionConfidence = clamp(
-        typeof detection.fusion?.confidence === 'number' ? detection.fusion.confidence : detection.score,
+        Math.max(baseScore, fusionConfidenceValue, objectnessConfidence, classConfidence),
         0,
         1
       );
-      const threatProbability = this.resolveThreatProbability(
-        bestLabel,
-        resolvedProbabilities,
-        rawProbabilities
-      );
-      const threatScore = clamp(threatProbability * detectionConfidence, 0, 1);
-      const isThreat = threatScore >= this.threatThreshold;
+      const threatProbability = this.resolveThreatProbability(bestLabel, probabilityLookup, rawProbabilities);
+      const fusedThreatScore = clamp(threatProbability * detectionConfidence, 0, 1);
+      const baseThreatScore = clamp(threatProbability * baseScore, 0, 1);
+      const isThreat = threatProbability >= this.threatThreshold;
 
       objects.push({
         detection: detections[index],
         label: bestLabel,
         rawLabel: bestRawLabel,
         score: bestScore,
-        probabilities: resolvedProbabilities,
+        probabilities: aggregatedProbabilities,
         rawProbabilities,
-        threatScore,
+        threatScore: baseThreatScore,
+        fusedThreatScore,
+        detectionConfidence,
         isThreat
       });
     }
@@ -255,6 +282,10 @@ export class ObjectClassifier {
   private mapLabel(label: string) {
     const normalized = label.trim();
     return this.labelMap.get(normalized) ?? normalized;
+  }
+
+  getThreatThreshold() {
+    return this.threatThreshold;
   }
 }
 
@@ -317,7 +348,15 @@ function createMockSession(labelCount: number): InferenceSessionLike {
   };
 }
 
-export function summarizeThreatMetadata(meta: Record<string, unknown> | undefined): ThreatSummary | null {
+export interface ThreatSummaryOptions {
+  threshold?: number;
+  clampToThreshold?: boolean;
+}
+
+export function summarizeThreatMetadata(
+  meta: Record<string, unknown> | undefined,
+  options: ThreatSummaryOptions = {}
+): ThreatSummary | null {
   if (!meta || typeof meta !== 'object') {
     return null;
   }
@@ -328,13 +367,13 @@ export function summarizeThreatMetadata(meta: Record<string, unknown> | undefine
   const normalized: ThreatSummaryEntry[] = [];
 
   for (const entry of objectsRaw) {
-    const normalizedEntry = normalizeThreatEntry(entry);
+    const normalizedEntry = normalizeThreatEntry(entry, options);
     if (normalizedEntry) {
       normalized.push(normalizedEntry);
     }
   }
 
-  const explicitThreat = normalizeThreatEntry((meta as { threat?: unknown }).threat);
+  const explicitThreat = normalizeThreatEntry((meta as { threat?: unknown }).threat, options);
   if (explicitThreat) {
     normalized.push(explicitThreat);
   }
@@ -361,18 +400,28 @@ export function summarizeThreatMetadata(meta: Record<string, unknown> | undefine
   };
 }
 
-function normalizeThreatEntry(value: unknown): ThreatSummaryEntry | null {
+function normalizeThreatEntry(value: unknown, options: ThreatSummaryOptions): ThreatSummaryEntry | null {
   if (!value || typeof value !== 'object') {
     return null;
   }
   const record = value as Record<string, unknown>;
   const threatScoreCandidate = record.threatScore ?? record.score ?? record.confidence;
-  const threatScore = typeof threatScoreCandidate === 'number' ? threatScoreCandidate : null;
+  let threatScore = typeof threatScoreCandidate === 'number' ? clamp(threatScoreCandidate, 0, 1) : null;
   if (threatScore === null) {
     return null;
   }
   const label = resolveThreatEntryLabel(record);
-  const isThreat = typeof record.threat === 'boolean' ? record.threat : threatScore >= 0.5;
+  const threshold =
+    typeof options.threshold === 'number' && Number.isFinite(options.threshold) ? options.threshold : null;
+  const isThreat =
+    typeof record.threat === 'boolean'
+      ? record.threat
+      : threshold !== null
+      ? threatScore >= threshold
+      : threatScore >= 0.5;
+  if (isThreat && threshold !== null && options.clampToThreshold) {
+    threatScore = Math.max(threatScore, threshold);
+  }
   return { label, threatScore, isThreat };
 }
 
