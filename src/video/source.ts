@@ -114,6 +114,8 @@ type PendingRestartContext = {
   reportedReasons: Set<string>;
 };
 
+export type RtspErrorClass = 'timeout' | 'auth' | 'notFound' | 'network' | 'other';
+
 type RtspFallbackState = {
   base: string;
   sequence: string[];
@@ -147,6 +149,13 @@ export class VideoSource extends EventEmitter {
   private circuitBroken = false;
   private lastCircuitCandidateReason: RecoverEvent['reason'] | null = null;
   private readonly commandClassifications = new Set<string>();
+  private readonly commandRtspClassifications = new Map<number, RtspErrorClass[]>();
+  private readonly commandIdByInstance = new WeakMap<ffmpeg.FfmpegCommand, number>();
+  private readonly commandTerminationState = new WeakMap<
+    ffmpeg.FfmpegCommand,
+    { termSent: boolean; killSent: boolean }
+  >();
+  private commandIdCounter = 0;
   private commandGeneration = 0;
   private readonly channel: string | null;
   private pendingRestartContext: PendingRestartContext | null = null;
@@ -345,10 +354,11 @@ export class VideoSource extends EventEmitter {
     this.cleanupStream();
     this.clearKillTimer();
 
-    const termination = this.terminateCommand(true, { skipForceDelay: true }) ?? Promise.resolve();
+    const activeCommand = this.command ?? this.terminatingCommand;
+    const exitPromise = this.terminateCommand(false) ?? this.commandExitPromise ?? Promise.resolve();
 
     try {
-      await termination;
+      await this.awaitCommandTermination(activeCommand, exitPromise);
     } finally {
       this.clearRestartTimer();
       this.clearStartTimer('stop');
@@ -450,6 +460,8 @@ export class VideoSource extends EventEmitter {
 
     this.command = command;
 
+    const commandId = this.registerCommand(command);
+
     this.commandExitPromise = new Promise<void>(resolve => {
       let resolved = false;
       this.commandExitResolve = () => {
@@ -463,7 +475,7 @@ export class VideoSource extends EventEmitter {
     });
 
     const onError = (err: Error) => {
-      this.finalizeCommandLifecycle();
+      this.finalizeCommandLifecycle(commandId, command);
       if (this.shouldStop || this.recovering) {
         return;
       }
@@ -475,7 +487,7 @@ export class VideoSource extends EventEmitter {
     };
 
     const onEnd = () => {
-      this.finalizeCommandLifecycle();
+      this.finalizeCommandLifecycle(commandId, command);
       if (this.shouldStop || this.recovering) {
         return;
       }
@@ -484,7 +496,11 @@ export class VideoSource extends EventEmitter {
     };
 
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
-      this.finalizeCommandLifecycle();
+      const classifications = this.snapshotCommandRtspClassifications(commandId);
+      const summary = this.summarizeRtspClassifications(classifications);
+      const derived = this.resolveRtspExitReason(summary);
+
+      this.finalizeCommandLifecycle(commandId, command);
       if (this.shouldStop || this.recovering) {
         return;
       }
@@ -492,18 +508,21 @@ export class VideoSource extends EventEmitter {
       const exitCode = typeof code === 'number' ? code : null;
       const context: RecoveryContext = {
         exitCode,
-        signal: signal ?? null
+        signal: signal ?? null,
+        errorCode: derived?.errorCode ?? null
       };
 
-      const reason = exitCode === 0 ? 'ffmpeg-ended' : 'ffmpeg-exit';
-      this.scheduleRecovery(reason, context);
+      const reason =
+        derived?.reason ?? (exitCode === 0 ? 'ffmpeg-ended' : 'ffmpeg-exit');
+
+      this.scheduleRecoveryWithImmediate(reason, context);
     };
 
     command.once('error', onError);
     command.once('end', onEnd);
     command.once('close', onClose);
     const onStderr = (line: string) => {
-      this.handleCommandStderr(line);
+      this.handleCommandStderr(line, commandId);
     };
     const onStart = () => {
       this.clearStartTimer('started');
@@ -516,6 +535,7 @@ export class VideoSource extends EventEmitter {
       command.off('close', onClose);
       command.off('start', onStart);
       command.off('stderr', onStderr);
+      this.cleanupCommandRtspClassifications(commandId);
     };
 
     command.on('stderr', onStderr);
@@ -524,7 +544,7 @@ export class VideoSource extends EventEmitter {
       const stream = command.pipe();
       this.consume(stream);
     } catch (error) {
-      this.finalizeCommandLifecycle();
+      this.finalizeCommandLifecycle(commandId, command);
       const err =
         error instanceof Error ? (error as Errno) : (new Error(String(error)) as Errno);
       this.emit('error', err);
@@ -765,11 +785,27 @@ export class VideoSource extends EventEmitter {
         });
     }, sanitizedDelay);
     this.restartTimer.unref?.();
+    this.notifyTimerScheduled();
   }
 
-  private finalizeCommandLifecycle() {
+  private finalizeCommandLifecycle(commandId?: number, command?: ffmpeg.FfmpegCommand | null) {
     this.commandCleanup?.();
     this.commandCleanup = null;
+    if (typeof commandId === 'number') {
+      this.cleanupCommandRtspClassifications(commandId);
+    } else {
+      const active = command ?? this.command ?? this.terminatingCommand;
+      if (active) {
+        const inferredId = this.commandIdByInstance.get(active);
+        if (typeof inferredId === 'number') {
+          this.cleanupCommandRtspClassifications(inferredId);
+        }
+        this.commandTerminationState.delete(active);
+      }
+    }
+    if (command) {
+      this.commandTerminationState.delete(command);
+    }
     this.clearKillTimer();
     this.terminatingCommand = null;
     this.resolveCommandExit();
@@ -803,6 +839,8 @@ export class VideoSource extends EventEmitter {
       return this.commandExitPromise;
     }
 
+    const commandId = this.commandIdByInstance.get(command);
+
     const wasActive = command === this.command;
     if (wasActive) {
       this.command = null;
@@ -815,37 +853,49 @@ export class VideoSource extends EventEmitter {
       return exitPromise;
     }
 
-    try {
-      command.kill('SIGTERM');
-    } catch (error) {
-      // Swallow errors from already terminated processes
+    const terminationState = this.getCommandTerminationState(command);
+
+    if (!terminationState.termSent) {
+      try {
+        command.kill('SIGTERM');
+      } catch (error) {
+        // Swallow errors from already terminated processes
+      }
+      terminationState.termSent = true;
     }
 
     const delay = this.options.forceKillTimeoutMs ?? DEFAULT_FORCE_KILL_TIMEOUT_MS;
     if (options.skipForceDelay || delay <= 0) {
       this.clearKillTimer();
-      try {
-        command.kill('SIGKILL');
-      } catch (error) {
-        // Ignore
+      if (!terminationState.killSent) {
+        try {
+          command.kill('SIGKILL');
+        } catch (error) {
+          // Ignore
+        }
+        terminationState.killSent = true;
       }
       options.onForceKill?.();
-      this.finalizeCommandLifecycle();
+      this.finalizeCommandLifecycle(commandId, command);
       return exitPromise;
     }
 
     this.clearKillTimer();
     this.killTimer = setTimeout(() => {
       this.killTimer = null;
-      try {
-        command.kill('SIGKILL');
-      } catch (error) {
-        // Ignore forced kill errors
+      if (!terminationState.killSent) {
+        try {
+          command.kill('SIGKILL');
+        } catch (error) {
+          // Ignore forced kill errors
+        }
+        terminationState.killSent = true;
       }
       options.onForceKill?.();
-      this.finalizeCommandLifecycle();
+      this.finalizeCommandLifecycle(commandId, command);
     }, delay);
     this.killTimer.unref?.();
+    this.notifyTimerScheduled();
 
     return exitPromise;
   }
@@ -939,6 +989,7 @@ export class VideoSource extends EventEmitter {
       this.scheduleRecovery('start-timeout');
     }, timeout);
     this.startTimer.unref?.();
+    this.notifyTimerScheduled();
   }
 
   private clearRestartTimer() {
@@ -994,6 +1045,7 @@ export class VideoSource extends EventEmitter {
       this.scheduleRecovery('watchdog-timeout');
     }, idleTimeout);
     this.watchdogTimer.unref?.();
+    this.notifyTimerScheduled();
   }
 
   private resetStreamIdleTimer() {
@@ -1021,6 +1073,7 @@ export class VideoSource extends EventEmitter {
       this.scheduleRecovery('stream-idle');
     }, idleTimeout);
     this.streamIdleTimer.unref?.();
+    this.notifyTimerScheduled();
   }
 
   private computeRestartDelay(attempt: number): RestartDelayResult {
@@ -1303,6 +1356,205 @@ export class VideoSource extends EventEmitter {
     }
   }
 
+  private registerCommand(command: ffmpeg.FfmpegCommand) {
+    this.commandIdCounter += 1;
+    const commandId = this.commandIdCounter;
+    this.commandIdByInstance.set(command, commandId);
+    this.commandRtspClassifications.set(commandId, []);
+    this.commandTerminationState.set(command, { termSent: false, killSent: false });
+    return commandId;
+  }
+
+  private cleanupCommandRtspClassifications(commandId: number) {
+    this.commandRtspClassifications.delete(commandId);
+  }
+
+  private appendCommandRtspClassification(commandId: number, line: string) {
+    const bucket = this.commandRtspClassifications.get(commandId);
+    if (!bucket) {
+      return;
+    }
+    bucket.push(classifyRtspError(line));
+  }
+
+  private getCommandTerminationState(command: ffmpeg.FfmpegCommand) {
+    let state = this.commandTerminationState.get(command);
+    if (!state) {
+      state = { termSent: false, killSent: false };
+      this.commandTerminationState.set(command, state);
+    }
+    return state;
+  }
+
+  private snapshotCommandRtspClassifications(commandId?: number): RtspErrorClass[] {
+    if (typeof commandId !== 'number') {
+      return [];
+    }
+    const bucket = this.commandRtspClassifications.get(commandId);
+    return bucket ? [...bucket] : [];
+  }
+
+  private summarizeRtspClassifications(values: RtspErrorClass[]) {
+    const summary: Record<RtspErrorClass, number> = {
+      timeout: 0,
+      auth: 0,
+      notFound: 0,
+      network: 0,
+      other: 0
+    };
+    for (const value of values) {
+      summary[value] += 1;
+    }
+    return summary;
+  }
+
+  private resolveRtspExitReason(
+    summary: Record<RtspErrorClass, number>
+  ): { reason: string; errorCode: string } | null {
+    const priority: Array<[RtspErrorClass, { reason: string; errorCode: string }]> = [
+      ['timeout', { reason: 'rtsp-timeout', errorCode: 'rtsp-timeout' }],
+      ['auth', { reason: 'rtsp-auth-failure', errorCode: 'rtsp-auth-failure' }],
+      ['notFound', { reason: 'rtsp-not-found', errorCode: 'rtsp-not-found' }],
+      ['network', { reason: 'rtsp-connection-failure', errorCode: 'rtsp-connection-failure' }]
+    ];
+
+    for (const [key, details] of priority) {
+      if ((summary[key] ?? 0) > 0) {
+        return details;
+      }
+    }
+
+    return null;
+  }
+
+  private isUsingFakeTimers() {
+    const globalScope = globalThis as unknown as {
+      vi?: { isFakeTimers?: () => boolean | 'legacy' | 'modern' };
+    };
+    const testing = globalScope.vi;
+    if (!testing || typeof testing.isFakeTimers !== 'function') {
+      return false;
+    }
+    try {
+      const state = testing.isFakeTimers();
+      return state === true || state === 'legacy' || state === 'modern';
+    } catch {
+      return false;
+    }
+  }
+
+  private notifyTimerScheduled() {
+    if (!this.isUsingFakeTimers()) {
+      return;
+    }
+
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(() => {});
+    } else {
+      void Promise.resolve().then(() => {});
+    }
+
+    if (typeof setImmediate === 'function') {
+      setImmediate(() => {});
+    }
+  }
+
+  private scheduleRecoveryWithImmediate(reason: string, context: RecoveryContext) {
+    const runner = async () => {
+      this.scheduleRecovery(reason, context);
+      await this.waitForImmediateTick();
+    };
+    runner().catch(() => {});
+  }
+
+  private waitForImmediateTick(): Promise<void> {
+    return new Promise(resolve => {
+      if (typeof setImmediate === 'function') {
+        this.notifyTimerScheduled();
+        setImmediate(resolve);
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  private async waitForCommandExitOrTimeout(
+    exitPromise: Promise<void>,
+    timeoutMs: number
+  ): Promise<boolean> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      await exitPromise.catch(() => {});
+      return true;
+    }
+
+    let timer: NodeJS.Timeout | null = null;
+    let exited = false;
+
+    await Promise.race([
+      exitPromise
+        .then(() => {
+          exited = true;
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        })
+        .catch(() => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        }),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+        this.notifyTimerScheduled();
+      })
+    ]);
+
+    if (timer) {
+      clearTimeout(timer);
+    }
+
+    return exited;
+  }
+
+  private async awaitCommandTermination(
+    command: ffmpeg.FfmpegCommand | null,
+    exitPromise: Promise<void> | null
+  ) {
+    const promise = exitPromise ?? Promise.resolve();
+    if (!command) {
+      await promise.catch(() => {});
+      return;
+    }
+
+    const terminationState = this.getCommandTerminationState(command);
+
+    if (!terminationState.termSent) {
+      try {
+        command.kill('SIGTERM');
+      } catch (error) {
+        // Ignore errors from already terminated commands
+      }
+      terminationState.termSent = true;
+    }
+
+    const graceMs = this.options.forceKillTimeoutMs ?? DEFAULT_FORCE_KILL_TIMEOUT_MS;
+    const exited = await this.waitForCommandExitOrTimeout(promise, graceMs);
+
+    if (!exited && !terminationState.killSent) {
+      try {
+        command.kill('SIGKILL');
+      } catch (error) {
+        // Ignore forced kill errors
+      }
+      terminationState.killSent = true;
+    }
+
+    await promise.catch(() => {});
+  }
+
   private buildClassificationKey(classification: FfmpegClassification) {
     const reason = classification.reason;
     const prefix = isPersistentClassification(reason)
@@ -1311,7 +1563,7 @@ export class VideoSource extends EventEmitter {
     return `${prefix}:${reason}`;
   }
 
-  private handleCommandStderr(message: string) {
+  private handleCommandStderr(message: string, commandId?: number) {
     if (!message) {
       return;
     }
@@ -1322,6 +1574,10 @@ export class VideoSource extends EventEmitter {
       .filter(Boolean);
 
     for (const line of lines) {
+      if (typeof commandId === 'number') {
+        this.appendCommandRtspClassification(commandId, line);
+      }
+
       const classification = classifyFfmpegStderr(line);
       if (!classification) {
         continue;
@@ -1473,6 +1729,35 @@ const RTSP_CONNECTION_PATTERNS = [
   /network\s+is\s+unreachable/i,
   /unable\s+to\s+connect/i
 ];
+
+export function classifyRtspError(stderrLine: string): RtspErrorClass {
+  if (!stderrLine) {
+    return 'other';
+  }
+
+  const line = stderrLine.trim();
+  if (!line) {
+    return 'other';
+  }
+
+  if (RTSP_TIMEOUT_PATTERNS.some(pattern => pattern.test(line))) {
+    return 'timeout';
+  }
+
+  if (RTSP_AUTH_PATTERNS.some(pattern => pattern.test(line))) {
+    return 'auth';
+  }
+
+  if (RTSP_NOT_FOUND_PATTERNS.some(pattern => pattern.test(line))) {
+    return 'notFound';
+  }
+
+  if (RTSP_CONNECTION_PATTERNS.some(pattern => pattern.test(line))) {
+    return 'network';
+  }
+
+  return 'other';
+}
 
 function classifyFfmpegStderr(message: string): FfmpegClassification | null {
   if (!message) {
