@@ -4,16 +4,30 @@ import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import metrics from '../src/metrics/index.js';
 import {
+  classifyRtspError,
   VideoSource,
   type FatalEvent,
   type RecoverEventMeta,
-  type RecoverEvent
+  type RecoverEvent,
+  type RtspErrorClass
 } from '../src/video/source.js';
 
 const SAMPLE_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAAZuX6kAAAAASUVORK5CYII=',
   'base64'
 );
+
+async function waitForScheduledTasks() {
+  if (typeof vi.isFakeTimers === 'function' && vi.isFakeTimers()) {
+    if (typeof vi.runAllTicks === 'function') {
+      vi.runAllTicks();
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    return;
+  }
+
+  await new Promise<void>(resolve => setImmediate(resolve));
+}
 
 type TestRecoveryContext = {
   errorCode: string | number | null;
@@ -58,6 +72,7 @@ describe('VideoSource', () => {
     try {
       source.start();
 
+      await waitForScheduledTasks();
       await Promise.resolve();
 
       expect(commands).toHaveLength(1);
@@ -73,6 +88,7 @@ describe('VideoSource', () => {
 
       command.emit('error', new Error('ffmpeg crashed'));
 
+      await waitForScheduledTasks();
       await Promise.resolve();
 
       const internal = source as unknown as {
@@ -97,6 +113,8 @@ describe('VideoSource', () => {
       expect(snapshot.pipelines.ffmpeg.byReason['ffmpeg-error']).toBe(1);
 
       await vi.runOnlyPendingTimersAsync();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commandFactory).toHaveBeenCalledTimes(2);
@@ -136,6 +154,7 @@ describe('VideoSource', () => {
     try {
       source.start();
 
+      await waitForScheduledTasks();
       await Promise.resolve();
 
       expect(commands).toHaveLength(1);
@@ -144,6 +163,7 @@ describe('VideoSource', () => {
       const partialFrame = SAMPLE_PNG.subarray(0, SAMPLE_PNG.length - 10);
       command.pushFrame(partialFrame);
 
+      await waitForScheduledTasks();
       await Promise.resolve();
 
       const internalBefore = source as unknown as {
@@ -157,6 +177,9 @@ describe('VideoSource', () => {
       expect(internalBefore.watchdogTimer).not.toBeNull();
 
       command.stream.emit('error', new Error('stream failure'));
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
 
@@ -180,6 +203,8 @@ describe('VideoSource', () => {
       expect(snapshot.pipelines.ffmpeg.byReason['stream-error']).toBeGreaterThan(0);
 
       await vi.runOnlyPendingTimersAsync();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commandFactory).toHaveBeenCalledTimes(2);
@@ -224,6 +249,9 @@ describe('VideoSource', () => {
     try {
       source.start();
 
+      await waitForScheduledTasks();
+
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(1);
@@ -244,12 +272,18 @@ describe('VideoSource', () => {
 
       command.pushFrame(SAMPLE_PNG);
 
+      await waitForScheduledTasks();
+
+
       await Promise.resolve();
 
       expect(internals.streamIdleTimer).not.toBeNull();
       expect(internals.streamIdleTimer?.hasRef?.()).toBe(false);
 
       command.emit('error', new Error('ffmpeg crashed'));
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
 
@@ -266,6 +300,8 @@ describe('VideoSource', () => {
       expect(channelStats.byReason['ffmpeg-error']).toBeGreaterThanOrEqual(1);
     } finally {
       await source.stop();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       expect(vi.getTimerCount()).toBe(0);
       finalSnapshot = metrics.snapshot();
@@ -307,6 +343,9 @@ describe('VideoSource', () => {
 
     try {
       source.start();
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
 
@@ -443,7 +482,12 @@ describe('VideoSource', () => {
     try {
       source.start();
 
+      await waitForScheduledTasks();
+
+
       await Promise.resolve();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(1);
@@ -509,6 +553,9 @@ describe('VideoSource', () => {
     try {
       source.start();
 
+      await waitForScheduledTasks();
+
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(1);
@@ -569,6 +616,9 @@ describe('VideoSource', () => {
 
     try {
       source.start();
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
 
@@ -743,11 +793,15 @@ describe('VideoSource', () => {
       expect(commands).toHaveLength(1);
 
       await vi.advanceTimersByTimeAsync(15);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(recoverEvents.some(event => event.reason === 'start-timeout')).toBe(true);
 
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(recoverEvents.filter(event => event.reason === 'force-kill')).not.toHaveLength(0);
@@ -758,6 +812,8 @@ describe('VideoSource', () => {
       expect(commands[0]?.killedSignals).toContain('SIGKILL');
 
       await vi.runOnlyPendingTimersAsync();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
     } finally {
       await source.stop();
@@ -788,6 +844,9 @@ describe('VideoSource', () => {
     try {
       source.start();
       source.start();
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -874,6 +933,8 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(15);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(fatalEvents).toHaveLength(1);
@@ -926,21 +987,31 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(1);
 
       commands[0]!.emit('stderr', 'method DESCRIBE failed: timed out');
 
+      await waitForScheduledTasks();
+
+
       await Promise.resolve();
       expect(recoverReasons).toEqual(['rtsp-timeout']);
 
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(2);
 
       commands[1]!.emit('stderr', 'method DESCRIBE failed: timed out');
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
       await vi.runOnlyPendingTimersAsync();
@@ -992,6 +1063,8 @@ describe('VideoSource', () => {
 
     for (let i = 0; i < 3; i += 1) {
       await vi.advanceTimersByTimeAsync(20);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
     }
 
@@ -1048,8 +1121,12 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(recoverEvents[0]).toMatchObject({
@@ -1063,13 +1140,19 @@ describe('VideoSource', () => {
       expect(firstDelay).toBeGreaterThan(0);
 
       await vi.advanceTimersByTimeAsync(firstDelay);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(2);
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       const watchdogRecoveries = recoverEvents.filter(event => event.reason === 'watchdog-timeout');
@@ -1125,6 +1208,8 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(30);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       const startTimeoutEvent = recoverEvents.find(event => event.reason === 'start-timeout');
@@ -1133,15 +1218,22 @@ describe('VideoSource', () => {
 
       const firstDelay = startTimeoutEvent?.delayMs ?? 0;
       await vi.advanceTimersByTimeAsync(firstDelay + 1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(2);
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       const second = commands[1];
       second.emit('stderr', 'method DESCRIBE failed: Connection timed out');
+
+      await waitForScheduledTasks();
+
 
       await Promise.resolve();
 
@@ -1150,14 +1242,20 @@ describe('VideoSource', () => {
 
       const rtspDelay = rtspEvent?.delayMs ?? 0;
       await vi.advanceTimersByTimeAsync(rtspDelay + 1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(3);
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       await vi.advanceTimersByTimeAsync(40);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       const watchdogEvent = recoverEvents.find(event => event.reason === 'watchdog-timeout');
@@ -1172,6 +1270,8 @@ describe('VideoSource', () => {
       expect(timerBefore.start?.lastReason).toBe('started');
     } finally {
       await source.stop();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       vi.useRealTimers();
     }
@@ -1365,6 +1465,8 @@ describe('VideoSource', () => {
 
       for (let i = 0; i < 3; i += 1) {
         await vi.advanceTimersByTimeAsync(10);
+        await waitForScheduledTasks();
+
         await Promise.resolve();
       }
 
@@ -1419,21 +1521,31 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(fatalEvents).toHaveLength(0);
 
       const firstDelay = 10;
       await vi.advanceTimersByTimeAsync(firstDelay);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands).toHaveLength(2);
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(fatalEvents).toHaveLength(1);
@@ -1449,6 +1561,8 @@ describe('VideoSource', () => {
       expect(source.isCircuitBroken()).toBe(false);
 
       await vi.runOnlyPendingTimersAsync();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(commands.length).toBeGreaterThanOrEqual(3);
@@ -1513,6 +1627,8 @@ describe('VideoSource', () => {
       expect(commands).toHaveLength(2);
 
       await vi.advanceTimersByTimeAsync(2);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       const snapshot = metrics.snapshot();
@@ -1612,6 +1728,8 @@ describe('VideoSource', () => {
       const first = commands[0];
       first.emit('start');
       first.emit('stderr', 'method DESCRIBE failed: 401 Unauthorized');
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(recoverReasons).toContain('rtsp-auth-failure');
@@ -1856,9 +1974,13 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       await vi.advanceTimersByTimeAsync(16);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       const idleEvent = recoverEvents.find(event => event.reason === 'stream-idle');
@@ -1964,6 +2086,8 @@ describe('VideoSource', () => {
     expect(commands).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(26);
+    await waitForScheduledTasks();
+
     await Promise.resolve();
     expect(commands[0].killedSignals).toContain('SIGTERM');
 
@@ -1984,12 +2108,155 @@ describe('VideoSource', () => {
     expect(internals.killTimer).toBeNull();
 
     await vi.runAllTimersAsync();
+    await waitForScheduledTasks();
+
     await Promise.resolve();
 
     expect(commands).toHaveLength(1);
     expect(commands[0].killedSignals).toContain('SIGKILL');
 
     vi.useRealTimers();
+  });
+
+  it('VideoStopSequentialSignals sends SIGTERM before SIGKILL and is idempotent', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      forceKillTimeoutMs: 25,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    try {
+      source.start();
+      await waitFor(() => commands.length === 1, 200);
+      const command = commands[0];
+      command.emit('start');
+
+      const stopPromise = source.stop();
+      const secondStop = source.stop();
+
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(command.killedSignals.filter(signal => signal === 'SIGTERM')).toHaveLength(1);
+      expect(command.killedSignals).not.toContain('SIGKILL');
+
+      await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(command.killedSignals.filter(signal => signal === 'SIGTERM')).toHaveLength(1);
+      expect(command.killedSignals.filter(signal => signal === 'SIGKILL')).toHaveLength(1);
+
+      command.emitClose(0);
+
+      await Promise.all([stopPromise, secondStop]);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoStopRtspClassificationCleanup waits for SIGTERM, escalates to SIGKILL, and clears classification state', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 25,
+      restartDelayMs: 50,
+      restartMaxDelayMs: 50,
+      restartJitterFactor: 0,
+      watchdogTimeoutMs: 40,
+      forceKillTimeoutMs: 50,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length === 1, 200);
+
+      await waitForScheduledTasks();
+
+
+      await Promise.resolve();
+
+      const command = commands[0];
+      command.emit('start');
+
+      const internals = source as unknown as {
+        commandRtspClassifications: Map<number, RtspErrorClass[]>;
+        commandIdByInstance: WeakMap<FfmpegCommand, number>;
+      };
+
+      const commandId = internals.commandIdByInstance.get(command as unknown as FfmpegCommand);
+      expect(typeof commandId).toBe('number');
+
+      command.emit('stderr', 'method DESCRIBE failed: 404 Not Found');
+
+      await waitForScheduledTasks();
+
+
+      await Promise.resolve();
+
+      expect(internals.commandRtspClassifications.get(commandId!)).toEqual(['notFound']);
+      expect(internals.commandRtspClassifications.size).toBe(1);
+
+      const stopPromise = source.stop();
+
+      await waitForScheduledTasks();
+
+
+      await Promise.resolve();
+
+      expect(command.killedSignals.filter(signal => signal === 'SIGTERM')).toHaveLength(1);
+      expect(command.killedSignals).not.toContain('SIGKILL');
+
+      await vi.advanceTimersByTimeAsync(50);
+
+      await waitForScheduledTasks();
+
+
+      await Promise.resolve();
+
+      expect(command.killedSignals.filter(signal => signal === 'SIGTERM')).toHaveLength(1);
+      expect(command.killedSignals.filter(signal => signal === 'SIGKILL')).toHaveLength(1);
+
+      expect(internals.commandRtspClassifications.size).toBe(1);
+
+      command.emitClose(0);
+
+      await waitForScheduledTasks();
+
+
+      await Promise.resolve();
+
+      await stopPromise;
+
+      expect(internals.commandRtspClassifications.size).toBe(0);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
   });
 
   it('VideoSourceRtspErrorClassification restarts on RTSP timeouts and records circuit events', async () => {
@@ -2057,6 +2324,200 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoRtspTimeoutFakeTimers records timeout class and increments circuit counters', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'rtsp://camera/timeouts',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-timeout-case',
+      restartDelayMs: 25,
+      restartMaxDelayMs: 25,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 5,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      const command = commands[0];
+
+      command.emit('stderr', 'method DESCRIBE failed: timed out');
+
+      await vi.advanceTimersByTimeAsync(0);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      const internals = source as unknown as {
+        circuitBreakerFailures: number;
+        pendingRestartContext: { delayMs: number } | null;
+      };
+
+      expect(internals.circuitBreakerFailures).toBe(1);
+      expect(internals.pendingRestartContext).not.toBeNull();
+      expect(internals.pendingRestartContext?.delayMs).toBe(25);
+      expect(recoverEvents.map(event => event.reason)).toContain('rtsp-timeout');
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['rtsp-timeout']).toBe(1);
+      expect(
+        snapshot.pipelines.ffmpeg.byChannel['video:rtsp-timeout-case'].byReason['rtsp-timeout']
+      ).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(commands.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      const lastCommand = commands[commands.length - 1];
+      lastCommand?.emitClose(0);
+      await source.stop();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoRtspCircuitBreakerRecovery recovers after manual reset under fake timers', async () => {
+    vi.useFakeTimers();
+    metrics.reset();
+
+    const commands: FakeCommand[] = [];
+    const recoverEvents: RecoverEvent[] = [];
+    const fatalEvents: FatalEvent[] = [];
+
+    const source = new VideoSource({
+      file: 'rtsp://camera/circuit',
+      framesPerSecond: 1,
+      channel: 'video:rtsp-circuit',
+      restartDelayMs: 20,
+      restartMaxDelayMs: 80,
+      restartJitterFactor: 0,
+      forceKillTimeoutMs: 0,
+      circuitBreakerThreshold: 2,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('fatal', event => fatalEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      let command = commands[0];
+
+      command.emit('stderr', 'method DESCRIBE failed: timed out');
+
+      await vi.advanceTimersByTimeAsync(0);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      let internals = source as unknown as {
+        circuitBreakerFailures: number;
+        pendingRestartContext: { delayMs: number } | null;
+      };
+      expect(internals.circuitBreakerFailures).toBe(1);
+      expect(internals.pendingRestartContext?.delayMs).toBe(20);
+
+      await vi.advanceTimersByTimeAsync(20);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(commands.length).toBeGreaterThanOrEqual(2);
+      command = commands[commands.length - 1];
+
+      command.emit('stderr', 'method DESCRIBE failed: timed out');
+
+      await vi.advanceTimersByTimeAsync(0);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(source.isCircuitBroken()).toBe(true);
+      expect(fatalEvents.some(event => event.reason === 'circuit-breaker')).toBe(true);
+
+      internals = source as unknown as {
+        circuitBreakerFailures: number;
+        pendingRestartContext: unknown;
+        restartTimer: NodeJS.Timeout | null;
+      };
+      expect(internals.circuitBreakerFailures).toBe(2);
+      expect(internals.pendingRestartContext).toBeNull();
+      expect(internals.restartTimer).toBeNull();
+
+      const snapshotBeforeReset = metrics.snapshot();
+      expect(snapshotBeforeReset.pipelines.ffmpeg.byReason['rtsp-timeout']).toBeGreaterThanOrEqual(2);
+      expect(snapshotBeforeReset.pipelines.ffmpeg.byReason['circuit-breaker']).toBe(1);
+      const beforeResetChannel =
+        snapshotBeforeReset.pipelines.ffmpeg.byChannel['video:rtsp-circuit'];
+      expect(beforeResetChannel?.byReason['rtsp-timeout']).toBeGreaterThanOrEqual(2);
+      expect(beforeResetChannel?.byReason['circuit-breaker']).toBe(1);
+
+      const wasBroken = source.resetCircuitBreaker();
+      expect(wasBroken).toBe(true);
+      expect(source.isCircuitBroken()).toBe(false);
+
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(0);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(commands.length).toBeGreaterThanOrEqual(3);
+
+      const postResetInternals = source as unknown as { circuitBreakerFailures: number };
+      expect(postResetInternals.circuitBreakerFailures).toBe(0);
+
+      const snapshotAfterReset = metrics.snapshot();
+      const afterChannel = snapshotAfterReset.pipelines.ffmpeg.byChannel['video:rtsp-circuit'];
+      expect(afterChannel?.byReason['rtsp-timeout']).toBeGreaterThanOrEqual(2);
+      expect(snapshotAfterReset.pipelines.ffmpeg.byReason['circuit-breaker']).toBe(1);
+    } finally {
+      const latest = commands[commands.length - 1];
+      latest?.emitClose(0);
+      await source.stop();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
+
+    const finalSnapshot = metrics.snapshot();
+    expect(finalSnapshot.pipelines.ffmpeg.byReason['circuit-breaker']).toBe(1);
+  });
+
   it('VideoFfmpegCorruptedFrameRecovery retries when corrupted frames are detected', async () => {
     vi.useFakeTimers();
 
@@ -2096,7 +2557,11 @@ describe('VideoSource', () => {
       source.start();
 
       await vi.advanceTimersByTimeAsync(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(errors.some(error => error.message.includes('Corrupted frame'))).toBe(true);
@@ -2402,10 +2867,15 @@ describe('VideoSource', () => {
         settled = true;
       });
 
+      await waitForScheduledTasks();
+
+
       await Promise.resolve();
       expect(settled).toBe(false);
 
       await vi.advanceTimersByTimeAsync(40);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       expect(settled).toBe(false);
 
@@ -2528,6 +2998,8 @@ describe('VideoSource', () => {
       first.emit('stderr', 'method DESCRIBE failed: Connection timed out');
       first.emitClose(1);
       await vi.advanceTimersByTimeAsync(25);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       await waitFor(() => commands.length === 2, 500);
@@ -2536,6 +3008,8 @@ describe('VideoSource', () => {
       second.emit('stderr', 'Read timeout after 100 ms');
       second.emitClose(1);
       await vi.advanceTimersByTimeAsync(50);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       await waitFor(() => commands.length === 3, 500);
@@ -2544,6 +3018,8 @@ describe('VideoSource', () => {
       third.emit('stderr', 'connection refused');
       third.emitClose(1);
       await vi.advanceTimersByTimeAsync(100);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       await waitFor(() => commands.length === 4, 500);
@@ -2608,6 +3084,8 @@ describe('VideoSource', () => {
       const command = commands[0];
       command.emit('start');
       command.emit('stderr', 'Read timeout after 100 ms');
+      await waitForScheduledTasks();
+
       await Promise.resolve();
       expect(recoverEvents).toHaveLength(1);
 
@@ -2673,6 +3151,8 @@ describe('VideoSource', () => {
       first.emit('start');
       first.emit('stderr', 'Read timeout after 100 ms');
       first.emitClose(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(recoverEvents).toHaveLength(1);
@@ -2683,6 +3163,8 @@ describe('VideoSource', () => {
       expect(firstEvent.meta.appliedJitterMs).toBeLessThanOrEqual(firstEvent.meta.maxJitterMs);
 
       await vi.advanceTimersByTimeAsync(firstEvent.delayMs);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       await waitFor(() => commands.length === 2, 500);
@@ -2690,6 +3172,8 @@ describe('VideoSource', () => {
       second.emit('start');
       second.emit('stderr', 'Read timeout after 100 ms');
       second.emitClose(1);
+      await waitForScheduledTasks();
+
       await Promise.resolve();
 
       expect(recoverEvents).toHaveLength(2);
@@ -2809,6 +3293,176 @@ describe('VideoSource', () => {
       await source.stop();
     }
   });
+
+  it('VideoCommandRtspClassifications tracks stderr classes per command lifecycle', async () => {
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    const internals = source as unknown as {
+      commandRtspClassifications: Map<number, RtspErrorClass[]>;
+      scheduleRecovery: (reason: string, context?: unknown) => void;
+    };
+    const originalScheduleRecovery = internals.scheduleRecovery;
+    internals.scheduleRecovery = vi.fn();
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length === 1, 200);
+      await waitFor(() => internals.commandRtspClassifications.size === 1, 200);
+
+      const command = commands[0];
+      command.emit('stderr', 'RTSP response timeout');
+      command.emit('stderr', 'method DESCRIBE failed: 401 unauthorized');
+
+      const entries = Array.from(internals.commandRtspClassifications.entries());
+      expect(entries).toHaveLength(1);
+      const [, classifications] = entries[0];
+      expect(classifications).toEqual(['timeout', 'auth']);
+
+      internals.scheduleRecovery = originalScheduleRecovery;
+
+      command.emitClose(1);
+
+      await waitFor(() => internals.commandRtspClassifications.size === 0, 200);
+    } finally {
+      internals.scheduleRecovery = originalScheduleRecovery;
+      await source.stop();
+    }
+  });
+
+  it('VideoCommandRtspExitSummary derives recovery reason from stderr classifications on close', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      startTimeoutMs: 0,
+      watchdogTimeoutMs: 0,
+      idleTimeoutMs: 0,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    const internals = source as unknown as {
+      scheduleRecovery: (reason: string, context?: unknown) => void;
+    };
+    const originalSchedule = internals.scheduleRecovery;
+    const scheduleSpy = vi.fn();
+    internals.scheduleRecovery = scheduleSpy;
+
+    try {
+      source.start();
+
+      await waitFor(() => commands.length === 1, 200);
+      const command = commands[0];
+
+      command.emit('stderr', 'RTSP response timeout');
+      scheduleSpy.mockClear();
+
+      command.emitClose(1);
+
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(scheduleSpy).toHaveBeenCalledTimes(1);
+      const [reason, context] = scheduleSpy.mock.calls[0];
+      expect(reason).toBe('rtsp-timeout');
+      expect(context).toMatchObject({ exitCode: 1, signal: null, errorCode: 'rtsp-timeout' });
+    } finally {
+      internals.scheduleRecovery = originalSchedule;
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('VideoCommandExitWithoutRtspClassification falls back to ffmpeg exit reason', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      commandFactory: () => {
+        const command = new FakeCommand();
+        commands.push(command);
+        return command as unknown as FfmpegCommand;
+      }
+    });
+
+    source.on('error', () => {});
+
+    const internals = source as unknown as {
+      scheduleRecovery: (reason: string, context?: unknown) => void;
+    };
+    const originalSchedule = internals.scheduleRecovery;
+    const scheduleSpy = vi.fn();
+    internals.scheduleRecovery = scheduleSpy;
+
+    try {
+      source.start();
+      await waitFor(() => commands.length === 1, 200);
+
+      const command = commands[0];
+      scheduleSpy.mockClear();
+
+      command.emitClose(0);
+
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+
+      expect(scheduleSpy).toHaveBeenCalledTimes(1);
+      const [reason, context] = scheduleSpy.mock.calls[0];
+      expect(reason).toBe('ffmpeg-ended');
+      expect(context).toMatchObject({ exitCode: 0, signal: null });
+    } finally {
+      internals.scheduleRecovery = originalSchedule;
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('classifyRtspError', () => {
+  const cases: Array<{ line: string; expected: RtspErrorClass }> = [
+    { line: 'RTSP response timeout', expected: 'timeout' },
+    { line: 'method DESCRIBE failed: 401 unauthorized', expected: 'auth' },
+    { line: 'RTSP/1.0 404 Not Found', expected: 'notFound' },
+    { line: 'Connection refused by host', expected: 'network' },
+    { line: 'some unexpected warning', expected: 'other' }
+  ];
+
+  for (const testCase of cases) {
+    it(`classifies "${testCase.line}" as ${testCase.expected}`, () => {
+      expect(classifyRtspError(testCase.line)).toBe(testCase.expected);
+    });
+  }
+
+  it('returns other for empty or whitespace input', () => {
+    expect(classifyRtspError('')).toBe('other');
+    expect(classifyRtspError('   ')).toBe('other');
+  });
 });
 
 class FakeCommand extends EventEmitter {
@@ -2872,6 +3526,13 @@ async function waitFor(predicate: () => boolean, timeoutMs: number) {
     if (Date.now() - started > timeoutMs) {
       throw new Error('Timed out waiting for predicate');
     }
-    await new Promise(resolve => setTimeout(resolve, 5));
+    if (typeof vi.isFakeTimers === 'function' && vi.isFakeTimers()) {
+      await vi.advanceTimersByTimeAsync(5);
+      await waitForScheduledTasks();
+
+      await Promise.resolve();
+    } else {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
   }
 }
