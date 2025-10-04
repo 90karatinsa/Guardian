@@ -273,6 +273,50 @@ describe('ConfigHotReload', () => {
     }
   });
 
+  it('ConfigHotReloadObjectsDuplicates rejects conflicting label maps and emits error events', async () => {
+    const base = createConfig({ diffThreshold: 24 });
+    base.objects = {
+      modelPath: 'objects.onnx',
+      labels: ['person', 'package'],
+      labelMap: { package: 'parcel' }
+    };
+    base.video.channels = { 'video:cam-1': {} };
+
+    const baseRaw = JSON.stringify(base, null, 2);
+    fs.writeFileSync(configPath, baseRaw);
+
+    const manager = new ConfigManager(configPath);
+    const errorHandler = vi.fn();
+    manager.on('error', errorHandler);
+
+    try {
+      const invalid = JSON.parse(baseRaw) as GuardianConfig;
+      invalid.video.channels = invalid.video.channels ?? {};
+      invalid.video.channels['video:cam-1'] = {
+        ...(invalid.video.channels['video:cam-1'] ?? {}),
+        objects: { labelMap: { package: 'box' } }
+      } as GuardianConfig['video']['channels'][string];
+
+      expect(() => validateConfig(invalid)).toThrowErrorMatchingInlineSnapshot(
+        "[Error: config.video.channels.video:cam-1.objects.labelMap.package conflicts with config.objects.labelMap.package]"
+      );
+
+      fs.writeFileSync(configPath, JSON.stringify(invalid, null, 2));
+      (manager as unknown as { scheduleReload: () => void }).scheduleReload();
+
+      await waitFor(() => errorHandler.mock.calls.length > 0, 4000);
+      const errorArg = errorHandler.mock.calls[0]?.[0] as Error | undefined;
+      expect(errorArg).toBeInstanceOf(Error);
+      expect(errorArg?.message).toContain(
+        'config.video.channels.video:cam-1.objects.labelMap.package conflicts with config.objects.labelMap.package'
+      );
+
+      await waitFor(() => fs.readFileSync(configPath, 'utf-8') === baseRaw, 4000);
+    } finally {
+      manager.removeAllListeners();
+    }
+  });
+
   it('ConfigDuplicateChannelGuard handles duplicate camera channels and ids on reload', async () => {
     const base = createConfig({
       diffThreshold: 30,

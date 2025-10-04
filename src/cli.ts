@@ -4,14 +4,24 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import logger, { getAvailableLogLevels, getLogLevel, setLogLevel } from './logger.js';
 import metrics, { type MetricsSnapshot } from './metrics/index.js';
-import { canonicalChannel } from './utils/channel.js';
+import { canonicalChannel, normalizeChannelId } from './utils/channel.js';
 import {
   collectHealthChecks,
   runShutdownHooks,
   getIntegrationManifest,
   type IntegrationManifest
 } from './app.js';
-import configManager, { loadConfigFromFile, type GuardianConfig } from './config/index.js';
+import configManager, {
+  loadConfigFromFile,
+  type CameraConfig,
+  type CameraMotionConfig,
+  type CameraPersonConfig,
+  type GuardianConfig,
+  type MotionConfig,
+  type PersonConfig,
+  type VideoChannelConfig,
+  type VideoConfig
+} from './config/index.js';
 import { runRetentionOnce, type RetentionTaskOptions } from './tasks/retention.js';
 import packageJson from '../package.json' assert { type: 'json' };
 import type { RestartSeverityLevel } from './pipeline/channelHealth.js';
@@ -142,6 +152,7 @@ type PipelineChannelStatus = {
   backoffMs: number;
   watchdogRestarts: number;
   watchdogBackoffMs: number;
+  thresholds: ChannelThresholdSummary | null;
 };
 
 type PipelineHealthSummary = {
@@ -178,6 +189,24 @@ type RetentionSummary = {
 type TransportFallbackChannelSnapshots =
   MetricsSnapshot['pipelines']['ffmpeg']['transportFallbacks']['byChannel'];
 
+type MotionThresholdSummary = {
+  diffThreshold: number | null;
+  areaThreshold: number | null;
+  minIntervalMs: number | null;
+};
+
+type PersonThresholdSummary = {
+  score: number | null;
+  minIntervalMs: number | null;
+  checkEveryNFrames: number | null;
+  maxDetections: number | null;
+};
+
+type ChannelThresholdSummary = {
+  motion: MotionThresholdSummary | null;
+  person: PersonThresholdSummary | null;
+};
+
 type SuppressionCounterSummary<Key extends string> = {
   [P in Key]: string;
 } & { total: number };
@@ -200,7 +229,8 @@ type SuppressionSummary = {
 
 function buildPipelineHealthSummary(
   snapshot: MetricsSnapshot['pipelines']['ffmpeg'],
-  fallbackChannels: TransportFallbackChannelSummary[]
+  fallbackChannels: TransportFallbackChannelSummary[],
+  options: { pipeline: 'ffmpeg' | 'audio'; config?: GuardianConfig } = { pipeline: 'ffmpeg' }
 ): PipelineHealthSummary {
   const result: PipelineHealthSummary = {
     channels: {},
@@ -223,6 +253,10 @@ function buildPipelineHealthSummary(
   for (const [channel, channelSnapshot] of entries) {
     const health = channelSnapshot.health;
     const degraded = health.severity !== 'none';
+    let thresholds: ChannelThresholdSummary | null = null;
+    if (options.pipeline === 'ffmpeg' && options.config) {
+      thresholds = buildChannelThresholdSummary(channel, options.config);
+    }
     const status: PipelineChannelStatus = {
       degraded,
       severity: health.severity,
@@ -237,11 +271,50 @@ function buildPipelineHealthSummary(
           ? health.backoffMs
           : channelSnapshot.totalWatchdogBackoffMs,
       watchdogRestarts: channelSnapshot.watchdogRestarts,
-      watchdogBackoffMs: channelSnapshot.totalWatchdogBackoffMs
+      watchdogBackoffMs: channelSnapshot.totalWatchdogBackoffMs,
+      thresholds
     };
     result.channels[channel] = status;
     if (degraded) {
       result.degraded.push(channel);
+    }
+  }
+
+  if (options.pipeline === 'ffmpeg' && options.config) {
+    const known = new Set(Object.keys(result.channels));
+    const candidates = new Set<string>();
+    const channelConfigs = options.config.video.channels ?? {};
+    for (const channelId of Object.keys(channelConfigs)) {
+      const canonicalId = canonicalChannel(channelId);
+      if (canonicalId) {
+        candidates.add(canonicalId);
+      }
+    }
+    const cameras = options.config.video.cameras ?? [];
+    for (const camera of cameras) {
+      const canonicalId = canonicalChannel(camera.channel);
+      if (canonicalId) {
+        candidates.add(canonicalId);
+      }
+    }
+
+    const sortedCandidates = Array.from(candidates).filter(Boolean).sort((a, b) => a.localeCompare(b));
+    for (const candidate of sortedCandidates) {
+      if (known.has(candidate)) {
+        continue;
+      }
+      const thresholds = buildChannelThresholdSummary(candidate, options.config);
+      result.channels[candidate] = {
+        degraded: false,
+        severity: 'none',
+        reason: null,
+        degradedSince: null,
+        restarts: 0,
+        backoffMs: 0,
+        watchdogRestarts: 0,
+        watchdogBackoffMs: 0,
+        thresholds
+      };
     }
   }
 
@@ -264,6 +337,171 @@ function buildPipelineHealthSummary(
 
   result.totalDegraded = result.degraded.length;
   return result;
+}
+
+function buildChannelThresholdSummary(
+  channel: string,
+  config: GuardianConfig
+): ChannelThresholdSummary | null {
+  const canonical = canonicalChannel(channel);
+  if (!canonical) {
+    return null;
+  }
+
+  const videoConfig = config.video;
+  const channelConfig = resolveConfiguredChannel(videoConfig, canonical);
+  const cameraConfig = findCameraForChannel(videoConfig, canonical);
+  const motionSummary = summarizeMotionThresholds(config.motion, channelConfig?.motion, cameraConfig?.motion);
+  const personSummary = summarizePersonThresholds(
+    config.person,
+    channelConfig?.person,
+    cameraConfig?.person
+  );
+
+  if (!motionSummary && !personSummary) {
+    return null;
+  }
+
+  return {
+    motion: motionSummary,
+    person: personSummary
+  };
+}
+
+function summarizeMotionThresholds(
+  globalMotion: MotionConfig,
+  channelMotion: CameraMotionConfig | undefined,
+  cameraMotion: CameraMotionConfig | undefined
+): MotionThresholdSummary | null {
+  if (!globalMotion) {
+    return null;
+  }
+
+  let diffThreshold: number | null =
+    typeof globalMotion.diffThreshold === 'number' ? globalMotion.diffThreshold : null;
+  let areaThreshold: number | null =
+    typeof globalMotion.areaThreshold === 'number' ? globalMotion.areaThreshold : null;
+  let minIntervalMs: number | null =
+    typeof globalMotion.minIntervalMs === 'number' ? globalMotion.minIntervalMs : null;
+
+  const applyOverrides = (overrides: CameraMotionConfig | undefined) => {
+    if (!overrides) {
+      return;
+    }
+    if (typeof overrides.diffThreshold === 'number') {
+      diffThreshold = overrides.diffThreshold;
+    }
+    if (typeof overrides.areaThreshold === 'number') {
+      areaThreshold = overrides.areaThreshold;
+    }
+    if (typeof overrides.minIntervalMs === 'number') {
+      minIntervalMs = overrides.minIntervalMs;
+    }
+  };
+
+  applyOverrides(channelMotion);
+  applyOverrides(cameraMotion);
+
+  if (diffThreshold === null && areaThreshold === null && minIntervalMs === null) {
+    return null;
+  }
+
+  return { diffThreshold, areaThreshold, minIntervalMs };
+}
+
+function summarizePersonThresholds(
+  globalPerson: PersonConfig,
+  channelPerson: CameraPersonConfig | undefined,
+  cameraPerson: CameraPersonConfig | undefined
+): PersonThresholdSummary | null {
+  if (!globalPerson) {
+    return null;
+  }
+
+  let score: number | null = typeof globalPerson.score === 'number' ? globalPerson.score : null;
+  let minIntervalMs: number | null =
+    typeof globalPerson.minIntervalMs === 'number' ? globalPerson.minIntervalMs : null;
+  let checkEveryNFrames: number | null =
+    typeof globalPerson.checkEveryNFrames === 'number' ? globalPerson.checkEveryNFrames : null;
+  let maxDetections: number | null =
+    typeof globalPerson.maxDetections === 'number' ? globalPerson.maxDetections : null;
+
+  const applyOverrides = (overrides: CameraPersonConfig | undefined) => {
+    if (!overrides) {
+      return;
+    }
+    if (typeof overrides.score === 'number') {
+      score = overrides.score;
+    }
+    if (typeof overrides.minIntervalMs === 'number') {
+      minIntervalMs = overrides.minIntervalMs;
+    }
+    if (typeof overrides.checkEveryNFrames === 'number') {
+      checkEveryNFrames = overrides.checkEveryNFrames;
+    }
+    if (typeof overrides.maxDetections === 'number') {
+      maxDetections = overrides.maxDetections;
+    }
+  };
+
+  applyOverrides(channelPerson);
+  applyOverrides(cameraPerson);
+
+  if (score === null && minIntervalMs === null && checkEveryNFrames === null && maxDetections === null) {
+    return null;
+  }
+
+  return { score, minIntervalMs, checkEveryNFrames, maxDetections };
+}
+
+function resolveConfiguredChannel(
+  videoConfig: VideoConfig,
+  channel: string
+): VideoChannelConfig | undefined {
+  const channels = videoConfig.channels;
+  if (!channels) {
+    return undefined;
+  }
+
+  if (channel in channels) {
+    return channels[channel];
+  }
+
+  const withoutPrefix = channel.startsWith('video:') ? channel.slice('video:'.length) : channel;
+  if (withoutPrefix in channels) {
+    return channels[withoutPrefix];
+  }
+
+  const normalized = normalizeChannelId(channel);
+  if (normalized in channels) {
+    return channels[normalized];
+  }
+
+  const canonical = canonicalChannel(channel);
+  if (canonical && canonical in channels) {
+    return channels[canonical];
+  }
+
+  for (const [key, value] of Object.entries(channels)) {
+    if (canonicalChannel(key) === canonical) {
+      return value;
+    }
+    if (normalizeChannelId(key) === normalized) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function findCameraForChannel(videoConfig: VideoConfig, channel: string): CameraConfig | undefined {
+  const cameras = videoConfig.cameras ?? [];
+  for (const camera of cameras) {
+    if (canonicalChannel(camera.channel) === channel) {
+      return camera;
+    }
+  }
+  return undefined;
 }
 
 function summarizeTransportFallbackChannels(
@@ -544,14 +782,12 @@ export async function buildHealthPayload(): Promise<HealthPayload> {
   const audioFallbackChannels = summarizeTransportFallbackChannels(
     snapshot.pipelines.audio.transportFallbacks.byChannel
   );
-  const ffmpegHealth = buildPipelineHealthSummary(
-    snapshot.pipelines.ffmpeg,
-    ffmpegFallbackChannels
-  );
-  const audioHealth = buildPipelineHealthSummary(
-    snapshot.pipelines.audio,
-    audioFallbackChannels
-  );
+  const ffmpegHealth = buildPipelineHealthSummary(snapshot.pipelines.ffmpeg, ffmpegFallbackChannels, {
+    pipeline: 'ffmpeg'
+  });
+  const audioHealth = buildPipelineHealthSummary(snapshot.pipelines.audio, audioFallbackChannels, {
+    pipeline: 'audio'
+  });
   const pipelinesDegraded =
     ffmpegHealth.totalDegraded > 0 || audioHealth.totalDegraded > 0;
   const degraded = errorCount > 0 || fatalCount > 0 || pipelinesDegraded;
@@ -1178,8 +1414,21 @@ async function runDaemonPipelinesCommand(args: string[], io: CliIo): Promise<num
     }
 
     const snapshot = metrics.snapshot();
-    const ffmpeg = buildPipelineHealthSummary(snapshot.pipelines.ffmpeg.byChannel ?? {});
-    const audio = buildPipelineHealthSummary(snapshot.pipelines.audio.byChannel ?? {});
+    const ffmpegFallback = summarizeTransportFallbackChannels(
+      snapshot.pipelines.ffmpeg.transportFallbacks.byChannel
+    );
+    const audioFallback = summarizeTransportFallbackChannels(
+      snapshot.pipelines.audio.transportFallbacks.byChannel
+    );
+    const activeConfig = configManager.getConfig();
+    const ffmpeg = buildPipelineHealthSummary(snapshot.pipelines.ffmpeg, ffmpegFallback, {
+      pipeline: 'ffmpeg',
+      config: activeConfig
+    });
+    const audio = buildPipelineHealthSummary(snapshot.pipelines.audio, audioFallback, {
+      pipeline: 'audio',
+      config: activeConfig
+    });
     const payload = { pipelines: { ffmpeg, audio } };
 
     if (parsed.json) {
@@ -1199,10 +1448,47 @@ async function runDaemonPipelinesCommand(args: string[], io: CliIo): Promise<num
         continue;
       }
       for (const [channel, status] of entries) {
-        const stateLabel = status.degraded
+        const baseLabel = status.degraded
           ? `${status.severity} (restarts=${status.watchdogRestarts}, backoffMs=${status.watchdogBackoffMs})`
-          : 'ok';
-        io.stdout.write(`  ${channel} [${section.label}]: ${stateLabel}\n`);
+          : `ok (restarts=${status.watchdogRestarts})`;
+        const thresholdParts: string[] = [];
+        const motion = status.thresholds?.motion;
+        if (motion) {
+          const components: string[] = [];
+          if (typeof motion.diffThreshold === 'number') {
+            components.push(`diff=${motion.diffThreshold}`);
+          }
+          if (typeof motion.areaThreshold === 'number') {
+            components.push(`area=${motion.areaThreshold}`);
+          }
+          if (typeof motion.minIntervalMs === 'number') {
+            components.push(`minIntervalMs=${motion.minIntervalMs}`);
+          }
+          if (components.length > 0) {
+            thresholdParts.push(`motion(${components.join(', ')})`);
+          }
+        }
+        const person = status.thresholds?.person;
+        if (person) {
+          const components: string[] = [];
+          if (typeof person.score === 'number') {
+            components.push(`score=${person.score}`);
+          }
+          if (typeof person.minIntervalMs === 'number') {
+            components.push(`minIntervalMs=${person.minIntervalMs}`);
+          }
+          if (typeof person.checkEveryNFrames === 'number') {
+            components.push(`checkEvery=${person.checkEveryNFrames}`);
+          }
+          if (typeof person.maxDetections === 'number') {
+            components.push(`maxDetections=${person.maxDetections}`);
+          }
+          if (components.length > 0) {
+            thresholdParts.push(`person(${components.join(', ')})`);
+          }
+        }
+        const thresholdsLabel = thresholdParts.length > 0 ? ` | ${thresholdParts.join(' | ')}` : '';
+        io.stdout.write(`  ${channel} [${section.label}]: ${baseLabel}${thresholdsLabel}\n`);
       }
     }
     return 0;

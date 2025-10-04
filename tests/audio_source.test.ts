@@ -2049,6 +2049,123 @@ describe('AudioSource resilience', () => {
     }
   });
 
+  it('AudioMicFallbackRotation cycles microphone candidates after spawn errors', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    const processes: ReturnType<typeof createFakeProcess>[] = [];
+    const attemptedDevices: string[] = [];
+
+    spawnMock.mockImplementation((command: string, args: string[]) => {
+      const proc = createFakeProcess();
+      processes.push(proc);
+      const deviceIndex = args.indexOf('-i');
+      attemptedDevices.push(deviceIndex >= 0 ? (args[deviceIndex + 1] as string) : '');
+      return proc;
+    });
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:spawn-rotate',
+      device: 'hw:0',
+      inputFormat: 'alsa',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 50,
+      restartDelayMs: 25,
+      restartMaxDelayMs: 25,
+      restartJitterFactor: 0,
+      micFallbacks: { linux: [{ format: 'alsa', device: 'hw:1' }, { format: 'alsa', device: 'hw:2' }] },
+      deviceDiscoveryTimeoutMs: 0,
+      random: () => 0
+    });
+
+    const recoverReasons: string[] = [];
+    source.on('recover', event => recoverReasons.push(event.reason));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitForCondition(() => processes.length === 1);
+
+      const firstProcess = processes[0];
+      const spawnError = new Error('spawn failure') as NodeJS.ErrnoException;
+      spawnError.code = 'EPIPE';
+      firstProcess.emit('error', spawnError);
+
+      await waitForCondition(() => recoverReasons.includes('spawn-error'));
+
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+
+      await waitForCondition(() => processes.length === 2);
+
+      expect(recoverReasons).toContain('spawn-error');
+      expect(attemptedDevices[0]).toBe('hw:0');
+      expect(attemptedDevices[1]).toBe('hw:1');
+
+      const sampleFrameBytes = ((16000 * 50) / 1000) * 2;
+      processes[1].stdout.emit('data', Buffer.alloc(sampleFrameBytes));
+    } finally {
+      source.stop();
+      platformSpy.mockRestore();
+    }
+  });
+
+  it('AudioAnalysisWindowReconfigure resets RMS windows when sample rate changes', async () => {
+    const { AudioSource } = await import('../src/audio/source.js');
+
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+
+    const source = new AudioSource({
+      type: 'mic',
+      channel: 'audio:analysis-reset',
+      sampleRate: 16000,
+      channels: 1,
+      frameDurationMs: 100,
+      analysisRmsWindowMs: 400,
+      deviceDiscoveryTimeoutMs: 0
+    });
+
+    try {
+      const initialStream = new PassThrough();
+      source.consume(initialStream, 16000, 1);
+
+      const initialFrameBytes = ((16000 * 100) / 1000) * 2;
+      for (let i = 0; i < 4; i += 1) {
+        initialStream.write(Buffer.alloc(initialFrameBytes));
+        await Promise.resolve();
+      }
+
+      let snapshot = source.getAnalysisSnapshot();
+      const formats = Object.keys(snapshot);
+      expect(formats.length).toBeGreaterThan(0);
+      const format = formats[0];
+      expect(snapshot[format]?.frames ?? 0).toBeGreaterThanOrEqual(4);
+      expect(snapshot[format]?.rmsWindowMs ?? 0).toBeGreaterThanOrEqual(300);
+
+      const nextStream = new PassThrough();
+      source.consume(nextStream, 48000, 1);
+      const nextFrameBytes = ((48000 * 100) / 1000) * 2;
+      nextStream.write(Buffer.alloc(nextFrameBytes));
+      await Promise.resolve();
+
+      snapshot = source.getAnalysisSnapshot();
+      const updated = snapshot[format];
+      expect(updated.frames).toBe(1);
+      expect(updated.rmsWindowMs).toBeLessThanOrEqual(110);
+      expect(updated.rmsWindowFrames).toBeGreaterThanOrEqual(1);
+
+      initialStream.end();
+      nextStream.end();
+    } finally {
+      source.stop();
+      platformSpy.mockRestore();
+    }
+  });
+
   it('AudioSourceFallback parses device list output with fallback chain', async () => {
     const { AudioSource } = await import('../src/audio/source.js');
 

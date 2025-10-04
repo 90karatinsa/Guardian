@@ -148,6 +148,16 @@ type AnalysisState = {
   rmsSum: number;
   rmsValues: RmsWindowEntry[];
   lastFrameDurationMs: number;
+  sampleRate: number;
+  channels: number;
+};
+
+type AudioUpdateOptions = Partial<Omit<AudioTimingOptions, 'micFallbacks'>> & {
+  micFallbacks?: Record<string, MicCandidate[]>;
+  random?: () => number;
+  sampleRate?: number;
+  channels?: number;
+  frameDurationMs?: number;
 };
 
 export class AudioSource extends EventEmitter {
@@ -352,12 +362,7 @@ export class AudioSource extends EventEmitter {
     this.startProcess();
   }
 
-  updateOptions(
-    options: Partial<Omit<AudioTimingOptions, 'micFallbacks'>> & {
-      micFallbacks?: Record<string, MicCandidate[]>;
-      random?: () => number;
-    }
-  ) {
+  updateOptions(options: AudioUpdateOptions) {
     const previous = this.options as AudioSourceOptions;
     const next: AudioSourceOptions = {
       ...previous,
@@ -377,6 +382,15 @@ export class AudioSource extends EventEmitter {
     const analysisWindowChanged =
       Object.prototype.hasOwnProperty.call(options, 'analysisRmsWindowMs') &&
       next.analysisRmsWindowMs !== previous.analysisRmsWindowMs;
+    const sampleRateChanged =
+      Object.prototype.hasOwnProperty.call(options, 'sampleRate') &&
+      next.sampleRate !== previous.sampleRate;
+    const channelsChanged =
+      Object.prototype.hasOwnProperty.call(options, 'channels') &&
+      next.channels !== previous.channels;
+    const frameDurationChanged =
+      Object.prototype.hasOwnProperty.call(options, 'frameDurationMs') &&
+      next.frameDurationMs !== previous.frameDurationMs;
 
     this.options = next;
 
@@ -400,7 +414,7 @@ export class AudioSource extends EventEmitter {
       this.resetSilenceState();
     }
 
-    if (analysisWindowChanged) {
+    if (analysisWindowChanged || sampleRateChanged || channelsChanged || frameDurationChanged) {
       this.reconfigureAnalysisWindows();
     }
 
@@ -1251,7 +1265,8 @@ export class AudioSource extends EventEmitter {
       this.options.type !== 'mic' ||
       (reason !== 'stream-silence' &&
         reason !== 'watchdog-timeout' &&
-        reason !== 'device-discovery-timeout')
+        reason !== 'device-discovery-timeout' &&
+        reason !== 'spawn-error')
     ) {
       return;
     }
@@ -1471,9 +1486,23 @@ export class AudioSource extends EventEmitter {
         rmsTargetMs: desiredWindowMs,
         rmsSum: 0,
         rmsValues: [],
-        lastFrameDurationMs: resolvedFrameDurationMs
+        lastFrameDurationMs: resolvedFrameDurationMs,
+        sampleRate,
+        channels
       };
     } else {
+      const sampleRateChanged = state.sampleRate !== sampleRate || state.channels !== channels;
+      if (sampleRateChanged) {
+        state.frames = 0;
+        state.rms = 0;
+        state.spectralCentroid = 0;
+        state.rmsSum = 0;
+        state.rmsValues = [];
+        state.rmsWindowMs = 0;
+        state.lastFrameDurationMs = resolvedFrameDurationMs;
+      }
+      state.sampleRate = sampleRate;
+      state.channels = channels;
       state.rmsTargetMs = desiredWindowMs;
       if (state.rmsWindowFrames !== nextWindowFrames) {
         state.rmsWindowFrames = nextWindowFrames;

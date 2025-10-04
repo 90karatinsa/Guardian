@@ -86,6 +86,16 @@ describe('ReadmeExamples', () => {
     expect(readme).toContain('pose.forecast');
     expect(readme).toContain('threat.summary');
     expect(readme).toContain('PulseAudio fallback');
+    expect(readme).toContain('Retry-After');
+    expect(readme).toContain('offline banner');
+    expect(readme).toContain('Math.max(retryHint, backoffFloor)');
+    expect(readme).toContain('pose.forecastEnabled');
+    expect(readme).toContain('scripts/pose-dump.ts');
+    expect(readme).toContain('forecastHorizonMs');
+    expect(readme).toContain('audio.micFallbacks');
+    expect(readme).toContain('maxAttemptsPerDevice');
+    expect(readme).toContain('metrics.audio.analysis.rmsWindowSize');
+    expect(readme).toContain('Audio source recovering (reason=spawn-error)');
     expect(readme).toContain('metrics.pipelines.ffmpeg.transportFallbacks.total');
     expect(readme).toContain('metricsSummary.pipelines.transportFallbacks.video.byChannel');
     expect(readme).toContain('transportFallbacks.byChannel[].lastReason');

@@ -830,6 +830,91 @@ describe('run-guard multi camera orchestration', () => {
     }
   });
 
+  it('GuardRemovesChannelMetricsOnDelete clears metrics for removed pipelines', async () => {
+    const { startGuard } = await import('../src/run-guard.ts');
+
+    const initialConfig: GuardianConfig = {
+      video: {
+        framesPerSecond: 5,
+        cameras: [
+          {
+            id: 'cam-1',
+            channel: 'video:cam-1',
+            input: 'rtsp://cam-1/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          },
+          {
+            id: 'cam-2',
+            channel: 'video:cam-2',
+            input: 'rtsp://cam-2/stream',
+            person: { score: 0.5 },
+            motion: { diffThreshold: 20, areaThreshold: 0.02 }
+          }
+        ]
+      },
+      person: { modelPath: 'person.onnx', score: 0.5 },
+      motion: { diffThreshold: 20, areaThreshold: 0.02 }
+    } as GuardianConfig;
+
+    const manager = new MockConfigManager(initialConfig);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    const runtime = await startGuard({
+      bus: new EventEmitter(),
+      logger,
+      configManager: manager as unknown as ConfigManager
+    });
+
+    try {
+      await waitFor(() => runtime.pipelines.size === 2);
+      await waitFor(() => MockVideoSource.instances.length === 2);
+
+      metrics.recordPipelineRestart('ffmpeg', 'synthetic', { channel: 'video:cam-1', delayMs: 10 });
+      metrics.recordTransportFallback('ffmpeg', 'rtsp-timeout', {
+        channel: 'video:cam-1',
+        from: 'tcp',
+        to: 'udp',
+        attempt: 1,
+        stage: 0,
+        at: Date.now()
+      });
+
+      let snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']).toBeDefined();
+      expect(
+        snapshot.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1']?.total ?? 0
+      ).toBeGreaterThan(0);
+
+      const updatedConfig: GuardianConfig = {
+        ...initialConfig,
+        video: {
+          ...initialConfig.video,
+          cameras:
+            initialConfig.video?.cameras?.filter(camera => camera?.id !== 'cam-1').map(camera => ({
+              ...camera!
+            })) ?? []
+        }
+      } as GuardianConfig;
+
+      manager.setConfig(updatedConfig);
+
+      await waitFor(() => !runtime.pipelines.has('video:cam-1'));
+      await waitFor(() => runtime.pipelines.size === 1);
+
+      snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byChannel['video:cam-1']).toBeUndefined();
+      const fallbackState = snapshot.pipelines.ffmpeg.transportFallbacks.byChannel['video:cam-1'];
+      if (fallbackState) {
+        expect(fallbackState.total).toBe(0);
+        expect(fallbackState.history).toHaveLength(0);
+        expect(fallbackState.byReason).toEqual({});
+      }
+    } finally {
+      await runtime.stop();
+    }
+  });
+
   it('TransportResetCanonicalChannel resets transport fallback using canonical identifiers', async () => {
     const { startGuard } = await import('../src/run-guard.ts');
 

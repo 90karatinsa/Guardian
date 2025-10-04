@@ -7,7 +7,7 @@ import metrics from '../src/metrics/index.js';
 import AudioSource from '../src/audio/source.js';
 import { registerShutdownHook, registerHealthIndicator, resetAppLifecycle } from '../src/app.js';
 import logger from '../src/logger.js';
-import configManager from '../src/config/index.js';
+import configManager, { type GuardianConfig } from '../src/config/index.js';
 import * as dbModule from '../src/db.js';
 
 const startGuardMock = vi.fn();
@@ -185,6 +185,94 @@ describe('GuardianCliHealthcheck', () => {
     expect(payload.pipelines.audio.channels).toEqual({});
     expect(payload.pipelines.ffmpeg.totalDegraded).toBe(0);
     expect(payload.pipelines.audio.totalDegraded).toBe(0);
+  });
+
+  it('CliPipelinesListsThresholds includes detector thresholds and restart context in list output', async () => {
+    const capture = createTestIo();
+    const baseConfig = configManager.getConfig();
+    const thresholdConfig: GuardianConfig = JSON.parse(JSON.stringify(baseConfig));
+    thresholdConfig.motion = {
+      ...thresholdConfig.motion,
+      diffThreshold: 12,
+      areaThreshold: 4096,
+      minIntervalMs: 1500
+    };
+    thresholdConfig.person = {
+      ...thresholdConfig.person,
+      score: 0.42,
+      minIntervalMs: 2500,
+      checkEveryNFrames: 3,
+      maxDetections: 6
+    };
+    thresholdConfig.video.channels = {
+      'video:front-door': {
+        motion: {
+          diffThreshold: 18,
+          minIntervalMs: 2000
+        },
+        person: {
+          score: 0.5,
+          checkEveryNFrames: 5
+        }
+      }
+    };
+    thresholdConfig.video.cameras = [
+      {
+        id: 'front-door',
+        channel: 'video:front-door',
+        input: 'rtsp://example/front',
+        motion: {
+          areaThreshold: 6144
+        },
+        person: {
+          minIntervalMs: 3200,
+          maxDetections: 8
+        }
+      }
+    ];
+
+    const configSpy = vi.spyOn(configManager, 'getConfig').mockReturnValue(thresholdConfig);
+
+    metrics.recordPipelineRestart('ffmpeg', 'watchdog', {
+      channel: 'video:front-door',
+      delayMs: 2500,
+      attempt: 2
+    });
+    metrics.recordPipelineRestart('ffmpeg', 'watchdog', {
+      channel: 'video:front-door',
+      delayMs: 5000,
+      attempt: 3
+    });
+    metrics.setPipelineChannelHealth('ffmpeg', 'video:front-door', {
+      severity: 'warning',
+      restarts: 2,
+      backoffMs: 5000,
+      reason: 'test-warning'
+    });
+
+    try {
+      const code = await runCli(['daemon', 'pipelines', 'list', '--json'], capture.io);
+      expect(code).toBe(0);
+      const payload = JSON.parse(capture.stdout().trim());
+      const videoChannels = payload.pipelines.ffmpeg.channels;
+      expect(Object.keys(videoChannels)).toContain('video:front-door');
+      const summary = videoChannels['video:front-door'];
+      expect(summary.severity).toBe('warning');
+      expect(summary.restarts).toBe(2);
+      expect(summary.thresholds.motion).toEqual({
+        diffThreshold: 18,
+        areaThreshold: 6144,
+        minIntervalMs: 2000
+      });
+      expect(summary.thresholds.person).toEqual({
+        score: 0.5,
+        minIntervalMs: 3200,
+        checkEveryNFrames: 5,
+        maxDetections: 8
+      });
+    } finally {
+      configSpy.mockRestore();
+    }
   });
 
   it('CliAudioDevicesListsDiscovered outputs fallback-ordered device inventory', async () => {
@@ -699,8 +787,8 @@ describe('GuardianCliHealthcheck', () => {
       }
     });
     expect(payload.metricsSummary.retention.totalsByCamera).toEqual({
-      'front-door': { archivedSnapshots: 1, prunedArchives: 1 },
-      'rear-lot': { archivedSnapshots: 1, prunedArchives: 0 }
+      'front-door': { archivedSnapshots: 1, prunedArchives: 1, fallbackMoves: 0 },
+      'rear-lot': { archivedSnapshots: 1, prunedArchives: 0, fallbackMoves: 0 }
     });
   });
 

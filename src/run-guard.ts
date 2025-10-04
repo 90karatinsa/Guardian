@@ -689,7 +689,9 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       if (!desiredIds.has(runtime.id)) {
         pipelines.delete(runtime.channel);
         pipelinesById.delete(runtime.id);
-        metrics.clearPipelineChannel('ffmpeg', runtime.channel);
+        const canonicalId = canonicalChannel(runtime.channel) ?? runtime.channel;
+        metrics.resetTransportFallback(canonicalId);
+        metrics.clearPipelineChannel('ffmpeg', canonicalId);
         runtime.cleanup.forEach(fn => {
           try {
             fn();
@@ -731,9 +733,11 @@ export async function startGuard(options: GuardStartOptions = {}): Promise<Guard
       if (restartRequested) {
         pipelines.delete(existing.channel);
         pipelinesById.delete(existing.id);
-        if (transportSequenceChanged || rtspTransportChanged) {
-          metrics.resetTransportFallback(existing.channel);
-          metrics.clearPipelineChannel('ffmpeg', existing.channel);
+        const canonicalExisting = canonicalChannel(existing.channel) ?? existing.channel;
+        const channelChanged = existing.channel !== context.pipelineState.channel;
+        if (channelChanged || transportSequenceChanged || rtspTransportChanged) {
+          metrics.resetTransportFallback(canonicalExisting);
+          metrics.clearPipelineChannel('ffmpeg', canonicalExisting);
         }
         existing.cleanup.forEach(fn => {
           try {

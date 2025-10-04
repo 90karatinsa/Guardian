@@ -840,6 +840,12 @@ export class MotionDetector {
 
   private handleFrameResize(frame: GrayscaleFrame, ts: number) {
     this.resetAdaptiveState({ preserveWarmup: true });
+    metrics.resetDetectorCounters('motion', [
+      'suppressedFrames',
+      'suppressedFramesBeforeTrigger',
+      'backoffSuppressedFrames',
+      'backoffActivations'
+    ]);
     this.previousFrame = frame;
     this.baselineFrame = frame;
     this.lastFrameTs = ts;

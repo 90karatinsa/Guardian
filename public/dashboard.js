@@ -111,6 +111,7 @@ const state = {
   eventSource: null,
   lastEventId: null,
   reconnectDelayMs: 5000,
+  retryHint: null,
   stream: {
     heartbeats: 0,
     events: 0,
@@ -133,6 +134,7 @@ const state = {
     lastUpdated: null
   },
   warnings: [],
+  offlineBanner: null,
   layout: {
     active: 'wide',
     breakpoints: LAYOUT_BREAKPOINTS.map(({ name, query }) => ({ name, query })),
@@ -141,6 +143,164 @@ const state = {
     applyLayout: null
   }
 };
+
+function isDomAvailable() {
+  return (
+    typeof document !== 'undefined' &&
+    document !== null &&
+    typeof document.createElement === 'function' &&
+    typeof document.createDocumentFragment === 'function'
+  );
+}
+
+function clampReconnectDelay(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const normalized = Math.floor(value);
+  if (!Number.isFinite(normalized)) {
+    return null;
+  }
+  return Math.max(1000, Math.min(normalized, 60000));
+}
+
+function getOfflineBannerElement() {
+  const banner = state.offlineBanner;
+  if (!banner) {
+    return null;
+  }
+  const ownerDocument = banner.ownerDocument;
+  if (ownerDocument?.body?.contains(banner)) {
+    return banner;
+  }
+  if (isDomAvailable() && document.body?.contains(banner)) {
+    return banner;
+  }
+  return null;
+}
+
+function ensureOfflineBannerElement() {
+  if (!isDomAvailable()) {
+    return null;
+  }
+  const existing = getOfflineBannerElement();
+  if (existing) {
+    return existing;
+  }
+  const banner = document.createElement('div');
+  banner.id = 'offline-banner';
+  banner.className = 'offline-banner';
+  banner.setAttribute('role', 'status');
+  banner.setAttribute('aria-live', 'polite');
+  banner.setAttribute('aria-atomic', 'true');
+  banner.hidden = true;
+  const header = document.querySelector('.dashboard-header');
+  if (header && header.parentElement) {
+    header.parentElement.insertBefore(banner, header.nextSibling);
+  } else if (document.body) {
+    document.body.prepend(banner);
+  }
+  state.offlineBanner = banner;
+  return banner;
+}
+
+function hideOfflineBanner() {
+  const banner = getOfflineBannerElement();
+  if (!banner) {
+    return;
+  }
+  banner.hidden = true;
+  banner.textContent = '';
+}
+
+function formatReconnectDelay(delayMs) {
+  if (typeof delayMs !== 'number' || !Number.isFinite(delayMs)) {
+    return 'soon';
+  }
+  const seconds = Math.max(1, Math.round(delayMs / 1000));
+  if (seconds < 60) {
+    return `${seconds} second${seconds === 1 ? '' : 's'}`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (remainingSeconds === 0) {
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  }
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
+function showOfflineBanner(delayMs) {
+  const banner = ensureOfflineBannerElement();
+  const delayText = formatReconnectDelay(delayMs);
+  banner.textContent = `Connection lost. Reconnecting in ${delayText}…`;
+  banner.hidden = false;
+}
+
+function normalizeRetryHint(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const baseCandidate =
+    clampReconnectDelay(payload.baseMs) ??
+    clampReconnectDelay(payload.retryMs) ??
+    clampReconnectDelay(payload.defaultMs) ??
+    clampReconnectDelay(state.reconnectDelayMs);
+  const minCandidate =
+    clampReconnectDelay(payload.minMs) ??
+    clampReconnectDelay(payload.minimumMs) ??
+    clampReconnectDelay(payload.min) ??
+    baseCandidate;
+  const maxCandidate =
+    clampReconnectDelay(payload.maxMs) ??
+    clampReconnectDelay(payload.maximumMs) ??
+    clampReconnectDelay(payload.max) ??
+    baseCandidate;
+  const recommendedCandidate =
+    clampReconnectDelay(payload.recommendedMs) ??
+    clampReconnectDelay(payload.recommended) ??
+    clampReconnectDelay(payload.suggestedMs) ??
+    clampReconnectDelay(payload.hintMs) ??
+    baseCandidate;
+
+  if (!baseCandidate && !minCandidate && !maxCandidate && !recommendedCandidate) {
+    return null;
+  }
+
+  const baseMs = baseCandidate ?? 5000;
+  const minMs = Math.min(minCandidate ?? baseMs, maxCandidate ?? baseMs);
+  const maxMs = Math.max(maxCandidate ?? baseMs, minCandidate ?? baseMs);
+  const recommendedMsRaw = recommendedCandidate ?? baseMs;
+  const recommendedMs = Math.min(Math.max(recommendedMsRaw, minMs), maxMs);
+
+  return { baseMs, minMs, maxMs, recommendedMs };
+}
+
+function pickReconnectDelay() {
+  const hint = state.retryHint;
+  if (hint && typeof hint === 'object') {
+    const minMs = clampReconnectDelay(hint.minMs) ?? clampReconnectDelay(state.reconnectDelayMs) ?? 5000;
+    const maxMs = clampReconnectDelay(hint.maxMs) ?? minMs;
+    const lower = Math.min(minMs, maxMs);
+    const upper = Math.max(minMs, maxMs);
+    if (upper <= lower) {
+      return lower;
+    }
+    const span = upper - lower;
+    const sample = lower + Math.floor(Math.random() * (span + 1));
+    return clampReconnectDelay(sample) ?? lower;
+  }
+
+  return clampReconnectDelay(state.reconnectDelayMs) ?? 5000;
+}
+
+function updateRetryHint(payload) {
+  const hint = normalizeRetryHint(payload);
+  if (!hint) {
+    return;
+  }
+  state.retryHint = hint;
+  state.reconnectDelayMs = hint.recommendedMs;
+}
 
 function parseEventId(candidate) {
   if (candidate === null || typeof candidate === 'undefined') {
@@ -383,6 +543,12 @@ function sortEvents(events) {
 }
 
 function renderEvents() {
+  if (!list) {
+    return;
+  }
+  if (!isDomAvailable()) {
+    return;
+  }
   const filtered = state.events.filter(matchesFilters);
   const fragment = document.createDocumentFragment();
 
@@ -408,6 +574,13 @@ function renderEvents() {
 }
 
 function renderEventCard(event) {
+  if (!isDomAvailable()) {
+    const doc = typeof document !== 'undefined' ? document : list?.ownerDocument ?? null;
+    if (doc && typeof doc.createElement === 'function') {
+      return doc.createElement('article');
+    }
+    return { appendChild() {}, classList: { add() {} }, dataset: {} };
+  }
   const container = document.createElement('article');
   container.className = 'event';
   container.dataset.eventId = event.__key;
@@ -649,6 +822,9 @@ function updatePoseWidget() {
 
 function setConnectionState(status) {
   state.stream.status = status;
+  if (status === 'connected' || status === 'connecting') {
+    hideOfflineBanner();
+  }
   updateStreamWidget();
 }
 
@@ -807,6 +983,9 @@ function renderWarnings() {
   if (!warningList || !warningEmpty) {
     return;
   }
+  if (!isDomAvailable()) {
+    return;
+  }
 
   warningList.replaceChildren();
   const warnings = Array.isArray(state.warnings) ? state.warnings : [];
@@ -917,6 +1096,10 @@ function renderMetricsMessage(message) {
   if (!pipelineMetricsContainer) {
     return;
   }
+  if (!isDomAvailable()) {
+    pipelineMetricsContainer.textContent = message;
+    return;
+  }
   pipelineMetricsContainer.innerHTML = '';
   const note = document.createElement('p');
   note.className = 'meta';
@@ -925,6 +1108,9 @@ function renderMetricsMessage(message) {
 }
 
 function createMetricsRow(label, detail, options = {}) {
+  if (!isDomAvailable()) {
+    return null;
+  }
   const item = document.createElement('div');
   item.className = 'metrics-channel';
   if (options.tooltip) {
@@ -956,6 +1142,9 @@ function renderThreatSummary(summary) {
   if (!threatSummaryContainer) {
     return;
   }
+  if (!isDomAvailable()) {
+    return;
+  }
   threatSummaryContainer.innerHTML = '';
   if (!summary) {
     if (threatSummaryEmpty) {
@@ -977,10 +1166,16 @@ function renderThreatSummary(summary) {
     const list = document.createElement('div');
     list.className = 'metrics-channels';
     const forecastCount = typeof poseSummary.forecasts === 'number' ? poseSummary.forecasts : 0;
-    list.appendChild(createMetricsRow('Forecasts', `${forecastCount}`));
+    const forecastsRow = createMetricsRow('Forecasts', `${forecastCount}`);
+    if (forecastsRow) {
+      list.appendChild(forecastsRow);
+    }
     const avgConfidence = formatPercent(poseSummary.averageConfidence ?? null);
     if (avgConfidence) {
-      list.appendChild(createMetricsRow('Avg confidence', avgConfidence));
+      const avgConfidenceRow = createMetricsRow('Avg confidence', avgConfidence);
+      if (avgConfidenceRow) {
+        list.appendChild(avgConfidenceRow);
+      }
     }
     const latest = poseSummary.lastForecast && typeof poseSummary.lastForecast === 'object' ? poseSummary.lastForecast : null;
     if (latest) {
@@ -993,7 +1188,10 @@ function renderThreatSummary(summary) {
         parts.push(latestRatio);
       }
       if (parts.length > 0) {
-        list.appendChild(createMetricsRow('Latest movement', parts.join(' · ')));
+        const latestRow = createMetricsRow('Latest movement', parts.join(' · '));
+        if (latestRow) {
+          list.appendChild(latestRow);
+        }
       }
     }
     const threats = poseSummary.threats && typeof poseSummary.threats === 'object' ? poseSummary.threats : null;
@@ -1006,7 +1204,10 @@ function renderThreatSummary(summary) {
             return score ? `${label} (${score})` : label;
           })()
         : 'No threat spikes';
-      list.appendChild(createMetricsRow('Peak threat', peak));
+      const peakRow = createMetricsRow('Peak threat', peak);
+      if (peakRow) {
+        list.appendChild(peakRow);
+      }
       if (typeof threats.events === 'number' && threats.events > 0) {
         const averageThreat = formatPercent(threats.averageMaxThreatScore ?? null);
         const pieces = [];
@@ -1017,7 +1218,10 @@ function renderThreatSummary(summary) {
           pieces.push(`${threats.totalDetections} detections`);
         }
         if (pieces.length > 0) {
-          list.appendChild(createMetricsRow('Threat activity', pieces.join(' · ')));
+          const activityRow = createMetricsRow('Threat activity', pieces.join(' · '));
+          if (activityRow) {
+            list.appendChild(activityRow);
+          }
         }
       }
     }
@@ -1044,7 +1248,10 @@ function renderThreatSummary(summary) {
     severityEntries
       .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
       .forEach(([level, count]) => {
-        list.appendChild(createMetricsRow(level, `${count} events`));
+        const row = createMetricsRow(level, `${count} events`);
+        if (row) {
+          list.appendChild(row);
+        }
       });
     severitySection.appendChild(list);
   }
@@ -1067,7 +1274,10 @@ function renderThreatSummary(summary) {
       .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
       .slice(0, 5)
       .forEach(([detector, count]) => {
-        list.appendChild(createMetricsRow(detector, `${count} events`));
+        const row = createMetricsRow(detector, `${count} events`);
+        if (row) {
+          list.appendChild(row);
+        }
       });
     detectorSection.appendChild(list);
   }
@@ -1076,6 +1286,9 @@ function renderThreatSummary(summary) {
 
 function renderChannelStatus() {
   if (!channelStatusContainer) {
+    return;
+  }
+  if (!isDomAvailable()) {
     return;
   }
   channelStatusContainer.innerHTML = '';
@@ -1217,9 +1430,15 @@ function renderChannelStatus() {
     }
     const detail = parts.join(' · ');
     if (Object.keys(rowOptions).length > 0) {
-      list.appendChild(createMetricsRow(entry.id, detail, rowOptions));
+      const row = createMetricsRow(entry.id, detail, rowOptions);
+      if (row) {
+        list.appendChild(row);
+      }
     } else {
-      list.appendChild(createMetricsRow(entry.id, detail));
+      const row = createMetricsRow(entry.id, detail);
+      if (row) {
+        list.appendChild(row);
+      }
     }
   });
   channelStatusContainer.appendChild(list);
@@ -1227,6 +1446,9 @@ function renderChannelStatus() {
 
 function renderPipelineSection(label, snapshot) {
   if (!snapshot) {
+    return null;
+  }
+  if (!isDomAvailable()) {
     return null;
   }
   const section = document.createElement('section');
@@ -1295,6 +1517,9 @@ function renderPipelineSection(label, snapshot) {
 
 function renderRetentionSection(retention) {
   if (!retention) {
+    return null;
+  }
+  if (!isDomAvailable()) {
     return null;
   }
   const section = document.createElement('section');
@@ -1366,7 +1591,7 @@ function renderRetentionSection(retention) {
 }
 
 function updatePipelineWidget(payload) {
-  if (!pipelineMetricsContainer) {
+  if (!pipelineMetricsContainer || !isDomAvailable()) {
     return;
   }
   if (pipelineMetricsEmpty) {
@@ -1413,7 +1638,7 @@ function updatePipelineWidget(payload) {
 }
 
 async function refreshPipelineMetrics() {
-  if (!pipelineMetricsContainer || state.metrics.pending) {
+  if (!pipelineMetricsContainer || state.metrics.pending || !isDomAvailable()) {
     return;
   }
   state.metrics.pending = true;
@@ -1426,7 +1651,9 @@ async function refreshPipelineMetrics() {
     const payload = await response.json();
     state.metrics.data = payload;
     state.metrics.lastFetched = Date.now();
-    updatePipelineWidget(payload);
+    if (isDomAvailable()) {
+      updatePipelineWidget(payload);
+    }
   } catch (error) {
     console.error('Failed to load pipeline metrics', error);
     state.metrics.data = null;
@@ -1861,6 +2088,9 @@ function updateChannelFilterControls() {
   if (!channelFilterOptions || !channelFilterEmpty) {
     return;
   }
+  if (!isDomAvailable()) {
+    return;
+  }
 
   const selected = getSelectedChannels();
   const channels = Array.from(state.channelStats.entries()).sort(
@@ -1942,14 +2172,31 @@ function subscribe() {
   source.addEventListener('stream-status', event => {
     try {
       const payload = JSON.parse(event.data);
-      if (payload?.retryMs) {
-        state.reconnectDelayMs = payload.retryMs;
+      if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'retryMs')) {
+        const normalized = clampReconnectDelay(payload?.retryMs);
+        if (normalized !== null) {
+          state.reconnectDelayMs = normalized;
+        }
+        state.retryHint = null;
       }
       if (payload?.status) {
         setConnectionState(String(payload.status));
       }
     } catch (error) {
       console.debug('Failed to parse stream-status payload', error);
+    }
+  });
+
+  source.addEventListener('retry-hint', event => {
+    try {
+      const payload = JSON.parse(event.data);
+      updateRetryHint(payload);
+      const banner = getOfflineBannerElement();
+      if (banner && !banner.hidden) {
+        showOfflineBanner(state.reconnectDelayMs);
+      }
+    } catch (error) {
+      console.debug('Failed to parse retry-hint payload', error);
     }
   });
 
@@ -2046,10 +2293,13 @@ function subscribe() {
     source.close();
     state.eventSource = null;
     channelFilter?.setAttribute('aria-busy', 'false');
+    const delayMs = pickReconnectDelay();
+    state.reconnectDelayMs = delayMs;
+    showOfflineBanner(delayMs);
     setTimeout(() => {
       setConnectionState('reconnecting');
       subscribe();
-    }, state.reconnectDelayMs);
+    }, delayMs);
   };
 }
 

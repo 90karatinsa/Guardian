@@ -468,7 +468,10 @@ async function executeRetentionRun(
   }
 
   const computeSanitizedPerCamera = () => {
-    const sanitized = new Map<string, { archivedSnapshots: number; prunedArchives: number }>();
+    const sanitized = new Map<
+      string,
+      { archivedSnapshots: number; prunedArchives: number; fallbackMoves: number }
+    >();
     const fallbackByCamera = new Map<string, number>();
     let fallbackTotal = 0;
 
@@ -485,7 +488,11 @@ async function executeRetentionRun(
         typeof stats?.fallbackMoves === 'number' && Number.isFinite(stats.fallbackMoves)
           ? Math.max(0, Math.floor(stats.fallbackMoves))
           : 0;
-      sanitized.set(camera, { archivedSnapshots: archived, prunedArchives: pruned });
+      sanitized.set(camera, {
+        archivedSnapshots: archived,
+        prunedArchives: pruned,
+        fallbackMoves: fallback
+      });
       fallbackByCamera.set(camera, fallback);
       fallbackTotal += fallback;
     }
@@ -505,19 +512,29 @@ async function executeRetentionRun(
           stats.archivedSnapshots -= maxReduction;
           stats.prunedArchives -= maxReduction;
           remainingReduction -= maxReduction;
-          sanitized.set(camera, stats);
+          sanitized.set(camera, { ...stats });
         }
       }
     }
 
-    const perCamera = Object.fromEntries(sanitized);
+    const perCamera = Object.fromEntries(
+      Array.from(sanitized.entries()).map(([camera, stats]) => [
+        camera,
+        {
+          archivedSnapshots: stats.archivedSnapshots,
+          prunedArchives: stats.prunedArchives,
+          fallbackMoves: stats.fallbackMoves
+        }
+      ])
+    );
     const totals = Object.values(perCamera).reduce(
       (acc, stats) => {
         acc.archived += stats.archivedSnapshots;
         acc.pruned += stats.prunedArchives;
+        acc.fallback += stats.fallbackMoves;
         return acc;
       },
-      { archived: 0, pruned: 0 }
+      { archived: 0, pruned: 0, fallback: 0 }
     );
 
     return { perCamera, totals };
@@ -530,7 +547,11 @@ async function executeRetentionRun(
     archivedSnapshots: sanitizedTotals.archived,
     prunedArchives: sanitizedTotals.pruned,
     perCamera: perCameraSummary,
-    diskSavingsBytes: Math.max(0, diskBefore.totalBytes - (vacuumResult?.disk.after.totalBytes ?? diskBefore.totalBytes))
+    diskSavingsBytes: Math.max(
+      0,
+      diskBefore.totalBytes - (vacuumResult?.disk.after.totalBytes ?? diskBefore.totalBytes)
+    ),
+    fallbackMoves: sanitizedTotals.fallback
   });
 
   const vacuumSummary: RetentionVacuumSummary = {
@@ -573,6 +594,7 @@ async function executeRetentionRun(
       removedEvents: outcome.removedEvents,
       archivedSnapshots: sanitizedTotals.archived,
       prunedArchives: sanitizedTotals.pruned,
+      fallbackMoves: sanitizedTotals.fallback,
       retentionDays: options.retentionDays,
       vacuumMode: vacuumSummary.mode,
       vacuumRunMode: options.vacuum.run,

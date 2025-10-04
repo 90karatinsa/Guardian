@@ -871,6 +871,71 @@ describe('EventSuppressionRateLimit', () => {
     expect(metricsSnapshot.suppression.lastWarning?.channel).toBe('cam:a');
   });
 
+  it('EventSuppressionMaxEventsTtl resets window after TTL and emits metrics warnings', () => {
+    const metrics = new MetricsRegistry();
+    metrics.reset();
+    const warnings: MetricsWarningEvent[] = [];
+    const handler = (event: MetricsWarningEvent) => warnings.push(event);
+    metrics.onWarning(handler);
+
+    const metricsBus = new EventBus({
+      store: event => store(event),
+      log: log as any,
+      metrics
+    });
+
+    metricsBus.configureSuppression([
+      {
+        id: 'max-ttl',
+        detector: 'test-detector',
+        channel: 'cam:ttl-window',
+        maxEvents: 2,
+        suppressForMs: 800,
+        rateLimit: { count: 2, perMs: 600, cooldownMs: 500 },
+        timelineTtlMs: 400,
+        reason: 'max ttl limit'
+      }
+    ]);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 0, meta: { channel: 'cam:ttl-window' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 120, meta: { channel: 'cam:ttl-window' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 220, meta: { channel: 'cam:ttl-window' } })).toBe(false);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 260, meta: { channel: 'cam:ttl-window' } })).toBe(false);
+
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1500, meta: { channel: 'cam:ttl-window' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1620, meta: { channel: 'cam:ttl-window' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1700, meta: { channel: 'cam:ttl-window' } })).toBe(true);
+    expect(metricsBus.emitEvent({ ...basePayload, ts: 1800, meta: { channel: 'cam:ttl-window' } })).toBe(false);
+
+    metrics.offWarning(handler);
+
+    const ruleState = (metricsBus as any).suppressionRules.find((rule: any) => rule.id === 'max-ttl');
+    const timelineState = ruleState?.timelines.get('cam:ttl-window');
+    expect(Array.isArray(timelineState?.history)).toBe(true);
+    expect(timelineState?.history).toEqual([1620, 1700]);
+
+    const suppressionLogs = log.info.mock.calls
+      .filter(([, message]) => message === 'Event suppressed')
+      .map(call => call[0]?.meta ?? {});
+    expect(suppressionLogs).toHaveLength(3);
+    const lastSuppression = suppressionLogs[suppressionLogs.length - 1];
+    expect(lastSuppression.suppressionRuleId).toBe('max-ttl');
+    expect(lastSuppression.suppressedBy?.[0]?.historyCount).toBe(2);
+
+    const ttlWarning = warnings.find(event => event.type === 'suppression');
+    expect(ttlWarning?.type).toBe('suppression');
+    expect(ttlWarning?.suppression?.ruleId).toBe('max-ttl');
+    expect(ttlWarning?.suppression?.channel).toBe('cam:ttl-window');
+    expect(ttlWarning?.suppression?.count).toBeGreaterThanOrEqual(2);
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.suppression.historyTotals.historyTtlPruned).toBeGreaterThanOrEqual(2);
+    const ruleSnapshot = snapshot.suppression.rules['max-ttl'];
+    expect(ruleSnapshot.history.lastTtlPruned).toBeGreaterThanOrEqual(2);
+    expect(ruleSnapshot.history.lastCount).toBe(2);
+    expect(snapshot.suppression.lastWarning?.timelineExpired).toBe(true);
+  });
+
   it('EventSuppressionTimelineTtlExpires removes stale cooldown timelines and records TTL purge metrics', () => {
     const metrics = new MetricsRegistry();
     metrics.reset();

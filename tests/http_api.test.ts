@@ -258,7 +258,8 @@ describe('RestApiEvents', () => {
       archivedSnapshots: 0,
       prunedArchives: 0,
       diskSavingsBytes: 0,
-      perCamera: { 'video:cam-asset': { archivedSnapshots: 0, prunedArchives: 0 } }
+      fallbackMoves: 0,
+      perCamera: { 'video:cam-asset': { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 } }
     });
 
     const { port } = await ensureServer();
@@ -525,6 +526,51 @@ describe('RestApiEvents', () => {
     expect(collectRetryLine('?retryMs=2500')).toBe('retry: 2500');
 
     router.close();
+  });
+
+  it('HttpApiStreamRetryBackoff emits retry hints with jittered recommendations', () => {
+    const router = createEventsRouter({ bus: new EventEmitter() });
+    const decoder = new TextDecoder();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.25);
+
+    class RecordingResponse extends StubServerResponse {
+      chunks: string[] = [];
+
+      write(chunk: any) {
+        const value = typeof chunk === 'string' ? chunk : decoder.decode(chunk);
+        this.chunks.push(value);
+        return true;
+      }
+    }
+
+    const request = new StubIncomingMessage('/api/events/stream');
+    const response = new RecordingResponse();
+
+    try {
+      const handled = router.handle(
+        request as unknown as import('node:http').IncomingMessage,
+        response as unknown as import('node:http').ServerResponse
+      );
+      expect(handled).toBe(true);
+      expect(response.headers['Content-Type']).toBe('text/event-stream');
+      expect(response.headers['Retry-After']).toBe('5');
+
+      const combined = response.chunks.join('');
+      const hintMatch = /event: retry-hint\ndata: ([^\n]+)\n\n/.exec(combined);
+      expect(hintMatch).not.toBeNull();
+      const payload = JSON.parse(hintMatch?.[1] ?? '{}');
+      expect(payload.baseMs).toBe(5000);
+      expect(payload.minMs).toBeGreaterThanOrEqual(3000);
+      expect(payload.maxMs).toBeGreaterThan(payload.minMs);
+      expect(payload.recommendedMs).toBeGreaterThanOrEqual(payload.minMs);
+      expect(payload.recommendedMs).toBeLessThanOrEqual(payload.maxMs);
+      expect(Number.isInteger(payload.recommendedMs)).toBe(true);
+    } finally {
+      randomSpy.mockRestore();
+      request.emit('close');
+      response.emit('close');
+      router.close();
+    }
   });
 
   it('HttpEventStreamHeartbeatUnref unrefs and clears the heartbeat timer on close', () => {
@@ -1239,6 +1285,7 @@ describe('RestApiEvents', () => {
                 removedEvents: 0,
                 archivedSnapshots: 0,
                 prunedArchives: 0,
+                fallbackMoves: 0,
                 diskSavingsBytes: 0
               },
               totalsByCamera: {}
@@ -1420,7 +1467,8 @@ describe('RestApiEvents', () => {
       archivedSnapshots: 1,
       prunedArchives: 0,
       diskSavingsBytes: 0,
-      perCamera: { 'video:test': { archivedSnapshots: 1, prunedArchives: 0 } }
+      fallbackMoves: 0,
+      perCamera: { 'video:test': { archivedSnapshots: 1, prunedArchives: 0, fallbackMoves: 0 } }
     });
 
     const { port } = await ensureServer();
@@ -1494,7 +1542,8 @@ describe('RestApiEvents', () => {
       archivedSnapshots: 0,
       prunedArchives: 0,
       diskSavingsBytes: 0,
-      perCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0 } }
+      fallbackMoves: 0,
+      perCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 } }
     });
 
     const { port } = await ensureServer();
@@ -1591,7 +1640,13 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
+        totals: {
+          removedEvents: 0,
+          archivedSnapshots: 0,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
         totalsByCamera: {}
       }
     };
@@ -1678,8 +1733,16 @@ describe('RestApiEvents', () => {
         warnings: 1,
         warningsByCamera: { 'video:test': 1 },
         lastWarning: { camera: 'video:test', path: '/snapshots/test.jpg', reason: 'Missing file' },
-        totals: { removedEvents: 5, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
-        totalsByCamera: { 'video:test': { archivedSnapshots: 0, prunedArchives: 0 } }
+        totals: {
+          removedEvents: 5,
+          archivedSnapshots: 0,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
+        totalsByCamera: {
+          'video:test': { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 }
+        }
       }
     };
     instance?.dispatch('metrics', JSON.stringify(retentionDigest));
@@ -2012,9 +2075,10 @@ describe('RestApiEvents', () => {
       archivedSnapshots: 3,
       prunedArchives: 1,
       diskSavingsBytes: 0,
+      fallbackMoves: 0,
       perCamera: {
-        lobby: { archivedSnapshots: 2, prunedArchives: 1 },
-        global: { archivedSnapshots: 1, prunedArchives: 0 }
+        lobby: { archivedSnapshots: 2, prunedArchives: 1, fallbackMoves: 0 },
+        global: { archivedSnapshots: 1, prunedArchives: 0, fallbackMoves: 0 }
       }
     });
 
@@ -2378,10 +2442,16 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 2, prunedArchives: 0, diskSavingsBytes: 0 },
+        totals: {
+          removedEvents: 0,
+          archivedSnapshots: 2,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
         totalsByCamera: {
-          lobby: { archivedSnapshots: 1, prunedArchives: 0 },
-          stream: { archivedSnapshots: 1, prunedArchives: 0 }
+          lobby: { archivedSnapshots: 1, prunedArchives: 0, fallbackMoves: 0 },
+          stream: { archivedSnapshots: 1, prunedArchives: 0, fallbackMoves: 0 }
         }
       }
     };
@@ -2625,6 +2695,237 @@ describe('RestApiEvents', () => {
     }
   });
 
+  it('DashboardReconnectBackoff shows offline banner with jittered retries', async () => {
+    const originalWindow = globalThis.window;
+    const originalDocument = globalThis.document;
+    const originalEventSource = globalThis.EventSource;
+    const originalFetch = globalThis.fetch;
+    const originalHTMLElement = globalThis.HTMLElement;
+    const originalMessageEvent = globalThis.MessageEvent;
+    const originalNavigator = globalThis.navigator;
+
+    const { JSDOM } = await import(/* @vite-ignore */ 'jsdom');
+    const html = fs.readFileSync(path.resolve('public/index.html'), 'utf-8');
+    const dom = new JSDOM(html, { url: 'http://localhost/' });
+    const { window } = dom;
+
+    globalThis.window = window as unknown as typeof globalThis.window;
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: window.document
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: window.navigator
+    });
+    globalThis.HTMLElement = window.HTMLElement;
+    globalThis.MessageEvent = window.MessageEvent;
+
+    const now = Date.now();
+    const metricsSnapshot = {
+      fetchedAt: new Date(now).toISOString(),
+      pipelines: {},
+      retention: {
+        runs: 0,
+        lastRunAt: null,
+        warnings: 0,
+        warningsByCamera: {},
+        lastWarning: null,
+        totals: {
+          removedEvents: 0,
+          archivedSnapshots: 0,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
+        totalsByCamera: {}
+      }
+    };
+
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? '';
+      if (url.includes('/api/events')) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: 1,
+                ts: now - 1000,
+                detector: 'motion',
+                severity: 'warning',
+                source: 'video:cam-1',
+                message: 'Motion detected',
+                meta: { channel: 'video:cam-1', camera: 'cam-1' }
+              }
+            ],
+            total: 1,
+            summary: {
+              totals: { bySeverity: { warning: 1 }, byDetector: { motion: 1 } },
+              channels: ['video:cam-1']
+            }
+          }),
+          { headers: { 'Content-Type': 'application/json' }, status: 200 }
+        );
+      }
+      if (url.includes('/api/metrics/pipelines')) {
+        return new Response(JSON.stringify(metricsSnapshot), {
+          headers: { 'Content-Type': 'application/json' },
+          status: 200
+        });
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        headers: { 'Content-Type': 'application/json' },
+        status: 200
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    type Listener = (event: MessageEvent) => void;
+    class MockEventSource {
+      static instances: MockEventSource[] = [];
+      public url: string;
+      public readyState = 0;
+      public onopen: ((event: Event) => void) | null = null;
+      public onmessage: ((event: MessageEvent) => void) | null = null;
+      public onerror: ((event: Event) => void) | null = null;
+      private listeners = new Map<string, Set<Listener>>();
+
+      constructor(url: string) {
+        this.url = url;
+        MockEventSource.instances.push(this);
+      }
+
+      addEventListener(type: string, handler: Listener) {
+        const set = this.listeners.get(type) ?? new Set<Listener>();
+        set.add(handler);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, handler: Listener) {
+        this.listeners.get(type)?.delete(handler);
+      }
+
+      dispatch(type: string, data: unknown) {
+        const payload = new window.MessageEvent(type, { data } as MessageEventInit);
+        this.listeners.get(type)?.forEach(listener => listener(payload));
+      }
+
+      open() {
+        this.onopen?.(new window.Event('open'));
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    MockEventSource.instances = [];
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+
+    const timeoutSpy = vi
+      .spyOn(globalThis, 'setTimeout')
+      .mockImplementation((handler: TimerHandler, timeout?: number) => {
+        return Number(timeout ?? 0);
+      });
+    const intervalSpy = vi
+      .spyOn(globalThis, 'setInterval')
+      .mockImplementation(() => 1 as unknown as NodeJS.Timeout);
+    const clearIntervalSpy = vi
+      .spyOn(globalThis, 'clearInterval')
+      .mockImplementation(() => {});
+
+    let instance: MockEventSource | undefined;
+    try {
+      bootstrapDashboardScript();
+      await Promise.resolve();
+      await vi.waitFor(() => {
+        const state = (window as any).__guardianDashboardState;
+        if (!state) {
+          throw new Error('state not ready');
+        }
+        expect(Array.isArray(state.events)).toBe(true);
+      });
+
+      instance = MockEventSource.instances[0];
+      expect(instance).toBeDefined();
+      instance!.open();
+      instance!.dispatch('stream-status', JSON.stringify({ status: 'connected', retryMs: 5000 }));
+      instance!.dispatch(
+        'retry-hint',
+        JSON.stringify({ baseMs: 5000, minMs: 4000, maxMs: 8000, recommendedMs: 5500 })
+      );
+
+      const dashboardState = (window as any).__guardianDashboardState;
+      expect(dashboardState.reconnectDelayMs).toBe(5500);
+
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+      instance!.onerror?.(new window.Event('error'));
+      randomSpy.mockRestore();
+      await Promise.resolve();
+
+      expect(dashboardState.reconnectDelayMs).toBeGreaterThanOrEqual(4000);
+      expect(dashboardState.reconnectDelayMs).toBeLessThanOrEqual(8000);
+      expect(timeoutSpy).toHaveBeenCalled();
+      const lastCall = timeoutSpy.mock.calls.at(-1) ?? [];
+      expect(lastCall[1]).toBe(dashboardState.reconnectDelayMs);
+
+      const banner = window.document.getElementById('offline-banner');
+      expect(banner).not.toBeNull();
+      expect(banner?.hidden).toBe(false);
+      expect(banner?.textContent ?? '').toContain('Reconnecting in');
+    } finally {
+      timeoutSpy.mockRestore();
+      intervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+      instance?.close?.();
+      MockEventSource.instances = [];
+      dom.window.close();
+      vi.unstubAllGlobals();
+      if (originalWindow) {
+        globalThis.window = originalWindow;
+      } else {
+        // @ts-expect-error cleanup for test environment
+        delete globalThis.window;
+      }
+      if (originalDocument) {
+        globalThis.document = originalDocument;
+      } else {
+        // @ts-expect-error cleanup for test environment
+        delete globalThis.document;
+      }
+      if (originalNavigator) {
+        globalThis.navigator = originalNavigator;
+      } else {
+        // @ts-expect-error cleanup for navigator in node environment
+        delete globalThis.navigator;
+      }
+      if (originalEventSource) {
+        globalThis.EventSource = originalEventSource as typeof EventSource;
+      } else {
+        // @ts-expect-error cleanup when EventSource was undefined
+        delete globalThis.EventSource;
+      }
+      if (originalFetch) {
+        globalThis.fetch = originalFetch as typeof fetch;
+      } else {
+        // @ts-expect-error cleanup when fetch was undefined
+        delete globalThis.fetch;
+      }
+      if (originalHTMLElement) {
+        globalThis.HTMLElement = originalHTMLElement as typeof HTMLElement;
+      } else {
+        // @ts-expect-error cleanup when HTMLElement was undefined
+        delete globalThis.HTMLElement;
+      }
+      if (originalMessageEvent) {
+        globalThis.MessageEvent = originalMessageEvent as typeof MessageEvent;
+      } else {
+        // @ts-expect-error cleanup when MessageEvent was undefined
+        delete globalThis.MessageEvent;
+      }
+    }
+  });
+
   it('DashboardRenderEvents renders face previews and snapshots', async () => {
     const originalWindow = globalThis.window;
     const originalDocument = globalThis.document;
@@ -2671,7 +2972,13 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
+        totals: {
+          removedEvents: 0,
+          archivedSnapshots: 0,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
         totalsByCamera: {}
       }
     };
@@ -2866,7 +3173,13 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
+        totals: {
+          removedEvents: 0,
+          archivedSnapshots: 0,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
         totalsByCamera: {}
       }
     };
@@ -3125,7 +3438,13 @@ describe('RestApiEvents', () => {
         warnings: 0,
         warningsByCamera: {},
         lastWarning: null,
-        totals: { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 },
+        totals: {
+          removedEvents: 0,
+          archivedSnapshots: 0,
+          prunedArchives: 0,
+          fallbackMoves: 0,
+          diskSavingsBytes: 0
+        },
         totalsByCamera: {}
       }
     };

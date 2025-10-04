@@ -819,8 +819,65 @@ function projectBoundingBox(
 }
 
 function buildProjectionCandidates(meta: PreprocessMeta): ProjectionMeta[] {
-  const variants: ProjectionMeta[] = Array.isArray(meta.variants) ? meta.variants.map(variant => ({ ...variant })) : [];
-  return [meta, ...variants];
+  const { variants, ...baseProjection } = meta;
+  const unique: ProjectionMeta[] = [];
+  const seen = new Set<string>();
+
+  const pushUnique = (projection: ProjectionMeta) => {
+    const normalized = { ...projection };
+    const key = serializeProjection(normalized);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    unique.push(normalized);
+  };
+
+  pushUnique(baseProjection);
+  if (Array.isArray(variants)) {
+    for (const variant of variants) {
+      pushUnique(variant);
+    }
+  }
+
+  return unique;
+}
+
+function serializeProjection(projection: ProjectionMeta) {
+  const encode = (value: number | undefined) => {
+    if (value === undefined) {
+      return 'u';
+    }
+    if (Number.isNaN(value)) {
+      return 'nan';
+    }
+    if (value === 0) {
+      return '0';
+    }
+    if (!Number.isFinite(value)) {
+      return `${value}`;
+    }
+    return `${value}`;
+  };
+
+  const normalized = projection.normalized === true
+    ? 't'
+    : projection.normalized === false
+      ? 'f'
+      : 'u';
+
+  return [
+    encode(projection.padX),
+    encode(projection.padY),
+    encode(projection.originalWidth),
+    encode(projection.originalHeight),
+    encode(projection.resizedWidth),
+    encode(projection.resizedHeight),
+    encode(projection.scale),
+    encode(projection.scaleX),
+    encode(projection.scaleY),
+    normalized
+  ].join('|');
 }
 
 function createProjectionContext(projection: ProjectionMeta): ProjectionContext {
