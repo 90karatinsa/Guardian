@@ -217,6 +217,100 @@ describe('VideoSource', () => {
     }
   });
 
+  it('VideoImmediateRecoveryContext', async () => {
+    vi.useFakeTimers();
+
+    const commands: FakeCommand[] = [];
+    const commandFactory = vi.fn(() => {
+      const command = new FakeCommand();
+      commands.push(command);
+      return command as unknown as FfmpegCommand;
+    });
+
+    const source = new VideoSource({
+      file: 'noop',
+      framesPerSecond: 1,
+      restartDelayMs: 75,
+      restartMaxDelayMs: 75,
+      restartJitterFactor: 0.4,
+      forceKillTimeoutMs: 0,
+      commandFactory
+    });
+
+    const recoverEvents: RecoverEvent[] = [];
+    source.on('recover', event => recoverEvents.push(event));
+    source.on('error', () => {});
+
+    try {
+      source.start();
+
+      await waitForScheduledTasks();
+      await Promise.resolve();
+
+      expect(commands).toHaveLength(1);
+      const command = commands[0];
+
+      command.emit('start');
+      command.emit('end');
+
+      await waitForScheduledTasks();
+      await Promise.resolve();
+
+      expect(recoverEvents).toHaveLength(1);
+      const firstEvent = recoverEvents[0];
+      expect(firstEvent.reason).toBe('ffmpeg-ended');
+
+      const internalsBefore = source as unknown as {
+        pendingRestartContext: {
+          exitCode: number | null;
+          meta: RecoverEventMeta;
+          reportedReasons: Set<string>;
+        } | null;
+      };
+      expect(internalsBefore.pendingRestartContext).not.toBeNull();
+      const pendingContext = internalsBefore.pendingRestartContext!;
+      expect(pendingContext.reportedReasons.has('ffmpeg-ended')).toBe(true);
+
+      command.emitClose(1);
+
+      await waitForScheduledTasks();
+      await Promise.resolve();
+
+      await waitFor(() => recoverEvents.length === 2, 200);
+
+      expect(recoverEvents).toHaveLength(2);
+      const secondEvent = recoverEvents[1];
+      expect(secondEvent.reason).toBe('ffmpeg-exit');
+      expect(secondEvent.exitCode).toBe(1);
+      expect(secondEvent.meta.minJitterMs).toBe(firstEvent.meta.minJitterMs);
+      expect(secondEvent.meta.maxJitterMs).toBe(firstEvent.meta.maxJitterMs);
+
+      const internalsAfter = source as unknown as {
+        pendingRestartContext: {
+          exitCode: number | null;
+          meta: RecoverEventMeta;
+          reportedReasons: Set<string>;
+        } | null;
+      };
+      expect(internalsAfter.pendingRestartContext).toBe(pendingContext);
+      expect(internalsAfter.pendingRestartContext?.exitCode).toBe(1);
+      expect(internalsAfter.pendingRestartContext?.reportedReasons.has('ffmpeg-exit')).toBe(true);
+
+      const snapshot = metrics.snapshot();
+      expect(snapshot.pipelines.ffmpeg.byReason['ffmpeg-ended']).toBe(1);
+      expect(snapshot.pipelines.ffmpeg.byReason['ffmpeg-exit']).toBe(1);
+      const history = snapshot.pipelines.ffmpeg.restartHistory;
+      expect(history).toHaveLength(2);
+      expect(history.map(entry => entry.reason)).toEqual(['ffmpeg-ended', 'ffmpeg-exit']);
+      expect(history[1].minJitterMs).toBe(secondEvent.meta.minJitterMs);
+      expect(history[1].maxJitterMs).toBe(secondEvent.meta.maxJitterMs);
+      expect(history[1].exitCode).toBe(1);
+    } finally {
+      await source.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('VideoTimerUnref', async () => {
     vi.useFakeTimers();
     metrics.reset();

@@ -194,6 +194,80 @@ describe('RetentionMaintenance', () => {
     }
   });
 
+  it('RetentionSnapshotFallback records fallback moves per camera and metrics summaries', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const now = Date.UTC(2024, 11, 5);
+    vi.setSystemTime(now);
+
+    const staleTs = now - 40 * dayMs;
+    const snapshotPath = path.join(cameraTwoDir, 'fallback-old.jpg');
+    fs.writeFileSync(snapshotPath, 'fallback');
+    fs.utimesSync(snapshotPath, staleTs / 1000, staleTs / 1000);
+
+    const realRename = fs.renameSync;
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((source, target) => {
+      if (source === snapshotPath) {
+        const error = new Error('EXDEV move') as NodeJS.ErrnoException;
+        error.code = 'EXDEV';
+        throw error;
+      }
+      return realRename(source, target);
+    });
+    const copySpy = vi.spyOn(fs, 'copyFileSync');
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync');
+
+    const metrics = {
+      recordRetentionRun: vi.fn(),
+      recordRetentionWarning: vi.fn()
+    } as const;
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn()
+    };
+
+    try {
+      const result = await runRetentionOnce({
+        enabled: true,
+        retentionDays: 20,
+        intervalMs: 60000,
+        archiveDir,
+        snapshotDirs: [cameraTwoDir],
+        snapshot: { mode: 'archive', retentionDays: 15 },
+        logger,
+        metrics: metrics as any
+      });
+
+      expect(result.skipped).toBe(false);
+      expect(copySpy).toHaveBeenCalledTimes(1);
+      expect(unlinkSpy).toHaveBeenCalledWith(snapshotPath);
+      const cameraKey = path.basename(cameraTwoDir);
+      const perCamera = result.outcome?.perCamera?.[cameraKey];
+      expect(perCamera?.archivedSnapshots).toBe(1);
+      expect(perCamera?.fallbackMoves).toBe(1);
+      expect(perCamera?.prunedArchives).toBe(0);
+
+      const runArgs = metrics.recordRetentionRun.mock.calls.at(-1)?.[0];
+      expect(runArgs).toMatchObject({
+        fallbackMoves: 1,
+        perCamera: {
+          [cameraKey]: { archivedSnapshots: 1, prunedArchives: 0, fallbackMoves: 1 }
+        }
+      });
+      expect(metrics.recordRetentionWarning).not.toHaveBeenCalled();
+
+      const archiveDate = formatArchiveDate(staleTs);
+      const archiveRoot = path.join(archiveDir, cameraKey, archiveDate);
+      const archivedFiles = collectArchiveFiles(archiveRoot);
+      expect(archivedFiles).toContain(path.join(archiveRoot, 'fallback-old.jpg'));
+    } finally {
+      renameSpy.mockRestore();
+      copySpy.mockRestore();
+      unlinkSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('RetentionDiskSavingsMetrics records disk usage and vacuum table stats', async () => {
     const now = Date.now();
     const staleTs = now - 90 * dayMs;

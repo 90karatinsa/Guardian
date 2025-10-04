@@ -251,6 +251,65 @@ describe('MotionDetector', () => {
     expect(typeof lastMeta.areaThreshold).toBe('number');
   });
 
+  it('MotionResizeResetsMetrics', () => {
+    const detector = new MotionDetector(
+      {
+        source: 'resize-metrics-motion',
+        diffThreshold: 2,
+        areaThreshold: 0.02,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 1,
+        noiseMultiplier: 1.1,
+        noiseSmoothing: 0.1,
+        areaSmoothing: 0.12,
+        areaInflation: 1.05,
+        noiseWarmupFrames: 0,
+        temporalMedianWindow: 4,
+        temporalMedianBackoffSmoothing: 0.3
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(8, 6, 40);
+    detector.handleFrame(baseline, 0);
+    const noisy = createFrame(8, 6, (x, y) => 40 + ((x + y) % 4 === 0 ? 30 : -28));
+    detector.handleFrame(noisy, 1);
+
+    metrics.incrementDetectorCounter('motion', 'suppressedFrames', 3);
+    metrics.incrementDetectorCounter('motion', 'suppressedFramesBeforeTrigger', 2);
+    metrics.incrementDetectorCounter('motion', 'backoffSuppressedFrames', 1);
+    metrics.incrementDetectorCounter('motion', 'backoffActivations', 1);
+    metrics.setDetectorGauge('motion', 'temporalWindow', 0.42);
+    metrics.setDetectorGauge('motion', 'temporalSuppression', 5);
+    metrics.setDetectorGauge('motion', 'temporalDebouncePadding', 3);
+    metrics.setDetectorGauge('motion', 'temporalBackoffPadding', 2);
+    metrics.setDetectorGauge('motion', 'temporalGateMultiplier', 2.4);
+    metrics.setDetectorGauge('motion', 'temporalAreaThreshold', 0.15);
+    metrics.setDetectorGauge('motion', 'temporalDeltaThreshold', 0.12);
+    metrics.setDetectorGauge('motion', 'pendingSuppressedFramesBeforeTrigger', 6);
+
+    const resized = createUniformFrame(10, 9, 45);
+    detector.handleFrame(resized, 2);
+
+    const snapshot = metrics.snapshot();
+    const motionCounters = snapshot.detectors.motion?.counters ?? {};
+    const motionGauges = snapshot.detectors.motion?.gauges ?? {};
+
+    expect(motionCounters.suppressedFrames ?? -1).toBe(0);
+    expect(motionCounters.suppressedFramesBeforeTrigger ?? -1).toBe(0);
+    expect(motionCounters.backoffSuppressedFrames ?? -1).toBe(0);
+    expect(motionCounters.backoffActivations ?? -1).toBe(0);
+    expect(motionGauges.pendingSuppressedFramesBeforeTrigger ?? -1).toBe(0);
+    expect(motionGauges.temporalWindow ?? -1).toBe(0);
+    expect(motionGauges.temporalSuppression ?? -1).toBe(0);
+    expect(motionGauges.temporalDebouncePadding ?? -1).toBe(0);
+    expect(motionGauges.temporalBackoffPadding ?? -1).toBe(0);
+    expect(motionGauges.temporalGateMultiplier ?? -1).toBe(1);
+    expect(motionGauges.temporalAreaThreshold ?? -1).toBe(0);
+    expect(motionGauges.temporalDeltaThreshold ?? -1).toBe(0);
+  });
+
   it('LightTemporalMedianBackoff', () => {
     const detector = new LightDetector(
       {
@@ -1683,6 +1742,106 @@ describe('LightDetector', () => {
     expect(secondMeta.effectiveBackoffFrames).toBeGreaterThanOrEqual(4);
     expect(secondMeta.sustainedNoiseBoost).toBeGreaterThanOrEqual(1);
     expect(secondMeta.sustainedNoiseBoost).toBeLessThanOrEqual(4);
+  });
+
+  it('LightDetectorResolutionReset', () => {
+    const detector = new LightDetector(
+      {
+        source: 'resize-light',
+        deltaThreshold: 14,
+        smoothingFactor: 0.09,
+        minIntervalMs: 0,
+        debounceFrames: 2,
+        backoffFrames: 3,
+        noiseMultiplier: 2.3,
+        noiseSmoothing: 0.2,
+        noiseWarmupFrames: 1,
+        noiseBackoffPadding: 1,
+        temporalMedianWindow: 5,
+        temporalMedianBackoffSmoothing: 0.4
+      },
+      bus
+    );
+
+    const baseline = createUniformFrame(6, 6, 36);
+    detector.handleFrame(baseline, 0);
+
+    for (let idx = 0; idx < 12; idx += 1) {
+      const flicker = createFrame(6, 6, (x, y) => 36 + ((x + y + idx) % 4 === 0 ? 7 : -6));
+      detector.handleFrame(flicker, (idx + 1) * 80);
+    }
+
+    metrics.incrementDetectorCounter('light', 'suppressedFrames', 4);
+    metrics.incrementDetectorCounter('light', 'suppressedFramesBeforeTrigger', 3);
+    metrics.incrementDetectorCounter('light', 'backoffFrames', 2);
+    metrics.incrementDetectorCounter('light', 'backoffSuppressedFrames', 5);
+    metrics.incrementDetectorCounter('light', 'backoffActivations', 1);
+    metrics.incrementDetectorCounter('light', 'backoffFrameBudget', 7);
+
+    const internalsBefore = detector as unknown as {
+      noiseWindow: unknown[];
+      deltaWindow: unknown[];
+      temporalWindow: unknown[];
+      suppressedFrames: number;
+      pendingSuppressedFramesBeforeTrigger: number;
+      backoffFrames: number;
+      frameWidth: number | null;
+      frameHeight: number | null;
+    };
+    expect(internalsBefore.noiseWindow.length).toBeGreaterThan(0);
+    expect(internalsBefore.deltaWindow.length).toBeGreaterThan(0);
+    expect(internalsBefore.temporalWindow.length).toBeGreaterThanOrEqual(0);
+    expect(internalsBefore.frameWidth).toBe(6);
+    expect(internalsBefore.frameHeight).toBe(6);
+
+    const beforeSnapshot = metrics.snapshot();
+    expect(beforeSnapshot.detectors.light?.counters?.suppressedFrames ?? 0).toBeGreaterThan(0);
+    expect(beforeSnapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? 0).toBeGreaterThan(0);
+
+    const resized = createUniformFrame(8, 8, 40);
+    detector.handleFrame(resized, 5000);
+
+    const afterSnapshot = metrics.snapshot();
+    expect(afterSnapshot.detectors.light?.counters?.suppressedFrames ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.counters?.suppressedFramesBeforeTrigger ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.counters?.backoffFrames ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.counters?.backoffSuppressedFrames ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.counters?.backoffActivations ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.counters?.backoffFrameBudget ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? -1).toBe(0);
+    expect(afterSnapshot.detectors.light?.gauges?.noiseWarmupRemaining).toBe(1);
+    expect(afterSnapshot.detectors.light?.gauges?.noiseBackoffPadding).toBe(1);
+
+    const internalsAfter = detector as unknown as {
+      noiseWindow: unknown[];
+      deltaWindow: unknown[];
+      temporalWindow: unknown[];
+      suppressedFrames: number;
+      pendingSuppressedFramesBeforeTrigger: number;
+      backoffFrames: number;
+      frameWidth: number | null;
+      frameHeight: number | null;
+    };
+    expect(internalsAfter.noiseWindow.length).toBe(0);
+    expect(internalsAfter.deltaWindow.length).toBe(0);
+    expect(internalsAfter.temporalWindow.length).toBe(0);
+    expect(internalsAfter.suppressedFrames).toBe(0);
+    expect(internalsAfter.pendingSuppressedFramesBeforeTrigger).toBe(0);
+    expect(internalsAfter.backoffFrames).toBe(0);
+    expect(internalsAfter.frameWidth).toBe(8);
+    expect(internalsAfter.frameHeight).toBe(8);
+
+    expect(events.filter(event => event.detector === 'light')).toHaveLength(0);
+
+    const resumedBaseline = createUniformFrame(8, 8, 44);
+    detector.handleFrame(resumedBaseline, 5100);
+    detector.handleFrame(
+      createFrame(8, 8, (x, y) => 44 + ((2 * x + y) % 5 === 0 ? 9 : -7)),
+      5200
+    );
+
+    const resumedSnapshot = metrics.snapshot();
+    expect(resumedSnapshot.detectors.light?.gauges?.pendingSuppressedFramesBeforeTrigger ?? 0).toBeGreaterThanOrEqual(0);
   });
 
   it('LightDetectorFrameErrorResets', () => {

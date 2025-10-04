@@ -149,6 +149,11 @@ type MetricsWarningEvent =
   | { type: 'transport-fallback'; fallback: TransportFallbackRecordSnapshot }
   | { type: 'suppression'; suppression: SuppressionWarningSnapshot };
 
+type StreamWarningSnapshot = {
+  total: number;
+  byType: CounterMap;
+};
+
 type PipelineRestartHistorySnapshot = {
   reason: string;
   attempt: number | null;
@@ -353,6 +358,7 @@ type RetentionTotals = {
   removedEvents: number;
   archivedSnapshots: number;
   prunedArchives: number;
+  fallbackMoves: number;
   diskSavingsBytes: number;
 };
 
@@ -375,6 +381,7 @@ type RetentionSnapshot = {
 type RetentionCameraTotals = {
   archivedSnapshots: number;
   prunedArchives: number;
+  fallbackMoves: number;
 };
 
 type RetentionRunContext = {
@@ -382,6 +389,7 @@ type RetentionRunContext = {
   archivedSnapshots?: number;
   prunedArchives?: number;
   diskSavingsBytes?: number;
+  fallbackMoves?: number;
   perCamera?: Record<string, RetentionCameraTotals>;
 };
 
@@ -441,6 +449,9 @@ type MetricsSnapshot = {
   suppression: SuppressionSnapshot;
   retention: RetentionSnapshot;
   detectors: Record<string, DetectorSnapshot>;
+  streams: {
+    warnings: StreamWarningSnapshot;
+  };
 };
 
 type HistogramConfig = {
@@ -702,6 +713,8 @@ class MetricsRegistry {
     ffmpeg: new Map(),
     audio: new Map()
   };
+  private streamWarningTotal = 0;
+  private readonly streamWarningsByType = new Map<string, number>();
 
   constructor() {
     this.registerReservedHistogram('logs.level', LOG_LEVEL_HISTOGRAM);
@@ -784,7 +797,13 @@ class MetricsRegistry {
     this.retentionWarnings = 0;
     this.retentionWarningsByCamera.clear();
     this.lastRetentionWarning = null;
-    this.retentionTotals = { removedEvents: 0, archivedSnapshots: 0, prunedArchives: 0, diskSavingsBytes: 0 };
+    this.retentionTotals = {
+      removedEvents: 0,
+      archivedSnapshots: 0,
+      prunedArchives: 0,
+      fallbackMoves: 0,
+      diskSavingsBytes: 0
+    };
     this.retentionTotalsByCamera.clear();
     this.transportFallbackTotal = 0;
     this.transportFallbackLast = null;
@@ -793,6 +812,8 @@ class MetricsRegistry {
     this.transportFallbackByTarget.clear();
     this.transportFallbackResetsBackoff = 0;
     this.transportFallbackResetsCircuitBreaker = 0;
+    this.streamWarningTotal = 0;
+    this.streamWarningsByType.clear();
     this.pipelineTimers.ffmpeg.clear();
     this.pipelineTimers.audio.clear();
     this.resetEmitter.emit('reset');
@@ -1311,6 +1332,7 @@ class MetricsRegistry {
     };
     this.suppressionWarnings += 1;
     this.lastSuppressionWarning = snapshot;
+    this.incrementStreamWarning('suppression');
     this.warningEmitter.emit('warning', { type: 'suppression', suppression: snapshot });
   }
 
@@ -1321,6 +1343,7 @@ class MetricsRegistry {
       removedEvents: this.retentionTotals.removedEvents + (context.removedEvents ?? 0),
       archivedSnapshots: this.retentionTotals.archivedSnapshots + (context.archivedSnapshots ?? 0),
       prunedArchives: this.retentionTotals.prunedArchives + (context.prunedArchives ?? 0),
+      fallbackMoves: this.retentionTotals.fallbackMoves + (context.fallbackMoves ?? 0),
       diskSavingsBytes: this.retentionTotals.diskSavingsBytes + (context.diskSavingsBytes ?? 0)
     };
     if (context.perCamera) {
@@ -1330,7 +1353,8 @@ class MetricsRegistry {
         }
         const existing = this.retentionTotalsByCamera.get(camera) ?? {
           archivedSnapshots: 0,
-          prunedArchives: 0
+          prunedArchives: 0,
+          fallbackMoves: 0
         };
         const archived =
           typeof stats?.archivedSnapshots === 'number' && Number.isFinite(stats.archivedSnapshots)
@@ -1340,8 +1364,13 @@ class MetricsRegistry {
           typeof stats?.prunedArchives === 'number' && Number.isFinite(stats.prunedArchives)
             ? stats.prunedArchives
             : 0;
+        const fallback =
+          typeof stats?.fallbackMoves === 'number' && Number.isFinite(stats.fallbackMoves)
+            ? stats.fallbackMoves
+            : 0;
         existing.archivedSnapshots += archived;
         existing.prunedArchives += pruned;
+        existing.fallbackMoves += fallback;
         this.retentionTotalsByCamera.set(camera, existing);
       }
     }
@@ -1360,6 +1389,7 @@ class MetricsRegistry {
       reason: warning.reason
     };
     this.lastRetentionWarning = payload;
+    this.incrementStreamWarning('retention');
     this.warningEmitter.emit('warning', { type: 'retention', warning: payload });
   }
 
@@ -1625,6 +1655,7 @@ class MetricsRegistry {
       resetsCircuitBreaker: record.resetsCircuitBreaker,
       at: new Date(record.at).toISOString()
     };
+    this.incrementStreamWarning('transport-fallback');
     this.warningEmitter.emit('warning', { type: 'transport-fallback', fallback: snapshot });
   }
 
@@ -1777,6 +1808,12 @@ class MetricsRegistry {
       byReason.set(normalized, (byReason.get(normalized) ?? 0) + 1);
       this.audioDeviceDiscoveryByChannel.set(meta.channel, byReason);
     }
+  }
+
+  private incrementStreamWarning(type: string) {
+    const key = type || 'unknown';
+    this.streamWarningTotal += 1;
+    this.streamWarningsByType.set(key, (this.streamWarningsByType.get(key) ?? 0) + 1);
   }
 
   resetPipelineChannel(pipeline: PipelineType, channel: string) {
@@ -2686,7 +2723,13 @@ class MetricsRegistry {
         totals: { ...this.retentionTotals },
         totalsByCamera: mapFromRetentionCameras(this.retentionTotalsByCamera)
       },
-      detectors: mapFromDetectors(this.detectorMetrics)
+      detectors: mapFromDetectors(this.detectorMetrics),
+      streams: {
+        warnings: {
+          total: this.streamWarningTotal,
+          byType: mapFrom(this.streamWarningsByType)
+        }
+      }
     };
   }
 }
@@ -3310,7 +3353,8 @@ function mapFromRetentionCameras(
   for (const [camera, totals] of ordered) {
     result[camera] = {
       archivedSnapshots: totals.archivedSnapshots,
-      prunedArchives: totals.prunedArchives
+      prunedArchives: totals.prunedArchives,
+      fallbackMoves: totals.fallbackMoves
     };
   }
   return result;

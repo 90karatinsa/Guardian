@@ -540,7 +540,7 @@ export interface RetentionOutcome {
   archivedSnapshots: number;
   prunedArchives: number;
   warnings: Array<{ path: string; error: Error; camera: string }>;
-  perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number; fallbackMoves?: number }>;
+  perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number; fallbackMoves: number }>;
 }
 
 export function applyRetentionPolicy(options: RetentionPolicyOptions): RetentionOutcome {
@@ -555,7 +555,7 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
   let archivedSnapshots = 0;
   let prunedArchives = 0;
   let removedSnapshots = 0;
-  const perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number; fallbackMoves?: number }> = {};
+  const perCamera: Record<string, { archivedSnapshots: number; prunedArchives: number; fallbackMoves: number }> = {};
   const warnings: Array<{ path: string; error: Error; camera: string }> = [];
 
   for (const { sourceDir, archiveBase } of directories) {
@@ -580,10 +580,11 @@ export function applyRetentionPolicy(options: RetentionPolicyOptions): Retention
     }
     prunedArchives += rotation.perCamera.prunedArchives;
     warnings.push(...rotation.warnings);
-    const cameraStats = perCamera[cameraId] ?? { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 };
+    const cameraStats =
+      perCamera[cameraId] ?? { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 };
     cameraStats.archivedSnapshots += rotation.perCamera.archivedSnapshots;
     cameraStats.prunedArchives += rotation.perCamera.prunedArchives;
-    cameraStats.fallbackMoves = (cameraStats.fallbackMoves ?? 0) + rotation.perCamera.fallbackMoves;
+    cameraStats.fallbackMoves += rotation.perCamera.fallbackMoves;
     perCamera[cameraId] = cameraStats;
   }
 
@@ -745,7 +746,12 @@ function rotateSnapshots(
   cameraId: string
 ): RotationOutcome {
   if (mode === 'ignore' || !fs.existsSync(snapshotDir)) {
-    return { moved: 0, pruned: 0, warnings: [] };
+    return {
+      moved: 0,
+      pruned: 0,
+      warnings: [],
+      perCamera: { archivedSnapshots: 0, prunedArchives: 0, fallbackMoves: 0 }
+    };
   }
 
   if (mode === 'archive') {

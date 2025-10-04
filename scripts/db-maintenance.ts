@@ -10,6 +10,7 @@ type MaintenanceSummary = {
   removedEvents: number;
   archivedSnapshots: number;
   prunedArchives: number;
+  fallbackMoves: number;
   warnings: number;
   diskSavingsBytes: number;
 };
@@ -59,6 +60,7 @@ export async function runMaintenance(overrides: MaintenanceOptions = {}): Promis
     removedEvents: 0,
     archivedSnapshots: 0,
     prunedArchives: 0,
+    fallbackMoves: 0,
     warnings: result.warnings.length,
     diskSavingsBytes: result.disk.savingsBytes
   };
@@ -68,6 +70,7 @@ export async function runMaintenance(overrides: MaintenanceOptions = {}): Promis
       removedEvents: totals.removedEvents,
       archivedSnapshots: totals.archivedSnapshots,
       prunedArchives: totals.prunedArchives,
+      fallbackMoves: totals.fallbackMoves,
       warnings: totals.warnings,
       diskSavingsBytes: totals.diskSavingsBytes,
       archiveDir: retentionOptions.archiveDir,
@@ -106,6 +109,10 @@ function normalizeOutcome(result: Awaited<ReturnType<typeof runRetentionOnce>>):
     removedEvents: outcome.removedEvents,
     archivedSnapshots: outcome.archivedSnapshots,
     prunedArchives: outcome.prunedArchives,
+    fallbackMoves: Object.values(outcome.perCamera ?? {}).reduce(
+      (sum, stats) => sum + (stats?.fallbackMoves ?? 0),
+      0
+    ),
     warnings: result.warnings.length,
     diskSavingsBytes: result.disk.savingsBytes
   } satisfies MaintenanceSummary;

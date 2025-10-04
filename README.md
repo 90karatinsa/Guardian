@@ -464,6 +464,12 @@ guardian status
 
 Guardian, SSE istemcileri hata aldığında `req.on('error')` ve `res.on('error')` dinleyicileriyle bağlantıyı sonlandırıp heartbeat zamanlayıcısını temizler; böylece ağ kesintilerinde `clients.size` büyümez ve `HttpSseResponseErrorCleanup` senaryosu `clients.size === 0` beklentisini doğrular.
 
+### SSE yeniden deneme ve offline banner davranışı
+
+- `/api/events/stream` uç noktası, istemcilerin yeniden bağlanma denemelerini kademeli hale getirmek için hem `Retry-After` başlığı hem de `retry:` SSE ipucu yayımlar. Sunucu, `retry` değerini konfigürasyondaki jitter sınırları dahilinde rastgele seçerek eşzamanlı istemci fırtınalarını azaltır; dashboard tarafı `Math.max(retryHint, backoffFloor)` ile minimum gecikmeyi korur.
+- Dashboard, `retry` değerini kullanıcıya göstermek için çevrimdışı banner üzerinde `Tekrar denenecek: 5.2 saniye` benzeri okunaklı etiketler üretir; banner, SSE bağlantısı kapanır kapanmaz görünür ve ilk heartbeat geldiğinde otomatik kapanır.
+- `Retry-After` başlığı, reverse proxy veya tarayıcı tarafından sayfa yenilemeye gerek kalmadan okunabilir. `curl -i` ile isteği test ettiğinizde `Retry-After: <ms>` satırını görecek, istemci tarafı da aynı değeri exponential backoff hesaplarına dahil edecektir.
+
 Yalnızca belirli metrik bölümlerini tüketmek için `metrics` sorgu parametresiyle SSE'yi daraltabilirsiniz. Örneğin sadece ses ve retention metriklerini dinlemek için aşağıdaki komutu çalıştırabilirsiniz; ffmpeg istatistikleri bu akışta gönderilmez:
 
 ```bash
@@ -524,10 +530,25 @@ Video için ffmpeg süreçleri, `src/video/source.ts` altında watchdog tarafın
 - Kişi dedektörü, `ObjectClassifier` sonuçlarını olay meta verisine kopyalarken ham sınıf isimlerini `labelMap` tanımlarına göre normalize eder. Aynı alias altında toplanan olasılıklar tek bir kovada birleştirilir; böylece "cat" ve "dog" gibi farklı etiketler `pet` alias'ı için tek bir toplam olasılık üretir.
 - Meta verideki `objects[].probabilities` alanı bu toplulaştırılmış dağılımı taşırken `rawProbabilities` aynı kovadaki ham sınıf katkılarını korur. Tehdit hesaplamaları bu ortak kümeyi kullanarak alias ve ham isimler arasında tutarlı eşikler uygular.
 - Tehdit skoru, nesnenin YOLO sınıflandırma skoru ile alias altındaki toplam tehdit olasılığının çarpımıdır; sonuç `threatThreshold` değerine göre değerlendirilir. Olay meta verisinde `threatThreshold` ve `threatSummary` alanları eşik altında kalan skorları kırparak güncellenmiş day/night eşik planlarının hemen uygulanmasını sağlar.
+- Çok ölçekli YOLO çıktılarında aynı `projectionLabel` veya `projectionIndex` değerine sahip varyantlar `normalizedProjection` anahtarı üzerinden tekilleştirilir. Böylece tehdit analizinde farklı çözünürlük katmanlarından gelen fakat aynı nesneyi temsil eden sonuçlar çift sayılmaz.
+- `NaN` olarak işaretlenen logits değerleri filtrelenir ve olay meta verisine eklenmez; hatalı modeller tek tek sınıflar için sayısal taşmalar üretse bile `threat.summary` alanı yalnızca geçerli olasılık dağılımlarını gösterir.
+- Konfigürasyon hot reload sırasında global, kanal ve kamera düzeyindeki `objects.labelMap` eşlemeleri çakışırsa Guardian derhal yapılandırmayı geri alır ve `config-manager` SSE akışında hata olayı yayımlar; bu davranış tehdit eşiklerinin sahada yanlış uygulanmasını engeller.
+
+### Pose tahmini kullanım örnekleri
+
+- `config/video.cameras[].pose` bloğuna `modelPath`, `forecastHorizonMs`, `smoothingWindow` ve `minMovement` değerleri girildiğinde Guardian, aynı kameraya ait pose tahmini kuyruğunu otomatik olarak başlatır. Kuyruk, son `historySize` kadar iskelet karesini hafızada tutarak ani hareketlerin gürültüsünü azaltır.
+- SSE akışında `pose.forecast` olayları, `horizonSeconds` ve `positions` alanlarıyla birlikte yayınlanır; dashboard bu veriyi çizgisel öngörü (line projection) olarak overlay şeklinde gösterir. CLI tarafında `guardian daemon pipelines list --json` çıktısındaki `pose.forecastEnabled` alanıyla hangi kameraların tahmin yayınladığını görebilirsiniz.
+- Poz tahminlerini debug etmek için `pnpm tsx scripts/pose-dump.ts --channel video:test-camera` komutu, son `historySize` iskeletin düzleştirilmiş koordinatlarını yazar. Eğer `pose` modeli RTSP akışına paralel olarak yeniden başlatılırsa, Guardian daha önce kuyruğa alınmış hareketleri `forecastHorizonMs` boyunca yeniden hesaplar ve SSE tarafında kesinti yaşanmaz.
 
 ffmpeg komutları beklenmedik şekilde hata verdiğinde daemon loglarında `Video source reconnecting (reason=ffmpeg-error)` satırı görünür; aynı anda `guardian daemon status --json` çıktısındaki `pipelines.ffmpeg.byReason['ffmpeg-error']` sayaçları artar ve toparlanan kanalın kimliğini rapor eder. Manuel taşıyıcı sıfırlamalarını doğrulamak için `guardian daemon restart --transport video:lobby` komutunu çalıştırın; komut tamamlandığında sağlık özetindeki `metricsSummary.pipelines.transportFallbacks.video.byChannel` girdilerinde ilgili `total` değerinin 0'a döndüğünü ve `lastReason` alanının sıfırlandığını kontrol edin.
 
 Ses tarafında anomaly dedektörü, RMS ve spectral centroid ölçümlerini `audio.anomaly` konfigürasyonu doğrultusunda toplar. `metrics.detectors['audio-anomaly'].latencyHistogram` değeri, pencere hizasının doğruluğunu teyit eder. Sustained sessizlikte devre kesici tetiklendiğinde `pipelines.audio.watchdogBackoffByChannel` ve `pipelines.audio.restartHistogram.delay` artışları görülebilir.
+
+### Ses fallback ve analiz penceresi ayarlarını optimize etmek
+
+- `audio.micFallbacks` dizisindeki kimlikler Guardian tarafından döngüsel olarak kullanılır; aynı cihaz üst üste `maxAttemptsPerDevice` kadar denendikten sonra sıradaki fallback devreye girer. Özellikle PulseAudio ve ALSA karma yapılandırmalarında her giriş için `format`, `sampleRate` ve `channelLayout` tanımlamak yeniden başlatma sürelerini azaltır.
+- Çalışan akışın örnekleme hızı değiştiğinde RMS pencereleri otomatik olarak yeniden boyutlandırılır. `audio.analysis.rmsWindowSeconds` değeri, Guardian'ın yeni sample rate'e göre hesapladığı hedef pencere süresini belirler; `metrics.audio.analysis.rmsWindowSize` gauge'u bu yeniden yapılandırmaları gerçek zamanlı izler.
+- Sürekli hata alan mikrofonlarda Guardian, `Audio source recovering (reason=spawn-error)` logunu üreterek fallback zincirinde bir sonraki kaynağa geçer. `tests/audio_source.test.ts` senaryolarında olduğu gibi `guardian daemon pipelines list --json` çıktısındaki `pipelines.audio.byChannel[].currentFallback` alanı, hangi cihazın aktif olduğunu doğrulamak için kullanılabilir.
 
 ## Docker ile çalışma
 `Dockerfile` çok aşamalı build tanımlar ve `public/`, `scripts/` ile `models/` dizinlerini imaj içerisine kopyalar. İmajı inşa etmek için:

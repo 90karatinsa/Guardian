@@ -360,6 +360,10 @@ const cameraObjectsConfigSchema: JsonSchema = {
     classIndices: {
       type: 'array',
       items: { type: 'number', minimum: 0 }
+    },
+    labelMap: {
+      type: 'object',
+      additionalProperties: { type: 'string' }
     }
   }
 };
@@ -807,6 +811,10 @@ const guardianConfigSchema: JsonSchema = {
         classIndices: {
           type: 'array',
           items: { type: 'number', minimum: 0 }
+        },
+        labelMap: {
+          type: 'object',
+          additionalProperties: { type: 'string' }
         }
       }
     },
@@ -1265,6 +1273,124 @@ function validateLogicalConfig(config: GuardianConfig) {
         validateTransportSequence(
           camera.ffmpeg.transportFallbackSequence,
           `config.video.cameras[${label}].ffmpeg.transportFallbackSequence`
+        );
+      }
+    });
+  }
+
+  const normalizeLabelKey = (key: string) => {
+    const trimmed = key.trim();
+    return trimmed.length > 0 ? trimmed.toLowerCase() : '';
+  };
+  const normalizeLabelValue = (value: unknown) => {
+    if (typeof value !== 'string') {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  };
+
+  const globalLabelMap = new Map<string, { value: string; path: string }>();
+  if (config.objects?.labelMap && typeof config.objects.labelMap === 'object') {
+    for (const [rawKey, rawValue] of Object.entries(config.objects.labelMap)) {
+      const normalizedKey = normalizeLabelKey(rawKey);
+      if (!normalizedKey) {
+        continue;
+      }
+      const normalizedValue = normalizeLabelValue(rawValue);
+      if (!normalizedValue) {
+        continue;
+      }
+      globalLabelMap.set(normalizedKey, {
+        value: normalizedValue,
+        path: `config.objects.labelMap.${rawKey}`
+      });
+    }
+  }
+
+  type LabelMapEntry = { value: string; path: string };
+  const perChannelLabelMaps = new Map<string, Map<string, LabelMapEntry>>();
+  const ensureChannelLabelMap = (channelId: string) => {
+    const normalizedChannel = canonicalChannel(channelId);
+    if (!normalizedChannel) {
+      return null;
+    }
+    let tracker = perChannelLabelMaps.get(normalizedChannel);
+    if (!tracker) {
+      tracker = new Map<string, LabelMapEntry>();
+      for (const [key, entry] of globalLabelMap.entries()) {
+        tracker.set(key, { ...entry });
+      }
+      perChannelLabelMaps.set(normalizedChannel, tracker);
+    }
+    return tracker;
+  };
+
+  const registerLabelOverrides = (
+    channelId: string,
+    overrides: Record<string, unknown> | undefined,
+    pathPrefix: string
+  ) => {
+    if (!overrides || typeof overrides !== 'object') {
+      return;
+    }
+    const tracker = ensureChannelLabelMap(channelId);
+    if (!tracker) {
+      return;
+    }
+    for (const [rawKey, rawValue] of Object.entries(overrides)) {
+      const normalizedKey = normalizeLabelKey(rawKey);
+      if (!normalizedKey) {
+        continue;
+      }
+      const normalizedValue = normalizeLabelValue(rawValue);
+      if (!normalizedValue) {
+        continue;
+      }
+
+      const existingGlobal = globalLabelMap.get(normalizedKey);
+      if (existingGlobal && existingGlobal.value !== normalizedValue) {
+        messages.push(
+          `${pathPrefix}.labelMap.${rawKey} conflicts with ${existingGlobal.path}`
+        );
+        continue;
+      }
+
+      const existing = tracker.get(normalizedKey);
+      if (existing && existing.value !== normalizedValue) {
+        messages.push(
+          `${pathPrefix}.labelMap.${rawKey} conflicts with ${existing.path}`
+        );
+        continue;
+      }
+
+      tracker.set(normalizedKey, {
+        value: normalizedValue,
+        path: `${pathPrefix}.labelMap.${rawKey}`
+      });
+    }
+  };
+
+  if (config.video.channels) {
+    for (const [channelId, channelConfig] of Object.entries(config.video.channels)) {
+      if (channelConfig.objects && typeof channelConfig.objects === 'object') {
+        registerLabelOverrides(
+          channelId,
+          (channelConfig.objects as ObjectsOverrideConfig)?.labelMap,
+          `config.video.channels.${channelId}.objects`
+        );
+      }
+    }
+  }
+
+  if (Array.isArray(config.video.cameras)) {
+    config.video.cameras.forEach((camera, index) => {
+      const label = camera.id ?? `#${index}`;
+      if (camera.objects && typeof camera.objects === 'object' && camera.channel) {
+        registerLabelOverrides(
+          camera.channel,
+          camera.objects.labelMap,
+          `config.video.cameras[${label}].objects`
         );
       }
     });

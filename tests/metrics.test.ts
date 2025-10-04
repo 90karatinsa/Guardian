@@ -786,6 +786,26 @@ describe('MetricsSnapshotEnrichment', () => {
     expect(metricsCheck?.details?.lastSuppressed?.ruleId).toBe('window-1');
   });
 
+  it('MetricsIncludesAudioAnalysis exports audio windows and stream warning totals', () => {
+    metrics.setDetectorGauge('audio-anomaly', 'analysis.pulse.rms-window-ms', 480);
+    metrics.setDetectorGauge('audio-anomaly', 'analysis.pulse.rms-window-frames', 160);
+    metrics.setDetectorGauge('audio-anomaly', 'analysis.pulse.rms', 0.12);
+
+    metrics.recordSuppressionHistoryTtlPruned({ count: 2, ruleId: 'motion-window', channel: 'video:lobby' });
+    metrics.recordRetentionWarning({ camera: 'lobby', path: '/snapshots/1', reason: 'stale' });
+    metrics.recordTransportFallback('ffmpeg', 'udp-retry', { channel: 'video:lobby' });
+
+    const snapshot = metrics.snapshot();
+    const audioAnalysis = snapshot.detectors['audio-anomaly'].analysis.pulse;
+    expect(audioAnalysis.rmsWindowMs).toBe(480);
+    expect(audioAnalysis.rmsWindowFrames).toBe(160);
+    expect(audioAnalysis.rms).toBeCloseTo(0.12, 5);
+    expect(snapshot.streams.warnings.total).toBe(3);
+    expect(snapshot.streams.warnings.byType['suppression']).toBe(1);
+    expect(snapshot.streams.warnings.byType['retention']).toBe(1);
+    expect(snapshot.streams.warnings.byType['transport-fallback']).toBe(1);
+  });
+
   it('MetricsAudioDeviceDiscovery exposes audio device discovery counters in health snapshots', async () => {
     metrics.recordAudioDeviceDiscovery('probe-failed', { channel: 'audio:lobby' });
     metrics.recordAudioDeviceDiscovery('probe-failed');

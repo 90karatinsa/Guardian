@@ -474,9 +474,12 @@ export class VideoSource extends EventEmitter {
       };
     });
 
+    let closeHandled = false;
+
     const onError = (err: Error) => {
       this.finalizeCommandLifecycle(commandId, command);
-      if (this.shouldStop || this.recovering) {
+      const hasPendingRestart = Boolean(this.restartTimer);
+      if (this.shouldStop || (this.recovering && !hasPendingRestart)) {
         return;
       }
 
@@ -484,15 +487,22 @@ export class VideoSource extends EventEmitter {
       this.emit('error', err);
       const reason = details.errorCode === 'ENOENT' ? 'ffmpeg-missing' : 'ffmpeg-error';
       this.scheduleRecovery(reason, details);
+      if (!closeHandled) {
+        command.once('close', onClose);
+      }
     };
 
     const onEnd = () => {
       this.finalizeCommandLifecycle(commandId, command);
-      if (this.shouldStop || this.recovering) {
+      const hasPendingRestart = Boolean(this.restartTimer);
+      if (this.shouldStop || (this.recovering && !hasPendingRestart)) {
         return;
       }
       this.emit('end');
       this.scheduleRecovery('ffmpeg-ended');
+      if (!closeHandled) {
+        command.once('close', onClose);
+      }
     };
 
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
@@ -500,8 +510,10 @@ export class VideoSource extends EventEmitter {
       const summary = this.summarizeRtspClassifications(classifications);
       const derived = this.resolveRtspExitReason(summary);
 
+      closeHandled = true;
       this.finalizeCommandLifecycle(commandId, command);
-      if (this.shouldStop || this.recovering) {
+      const hasPendingRestart = Boolean(this.restartTimer);
+      if (this.shouldStop || (this.recovering && !hasPendingRestart)) {
         return;
       }
 
@@ -639,15 +651,19 @@ export class VideoSource extends EventEmitter {
   }
 
   private scheduleRecovery(reason: string, context: RecoveryContext = {}) {
-    if (this.shouldStop || this.circuitBroken || this.recovering) {
+    if (this.shouldStop || this.circuitBroken) {
       return;
     }
 
-    if (this.restartTimer) {
+    const hasPendingRestart = Boolean(this.restartTimer);
+    if (this.recovering && !hasPendingRestart) {
       return;
     }
 
-    const attemptPreview = this.restartCount + 1;
+    const existingContext = this.pendingRestartContext;
+    const attemptPreviewRaw =
+      existingContext?.attempt ?? this.restartCount + (hasPendingRestart ? 0 : 1);
+    const attemptPreview = Math.max(1, attemptPreviewRaw);
     const resolvedContext: RecoveryContext = {
       errorCode:
         typeof context.errorCode === 'string' || typeof context.errorCode === 'number'
@@ -659,6 +675,37 @@ export class VideoSource extends EventEmitter {
       signal: context.signal ?? null
     };
     this.maybeApplyRtspTransportFallback(reason, resolvedContext, attemptPreview);
+
+    if (hasPendingRestart && this.restartTimer && this.pendingRestartContext === null) {
+      this.clearRestartTimer();
+    }
+
+    const activePendingContext = this.pendingRestartContext;
+    if (
+      hasPendingRestart &&
+      this.restartTimer &&
+      activePendingContext &&
+      activePendingContext === existingContext
+    ) {
+      if (Object.prototype.hasOwnProperty.call(context, 'errorCode')) {
+        activePendingContext.errorCode =
+          typeof resolvedContext.errorCode === 'string' || typeof resolvedContext.errorCode === 'number'
+            ? resolvedContext.errorCode
+            : null;
+      }
+      if (Object.prototype.hasOwnProperty.call(context, 'exitCode')) {
+        activePendingContext.exitCode = resolvedContext.exitCode ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(context, 'signal')) {
+        activePendingContext.signal = resolvedContext.signal ?? null;
+      }
+      this.reportRecovery(activePendingContext, reason);
+      return;
+    }
+
+    if (this.restartTimer) {
+      this.clearRestartTimer();
+    }
 
     this.recovering = true;
     this.restartCount += 1;

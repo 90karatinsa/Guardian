@@ -65,6 +65,8 @@ type ClientState = {
 };
 
 const DEFAULT_FACE_THRESHOLD = 0.5;
+const MIN_RETRY_MS = 1000;
+const MAX_RETRY_MS = 60000;
 
 export class EventsRouter {
   private readonly bus: EventEmitter;
@@ -285,10 +287,16 @@ export class EventsRouter {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      Connection: 'keep-alive'
+      Connection: 'keep-alive',
+      'Retry-After': String(Math.max(1, Math.ceil(retryMs / 1000)))
     });
     res.write(': connected\n');
     res.write(`retry: ${retryMs}\n`);
+    const retryHint = createRetryHint(retryMs);
+    if (retryHint) {
+      res.write('event: retry-hint\n');
+      res.write(`data: ${JSON.stringify(retryHint)}\n\n`);
+    }
     res.write(`event: stream-status\n`);
     const statusPayload = {
       status: 'connected',
@@ -1057,13 +1065,11 @@ function resolveResumeRequest(req: IncomingMessage, url: URL): ResumeRequest {
 }
 
 function resolveRetryInterval(params: URLSearchParams): number {
-  const clamp = (value: number) => Math.max(1000, Math.min(Math.floor(value), 60000));
-
   const retryMs = params.get('retryMs');
   if (retryMs) {
     const parsed = Number(retryMs);
     if (Number.isFinite(parsed)) {
-      return clamp(parsed);
+      return clampRetryMs(parsed);
     }
     return 5000;
   }
@@ -1079,7 +1085,42 @@ function resolveRetryInterval(params: URLSearchParams): number {
     return 5000;
   }
 
-  return clamp(numeric * 1000);
+  return clampRetryMs(numeric * 1000);
+}
+
+function clampRetryMs(value: number): number {
+  return Math.max(MIN_RETRY_MS, Math.min(Math.floor(value), MAX_RETRY_MS));
+}
+
+function createRetryHint(retryMs: number):
+  | { baseMs: number; minMs: number; maxMs: number; recommendedMs: number }
+  | null {
+  if (!Number.isFinite(retryMs) || retryMs <= 0) {
+    return null;
+  }
+
+  const baseMs = clampRetryMs(retryMs);
+  const jitterWindow = Math.max(500, Math.floor(baseMs * 0.5));
+  const minMs = clampRetryMs(baseMs - Math.floor(jitterWindow / 2));
+  const maxMs = clampRetryMs(baseMs + jitterWindow);
+  const recommendedMs = sampleRetryDelay(minMs, maxMs);
+
+  return { baseMs, minMs, maxMs, recommendedMs };
+}
+
+function sampleRetryDelay(minMs: number, maxMs: number): number {
+  if (!Number.isFinite(minMs) || !Number.isFinite(maxMs) || minMs <= 0 || maxMs <= 0) {
+    return MIN_RETRY_MS;
+  }
+
+  const lower = Math.min(minMs, maxMs);
+  const upper = Math.max(minMs, maxMs);
+  if (lower === upper) {
+    return lower;
+  }
+
+  const span = upper - lower;
+  return lower + Math.floor(Math.random() * (span + 1));
 }
 
 function resolveDateParam(value: string | null): number | undefined {

@@ -62,6 +62,8 @@ export class LightDetector {
   private rebaselineFramesRemaining = 0;
   private readonly temporalWindow: number[] = [];
   private temporalSuppression = 0;
+  private frameWidth: number | null = null;
+  private frameHeight: number | null = null;
 
   constructor(options: LightDetectorOptions, private readonly bus: EventEmitter = eventBus) {
     this.options = {
@@ -188,6 +190,17 @@ export class LightDetector {
       this.lastFrameTs = ts;
 
       const grayscale = readFrameAsGrayscale(frame);
+      const resolutionChanged =
+        this.frameWidth !== null &&
+        this.frameHeight !== null &&
+        (grayscale.width !== this.frameWidth || grayscale.height !== this.frameHeight);
+
+      if (resolutionChanged) {
+        this.handleResolutionChange(grayscale.width, grayscale.height, ts);
+      }
+
+      this.frameWidth = grayscale.width;
+      this.frameHeight = grayscale.height;
       const baseGaussian = gaussianBlur(grayscale);
       const baseMedian = medianFilter(baseGaussian);
       let smoothed = baseMedian;
@@ -700,6 +713,24 @@ export class LightDetector {
       return;
     }
     this.baseline = this.baseline * (1 - smoothing) + luminance * smoothing;
+  }
+
+  private handleResolutionChange(width: number, height: number, ts: number) {
+    this.resetAdaptiveState({ preserveBaseline: false });
+    this.frameWidth = width;
+    this.frameHeight = height;
+    this.lastFrameTs = ts;
+    metrics.resetDetectorCounters('light', [
+      'suppressedFrames',
+      'suppressedFramesBeforeTrigger',
+      'backoffFrames',
+      'backoffSuppressedFrames',
+      'backoffActivations',
+      'backoffFrameBudget'
+    ]);
+    this.updatePendingSuppressedGauge();
+    metrics.setDetectorGauge('light', 'noiseWarmupRemaining', this.noiseWarmupRemaining);
+    metrics.setDetectorGauge('light', 'noiseBackoffPadding', this.noiseBackoffPadding);
   }
 
   private resetAdaptiveState(
